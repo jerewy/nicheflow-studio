@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
+import os
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
@@ -45,8 +47,10 @@ class MainWindow(QWidget):
         top_row.addWidget(self._download_button)
 
         self._table = QTableWidget()
-        self._table.setColumnCount(4)
-        self._table.setHorizontalHeaderLabels(["Status", "Title", "Source URL", "Output"])
+        self._table.setColumnCount(5)
+        self._table.setHorizontalHeaderLabels(
+            ["Status", "Title", "Source URL", "Output", "Actions"]
+        )
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self._table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
 
@@ -64,6 +68,25 @@ class MainWindow(QWidget):
         self._refresh_timer.start()
 
         self._refresh_list()
+
+    def _action_widget(self, item: DownloadItem) -> QWidget:
+        widget = QWidget()
+        layout = QHBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        retry_button = QPushButton("Retry")
+        retry_button.setEnabled(item.status in {"failed", "downloaded"})
+        retry_button.clicked.connect(lambda: self._on_retry_clicked(item.id))
+
+        open_button = QPushButton("Open")
+        open_button.setEnabled(bool(item.file_path))
+        open_button.clicked.connect(lambda: self._on_open_clicked(item.file_path))
+
+        layout.addWidget(retry_button)
+        layout.addWidget(open_button)
+        widget.setLayout(layout)
+        return widget
 
     def _refresh_list(self) -> None:
         self._table.setRowCount(0)
@@ -88,6 +111,7 @@ class MainWindow(QWidget):
             self._table.setItem(row, 1, title_item)
             self._table.setItem(row, 2, source_item)
             self._table.setItem(row, 3, file_item)
+            self._table.setCellWidget(row, 4, self._action_widget(item))
 
     def _on_download_clicked(self) -> None:
         url = self._url_input.text().strip()
@@ -105,3 +129,20 @@ class MainWindow(QWidget):
             self._status_label.setText(f"Queue failed: {exc}")
         finally:
             self._download_button.setEnabled(True)
+
+    def _on_retry_clicked(self, item_id: int) -> None:
+        if QueueManager.retry_item(item_id):
+            self._status_label.setText("Retrying download…")
+            self._refresh_list()
+        else:
+            self._status_label.setText("Could not retry download.")
+
+    def _on_open_clicked(self, target: str | None) -> None:
+        if not target:
+            self._status_label.setText("No file to open yet.")
+            return
+        path = Path(target)
+        if not path.exists():
+            self._status_label.setText("File missing.")
+            return
+        os.startfile(str(path))

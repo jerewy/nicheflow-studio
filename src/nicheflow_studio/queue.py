@@ -34,6 +34,22 @@ class QueueManager:
         return item_id
 
     @classmethod
+    def retry_item(cls, item_id: int) -> bool:
+        with get_session() as session:
+            item = session.get(DownloadItem, item_id)
+            if item is None:
+                return False
+            item.status = "queued"
+            item.file_path = None
+            item.extractor = None
+            item.video_id = None
+            item.title = None
+            session.commit()
+
+        cls._executor.submit(cls._run_download, item_id, item.source_url, None)
+        return True
+
+    @classmethod
     def _run_download(cls, item_id: int, url: str, callback: Callable[[DownloadItem], None] | None) -> None:
         with get_session() as session:
             item = session.get(DownloadItem, item_id)

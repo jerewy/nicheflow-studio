@@ -19,6 +19,7 @@ python -m venv .venv
 - `data/` - local runtime data (ignored by git)
 - `docs/` - documentation
 - `src/nicheflow_studio/queue.py` - threaded downloader queue + status updater
+- `src/nicheflow_studio/app/main_window.py` - queue table with retry/open controls
 
 ## Notes
 
