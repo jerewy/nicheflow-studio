@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtualenvs
+.venv/
+venv/
+ENV/
+env/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini
+
+# Env / secrets
+.env
+.env.*
+
+# Builds / packaging
+build/
+dist/
+*.spec
+
+# Local app data (downloads, db, logs, cache)
+data/
+
