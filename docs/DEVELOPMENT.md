@@ -15,12 +15,12 @@ python -m venv .venv
 
 ## Project Layout (MVP)
 
-- `src/nicheflow_studio/` — app code
-- `data/` — local runtime data (ignored by git)
-- `docs/` — documentation
+- `src/nicheflow_studio/` - app code
+- `data/` - local runtime data (ignored by git)
+- `docs/` - documentation
+- `src/nicheflow_studio/queue.py` - threaded downloader queue + status updater
 
 ## Notes
 
 - If you hit download issues, `yt-dlp` can break when sites change; update it with:
   `.\.venv\Scripts\pip install -U yt-dlp`
-
