@@ -1,51 +1,39 @@
-# 🎯 NicheFlow Studio
+# NicheFlow Studio
 
-Multi-Account Content Automation Platform for Social Media
+Multi-account content management (Windows-first MVP).
 
-## Features
+## MVP (current)
 
-- 🎯 **Multi-Niche Support** - Manage 10+ accounts across different niches
-- 🤖 **AI-Powered Verification** - Intelligent niche consistency checking
-- ⚡ **Flexible Automation** - Full auto, hybrid, or manual control
-- 🕵️ **Stealth Operations** - Human behavior simulation
-- 📊 **Advanced Analytics** - Performance tracking & optimization
-- 🔄 **Cross-Platform** - Instagram, TikTok, YouTube Shorts
+- Desktop app: PyQt6
+- Local DB: SQLite (`data/nicheflow.db`)
+- YouTube ingestion: `yt-dlp` (supports YouTube Shorts URLs)
+- Local runtime data folder: `data/` (ignored by git)
 
-## Quick Start
+See `docs/MVP.md` for the current scope and what’s explicitly out of scope.
 
-```bash
-# Clone repository
-git clone https://github.com/yourusername/nicheflow-studio.git
-cd nicheflow-studio
+## Quick Start (Windows PowerShell)
 
-# Install dependencies
-pip install -r requirements.txt
-
-# Initialize database
-python src/db/init_db.py
-
-# Run application
-python src/main.py
+```powershell
+python -m venv .venv
+.\.venv\Scripts\pip install -r requirements.txt
+.\.venv\Scripts\python -m nicheflow_studio
 ```
 
-## Documentation
+Or run the helper:
 
-- [Installation Guide](docs/INSTALLATION.md)
-- [User Guide](docs/USER_GUIDE.md)
-- [Development Guide](docs/DEVELOPMENT.md)
-- [Master Plan](PLAN.md)
+```powershell
+.\scripts\run.ps1
+```
 
-## Requirements
+## Runtime Data
 
-- Python 3.11+
-- 8GB RAM minimum
-- 10GB free disk space
-- FFmpeg installed
+- Default data directory is `.\data\`
+- Override with `NICHEFLOW_DATA_DIR` if you want it elsewhere
 
-## License
+## Docs
 
-MIT License - see [LICENSE](LICENSE)
+- MVP scope: `docs/MVP.md`
+- Development: `docs/DEVELOPMENT.md`
+- Installation: `docs/INSTALLATION.md`
+- Master plan: `PLAN.md`
 
-## Disclaimer
-
-⚠️ Use responsibly. Users are responsible for complying with platform TOS and copyright laws.
