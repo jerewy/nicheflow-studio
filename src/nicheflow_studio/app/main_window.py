@@ -55,6 +55,7 @@ from nicheflow_studio.processing.transcription import generate_transcript_draft_
 from nicheflow_studio.processing.smart_drafts import (
     SMART_DRAFT_OPTION_COUNT,
     SmartDrafts,
+    _groq_limit_profile,
     can_generate_smart_drafts,
     generate_smart_drafts,
 )
@@ -1909,6 +1910,11 @@ class MainWindow(QWidget):
         self._processing_eval_provider_label.setWordWrap(True)
         text_layout.addWidget(self._processing_eval_provider_label)
 
+        self._processing_usage_label = QLabel("Usage budget will appear here after smart generation is configured.")
+        self._processing_usage_label.setObjectName("subtleLabel")
+        self._processing_usage_label.setWordWrap(True)
+        text_layout.addWidget(self._processing_usage_label)
+
         self._processing_eval_meta_input = QTextEdit()
         self._processing_eval_meta_input.setObjectName("smartOptionEdit")
         self._processing_eval_meta_input.setReadOnly(True)
@@ -2284,6 +2290,7 @@ class MainWindow(QWidget):
             "Smart draft summary will appear here after Groq generation."
         )
         self._set_processing_eval_state()
+        self._refresh_processing_usage_label()
         self._set_processing_smart_options([], [])
         self._apply_title_style_preset("clean_hook")
         self._processing_style_status_label.setText(
@@ -2601,6 +2608,87 @@ class MainWindow(QWidget):
         )
         self._processing_eval_meta_input.setPlainText(generation_meta or "")
         self._processing_eval_vision_input.setPlainText(vision_payload or "")
+        self._refresh_processing_usage_label()
+
+    def _refresh_processing_usage_label(self) -> None:
+        profile = _groq_limit_profile()
+        summary = self._processing_monthly_usage_summary()
+        estimated_cost = self._processing_generation_meta_cost(self._processing_generation_meta_text)
+        cost_text = f"${summary['cost']:.4f} / ${profile['monthly_budget_usd']:.2f}"
+        count_text = f"{summary['count']} / {profile['monthly_video_cap']} videos"
+        parts = [
+            f"Month usage: {cost_text}",
+            count_text,
+            f"daily cap {profile['daily_video_cap']}",
+            f"{profile['max_frames_per_video']} frames/video",
+        ]
+        if estimated_cost > 0:
+            parts.append(f"selected estimate ${estimated_cost:.4f}")
+        if summary["cost"] >= profile["budget_warn_at_usd"]:
+            parts.append(f"warning threshold ${profile['budget_warn_at_usd']:.2f}")
+        self._processing_usage_label.setText(" | ".join(parts))
+
+    def _processing_monthly_usage_summary(self) -> dict[str, float | int]:
+        now = dt.datetime.now(dt.timezone.utc)
+        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        total_cost = 0.0
+        generated_count = 0
+        with get_session() as session:
+            rows = (
+                session.query(DownloadItem.smart_generation_meta, DownloadItem.smart_generated_at)
+                .filter(DownloadItem.smart_generation_meta.isnot(None))
+                .all()
+        )
+        for raw_meta, generated_at in rows:
+            normalized_generated_at = self._as_utc_datetime(generated_at)
+            if normalized_generated_at is None or normalized_generated_at < month_start:
+                continue
+            cost = self._processing_generation_meta_cost(raw_meta)
+            if cost <= 0:
+                continue
+            total_cost += cost
+            generated_count += 1
+        return {"cost": total_cost, "count": generated_count}
+
+    @staticmethod
+    def _as_utc_datetime(value: dt.datetime | None) -> dt.datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=dt.timezone.utc)
+        return value.astimezone(dt.timezone.utc)
+
+    @staticmethod
+    def _processing_generation_meta_cost(raw_meta: str | None) -> float:
+        if not raw_meta:
+            return 0.0
+        try:
+            payload = json.loads(raw_meta)
+        except json.JSONDecodeError:
+            return 0.0
+        if not isinstance(payload, dict):
+            return 0.0
+        raw_cost = payload.get("estimated_cost_usd")
+        if isinstance(raw_cost, bool):
+            return 0.0
+        if isinstance(raw_cost, (int, float)):
+            return max(0.0, float(raw_cost))
+        return 0.0
+
+    def _smart_generation_budget_guard_message(self) -> str | None:
+        profile = _groq_limit_profile()
+        summary = self._processing_monthly_usage_summary()
+        if summary["cost"] >= profile["monthly_budget_usd"]:
+            return (
+                f"Smart generation budget reached: ${summary['cost']:.4f} / "
+                f"${profile['monthly_budget_usd']:.2f} this month."
+            )
+        if summary["count"] >= profile["monthly_video_cap"]:
+            return (
+                f"Smart generation monthly video cap reached: "
+                f"{summary['count']} / {profile['monthly_video_cap']} videos."
+            )
+        return None
 
     def _title_style_config_payload(self) -> str:
         payload = {
@@ -2905,6 +2993,11 @@ class MainWindow(QWidget):
         if item is None:
             self._notify("Select a downloaded video first.", Tone.WARNING)
             return
+        guard_message = self._smart_generation_budget_guard_message()
+        if guard_message is not None:
+            self._refresh_processing_usage_label()
+            self._notify(guard_message, Tone.WARNING)
+            return
 
         transcript_text = self._processing_transcript_input.toPlainText().strip()
         if not transcript_text:
@@ -3011,6 +3104,12 @@ class MainWindow(QWidget):
 
         item = self._processing_selected_item()
         if item is None:
+            return False
+        guard_message = self._smart_generation_budget_guard_message()
+        if guard_message is not None:
+            self._refresh_processing_usage_label()
+            self._processing_draft_status_label.setText(guard_message)
+            self._notify(guard_message, Tone.WARNING)
             return False
 
         account = self._active_account()

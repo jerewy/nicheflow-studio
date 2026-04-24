@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 from pathlib import Path
 
 import pytest
@@ -1047,6 +1048,127 @@ def test_processing_page_shows_eval_debug_metadata(monkeypatch, qt_app, tmp_path
         assert "Groq Scout + Llama 3.3" in window._processing_eval_provider_label.text()
         assert "frame_count" in window._processing_eval_meta_input.toPlainText()
         assert "scene_summary" in window._processing_eval_vision_input.toPlainText()
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_processing_page_shows_usage_budget_summary(monkeypatch, qt_app, tmp_path: Path) -> None:
+    init_db()
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"video")
+
+    with get_session() as session:
+        account = Account(name="YT Main", platform="youtube", niche_label="animal comedy")
+        session.add(account)
+        session.flush()
+        session.add_all(
+            [
+                DownloadItem(
+                    source_url="https://youtube.com/watch?v=smartbudget",
+                    title="Zoo source",
+                    status="downloaded",
+                    account_id=account.id,
+                    file_path=str(video_path),
+                    smart_generation_meta='{"estimated_cost_usd":0.25}',
+                    smart_generated_at=dt.datetime.now(dt.timezone.utc),
+                ),
+                DownloadItem(
+                    source_url="https://youtube.com/watch?v=oldbudget",
+                    title="Old source",
+                    status="downloaded",
+                    account_id=account.id,
+                    file_path=str(video_path),
+                    smart_generation_meta='{"estimated_cost_usd":0.40}',
+                    smart_generated_at=dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=45),
+                ),
+            ]
+        )
+        session.commit()
+
+    monkeypatch.setenv("GROQ_MONTHLY_BUDGET_USD", "1")
+    monkeypatch.setenv("GROQ_MONTHLY_VIDEO_CAP", "1000")
+    monkeypatch.setenv("GROQ_DAILY_VIDEO_CAP", "40")
+    monkeypatch.setattr(
+        "nicheflow_studio.app.main_window.probe_video",
+        lambda _: VideoProbe(width=1280, height=720, duration_seconds=12.0),
+    )
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._current_account_combo.setCurrentIndex(1)
+        window._set_current_page("processing")
+        qt_app.processEvents()
+
+        usage_text = window._processing_usage_label.text()
+        assert "$0.2500 / $1.00" in usage_text
+        assert "1 / 1000 videos" in usage_text
+        assert "daily cap 40" in usage_text
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_processing_smart_generation_stops_at_monthly_budget(monkeypatch, qt_app, tmp_path: Path) -> None:
+    init_db()
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"video")
+
+    with get_session() as session:
+        account = Account(name="YT Main", platform="youtube", niche_label="animal comedy")
+        session.add(account)
+        session.flush()
+        session.add_all(
+            [
+                DownloadItem(
+                    source_url="https://youtube.com/watch?v=selected",
+                    title="Zoo source",
+                    status="downloaded",
+                    account_id=account.id,
+                    file_path=str(video_path),
+                    transcript_text="This is already transcribed.",
+                ),
+                DownloadItem(
+                    source_url="https://youtube.com/watch?v=spent",
+                    title="Spent source",
+                    status="downloaded",
+                    account_id=account.id,
+                    file_path=str(video_path),
+                    smart_generation_meta='{"estimated_cost_usd":1.01}',
+                    smart_generated_at=dt.datetime.now(dt.timezone.utc),
+                ),
+            ]
+        )
+        session.commit()
+
+    monkeypatch.setenv("GROQ_MONTHLY_BUDGET_USD", "1")
+    monkeypatch.setattr(
+        "nicheflow_studio.app.main_window.probe_video",
+        lambda _: VideoProbe(width=1280, height=720, duration_seconds=12.0),
+    )
+    monkeypatch.setattr("nicheflow_studio.app.main_window.can_generate_smart_drafts", lambda: True)
+    started_jobs = []
+    monkeypatch.setattr(MainWindow, "_start_smart_draft_job", lambda self, job: started_jobs.append(job))
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._current_account_combo.setCurrentIndex(1)
+        window._set_current_page("processing")
+        qt_app.processEvents()
+
+        window._on_generate_smart_drafts_clicked()
+        qt_app.processEvents()
+
+        assert started_jobs == []
+        assert "budget" in window._toast_label.text().lower()
     finally:
         window._refresh_timer.stop()
         window._toast_timer.stop()
