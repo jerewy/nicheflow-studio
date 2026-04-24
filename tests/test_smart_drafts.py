@@ -516,6 +516,12 @@ def test_smart_draft_prompt_is_niche_aware() -> None:
     assert "Account voice settings" in prompt
     assert "Visual evidence JSON" in prompt
     assert "like and follow" in prompt
+    assert "human clipper" in prompt
+    assert "reaction-caption" in prompt
+    assert "context-caption" in prompt
+    assert "what do you think" in prompt
+    assert "what's your" in prompt
+    assert "do not copy lowercased OCR handles" in prompt
 
 
 def test_smart_draft_prompt_uses_visual_first_mode_without_transcript() -> None:
@@ -538,6 +544,8 @@ def test_smart_draft_prompt_uses_visual_first_mode_without_transcript() -> None:
     assert "Visual-first mode" in prompt
     assert "silent or meme-style clips" in prompt
     assert "Do not write as if the clip has spoken narration" in prompt
+    assert "Use the on-screen OCR text as the main context signal" in prompt
+    assert "preserve spelling exactly or omit" in prompt
     assert "cat freezes" in prompt
 
 
