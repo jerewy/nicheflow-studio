@@ -33,7 +33,12 @@ def _run_scrape_job_immediately(window: MainWindow, job) -> None:  # noqa: ANN00
         if source.id in job.source_ids
     ]
     for source in sources:
-        created_count, refreshed_count, skipped_count, rejected_count = window._run_scrape_for_source(
+        (
+            created_count,
+            refreshed_count,
+            skipped_count,
+            rejected_count,
+        ) = window._run_scrape_for_source(
             account_id=job.account_id,
             source=source,
             keywords=job.keywords,
@@ -75,7 +80,10 @@ def _complete_suggest_job_immediately(window: MainWindow, job) -> None:  # noqa:
     window._on_suggest_crop_completed(
         {
             "crop": CropSettings(left=18, top=24, right=12, bottom=96),
-            "reasons": ["removed detected border margins", "trimmed repeated OCR text near the frame edges"],
+            "reasons": [
+                "removed detected border margins",
+                "trimmed repeated OCR text near the frame edges",
+            ],
             "used_border_detection": True,
             "used_ocr": True,
         }
@@ -99,7 +107,10 @@ def _complete_smart_draft_job_immediately(window: MainWindow, job) -> None:  # n
         {
             "summary": "A funny zoo moment with a clear elephant hook.",
             "title_options": ["Elephant Chaos", "Zoo Hook", "Watch The Elephant"],
-            "caption_options": ["This elephant stole the whole clip", "Wait for the elephant reveal"],
+            "caption_options": [
+                "This elephant stole the whole clip",
+                "Wait for the elephant reveal",
+            ],
             "provider_label": "Groq Scout + Llama 3.3",
             "used_fallback": False,
             "vision_payload": {
@@ -295,7 +306,9 @@ def test_source_intake_persists_candidates_for_selected_account(monkeypatch, qt_
         assert window._candidate_table.rowCount() == 1
         assert window._candidate_table.item(0, 0).text() == "ready"
         assert window._candidate_table.item(0, 6).text() == "Intake clip"
-        assert window._scrape_summary_label.text().startswith("1 of 1 source(s) enabled, 1 keyword(s)")
+        assert window._scrape_summary_label.text().startswith(
+            "1 of 1 source(s) enabled, 1 keyword(s)"
+        )
     finally:
         window._refresh_timer.stop()
         window._toast_timer.stop()
@@ -329,7 +342,9 @@ def test_workspace_can_add_scrape_source_to_selected_account(qt_app) -> None:
         assert window._status_label.text() == "Added source to the current account."
         assert window._scrape_source_input.text() == ""
         assert window._source_table.rowCount() == 1
-        assert window._scrape_summary_label.text().startswith("1 of 1 source(s) enabled, 0 keyword(s)")
+        assert window._scrape_summary_label.text().startswith(
+            "1 of 1 source(s) enabled, 0 keyword(s)"
+        )
     finally:
         window._refresh_timer.stop()
         window._toast_timer.stop()
@@ -611,7 +626,9 @@ def test_processing_page_applies_auto_suggested_crop_state(
         window._start_suggest_crop_job(SuggestCropJobConfig(input_path=video_path))
         qt_app.processEvents()
 
-        assert window._processing_crop_settings() == CropSettings(left=18, top=24, right=12, bottom=96)
+        assert window._processing_crop_settings() == CropSettings(
+            left=18, top=24, right=12, bottom=96
+        )
         assert window._processing_progress_label.text() == "Automatic crop suggestion applied."
         assert "OCR text" in window._processing_suggestion_label.text()
     finally:
@@ -663,7 +680,10 @@ def test_processing_page_can_generate_and_save_text_drafts(
         qt_app.processEvents()
 
         assert window._processing_title_draft_input.text() == "Generated title draft"
-        assert window._processing_caption_draft_input.toPlainText() == "This is a generated caption draft."
+        assert (
+            window._processing_caption_draft_input.toPlainText()
+            == "This is a generated caption draft."
+        )
         assert "Source title" in window._processing_transcript_input.toPlainText()
         assert "generated transcript" in window._processing_transcript_input.toPlainText()
 
@@ -740,9 +760,9 @@ def test_processing_page_saves_and_restores_style_settings(
             saved = session.query(DownloadItem).one()
 
         assert saved.title_style_preset == "boxed_banner"
-        assert "\"font_size\": 72" in (saved.title_style_config or "")
-        assert "\"font_name\": \"impact\"" in (saved.title_style_config or "")
-        assert "\"background\": \"light\"" in (saved.title_style_config or "")
+        assert '"font_size": 72' in (saved.title_style_config or "")
+        assert '"font_name": "impact"' in (saved.title_style_config or "")
+        assert '"background": "light"' in (saved.title_style_config or "")
 
         window._apply_refresh(force=True)
         window._set_current_page("processing")
@@ -916,6 +936,9 @@ def test_non_processing_pages_do_not_probe_videos_during_refresh(
         qt_app.processEvents()
 
         assert probe_calls == []
+        assert window._schedule_table.rowCount() == 1
+        assert window._schedule_table.item(0, 1).text() == "Valid Clip"
+        assert window._schedule_table.item(0, 4).text() == "Needs preprocessing"
 
         window._apply_refresh(force=True)
         qt_app.processEvents()
@@ -974,20 +997,31 @@ def test_processing_page_can_generate_and_apply_smart_drafts(
         assert "elephant hook" in window._processing_smart_summary_label.text().lower()
         assert len(window._processing_smart_option_buttons) == 3
         assert window._processing_smart_option_title_inputs[0].text() == "Elephant Chaos"
-        assert window._processing_smart_option_caption_inputs[0].toPlainText() == "This elephant stole the whole clip"
+        assert (
+            window._processing_smart_option_caption_inputs[0].toPlainText()
+            == "This elephant stole the whole clip"
+        )
         assert window._processing_title_draft_input.text() == "Elephant Chaos"
-        assert window._processing_caption_draft_input.toPlainText() == "This elephant stole the whole clip"
+        assert (
+            window._processing_caption_draft_input.toPlainText()
+            == "This elephant stole the whole clip"
+        )
         window._apply_refresh(force=True)
         window._set_current_page("processing")
         qt_app.processEvents()
         assert window._processing_title_draft_input.text() == "Elephant Chaos"
-        assert window._processing_caption_draft_input.toPlainText() == "This elephant stole the whole clip"
+        assert (
+            window._processing_caption_draft_input.toPlainText()
+            == "This elephant stole the whole clip"
+        )
 
         window._on_processing_smart_option_clicked(1)
         assert window._processing_title_draft_input.text() == "Zoo Hook"
 
         window._on_processing_smart_option_clicked(1)
-        assert window._processing_caption_draft_input.toPlainText() == "Wait for the elephant reveal"
+        assert (
+            window._processing_caption_draft_input.toPlainText() == "Wait for the elephant reveal"
+        )
 
         window._on_save_text_drafts_clicked()
         qt_app.processEvents()
@@ -1046,8 +1080,12 @@ def test_processing_page_shows_eval_debug_metadata(monkeypatch, qt_app, tmp_path
         qt_app.processEvents()
 
         assert "Groq Scout + Llama 3.3" in window._processing_eval_provider_label.text()
+        assert window._processing_debug_panel.isVisible() is False
         assert "frame_count" in window._processing_eval_meta_input.toPlainText()
         assert "scene_summary" in window._processing_eval_vision_input.toPlainText()
+        window._processing_debug_toggle.click()
+        qt_app.processEvents()
+        assert window._processing_debug_panel.isVisible() is True
     finally:
         window._refresh_timer.stop()
         window._toast_timer.stop()
@@ -1115,7 +1153,9 @@ def test_processing_page_shows_usage_budget_summary(monkeypatch, qt_app, tmp_pat
         window.close()
 
 
-def test_processing_smart_generation_stops_at_monthly_budget(monkeypatch, qt_app, tmp_path: Path) -> None:
+def test_processing_smart_generation_stops_at_monthly_budget(
+    monkeypatch, qt_app, tmp_path: Path
+) -> None:
     init_db()
     video_path = tmp_path / "clip.mp4"
     video_path.write_bytes(b"video")
@@ -1154,7 +1194,9 @@ def test_processing_smart_generation_stops_at_monthly_budget(monkeypatch, qt_app
     )
     monkeypatch.setattr("nicheflow_studio.app.main_window.can_generate_smart_drafts", lambda: True)
     started_jobs = []
-    monkeypatch.setattr(MainWindow, "_start_smart_draft_job", lambda self, job: started_jobs.append(job))
+    monkeypatch.setattr(
+        MainWindow, "_start_smart_draft_job", lambda self, job: started_jobs.append(job)
+    )
 
     window = MainWindow()
     try:
@@ -1310,7 +1352,10 @@ def test_processing_generate_drafts_falls_back_to_metadata_only_smart_drafts(
 
         assert len(window._processing_smart_option_buttons) == 3
         assert window._processing_title_draft_input.text() == "Elephant Chaos"
-        assert window._processing_caption_draft_input.toPlainText() == "This elephant stole the whole clip"
+        assert (
+            window._processing_caption_draft_input.toPlainText()
+            == "This elephant stole the whole clip"
+        )
         assert "smart draft options" in window._processing_draft_status_label.text().lower()
     finally:
         window._refresh_timer.stop()
@@ -1410,7 +1455,9 @@ def test_queue_selected_candidate_uses_existing_download_flow(monkeypatch, qt_ap
 
     captured: dict[str, object] = {}
 
-    def fake_enqueue_download(*, url: str, account_id: int | None, callback=None) -> int:  # noqa: ANN001
+    def fake_enqueue_download(
+        *, url: str, account_id: int | None, callback=None
+    ) -> int:  # noqa: ANN001
         captured["url"] = url
         captured["account_id"] = account_id
         return 77
@@ -1493,7 +1540,9 @@ def test_downloaded_candidate_can_be_queued_again_for_redownload(monkeypatch, qt
 
     captured: dict[str, object] = {}
 
-    def fake_enqueue_download(*, url: str, account_id: int | None, callback=None) -> int:  # noqa: ANN001
+    def fake_enqueue_download(
+        *, url: str, account_id: int | None, callback=None
+    ) -> int:  # noqa: ANN001
         captured["url"] = url
         captured["account_id"] = account_id
         return 88
@@ -1574,7 +1623,9 @@ def test_keyword_discovery_auto_queues_top_ranked_candidate(monkeypatch, qt_app)
 
     captured: dict[str, object] = {}
 
-    def fake_enqueue_download(*, url: str, account_id: int | None, callback=None) -> int:  # noqa: ANN001
+    def fake_enqueue_download(
+        *, url: str, account_id: int | None, callback=None
+    ) -> int:  # noqa: ANN001
         captured["url"] = url
         captured["account_id"] = account_id
         return 55
@@ -1666,7 +1717,14 @@ def test_scrape_controls_disable_during_running_job_and_reenable_on_completion(q
         assert window._source_remove_button.isEnabled() is False
 
         window._on_scrape_completed(
-            {"sources": 1, "created": 0, "refreshed": 0, "skipped": 0, "rejected": 0, "auto_queued": 0}
+            {
+                "sources": 1,
+                "created": 0,
+                "refreshed": 0,
+                "skipped": 0,
+                "rejected": 0,
+                "auto_queued": 0,
+            }
         )
         qt_app.processEvents()
 
@@ -1735,7 +1793,14 @@ def test_scrape_progress_bar_tracks_source_level_progress(qt_app) -> None:
         assert window._scrape_progress_bar.format() == "1/1 sources complete"
 
         window._on_scrape_completed(
-            {"sources": 1, "created": 1, "refreshed": 0, "skipped": 0, "rejected": 0, "auto_queued": 0}
+            {
+                "sources": 1,
+                "created": 1,
+                "refreshed": 0,
+                "skipped": 0,
+                "rejected": 0,
+                "auto_queued": 0,
+            }
         )
         qt_app.processEvents()
 
@@ -1777,7 +1842,9 @@ def test_workspace_is_blocked_without_current_account(qt_app) -> None:
         assert window._sidebar_toggle_button.isEnabled() is False
         assert window._sidebar_toggle_button.isChecked() is True
         assert window._library_gate_label.alignment() == Qt.AlignmentFlag.AlignCenter
-        assert window._status_label.text() == "Create and select an account target to use the library."
+        assert (
+            window._status_label.text() == "Create and select an account target to use the library."
+        )
     finally:
         window._refresh_timer.stop()
         window._toast_timer.stop()
@@ -1883,8 +1950,14 @@ def test_download_rejects_unsupported_domain_before_queueing(monkeypatch, qt_app
         qt_app.processEvents()
 
         assert enqueue_calls == []
-        assert window._status_label.text() == "Only YouTube and YouTube Shorts URLs are supported right now."
-        assert window._toast_label.text() == "Only YouTube and YouTube Shorts URLs are supported right now."
+        assert (
+            window._status_label.text()
+            == "Only YouTube and YouTube Shorts URLs are supported right now."
+        )
+        assert (
+            window._toast_label.text()
+            == "Only YouTube and YouTube Shorts URLs are supported right now."
+        )
     finally:
         window._refresh_timer.stop()
         window._toast_timer.stop()
@@ -1938,7 +2011,9 @@ def test_download_accepts_youtube_shorts_url(monkeypatch, qt_app) -> None:
 
         captured: dict[str, object] = {}
 
-        def fake_enqueue_download(*, url: str, account_id: int | None, callback=None) -> int:  # noqa: ANN001
+        def fake_enqueue_download(
+            *, url: str, account_id: int | None, callback=None
+        ) -> int:  # noqa: ANN001
             captured["url"] = url
             captured["account_id"] = account_id
             return 99
@@ -2018,7 +2093,9 @@ def test_download_rejects_channel_url_before_queueing(monkeypatch, qt_app) -> No
         qt_app.processEvents()
 
         assert enqueue_calls == []
-        assert window._status_label.text() == "Channel and profile URLs are not supported right now."
+        assert (
+            window._status_label.text() == "Channel and profile URLs are not supported right now."
+        )
         assert window._toast_label.text() == "Channel and profile URLs are not supported right now."
     finally:
         window._refresh_timer.stop()
@@ -2094,8 +2171,14 @@ def test_download_rejects_downloaded_duplicate_for_same_account(monkeypatch, qt_
         qt_app.processEvents()
 
         assert enqueue_calls == []
-        assert window._status_label.text() == "This video is already in this account library. Use Redownload from history."
-        assert window._toast_label.text() == "This video is already in this account library. Use Redownload from history."
+        assert (
+            window._status_label.text()
+            == "This video is already in this account library. Use Redownload from history."
+        )
+        assert (
+            window._toast_label.text()
+            == "This video is already in this account library. Use Redownload from history."
+        )
         assert window._selected_item_id is not None
     finally:
         window._refresh_timer.stop()
@@ -2200,8 +2283,14 @@ def test_download_rejects_failed_duplicate_and_points_to_retry(monkeypatch, qt_a
         qt_app.processEvents()
 
         assert enqueue_calls == []
-        assert window._status_label.text() == "This video already failed for this account. Use Retry from history."
-        assert window._toast_label.text() == "This video already failed for this account. Use Retry from history."
+        assert (
+            window._status_label.text()
+            == "This video already failed for this account. Use Retry from history."
+        )
+        assert (
+            window._toast_label.text()
+            == "This video already failed for this account. Use Retry from history."
+        )
     finally:
         window._refresh_timer.stop()
         window._toast_timer.stop()
@@ -2403,7 +2492,9 @@ def test_account_assignment_and_review_state_persist(qt_app) -> None:
         qt_app.processEvents()
 
         with get_session() as session:
-            item = session.query(DownloadItem).filter(DownloadItem.source_url.contains("assign")).one()
+            item = (
+                session.query(DownloadItem).filter(DownloadItem.source_url.contains("assign")).one()
+            )
             account = session.get(Account, item.account_id)
 
         assert item.review_state == "kept"
@@ -2588,7 +2679,7 @@ def test_sidebar_brand_is_display_only(qt_app) -> None:
         window.close()
 
 
-def test_sidebar_selected_state_and_compact_width(qt_app) -> None:
+def test_sidebar_selected_state_and_pipeline_width(qt_app) -> None:
     init_db()
 
     with get_session() as session:
@@ -2606,11 +2697,66 @@ def test_sidebar_selected_state_and_compact_width(qt_app) -> None:
         window._set_current_page("downloads")
         qt_app.processEvents()
 
-        assert window._sidebar_panel.width() >= 72
-        assert window._sidebar_panel.width() <= 84
+        assert tuple(window._module_buttons) == ("scraping", "downloads", "processing", "uploads")
+        assert window._module_buttons["scraping"].text() == "Scrape"
+        assert window._module_buttons["downloads"].text() == "Download"
+        assert window._module_buttons["processing"].text() == "Preprocess"
+        assert window._module_buttons["uploads"].text() == "Schedule"
+        assert window._sidebar_panel.width() >= 170
+        assert window._sidebar_panel.width() <= 210
+        assert window._sidebar_nav.height() <= 230
+        assert all(button.height() <= 52 for button in window._module_buttons.values())
         assert window._module_buttons["downloads"].property("selected") is True
         assert window._module_buttons["scraping"].property("selected") is False
         assert window._sidebar_toggle_button.property("selected") is False
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_sidebar_account_switcher_changes_workspace(qt_app) -> None:
+    init_db()
+
+    with get_session() as session:
+        first = Account(name="YT Main", platform="youtube")
+        second = Account(name="Animal Shorts", platform="youtube")
+        session.add_all([first, second])
+        session.flush()
+        session.add_all(
+            [
+                DownloadItem(
+                    source_url="https://youtube.com/watch?v=main",
+                    title="Main account clip",
+                    status="downloaded",
+                    account_id=first.id,
+                ),
+                DownloadItem(
+                    source_url="https://youtube.com/watch?v=animal",
+                    title="Animal account clip",
+                    status="downloaded",
+                    account_id=second.id,
+                ),
+            ]
+        )
+        session.commit()
+        second_id = second.id
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+
+        sidebar_index = window._sidebar_account_combo.findData(second_id)
+        assert sidebar_index > 0
+        window._sidebar_account_combo.setCurrentIndex(sidebar_index)
+        qt_app.processEvents()
+
+        assert window._current_account_id == second_id
+        assert window._current_account_combo.currentData() == second_id
+        assert window._table.rowCount() == 1
+        assert window._table.item(0, 3).text() == "Animal account clip"
     finally:
         window._refresh_timer.stop()
         window._toast_timer.stop()
@@ -2688,7 +2834,9 @@ def test_rejected_item_clears_assignment(qt_app) -> None:
         qt_app.processEvents()
 
         with get_session() as session:
-            saved = session.query(DownloadItem).filter(DownloadItem.source_url.contains("reject")).one()
+            saved = (
+                session.query(DownloadItem).filter(DownloadItem.source_url.contains("reject")).one()
+            )
 
         assert saved.review_state == "rejected"
         assert saved.account_id is None
@@ -2792,10 +2940,14 @@ def test_batch_review_actions_update_multiple_download_rows(qt_app) -> None:
         with get_session() as session:
             items = (
                 session.query(DownloadItem)
-                .filter(DownloadItem.source_url.in_([
-                    "https://youtube.com/watch?v=batch1",
-                    "https://youtube.com/watch?v=batch2",
-                ]))
+                .filter(
+                    DownloadItem.source_url.in_(
+                        [
+                            "https://youtube.com/watch?v=batch1",
+                            "https://youtube.com/watch?v=batch2",
+                        ]
+                    )
+                )
                 .order_by(DownloadItem.source_url.asc())
                 .all()
             )
@@ -2878,7 +3030,7 @@ def test_remove_from_history_deletes_row_but_not_file(qt_app) -> None:
         window.close()
 
 
-def test_accounts_page_keeps_account_manager_visible(qt_app) -> None:
+def test_account_manager_is_global_drawer_not_pipeline_page(qt_app) -> None:
     init_db()
 
     with get_session() as session:
@@ -2895,14 +3047,18 @@ def test_accounts_page_keeps_account_manager_visible(qt_app) -> None:
         window._set_current_page("accounts")
         qt_app.processEvents()
 
-        assert window._current_page == "accounts"
+        assert window._current_page == "downloads"
+        assert "accounts" not in window._module_buttons
+        assert window._account_panel.isVisible() is False
+        assert window._sidebar_toggle_button.isEnabled() is True
+        window._sidebar_toggle_button.click()
+        qt_app.processEvents()
         assert window._account_panel.isVisible() is True
-        assert window._sidebar_toggle_button.isEnabled() is False
         assert window._runtime_fields["data_dir"].text().endswith("data")
         assert window._export_backup_button.text() == "Create Backup Zip"
         assert window._restore_backup_button.text() == "Restore Backup Zip"
 
-        window._set_current_page("downloads")
+        window._sidebar_toggle_button.click()
         qt_app.processEvents()
 
         assert window._current_page == "downloads"
@@ -3110,7 +3266,9 @@ def test_candidate_review_actions_show_clear_hint_and_restore_ignored_candidate(
         window._set_current_page("scraping")
         qt_app.processEvents()
 
-        window._candidate_state_filter.setCurrentIndex(window._candidate_state_filter.findData("ignored"))
+        window._candidate_state_filter.setCurrentIndex(
+            window._candidate_state_filter.findData("ignored")
+        )
         qt_app.processEvents()
         window._candidate_table.selectRow(0)
         qt_app.processEvents()
@@ -3169,7 +3327,11 @@ def test_scrape_intake_allows_video_already_downloaded_in_another_account(qt_app
     try:
         window.show()
         qt_app.processEvents()
-        source = next(item for item in window._load_sources_for_account(account_two_id) if item.id == source_id)
+        source = next(
+            item
+            for item in window._load_sources_for_account(account_two_id)
+            if item.id == source_id
+        )
 
         created_count, refreshed_count, skipped_count = window._persist_scrape_candidates(
             account_id=account_two_id,
@@ -3256,7 +3418,11 @@ def test_scrape_intake_allows_candidate_already_present_in_another_account(qt_ap
     try:
         window.show()
         qt_app.processEvents()
-        source = next(item for item in window._load_sources_for_account(account_two_id) if item.id == source_two_id)
+        source = next(
+            item
+            for item in window._load_sources_for_account(account_two_id)
+            if item.id == source_two_id
+        )
 
         created_count, refreshed_count, skipped_count = window._persist_scrape_candidates(
             account_id=account_two_id,
@@ -3386,7 +3552,7 @@ def test_scraping_page_uses_tabs_and_source_enabled_dropdown_updates_state(qt_ap
         assert window._scrape_tabs.count() == 3
         assert window._scrape_tabs.tabText(0) == "Sources"
         assert window._scrape_tabs.tabText(1) == "Candidates"
-        assert window._scrape_tabs.tabText(2) == "Runs"
+        assert window._scrape_tabs.tabText(2) == "Activity"
 
         enabled_combo = window._source_table.cellWidget(0, 0)
         assert enabled_combo is not None

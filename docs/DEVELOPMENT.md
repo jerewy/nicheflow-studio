@@ -38,7 +38,7 @@ When you need to verify the packaged `.exe` during development, use:
 .\scripts\run_fresh_packaged.ps1
 ```
 
-The script checks `src/`, `assets/`, and build inputs against `dist\NicheFlowStudio\NicheFlowStudio.exe`. If the packaged app is missing or stale, it rebuilds first; otherwise it launches the existing packaged exe.
+The script checks `src/`, `assets/`, and build inputs against `dist\NicheFlowStudio\NicheFlowStudio.exe`. If the packaged app is missing or stale, it rebuilds first. It then refreshes the local installed copy and shortcuts under `%LOCALAPPDATA%\NicheFlow Studio\app\NicheFlowStudio` when needed, so the Desktop and Start Menu shortcuts keep launching the latest packaged build.
 
 Useful options:
 
@@ -46,9 +46,10 @@ Useful options:
 .\scripts\run_fresh_packaged.ps1 -ForceBuild
 .\scripts\run_fresh_packaged.ps1 -NoLaunch
 .\scripts\run_fresh_packaged.ps1 -InstallLocal
+.\scripts\run_fresh_packaged.ps1 -NoInstallLocal
 ```
 
-`-InstallLocal` refreshes the local installed copy and shortcuts after rebuilding. Use it only when you intentionally want to update `%LOCALAPPDATA%\NicheFlow Studio\app\NicheFlowStudio`.
+`-InstallLocal` forces a local install and shortcut refresh even when the script thinks everything is current. `-NoInstallLocal` skips shortcut/install refresh and launches directly from `dist\` instead.
 
 ## Project Layout (MVP)
 
