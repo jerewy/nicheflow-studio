@@ -7,6 +7,7 @@ __pycache__/
 
 # Virtualenvs
 .venv/
+.venv*/
 venv/
 ENV/
 env/
@@ -21,12 +22,25 @@ Desktop.ini
 # Env / secrets
 .env
 .env.*
+!.env.example
 
 # Builds / packaging
 build/
 dist/
 *.spec
+*.egg-info/
+
+# Node tooling / local Codex install artifacts
+node_modules/
+package-lock.json
+package.json
+
+# Test / tool caches
+.pytest_cache/
 
 # Local app data (downloads, db, logs, cache)
 data/
 
+# Local diagnostics / screenshots
+*.log
+*.png

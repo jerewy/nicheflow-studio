@@ -2496,6 +2496,47 @@ def test_sidebar_selected_state_and_compact_width(qt_app) -> None:
         window.close()
 
 
+def test_account_panel_does_not_overlap_sidebar_or_workspace(qt_app) -> None:
+    init_db()
+
+    with get_session() as session:
+        account = Account(name="YT Main", platform="youtube")
+        session.add(account)
+        session.flush()
+        session.add(
+            DownloadItem(
+                source_url="https://youtube.com/watch?v=layout",
+                title="Layout clip",
+                status="downloaded",
+                account_id=account.id,
+            )
+        )
+        session.commit()
+
+    window = MainWindow()
+    try:
+        window.resize(1280, 820)
+        window.show()
+        qt_app.processEvents()
+        window._current_account_combo.setCurrentIndex(1)
+        qt_app.processEvents()
+
+        window._toggle_account_sidebar()
+        qt_app.processEvents()
+
+        sidebar_rect = window._sidebar_panel.geometry()
+        account_rect = window._account_panel.geometry()
+        workspace_rect = window._workspace_content.parentWidget().geometry()
+
+        assert sidebar_rect.right() < account_rect.left()
+        assert account_rect.right() < workspace_rect.left()
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
 def test_rejected_item_clears_assignment(qt_app) -> None:
     init_db()
 

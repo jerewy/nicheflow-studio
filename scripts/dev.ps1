@@ -11,4 +11,11 @@ if (!(Test-Path ".venv")) {
 & .\.venv\Scripts\python -m pip install --upgrade pip
 & .\.venv\Scripts\pip install -r requirements.txt
 & .\.venv\Scripts\python -m pip install -e .
-& .\.venv\Scripts\python -m nicheflow_studio
+
+$watchCommand = ".\.venv\Scripts\python -m nicheflow_studio"
+& .\.venv\Scripts\python -m watchfiles `
+  --target-type command `
+  --filter python `
+  --grace-period 2 `
+  --ignore-paths ".venv,data,.pytest_cache,src\nicheflow_studio.egg-info" `
+  $watchCommand src tests

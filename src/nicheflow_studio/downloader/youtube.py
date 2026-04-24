@@ -5,6 +5,8 @@ from pathlib import Path
 
 from yt_dlp import YoutubeDL
 
+from nicheflow_studio.core.media_tools import ffmpeg_binary
+
 
 @dataclass(frozen=True)
 class DownloadResult:
@@ -14,19 +16,33 @@ class DownloadResult:
     file_path: Path
 
 
-def download_youtube_url(*, url: str, output_dir: Path) -> DownloadResult:
-    output_dir.mkdir(parents=True, exist_ok=True)
+def _ffmpeg_available() -> bool:
+    return ffmpeg_binary() is not None
 
-    ydl_opts = {
-        "outtmpl": str(output_dir / "%(extractor)s_%(id)s_%(title).80s.%(ext)s"),
+
+def _yt_dlp_options(output_dir: Path) -> dict[str, object]:
+    output_template = output_dir / "%(extractor)s_%(id)s_%(title).80s.%(ext)s"
+    options: dict[str, object] = {
+        "outtmpl": str(output_template),
         "noplaylist": True,
         "restrictfilenames": True,
         "windowsfilenames": True,
         "quiet": True,
         "no_warnings": True,
-        "format": "bv*+ba/best",
-        "merge_output_format": "mp4",
     }
+    if _ffmpeg_available():
+        # Prefer the highest-quality separate streams when ffmpeg can merge them.
+        options["format"] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best"
+        options["merge_output_format"] = "mp4"
+    else:
+        # Fall back to a single-file MP4 when ffmpeg is unavailable.
+        options["format"] = "best[ext=mp4]/best"
+    return options
+
+
+def download_youtube_url(*, url: str, output_dir: Path) -> DownloadResult:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ydl_opts = _yt_dlp_options(output_dir)
 
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -43,4 +59,3 @@ def download_youtube_url(*, url: str, output_dir: Path) -> DownloadResult:
         title=info.get("title"),
         file_path=file_path,
     )
-

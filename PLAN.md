@@ -1,1330 +1,365 @@
-# 🎯 NicheFlow Studio - Complete Project Plan
+# NicheFlow Studio Plan
 
-> **Multi-Account Content Automation Platform**  
-> Scalable, Intelligent, and Stealth-Ready Social Media Content Management
+Last updated: 2026-04-05
+Status: Active execution plan
+Current milestone: Finish and harden the first Processing slice on top of the working scrape/download intake flow.
 
----
+## 1. What This Project Should Be Right Now
 
-## 📋 Table of Contents
+NicheFlow Studio should ship first as a small, reliable Windows desktop app for a multi-account clipping workflow.
 
-1. [Project Overview](#project-overview)
-2. [Core Features](#core-features)
-3. [System Architecture](#system-architecture)
-4. [Technology Stack](#technology-stack)
-5. [Database Schema](#database-schema)
-6. [UI/UX Structure](#uiux-structure)
-7. [Implementation Roadmap](#implementation-roadmap)
-8. [Module Specifications](#module-specifications)
-9. [Deployment Strategy](#deployment-strategy)
-10. [Risk Mitigation](#risk-mitigation)
-
----
-
-## 🎯 Project Overview
-
-### Vision
-
-Create a production-grade desktop application that enables multi-account social media content management with intelligent niche verification, automated workflows, and human-like posting behavior.
-
-### Target Platforms
-
-- **Primary:** Instagram Reels
-- **Secondary:** TikTok
-- **Tertiary:** YouTube Shorts
-
-### Core Value Propositions
-
-1. **Multi-Niche Scalability** - Manage 10+ accounts across different niches
-2. **Intelligent Curation** - AI-powered niche consistency verification
-3. **Flexible Automation** - Full auto, hybrid, or manual control per account
-4. **Stealth Operations** - Human behavior simulation to avoid detection
-5. **Portability** - Single-file database, sync across devices
-
----
-
-## 🚀 Core Features
-
-### 1. Account Management
-
-- Multi-platform account profiles (IG, TikTok, YouTube)
-- Per-account niche configuration
-- Automation level settings (Full Auto / Hybrid / Manual)
-- Session management & health monitoring
-- Credential encryption
-
-### 2. Niche Intelligence Engine
-
-- **Niche Signature Builder**
-  - Reference video processing (20-30 videos)
-  - Semantic embedding generation (sentence-transformers)
-  - Emotional profile extraction (LLM-based)
-  - Adaptive threshold calculation
-- **Multi-Gate Verification**
-
-  - Gate 1: Semantic Similarity (cosine similarity ≥ threshold)
-  - Gate 2: Emotional Consistency (tone, energy, persona matching)
-  - Gate 3: Quality Score (ASR confidence, length, spam detection)
-  - Gate 4: Freshness Score (meme-specific: trend velocity, saturation)
-
-- **Drift Detection**
-  - Batch-level variance monitoring
-  - Auto-pause on inconsistency
-  - Performance-based threshold adjustment
-
-### 3. Smart Scraping Pipeline
-
-- Multi-source support (YouTube, TikTok, Instagram)
-- Real-time trend detection (for meme niches)
-- Pre-download filtering (metadata-based)
-- 3-layer deduplication:
-  - URL tracking
-  - File hash (SHA-256)
-  - Perceptual hash (visual similarity)
-
-### 4. Content Processing
-
-- **Auto-Enhancement**
-  - Subtitle generation (Whisper ASR)
-  - Audio normalization
-  - Format standardization (9:16, 1080x1920)
-  - Background music layering
-- **Manual Editor**
-  - Video preview player
-  - Trim/crop tools
-  - Text overlay
-  - Color grading (LUT application)
-  - Blur/masking tools
-
-### 5. Caption Generator
-
-- LLM-based caption variations (3 options)
-- Niche-aligned tone matching
-- Hashtag rotation (anti-spam)
-- Custom templates per account
-- Attribution management
-
-### 6. Smart Scheduler
-
-- Human-like posting patterns
-  - Randomized delays (45-120 min base)
-  - Time-of-day variation
-  - Weekend adjustments
-  - Avoid exact-hour patterns
-- Queue management
-  - Drag-and-drop reordering
-  - Bulk scheduling (7-day auto-fill)
-  - Conflict detection
-  - Daily limit enforcement
-
-### 7. Stealth Upload Engine
-
-- Session fingerprinting (unique per account)
-- Human behavior simulation:
-  - Mouse movement
-  - Typing speed variation
-  - Random scrolling
-  - Pre/post-upload delays
-- Platform-specific uploaders:
-  - Instagram (instagrapi)
-  - TikTok (Selenium-based)
-  - YouTube (OAuth API)
-
-### 8. Analytics & Optimization
-
-- Performance tracking (views, ER, growth)
-- Top performer analysis
-- Niche quality correlation
-- AI insights & recommendations
-- Shadowban detection
-- Auto-optimization (threshold tuning, best time detection)
-
----
-
-## 🏗️ System Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      PRESENTATION LAYER                      │
-│                    (PyQt6 Desktop UI)                        │
-├─────────────────────────────────────────────────────────────┤
-│  Dashboard │ Accounts │ Niche │ Scraper │ Verify │ Queue   │
-│            │          │Builder│         │        │         │
-└─────────────────────────────────────────────────────────────┘
-                            ↕
-┌─────────────────────────────────────────────────────────────┐
-│                     BUSINESS LOGIC LAYER                     │
-├─────────────────────────────────────────────────────────────┤
-│                                                              │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐     │
-│  │ Niche Engine │  │   Scraper    │  │   Scheduler  │     │
-│  │              │  │   Pipeline   │  │   Engine     │     │
-│  │ - Signature  │  │              │  │              │     │
-│  │ - Gates      │  │ - Discovery  │  │ - Queue Mgmt │     │
-│  │ - Drift Det  │  │ - Dedup      │  │ - Human Sim  │     │
-│  └──────────────┘  │ - Download   │  └──────────────┘     │
-│                     └──────────────┘                        │
-│                                                              │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐     │
-│  │   Content    │  │   Caption    │  │   Uploader   │     │
-│  │   Processor  │  │   Generator  │  │   Engine     │     │
-│  │              │  │              │  │              │     │
-│  │ - FFmpeg     │  │ - LLM API    │  │ - Platform   │     │
-│  │ - Whisper    │  │ - Templates  │  │   APIs       │     │
-│  │ - Editing    │  │ - Hashtags   │  │ - Session    │     │
-│  └──────────────┘  └──────────────┘  └──────────────┘     │
-│                                                              │
-└─────────────────────────────────────────────────────────────┘
-                            ↕
-┌─────────────────────────────────────────────────────────────┐
-│                         ML/AI LAYER                          │
-├─────────────────────────────────────────────────────────────┤
-│                                                              │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐     │
-│  │ Whisper ASR  │  │  Sentence    │  │    Ollama    │     │
-│  │ (faster-     │  │  Transform.  │  │   (Llama3)   │     │
-│  │  whisper)    │  │  Embeddings  │  │              │     │
-│  └──────────────┘  └──────────────┘  └──────────────┘     │
-│                                                              │
-└─────────────────────────────────────────────────────────────┘
-                            ↕
-┌─────────────────────────────────────────────────────────────┐
-│                      DATA LAYER                              │
-├─────────────────────────────────────────────────────────────┤
-│                                                              │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │              SQLite Database                          │  │
-│  │  (Synced via Dropbox/Google Drive)                   │  │
-│  │                                                        │  │
-│  │  Tables:                                              │  │
-│  │  - accounts                                           │  │
-│  │  - account_platforms                                  │  │
-│  │  - videos                                             │  │
-│  │  - posts                                              │  │
-│  │  - content_sources                                    │  │
-│  │  - scraping_history                                   │  │
-│  │  - batch_metrics                                      │  │
-│  └──────────────────────────────────────────────────────┘  │
-│                                                              │
-│  File Storage:                                               │
-│  ~/Dropbox/NicheFlow/                                       │
-│  ├── data/                                                   │
-│  │   ├── app.db                                             │
-│  │   ├── signatures/      (niche embeddings)               │
-│  │   └── videos/          (processed content)              │
-│  └── logs/                                                   │
-│                                                              │
-└─────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 🛠️ Technology Stack
-
-### Frontend (UI)
-
-```yaml
-Framework: PyQt6 6.6.1
-Styling: Qt Stylesheets (QSS) - Dark Theme
-Charts: PyQtGraph / Matplotlib
-Video Player: QtMultimedia
-Icons: Qt Resource System
-```
-
-### Backend (Logic)
-
-```yaml
-Language: Python 3.11+
-Async: asyncio, QThread (for background tasks)
-Video Processing: FFmpeg-python, OpenCV
-Web Scraping: yt-dlp, BeautifulSoup, Selenium
-HTTP Client: requests, httpx
-```
-
-### ML/AI Stack
-
-```yaml
-Transcription: faster-whisper 0.10.0
-Embeddings: sentence-transformers 2.3.1
-LLM: ollama (Llama3 local)
-Deep Learning: PyTorch 2.1.2
-Vision: opencv-python 4.9.0
-OCR: easyocr (optional)
-```
-
-### Database
-
-```yaml
-Primary: SQLite 3.x (via SQLAlchemy 2.0.25)
-ORM: SQLAlchemy
-Migrations: Alembic 1.13.1
-Encryption: cryptography.fernet
-```
-
-### Platform APIs
-
-```yaml
-Instagram: instagrapi 1.16+
-TikTok: TikTokApi / Selenium fallback
-YouTube: google-api-python-client
-```
-
-### Utilities
-
-```yaml
-Config: python-dotenv
-Hashing: hashlib (SHA-256)
-Image: Pillow 10.2.0
-Packaging: PyInstaller 6.3.0
-```
-
----
-
-## 💾 Database Schema
-
-### Core Tables
-
-#### `accounts`
-
-```sql
-CREATE TABLE accounts (
-    account_id VARCHAR PRIMARY KEY,
-    niche_name VARCHAR NOT NULL,
-
-    -- Signature
-    signature_path VARCHAR,
-    embedding_model VARCHAR,
-
-    -- Emotional DNA
-    dominant_emotion VARCHAR,
-    energy_level VARCHAR,
-    persona_type VARCHAR,
-
-    -- Adaptive thresholds
-    similarity_mean FLOAT,
-    similarity_std FLOAT,
-    k_factor FLOAT DEFAULT 1.0,
-
-    -- Scraping config
-    target_channels TEXT,  -- JSON array
-    target_hashtags TEXT,  -- JSON array
-
-    -- Stats
-    total_videos_scraped INT DEFAULT 0,
-    total_videos_approved INT DEFAULT 0,
-    total_videos_posted INT DEFAULT 0,
-
-    -- Metadata
-    language VARCHAR DEFAULT 'id',
-    created_at TIMESTAMP,
-    last_calibrated TIMESTAMP,
-    last_post_at TIMESTAMP
-);
-```
-
-#### `account_platforms`
-
-```sql
-CREATE TABLE account_platforms (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    account_id VARCHAR REFERENCES accounts(account_id),
-    platform_id VARCHAR,  -- 'instagram', 'tiktok', 'youtube'
-
-    -- Credentials (encrypted)
-    username VARCHAR,
-    encrypted_password VARCHAR,
-    session_data TEXT,  -- JSON
-
-    -- Automation settings
-    automation_level VARCHAR DEFAULT 'hybrid',
-    posts_per_day INT DEFAULT 3,
-    posting_hours_start INT DEFAULT 8,
-    posting_hours_end INT DEFAULT 22,
-    min_delay_minutes INT DEFAULT 45,
-    max_delay_minutes INT DEFAULT 120,
-
-    -- Health
-    last_login TIMESTAMP,
-    session_healthy BOOLEAN DEFAULT TRUE,
-    shadowban_suspected BOOLEAN DEFAULT FALSE,
-    last_health_check TIMESTAMP,
-
-    -- Stats
-    total_posts INT DEFAULT 0,
-    avg_engagement_rate FLOAT,
-    follower_count INT,
-
-    UNIQUE(account_id, platform_id)
-);
-```
-
-#### `videos`
-
-```sql
-CREATE TABLE videos (
-    video_id VARCHAR PRIMARY KEY,
-    account_id VARCHAR REFERENCES accounts(account_id),
-
-    -- Source
-    source_url VARCHAR UNIQUE,
-    source_platform VARCHAR,
-    content_source_id VARCHAR REFERENCES content_sources(source_id),
-
-    -- Deduplication
-    file_hash VARCHAR(64) UNIQUE NOT NULL,
-    perceptual_hash VARCHAR,
-
-    -- File info
-    file_path VARCHAR,
-    duration INT,
-    file_size INT,
-
-    -- Status
-    status VARCHAR DEFAULT 'scraped',
-    -- Values: scraped, transcribed, verified, approved, rejected,
-    --         edited, queued, posted
-
-    -- Transcription
-    transcript TEXT,
-    language VARCHAR,
-    asr_confidence FLOAT,
-
-    -- Verification scores
-    semantic_score FLOAT,
-    semantic_passed BOOLEAN,
-    emotional_score FLOAT,
-    emotional_passed BOOLEAN,
-    quality_score FLOAT,
-    quality_passed BOOLEAN,
-    freshness_score FLOAT,  -- Meme-specific
-    weighted_confidence FLOAT,
-    overall_approved BOOLEAN,
-    reject_reason TEXT,
-
-    -- Metadata
-    scraped_at TIMESTAMP,
-    processed_at TIMESTAMP,
-
-    -- Indexes
-    INDEX idx_account_status (account_id, status),
-    INDEX idx_confidence (weighted_confidence DESC),
-    INDEX idx_file_hash (file_hash),
-    INDEX idx_perceptual (perceptual_hash)
-);
-```
-
-#### `posts`
-
-```sql
-CREATE TABLE posts (
-    post_id VARCHAR PRIMARY KEY,
-    video_id VARCHAR REFERENCES videos(video_id),
-    account_platform_id INT REFERENCES account_platforms(id),
-
-    -- Post data
-    platform_post_id VARCHAR,
-    post_url VARCHAR,
-    caption TEXT,
-    hashtags TEXT,  -- JSON array
-
-    -- Scheduling
-    scheduled_time TIMESTAMP,
-    posted_at TIMESTAMP,
-    status VARCHAR DEFAULT 'scheduled',
-    -- Values: scheduled, posting, posted, failed
-
-    -- Performance
-    views INT DEFAULT 0,
-    likes INT DEFAULT 0,
-    comments INT DEFAULT 0,
-    shares INT DEFAULT 0,
-    saves INT DEFAULT 0,
-    engagement_rate FLOAT,
-
-    -- Tracking
-    last_metrics_update TIMESTAMP,
-
-    INDEX idx_platform_status (account_platform_id, status),
-    INDEX idx_scheduled (scheduled_time),
-    INDEX idx_performance (engagement_rate DESC)
-);
-```
-
-#### `content_sources`
-
-```sql
-CREATE TABLE content_sources (
-    source_id VARCHAR PRIMARY KEY,
-    source_type VARCHAR NOT NULL,
-    -- Values: 'original', 'licensed', 'transformative', 'ugc_meme'
-
-    -- For licensed/transformative
-    original_creator VARCHAR,
-    permission_status VARCHAR,
-    license_type VARCHAR,
-
-    -- Legal
-    copyright_clear BOOLEAN DEFAULT FALSE,
-    attribution_required BOOLEAN DEFAULT TRUE,
-    attribution_text TEXT,
-
-    created_at TIMESTAMP
-);
-```
-
-#### `scraping_history`
-
-```sql
-CREATE TABLE scraping_history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    account_id VARCHAR REFERENCES accounts(account_id),
-    source_url VARCHAR,
-
-    -- Results
-    videos_found INT,
-    videos_downloaded INT,
-    videos_skipped_duplicate INT,
-    videos_failed INT,
-
-    scraped_at TIMESTAMP,
-
-    INDEX idx_account_date (account_id, scraped_at DESC)
-);
-```
-
-#### `batch_metrics`
-
-```sql
-CREATE TABLE batch_metrics (
-    batch_id VARCHAR PRIMARY KEY,
-    account_id VARCHAR REFERENCES accounts(account_id),
-    video_count INT,
-
-    -- Drift metrics
-    mean_intra_similarity FLOAT,
-    std_intra_similarity FLOAT,
-    dispersion_score FLOAT,
-    drift_detected BOOLEAN,
-
-    processed_at TIMESTAMP,
-
-    INDEX idx_account (account_id)
-);
-```
-
----
-
-## 🎨 UI/UX Structure
-
-### Navigation Hierarchy
-
-```
-Main Window
-├── Dashboard (Home)
-├── Accounts Management
-│   ├── Account List
-│   ├── New Account Dialog
-│   ├── Edit Account Dialog
-│   └── Platform Connection Dialog
-├── Niche Builder
-│   ├── Reference Video Upload
-│   ├── Processing Progress
-│   └── Signature Results
-├── Smart Scraper
-│   ├── Source Configuration
-│   ├── Scraping Progress
-│   └── Download History
-├── Verification Center
-│   ├── Video List (Grid/List view)
-│   ├── Video Detail Modal
-│   ├── Batch Actions
-│   └── Gate Settings
-├── Content Editor
-│   ├── Video Preview Player
-│   ├── Editing Tools Panel
-│   ├── Timeline Editor
-│   └── Export Settings
-├── Caption Generator
-│   ├── AI Variations Display
-│   ├── Custom Caption Editor
-│   └── Hashtag Manager
-├── Upload Queue
-│   ├── Scheduled Posts List
-│   ├── Calendar View
-│   ├── Drag-Drop Reordering
-│   └── Bulk Scheduler
-├── Analytics Dashboard
-│   ├── Performance Charts
-│   ├── Top Performers
-│   ├── AI Insights
-│   └── Health Monitor
-└── Settings
-    ├── General (storage, cleanup)
-    ├── Processing (models, devices)
-    ├── Scheduling (defaults, timing)
-    └── Advanced (debug, logging)
-```
-
-### Key UI Components
-
-#### Custom Widgets
-
-```python
-# Reusable components
-widgets/
-├── video_card.py          # Video thumbnail + metadata
-├── progress_widget.py     # Custom progress with messages
-├── gate_indicator.py      # Visual gate pass/fail display
-├── account_card.py        # Account status card
-├── timeline_editor.py     # Video editing timeline
-├── schedule_calendar.py   # Calendar-based scheduler
-└── chart_widgets.py       # Analytics charts
-```
-
-#### Dialogs
-
-```python
-dialogs/
-├── new_account.py         # Multi-step account creation
-├── video_detail.py        # Full video analysis view
-├── platform_auth.py       # OAuth/login dialogs
-├── bulk_edit.py           # Bulk video editing settings
-└── error_report.py        # Error handling dialogs
-```
-
----
-
-## 📅 Implementation Roadmap
-
-### **PHASE 1: Foundation** (Weeks 1-2)
-
-**Goal:** Working skeleton with core infrastructure
-
-#### Week 1: Setup & Database
-
-- [ ] Project structure setup
-- [ ] PyQt6 boilerplate (main window + navigation)
-- [ ] SQLite database setup
-- [ ] SQLAlchemy models implementation
-- [ ] Alembic migrations setup
-- [ ] Config management (settings, paths)
-- [ ] Logging system
-- [ ] Dark theme QSS implementation
-
-**Deliverable:** Empty UI shell with working database
-
-#### Week 2: Account Management
-
-- [ ] Account CRUD UI (create, read, update, delete)
-- [ ] Account list view with cards
-- [ ] New account dialog (multi-step wizard)
-- [ ] Platform connection UI (credential storage)
-- [ ] Password encryption (Fernet)
-- [ ] Cloud sync path detection (Dropbox/GDrive)
-- [ ] Database lock mechanism
-
-**Deliverable:** Can create/manage accounts, credentials saved securely
-
----
-
-### **PHASE 2: Niche Intelligence** (Weeks 3-4)
-
-**Goal:** Working niche signature builder + verification
-
-#### Week 3: Niche Signature Builder
-
-- [ ] Reference video upload UI
-- [ ] Whisper integration (faster-whisper)
-- [ ] Sentence-transformers integration
-- [ ] Ollama LLM integration (emotional classification)
-- [ ] Background worker (QThread) for processing
-- [ ] Progress tracking with real-time updates
-- [ ] Centroid calculation & stats
-- [ ] Signature file storage (.npz format)
-- [ ] Results display UI
-
-**Deliverable:** Can build niche signature from reference videos
-
-#### Week 4: Verification Gates
-
-- [ ] Semantic similarity gate implementation
-- [ ] Emotional consistency gate implementation
-- [ ] Quality scoring gate implementation
-- [ ] Freshness scoring (for meme niches)
-- [ ] Master verification orchestrator
-- [ ] Verification UI (video detail modal)
-- [ ] Batch verification workflow
-- [ ] Gate threshold configuration UI
-
-**Deliverable:** Can verify videos against niche signature
-
----
-
-### **PHASE 3: Content Pipeline** (Weeks 5-6)
-
-**Goal:** Scraping + deduplication + basic editing
-
-#### Week 5: Smart Scraper
-
-- [ ] yt-dlp integration
-- [ ] URL discovery (YouTube, TikTok, IG)
-- [ ] Pre-filter implementation (metadata checks)
-- [ ] 3-layer deduplication:
-  - [ ] URL tracking
-  - [ ] File hash (SHA-256)
-  - [ ] Perceptual hash (OpenCV + imagehash)
-- [ ] Scraping UI with progress
-- [ ] Download queue management
-- [ ] Scraping history tracking
-
-**Deliverable:** Can scrape and deduplicate videos from sources
-
-#### Week 6: Content Editor
-
-- [ ] FFmpeg integration
-- [ ] Video player widget (QtMultimedia)
-- [ ] Basic editing tools:
-  - [ ] Trim/crop
-  - [ ] Audio normalization
-  - [ ] Subtitle burning
-  - [ ] Format conversion (9:16)
-- [ ] Bulk edit settings UI
-- [ ] Preview & export
-- [ ] Processed video storage
-
-**Deliverable:** Can edit videos manually or bulk-apply settings
-
----
-
-### **PHASE 4: Captioning & Scheduling** (Weeks 7-8)
-
-**Goal:** AI captions + smart scheduler
-
-#### Week 7: Caption Generator
-
-- [ ] LLM caption generation (Ollama)
-- [ ] Multiple variation generation (3 options)
-- [ ] Niche tone matching
-- [ ] Hashtag rotation system
-- [ ] Caption templates
-- [ ] Custom caption editor UI
-- [ ] Attribution manager
-- [ ] Caption preview
-
-**Deliverable:** Can generate and customize captions
-
-#### Week 8: Smart Scheduler
-
-- [ ] Upload queue data model
-- [ ] Queue UI (list + calendar views)
-- [ ] Drag-drop reordering
-- [ ] Human-like scheduling algorithm:
-  - [ ] Random delays
-  - [ ] Time-of-day variation
-  - [ ] Pattern avoidance
-- [ ] Bulk scheduler (7-day auto-fill)
-- [ ] Conflict detection
-- [ ] Daily limit enforcement
-
-**Deliverable:** Can schedule posts with human-like patterns
-
----
-
-### **PHASE 5: Platform Integration** (Weeks 9-10)
-
-**Goal:** Working uploaders for all platforms
-
-#### Week 9: Instagram Uploader
-
-- [ ] instagrapi integration
-- [ ] Session management (cookies, tokens)
-- [ ] Login with 2FA handling
-- [ ] Video upload implementation
-- [ ] Caption posting
-- [ ] Thumbnail generation
-- [ ] Upload retry logic
-- [ ] Error handling
-
-**Deliverable:** Can upload to Instagram Reels
-
-#### Week 10: TikTok & YouTube
-
-- [ ] TikTok uploader (Selenium-based)
-- [ ] YouTube Shorts uploader (OAuth)
-- [ ] Multi-platform posting workflow
-- [ ] Platform-specific settings
-- [ ] Cross-platform queue management
-- [ ] Upload status tracking
-
-**Deliverable:** Can upload to all 3 platforms
-
----
-
-### **PHASE 6: Stealth & Automation** (Weeks 11-12)
-
-**Goal:** Human behavior simulation + full automation
-
-#### Week 11: Stealth Engine
-
-- [ ] Session fingerprinting
-- [ ] Human behavior simulation:
-  - [ ] Mouse movement
-  - [ ] Typing speed variation
-  - [ ] Random scrolling
-  - [ ] Pre/post delays
-- [ ] Upload behavior randomization
-- [ ] User-agent rotation
-- [ ] Browser fingerprint spoofing
-
-**Deliverable:** Uploads behave human-like
-
-#### Week 12: Automation Orchestrator
-
-- [ ] Full auto mode workflow
-- [ ] Hybrid mode (manual review gates)
-- [ ] Per-account automation settings
-- [ ] Auto-scraping scheduler (cron-like)
-- [ ] Auto-verification pipeline
-- [ ] Auto-posting engine
-- [ ] Error recovery & retry logic
-
-**Deliverable:** Can run fully autonomous per account
-
----
-
-### **PHASE 7: Analytics & Optimization** (Weeks 13-14)
-
-**Goal:** Performance tracking + auto-optimization
-
-#### Week 13: Analytics Dashboard
-
-- [ ] Metrics collection (via platform APIs)
-- [ ] Performance charts (PyQtGraph)
-- [ ] Top performers analysis
-- [ ] Engagement trend graphs
-- [ ] Niche quality correlation
-- [ ] Export reports (CSV/PDF)
-
-**Deliverable:** Can track and visualize performance
-
-#### Week 14: Auto-Optimization
-
-- [ ] Shadowban detector
-- [ ] Health monitoring
-- [ ] Performance-based threshold tuning
-- [ ] Best posting time analyzer
-- [ ] AI insights generator
-- [ ] Auto-pause on issues
-- [ ] Recommendation engine
-
-**Deliverable:** System self-optimizes based on performance
-
----
-
-### **PHASE 8: Polish & Release** (Weeks 15-16)
-
-**Goal:** Production-ready application
-
-#### Week 15: Testing & Bug Fixes
-
-- [ ] End-to-end testing (all workflows)
-- [ ] Edge case handling
-- [ ] Performance optimization
-- [ ] Memory leak fixes
-- [ ] UI/UX polish
-- [ ] Error message improvements
-- [ ] Logging enhancements
-
-#### Week 16: Packaging & Documentation
-
-- [ ] PyInstaller build script
-- [ ] Windows executable generation
-- [ ] User manual (markdown)
-- [ ] Video tutorials (screen recording)
-- [ ] Troubleshooting guide
-- [ ] Release notes
-- [ ] GitHub repository setup
-
-**Deliverable:** Distributable .exe + documentation
-
----
-
-## 📦 Module Specifications
-
-### Module 1: Niche Engine (`core/niche_engine.py`)
-
-```python
-class NicheSignatureBuilder:
-    """
-    Build niche signature from reference videos
-    """
-    def __init__(self, embedding_model='paraphrase-multilingual-MiniLM-L12-v2'):
-        self.model = SentenceTransformer(embedding_model)
-        self.whisper = WhisperModel("base", device="cpu")
-
-    def build_signature(self, reference_videos: List[str]) -> dict:
-        """
-        Process reference videos and generate niche signature
-
-        Returns:
-            {
-                'centroid': np.array,
-                'stats': {'mean': float, 'std': float},
-                'emotional_profile': dict,
-                'reference_count': int
-            }
-        """
-        pass
-
-class VerificationGates:
-    """
-    Multi-gate verification system
-    """
-    def semantic_gate(self, video_embedding, niche_signature) -> dict:
-        """Returns: {'passed': bool, 'score': float, 'reason': str}"""
-        pass
-
-    def emotional_gate(self, transcript, target_profile) -> dict:
-        pass
-
-    def quality_gate(self, transcript, video_metadata) -> dict:
-        pass
-
-    def freshness_gate(self, video_metadata) -> dict:
-        """Meme-specific: trend velocity + saturation"""
-        pass
-
-    def verify(self, video_path, niche_signature) -> dict:
-        """Master verification orchestrator"""
-        pass
-
-class DriftDetector:
-    """
-    Batch-level niche consistency monitoring
-    """
-    def detect_drift(self, batch_embeddings, niche_signature) -> dict:
-        """
-        Returns: {
-            'drift_detected': bool,
-            'dispersion': float,
-            'mean_similarity': float,
-            'message': str
-        }
-        """
-        pass
-```
-
-### Module 2: Scraper (`core/scraper.py`)
-
-```python
-class SmartScraper:
-    """
-    Multi-source video scraper with deduplication
-    """
-    def discover_videos(self, source_urls: List[str]) -> List[dict]:
-        """Discover videos from YouTube/TikTok/IG"""
-        pass
-
-    def pre_filter(self, video_metadata: dict, account_profile: dict) -> bool:
-        """Metadata-based filtering before download"""
-        pass
-
-    def download_video(self, url: str) -> str:
-        """Download with yt-dlp, return local path"""
-        pass
-
-    def is_duplicate(self, video_path: str) -> tuple[bool, str]:
-        """
-        3-layer dedup: URL, file hash, perceptual hash
-        Returns: (is_dup, reason)
-        """
-        pass
-
-    def scrape_batch(self, account_id: str, sources: List[str]) -> dict:
-        """
-        Full scraping pipeline
-        Returns: {'found': int, 'downloaded': int, 'skipped': int}
-        """
-        pass
-
-class TrendDetector:
-    """
-    Real-time meme trend detection (optional for meme niches)
-    """
-    def get_trending_memes(self, timeframe='24h') -> List[dict]:
-        """Cross-platform trend aggregation"""
-        pass
-
-    def calculate_virality_score(self, meme_metadata) -> float:
-        pass
-```
-
-### Module 3: Content Processor (`core/content_processor.py`)
-
-```python
-class VideoEditor:
-    """
-    FFmpeg-based video editing
-    """
-    def normalize_format(self, input_path: str, output_path: str):
-        """Convert to 9:16, 1080x1920, 30fps"""
-        pass
-
-    def normalize_audio(self, input_path: str, target_lufs=-16):
-        """Normalize audio levels"""
-        pass
-
-    def add_subtitles(self, video_path: str, transcript: str):
-        """Burn subtitles using FFmpeg"""
-        pass
-
-    def apply_lut(self, video_path: str, lut_file: str):
-        """Color grading"""
-        pass
-
-    def trim(self, video_path: str, start: float, end: float):
-        pass
-
-    def bulk_process(self, videos: List[str], settings: dict):
-        """Apply same edits to multiple videos"""
-        pass
-
-class TranscriptionService:
-    """
-    Whisper ASR wrapper
-    """
-    def transcribe(self, video_path: str, language='id') -> dict:
-        """
-        Returns: {
-            'transcript': str,
-            'confidence': float,
-            'segments': List[dict]
-        }
-        """
-        pass
-```
-
-### Module 4: Caption Generator (`core/caption_generator.py`)
-
-```python
-class CaptionGenerator:
-    """
-    LLM-based caption generation
-    """
-    def generate_variations(self, transcript: str, niche_profile: dict, count=3) -> List[str]:
-        """Generate multiple caption options"""
-        pass
-
-    def apply_template(self, template: str, variables: dict) -> str:
-        """Template-based caption generation"""
-        pass
-
-    def generate_hashtags(self, niche: str, count=8) -> List[str]:
-        """Niche-specific hashtag generation"""
-        pass
-
-    def rotate_hashtags(self, account_id: str) -> List[str]:
-        """Get next hashtag set (anti-spam rotation)"""
-        pass
-```
-
-### Module 5: Scheduler (`core/scheduler.py`)
-
-```python
-class SmartScheduler:
-    """
-    Human-like post scheduling
-    """
-    def calculate_next_post_time(self, account_config: dict, last_post: datetime) -> datetime:
-        """
-        Calculate next post time with:
-        - Random delays
-        - Time-of-day variation
-        - Pattern avoidance
-        """
-        pass
-
-    def schedule_batch(self, videos: List[str], account_id: str, days=7):
-        """Auto-fill queue for N days"""
-        pass
-
-    def check_conflicts(self, scheduled_time: datetime, account_id: str) -> bool:
-        """Detect scheduling conflicts"""
-        pass
-
-    def enforce_limits(self, account_id: str, date: datetime) -> bool:
-        """Check daily post limit"""
-        pass
-```
-
-### Module 6: Uploader (`core/uploader.py`)
-
-```python
-class InstagramUploader:
-    """
-    Instagram Reels uploader
-    """
-    def login(self, username: str, password: str) -> bool:
-        """Login with session management"""
-        pass
-
-    def upload_reel(self, video_path: str, caption: str) -> dict:
-        """
-        Upload with retry logic
-        Returns: {'success': bool, 'post_id': str, 'post_url': str}
-        """
-        pass
-
-class TikTokUploader:
-    """Selenium-based TikTok uploader"""
-    pass
-
-class YouTubeUploader:
-    """OAuth-based YouTube Shorts uploader"""
-    pass
-
-class HumanBehaviorSimulator:
-    """
-    Simulate human-like interaction
-    """
-    def type_with_human_speed(self, text: str, wpm=60):
-        pass
-
-    def simulate_mouse_movement(self):
-        pass
-
-    def random_scroll(self):
-        pass
-
-    def pre_upload_delay(self):
-        """Random delay before upload (30s-3min)"""
-        pass
-```
-
-### Module 7: Analytics (`core/analytics.py`)
-
-```python
-class PerformanceTracker:
-    """
-    Track and analyze post performance
-    """
-    def fetch_metrics(self, post_id: str, platform: str) -> dict:
-        """Fetch latest metrics from platform"""
-        pass
-
-    def calculate_engagement_rate(self, post: Post) -> float:
-        pass
-
-    def get_top_performers(self, account_id: str, limit=10) -> List[Post]:
-        pass
-
-    def analyze_trend(self, account_id: str, days=30) -> dict:
-        """Engagement trend analysis"""
-        pass
-
-class ShadowbanDetector:
-    """
-    Detect potential shadowban
-    """
-    def check_health(self, account_id: str) -> dict:
-        """
-        Returns: {
-            'status': 'healthy'|'warning'|'shadowban_suspected',
-            'engagement_drop': float,
-            'recommendation': str
-        }
-        """
-        pass
-
-class AutoOptimizer:
-    """
-    Auto-tune system parameters based on performance
-    """
-    def optimize_threshold(self, account_id: str):
-        """Adjust verification threshold based on top performers"""
-        pass
-
-    def find_best_posting_times(self, account_id: str) -> List[int]:
-        """Analyze when posts perform best"""
-        pass
-```
-
----
-
-## 🚀 Deployment Strategy
-
-### Development Environment
-
-```bash
-# Virtual environment
-python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Run in development
-python main.py
-```
-
-### Production Build (PyInstaller)
-
-```yaml
-# build.spec
-a = Analysis(
-['main.py'],
-pathex=[],
-binaries=[],
-datas=[
-('assets', 'assets'),
-('ml/models', 'ml/models')
-],
-hiddenimports=[
-'PyQt6',
-'faster_whisper',
-'sentence_transformers',
-'instagrapi'
-],
-...
-)
-```
-
-```bash
-# Build command
-pyinstaller build.spec
-
-# Output: dist/NicheFlowStudio.exe
-```
-
-### Distribution
-
-```
-NicheFlowStudio-v1.0.0/
-├── NicheFlowStudio.exe
-├── README.md
-├── LICENSE.txt
-├── INSTALLATION.md
-└── docs/
-    ├── USER_GUIDE.md
-    ├── TROUBLESHOOTING.md
-    └── screenshots/
-```
-
-### Cloud Sync Setup
-
-```yaml
-Recommended Setup:
-1. Install Dropbox/Google Drive
-2. Run app first time → creates ~/Dropbox/NicheFlow/
-3. Database auto-syncs
-4. Lock file prevents concurrent access
-```
-
----
-
-## ⚠️ Risk Mitigation
-
-### Technical Risks
-
-| Risk                  | Impact | Mitigation                         |
-| --------------------- | ------ | ---------------------------------- |
-| Platform API changes  | High   | Abstraction layer, regular updates |
-| Shadowban/account ban | High   | Human behavior sim, rate limiting  |
-| Database corruption   | Medium | Lock mechanism, auto-backup        |
-| NPU not utilized      | Low    | Graceful fallback to CPU/GPU       |
-| Memory leaks          | Medium | Proper cleanup, profiling          |
-
-### Legal/Ethical Risks
-
-| Risk                   | Impact | Mitigation                               |
-| ---------------------- | ------ | ---------------------------------------- |
-| Copyright infringement | High   | Focus on transformative/licensed content |
-| TOS violation          | High   | Stealth features, disclaimers            |
-| DMCA takedown          | Medium | Attribution system, quick removal        |
-
-### User Guidance
-
-- **Disclaimer:** Include clear terms that user is responsible for content
-- **Best Practices Guide:** Educate on legal content sourcing
-- **Built-in Warnings:** Flag high-risk content sources
-
----
-
-## 📊 Success Metrics
-
-### MVP Success Criteria (Phase 1-4)
-
-- [ ] Can manage 5+ accounts
-- [ ] Can build niche signature in <5 minutes
-- [ ] Verification accuracy >85%
-- [ ] Deduplication catches >95% duplicates
-- [ ] Manual workflow fully functional
-
-### V1.0 Success Criteria (Phase 1-8)
-
-- [ ] Full auto mode works for 7+ days unattended
-- [ ] Uploads to 3 platforms successfully
-- [ ] Human detection rate <5%
-- [ ] Analytics track 10+ metrics
-- [ ] Zero critical bugs
-
-### Long-term Goals
-
-- [ ] 1000+ users
-- [ ] 50+ niches supported
-- [ ] Community template library
-- [ ] Cloud-hosted option
-- [ ] Mobile companion app
-
----
-
-## 📝 Next Steps
-
-### Immediate Actions (This Week)
-
-1. ✅ Finalize tech stack choices
-2. ✅ Create detailed PLAN.md (this document)
-3. ⏳ Set up development environment
-4. ⏳ Initialize Git repository
-5. ⏳ Create project structure skeleton
-
-### Week 1 Sprint
-
-- [ ] PyQt6 main window boilerplate
-- [ ] SQLite database + SQLAlchemy models
-- [ ] Config management system
-- [ ] Dark theme QSS
-- [ ] Account management UI (basic CRUD)
-
-### Questions to Resolve
-
-1. **Platform Priority:** Instagram-first, then TikTok/YouTube?
-2. **Automation Default:** Hybrid mode as default for new accounts?
-3. **Cloud Sync:** Dropbox or Google Drive preferred?
-4. **Budget:** Any budget for premium APIs (ElevenLabs TTS, Claude API, etc.)?
-
----
-
-## 📚 Appendix
-
-### Useful Resources
-
-- **PyQt6 Docs:** https://doc.qt.io/qtforpython-6/
-- **instagrapi:** https://github.com/adw0rd/instagrapi
-- **faster-whisper:** https://github.com/guillaumekln/faster-whisper
-- **sentence-transformers:** https://www.sbert.net/
-- **yt-dlp:** https://github.com/yt-dlp/yt-dlp
-
-### Development Tools
-
-- **IDE:** VS Code / PyCharm
-- **Design:** Figma (UI mockups)
-- **Version Control:** Git + GitHub
-- **Testing:** pytest
-- **Profiling:** py-spy, memory_profiler
-
----
-
-**Document Version:** 1.0  
-**Last Updated:** 2026-03-13  
-**Author:** Development Team  
-**Status:** Ready for Implementation ✅
+The long-term product is not just a downloader. It is a system that helps a user:
+
+1. choose and manage a content account/profile
+2. acquire content for that account
+3. build and manage a local library of candidate clips
+4. prepare the workflow for later processing and uploading
+
+For the current MVP, only the first reliable slice needs to be finished:
+
+- account management
+- account selection
+- YouTube / YouTube Shorts acquisition
+- download history and local file tracking
+- packaged Windows delivery
+
+Current strategy:
+
+- Keep the account -> scrape -> download -> process flow coherent.
+- Improve Processing without reopening broad platform scope.
+- Keep implementation smaller than the vision.
+- Package it early so the MVP is real outside the dev environment.
+- Keep hosted/local AI usage confined to chosen videos in Processing.
+
+## 2. Product Direction
+
+### Long-Term Product Vision
+
+A multi-account Auto Clipper desktop app that helps users manage niche-specific accounts, discover or ingest suitable content, prevent duplicate work, process raw clips, and prepare or publish them to target platforms.
+
+### Current MVP
+
+The MVP is the first operational slice of that system:
+
+- Windows-only desktop app using PyQt6
+- account CRUD and account selection
+- niche/account-aware workspace gating
+- local runtime data with override support for dev/testing
+- SQLite database for accounts and download history
+- YouTube / YouTube Shorts ingestion via `yt-dlp`
+- download queue with background workers
+- local library/history with status, retry, remove, open, and review actions
+- enough packaging work to run the app outside the dev environment
+
+### Explicitly Deferred
+
+These are part of the broader vision, but should not drive current implementation:
+
+- TikTok and Instagram ingestion
+- automated smart scraping/discovery across multiple sources
+- uploader automation
+- broad processing automation beyond the current title/crop workflow
+- AI caption generation, embeddings, niche scoring, virality scoring, or drift detection
+- analytics dashboards
+- cloud sync
+- stealth / anti-detection systems
+
+## 3. Core User Flow
+
+The product flow should stay stable even while the MVP is narrow.
+
+### Flow A: Account-Centered Workflow
+
+1. User creates, edits, deletes, and selects an account/profile.
+2. Each account/profile represents a niche or content direction.
+3. User acquires content for the selected account.
+4. Acquired content is stored in the local library/history.
+5. User reviews chosen items and moves selected videos into Processing.
+6. Processing generates title/caption drafts, auto-crops when needed, and exports a first processed output.
+
+### Flow B: Future Full Auto Clipper Flow
+
+This is the intended future direction, not the MVP scope:
+
+1. choose account
+2. discover/scrape suitable content for that account
+3. avoid duplicates and low-value content
+4. process the raw clip
+5. prepare title/caption/format
+6. upload to a target platform
+
+The MVP must not break this future flow. It should be the foundation for it.
+
+## 4. Execution Principles
+
+1. Protect the real product flow.
+   The current implementation may be smaller than the vision, but every major decision should still fit the account -> acquire -> library -> later process/upload flow.
+
+2. Prefer reliable workflow over broad feature count.
+   One working account-based acquisition loop is more valuable than many incomplete systems.
+
+3. Keep the MVP smaller than the ambition.
+   The vision is bigger than the current milestone. That is intentional.
+
+4. Package earlier than feels comfortable.
+   The MVP is not truly real until it runs outside the dev environment.
+
+5. Avoid speculative architecture.
+   Add abstractions only when the second real use case arrives.
+
+6. Keep repo guidance tied to actual progress.
+   `PLAN.md` tracks roadmap direction.
+   `STATUS.md` tracks current reality and blockers.
+
+## 5. Current Progress Snapshot
+
+### Already Implemented
+
+- [x] Python package entrypoint via `python -m nicheflow_studio`
+- [x] PyQt6 desktop app bootstrap
+- [x] local runtime path setup with `NICHEFLOW_DATA_DIR` override support
+- [x] packaged Windows runtime path behavior
+- [x] logging setup
+- [x] SQLite initialization via SQLAlchemy
+- [x] account model
+- [x] download item model
+- [x] basic schema compatibility upgrades for existing databases
+- [x] `yt-dlp` downloader wrapper for YouTube URLs
+- [x] background download queue with threaded execution
+- [x] failure capture with sanitized error messages
+- [x] main window for account selection, queue table, and item details
+- [x] retry flow
+- [x] remove-from-history flow
+- [x] file open flow
+- [x] dev and run PowerShell scripts
+- [x] minimal PyInstaller-based Windows packaging flow
+- [x] first real packaged smoke test
+- [x] first real packaged download with persisted runtime data after restart
+- [x] automated tests for queue behavior, DB/path setup, and major UI flows
+- [x] source-based scraping with `Source` and `ScrapeRun` models
+- [x] background scrape worker with live progress updates
+- [x] sidebar-based module shell with separate Scraping / Downloads / Processing / Uploads / Accounts destinations
+- [x] candidate-state filter and color-coded candidate states in the scraping UI
+- [x] regression fix for unassigned download visibility
+- [x] regression fix for resetting linked scrape candidates when a download row is removed
+- [x] tabbed scraping workspace for Sources / Candidates / Runs
+- [x] source filter/sort controls and inline enabled dropdowns
+- [x] source URL normalization from channel/profile subpages to root URLs
+- [x] source-level scrape progress bar
+- [x] clearer candidate review labels and reversible ignore flow
+- [x] account-scoped duplicate handling during scrape intake
+
+### Needs Hardening
+
+- [x] improve URL validation before queueing
+- [x] improve pre-submit failure handling for bad input
+- [x] improve downloader failure messaging for common `yt-dlp` failures that still reach the queue
+- [x] add minimum useful duplicate protection in the submit path
+- [x] verify packaged `Open Video` / `Open Folder` behavior on Windows
+- [x] accept current `Open Folder` behavior for MVP
+- [x] document packaged update/upgrade expectations
+- [x] narrow one obvious maintainability seam in `main_window.py` without broad refactoring
+- [x] move scraping work off the UI thread
+- [x] show scrape progress/status while scraping runs
+- [x] separate account management into its own page destination
+
+### Not Started
+
+- [x] richer metadata visibility for existing library items
+- [x] stronger duplicate protection beyond source URL/history awareness
+- [x] import/export or backup support
+- [x] batch-safe review actions in Downloads
+- [x] first Processing slice with transcript-driven draft generation
+- [x] chosen-video-only smart generation in Processing
+- [x] Processing source preview and processed-output preview
+- [x] title-only processed export with automatic crop suggestion
+- [x] dark-title-band detection for crop suggestions
+- [ ] uploader integration
+- [x] scraping/intake `v0`
+
+## 6. Current Milestones
+
+### Milestone 1: Finish Processing V1
+
+Goal: Make the selected-video Processing flow strong enough for daily use.
+
+Tasks:
+
+- [x] keep LLM usage confined to Processing for chosen videos
+- [x] generate transcript/title/caption drafts for the selected item
+- [x] show original and processed preview states in Processing
+- [x] auto-crop only when the video actually needs it
+- [x] trim repeated dark title bars and blank bands when present
+- [x] render only the title into the processed output
+- [ ] continue tuning title size, title styling, and crop precision against real videos
+- [ ] continue tuning caption draft quality as editable copy, not baked output
+- [ ] manually validate a few real exported outputs end to end
+
+Definition of done:
+
+- A selected downloaded video can move through Processing and produce a usable first output with a sensible crop and a readable title overlay.
+
+### Milestone 2: Harden Account-Based Acquisition
+
+Goal: Make the acquisition loop trustworthy for repeated daily use.
+
+Tasks:
+
+- [x] add lightweight URL validation and clearer pre-submit errors
+- [x] harden downloader failure messaging for common `yt-dlp` failures
+- [ ] manually verify retry, open, remove, selection persistence, and refresh behavior on Windows
+- [x] manually verify packaged `Open Video` and `Open Folder` shell behavior on a real downloaded file
+- [x] add one smoke-test checklist for a successful Shorts download and a known failure case
+- [x] add minimum useful duplicate protection rules
+- [x] narrow obvious maintainability pressure in `main_window.py` without broad refactoring
+
+Definition of done:
+
+- A user can manage accounts, choose the correct account, submit valid YouTube/Shorts links, avoid obvious duplicate acquisition mistakes, recover cleanly from common failures, and trust the local library state.
+
+### Milestone 3: Improve Library Quality Without Breaking Scope
+
+Goal: Make the local library more useful while staying inside the acquisition foundation.
+
+Tasks:
+
+- [x] add richer metadata visibility where already available
+- [x] clarify review workflow semantics across scraped candidates
+- [x] align download review language more closely with the candidate review language
+- [x] add batch-safe actions only if repeated friction appears
+- [ ] improve small workflow pain points only when they are concrete and recurring
+
+Definition of done:
+
+- The app is pleasant enough to manage a small niche-specific content library every day.
+
+### Milestone 4: Scraping / Intake V0
+
+Start after Milestones 1-2 are sufficiently stable.
+
+Goal: Add the smallest metadata-first source intake flow that supports the future auto-clipper direction without taking on full scraping complexity.
+
+Tasks:
+
+- [x] choose one supported source input for `v0`
+- [x] ingest candidate YouTube items for the selected account without auto-download
+- [x] persist candidate metadata separately from download history
+- [x] avoid re-adding obvious duplicates using existing stable identifiers where possible
+- [x] keep ranking, uploader automation, and non-YouTube sources out of scope
+
+Definition of done:
+
+- A user can point the app at a supported YouTube source, ingest candidate items for one selected account, and queue a selected candidate into the existing download flow.
+
+### Milestone 4A: Scraping UX Hardening
+
+Goal: Make the first scraping slice usable for repeated daily intake work.
+
+Tasks:
+
+- [x] move scraping off the UI thread
+- [x] show progress/status updates while scraping runs
+- [x] separate scraping and downloads into clearer module pages
+- [x] give account management its own page destination
+- [x] improve candidate-state visibility and filtering
+- [x] make source management clearer and more structured
+- [x] add a visible source-level progress bar
+- [ ] manually validate intake with multiple real YouTube sources
+
+Definition of done:
+
+- A user can manage sources, run scrapes, review candidates, and queue selected items without the app feeling confusing or frozen.
+
+### Milestone 5: Expand Carefully
+
+Start only after Milestones 1-4 are complete.
+
+Possible future work:
+
+- [ ] smart scraping/discovery for selected accounts
+- [ ] direct manual intake from a single YouTube / Shorts URL such as `https://www.youtube.com/shorts/...`
+- [ ] stronger duplicate/content-fit rules
+- [ ] scheduling
+- [ ] uploaders
+- [ ] analytics
+
+## 7. Immediate Priority Backlog
+
+Ordered next work:
+
+1. Manually validate the new crop/title behavior against a few real exported outputs
+2. Continue tuning title overlay sizing and styling against real processed videos
+3. Continue improving caption draft quality for editing, not baked output
+4. Add a later manual direct-link intake path for a single YouTube / Shorts URL when the current Processing slice is stable
+
+## 8. Open Questions / Decision Points
+
+- Should `yt-dlp` be bundled, installed separately, or version-pinned in a controlled way?
+- Should cross-account duplicate handling become a warning-only signal later instead of a hard block?
+- Which Windows versions must be supported for MVP?
+- What account fields are truly needed now versus later?
+
+## 9. Architecture Guardrails
+
+- Keep `queue.py` responsible for job orchestration only.
+- Keep `downloader/youtube.py` responsible for `yt-dlp` interaction only.
+- Keep DB migration logic minimal until schema change frequency justifies something heavier.
+- Keep account management simple unless a concrete second workflow appears.
+- Split `main_window.py` only when a concrete seam appears:
+  - account management panel
+  - library table rendering
+  - detail panel actions
+- Do not add platform abstraction layers until a second real downloader exists.
+- Keep hosted AI usage inside Processing for chosen videos only.
+- Do not design the uploader architecture in advance of actual MVP pressure.
+
+## 10. Risks
+
+### High Risk
+
+- `yt-dlp` works today but drifts again outside the dev environment
+- packaged Windows shell handoff may still differ from source-run behavior
+- current `Open Folder` wording may over-promise compared with actual behavior if it only opens the containing folder
+- UI logic keeps accumulating in `main_window.py`
+
+### Medium Risk
+
+- ad hoc schema upgrades become messy after more DB changes
+- account credential storage becomes a real concern if it grows beyond notes/metadata
+- current global duplicate suppression is too strict for multi-account workflows where overlapping accounts should still review the same source video independently
+- the source-management UI is still functional rather than fully clear, so scaling from one source to many may feel clumsy
+
+## 11. Success Criteria
+
+### MVP Success
+
+- [ ] Windows user can run the app without manual code changes
+- [ ] user can create, edit, delete, and select an account/profile
+- [ ] YouTube and YouTube Shorts downloads succeed reliably for the selected account
+- [ ] failures produce readable messages
+- [ ] download history is useful and stable
+- [ ] packaged runtime behavior is predictable
+- [ ] the app clearly feels like the first slice of a multi-account Auto Clipper workflow
+
+### Post-MVP Success
+
+- [ ] packaged releases are repeatable
+- [ ] library management friction is low
+- [ ] minimum duplicate protection is working
+- [ ] expanding to smart scraping, processing, or uploaders does not require major rewrites
+
+## 12. What Not To Do Yet
+
+Do not spend time on these until the current Processing and acquisition hardening work is done:
+
+- embeddings / niche scoring
+- caption removal automation
+- advanced clip editing
+- TikTok or Instagram upload automation
+- stealth / anti-detection work
+- complex scheduler logic
+- cloud sync
+
+## 13. Recommended Next Step
+
+Manually validate the updated Processing crop/title behavior against real exported videos, then keep tightening output quality before adding the manual direct-link intake path.
