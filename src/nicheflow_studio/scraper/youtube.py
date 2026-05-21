@@ -20,6 +20,7 @@ class ScrapedVideoCandidate:
     description: str | None = None
     view_count: int | None = None
     like_count: int | None = None
+    comment_count: int | None = None
     duration_seconds: int | None = None
     thumbnail_url: str | None = None
     discovery_query: str | None = None
@@ -31,7 +32,9 @@ class ScrapedVideoCandidate:
 class DiscoveryWeights:
     views: int = 35
     likes: int = 20
+    comments: int = 0
     recency: int = 25
+    duration_fit: int = 0
     keyword_match: int = 20
 
 
@@ -149,6 +152,7 @@ def _candidate_from_entry(
     description = entry.get("description")
     view_count = _parse_optional_int(entry.get("view_count"))
     like_count = _parse_optional_int(entry.get("like_count"))
+    comment_count = _parse_optional_int(entry.get("comment_count"))
     duration_seconds = _parse_optional_int(entry.get("duration"))
     thumbnail_url = _thumbnail_url(entry)
 
@@ -163,6 +167,7 @@ def _candidate_from_entry(
         description=description if isinstance(description, str) else None,
         view_count=view_count,
         like_count=like_count,
+        comment_count=comment_count,
         duration_seconds=duration_seconds,
         thumbnail_url=thumbnail_url,
         discovery_query=discovery_query,
@@ -258,6 +263,20 @@ def _engagement_score(value: int | None) -> float:
     return min(math.log10(value + 1) / 6, 1.0)
 
 
+def _duration_fit_score(value: int | None) -> float:
+    if value is None or value < 1:
+        return 0.0
+    if 7 <= value <= 45:
+        return 1.0
+    if 46 <= value <= 90:
+        return 0.7
+    if 3 <= value <= 6:
+        return 0.6
+    if 91 <= value <= 180:
+        return 0.4
+    return 0.2
+
+
 def rank_candidate(
     candidate: ScrapedVideoCandidate,
     *,
@@ -265,10 +284,20 @@ def rank_candidate(
     weights: DiscoveryWeights,
     max_age_days: int | None = None,
 ) -> ScrapedVideoCandidate:
-    total_weight = max(weights.views + weights.likes + weights.recency + weights.keyword_match, 1)
+    total_weight = max(
+        weights.views
+        + weights.likes
+        + weights.comments
+        + weights.recency
+        + weights.duration_fit
+        + weights.keyword_match,
+        1,
+    )
     view_component = _engagement_score(candidate.view_count)
     like_component = _engagement_score(candidate.like_count)
+    comment_component = _engagement_score(candidate.comment_count)
     recency_component = _recency_score(candidate, max_age_days)
+    duration_component = _duration_fit_score(candidate.duration_seconds)
     keyword_component = _keyword_match_score(
         title=candidate.title,
         description=candidate.description,
@@ -278,7 +307,9 @@ def rank_candidate(
     weighted_score = (
         view_component * weights.views
         + like_component * weights.likes
+        + comment_component * weights.comments
         + recency_component * weights.recency
+        + duration_component * weights.duration_fit
         + keyword_component * weights.keyword_match
     ) / total_weight
     ranking_score = int(round(weighted_score * 100))
@@ -290,8 +321,12 @@ def rank_candidate(
         reasons.append("high views")
     if candidate.like_count and candidate.like_count >= 5_000:
         reasons.append("strong likes")
+    if candidate.comment_count and candidate.comment_count >= 50:
+        reasons.append("active comments")
     if recency_component >= 0.7:
         reasons.append("recent")
+    if duration_component >= 0.7:
+        reasons.append("short-form fit")
     if not reasons:
         reasons.append("metadata match")
 
@@ -306,6 +341,7 @@ def rank_candidate(
         description=candidate.description,
         view_count=candidate.view_count,
         like_count=candidate.like_count,
+        comment_count=candidate.comment_count,
         duration_seconds=candidate.duration_seconds,
         thumbnail_url=candidate.thumbnail_url,
         discovery_query=candidate.discovery_query,
@@ -355,6 +391,7 @@ def scrape_youtube_source(
                 description=candidate.description,
                 view_count=candidate.view_count,
                 like_count=candidate.like_count,
+                comment_count=candidate.comment_count,
                 duration_seconds=candidate.duration_seconds,
                 thumbnail_url=candidate.thumbnail_url,
                 discovery_query=None,
@@ -415,6 +452,7 @@ def search_youtube_query(
             description=candidate.description,
             view_count=candidate.view_count,
             like_count=candidate.like_count,
+            comment_count=candidate.comment_count,
             duration_seconds=candidate.duration_seconds,
             thumbnail_url=candidate.thumbnail_url,
             discovery_query=normalized_query,

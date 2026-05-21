@@ -36,6 +36,7 @@ class Account(Base):
     auto_queue_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
     min_view_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     min_like_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    candidate_min_like_filter: Mapped[int | None] = mapped_column(Integer, nullable=True)
     ranking_weight_views: Mapped[int | None] = mapped_column(Integer, nullable=True)
     ranking_weight_likes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     ranking_weight_recency: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -46,8 +47,14 @@ class Account(Base):
     banned_phrases: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     title_style_notes: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     caption_style_notes: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    upload_timezone: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    upload_default_privacy: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    upload_schedule_slots: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    upload_made_for_kids: Mapped[int] = mapped_column(Integer, default=0)
+    upload_contains_synthetic_media: Mapped[int] = mapped_column(Integer, default=0)
 
     download_items: Mapped[list["DownloadItem"]] = relationship(back_populates="account")
+    upload_jobs: Mapped[list["UploadJob"]] = relationship(back_populates="account")
     sources: Mapped[list["Source"]] = relationship(back_populates="account")
     scrape_runs: Mapped[list["ScrapeRun"]] = relationship(back_populates="account")
     scrape_candidates: Mapped[list["ScrapeCandidate"]] = relationship(back_populates="account")
@@ -65,6 +72,7 @@ class DownloadItem(Base):
     extractor: Mapped[str | None] = mapped_column(String(64), nullable=True)
     video_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     title: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    source_description: Mapped[str | None] = mapped_column(String(8192), nullable=True)
     file_path: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     error_message: Mapped[str | None] = mapped_column(String(512), nullable=True)
     transcript_text: Mapped[str | None] = mapped_column(String(65535), nullable=True)
@@ -86,6 +94,48 @@ class DownloadItem(Base):
     status: Mapped[str] = mapped_column(String(32), default="queued")
 
     account: Mapped[Account | None] = relationship(back_populates="download_items")
+    upload_jobs: Mapped[list["UploadJob"]] = relationship(back_populates="download_item")
+
+
+class UploadJob(Base):
+    __tablename__ = "upload_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: dt.datetime.now(dt.timezone.utc)
+    )
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: dt.datetime.now(dt.timezone.utc),
+        onupdate=lambda: dt.datetime.now(dt.timezone.utc),
+    )
+
+    account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"))
+    download_item_id: Mapped[int | None] = mapped_column(
+        ForeignKey("download_items.id"), nullable=True
+    )
+    processed_path: Mapped[str] = mapped_column(String(2048))
+    title: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    description: Mapped[str | None] = mapped_column(String(65535), nullable=True)
+    tags: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    scheduled_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    timezone: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    privacy_status: Mapped[str] = mapped_column(String(32), default="private")
+    made_for_kids: Mapped[int] = mapped_column(Integer, default=0)
+    contains_synthetic_media: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(32), default="draft")
+    youtube_video_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    posted_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    posted_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    posted_views: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    posted_likes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    posted_comments: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    posted_shares: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    content_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(String(512), nullable=True)
+
+    account: Mapped[Account] = relationship(back_populates="upload_jobs")
+    download_item: Mapped[DownloadItem | None] = relationship(back_populates="upload_jobs")
 
 
 class ScrapeCandidate(Base):
@@ -111,6 +161,7 @@ class ScrapeCandidate(Base):
     description: Mapped[str | None] = mapped_column(String(8192), nullable=True)
     view_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     like_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    comment_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     thumbnail_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     discovery_query: Mapped[str | None] = mapped_column(String(512), nullable=True)

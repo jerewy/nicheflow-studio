@@ -1,8 +1,8 @@
 # NicheFlow Studio Plan
 
-Last updated: 2026-04-05
+Last updated: 2026-04-28
 Status: Active execution plan
-Current milestone: Finish and harden the first Processing slice on top of the working scrape/download intake flow.
+Current milestone: Make the Instagram-first manual publishing MVP coherent on top of the working scrape/download/processing flow.
 
 ## 1. What This Project Should Be Right Now
 
@@ -13,20 +13,25 @@ The long-term product is not just a downloader. It is a system that helps a user
 1. choose and manage a content account/profile
 2. acquire content for that account
 3. build and manage a local library of candidate clips
-4. prepare the workflow for later processing and uploading
+4. prepare Instagram-ready Reels for manual publishing
+5. track posted Reels and basic performance manually
 
 For the current MVP, only the first reliable slice needs to be finished:
 
 - account management
 - account selection
-- YouTube / YouTube Shorts acquisition
+- YouTube / YouTube Shorts acquisition as a source pipeline
+- Instagram manual source intake for Reel/profile/hashtag references
+- Instagram-ready Processing output
+- manual Instagram Publish Queue
 - download history and local file tracking
 - packaged Windows delivery
 
 Current strategy:
 
 - Keep the account -> scrape -> download -> process flow coherent.
-- Improve Processing without reopening broad platform scope.
+- Make Instagram the publishing target without requiring Meta API approval.
+- Keep YouTube as an intake/download source, not the publishing center of gravity.
 - Keep implementation smaller than the vision.
 - Package it early so the MVP is real outside the dev environment.
 - Keep hosted/local AI usage confined to chosen videos in Processing.
@@ -46,18 +51,23 @@ The MVP is the first operational slice of that system:
 - niche/account-aware workspace gating
 - local runtime data with override support for dev/testing
 - SQLite database for accounts and download history
-- YouTube / YouTube Shorts ingestion via `yt-dlp`
+- YouTube / YouTube Shorts ingestion via `yt-dlp` as a source pipeline
+- Instagram manual source intake for pasted Reel/profile/hashtag references
 - download queue with background workers
 - local library/history with status, retry, remove, open, and review actions
+- Processing export optimized for Instagram Reels
+- manual Instagram Publish Queue with copy-caption, open-output, mark-posted, and metric tracking
 - enough packaging work to run the app outside the dev environment
 
 ### Explicitly Deferred
 
 These are part of the broader vision, but should not drive current implementation:
 
-- TikTok and Instagram ingestion
+- TikTok ingestion
 - automated smart scraping/discovery across multiple sources
-- uploader automation
+- official Instagram Graph API intake or publishing
+- logged-in Instagram scraping or bot automation
+- automatic Instagram media downloading/reposting without rights
 - broad processing automation beyond the current title/crop workflow
 - AI caption generation, embeddings, niche scoring, virality scoring, or drift detection
 - analytics dashboards
@@ -89,6 +99,19 @@ This is the intended future direction, not the MVP scope:
 6. upload to a target platform
 
 The MVP must not break this future flow. It should be the foundation for it.
+
+### Flow C: Instagram-First MVP Flow
+
+This is the current MVP target after the Instagram pivot:
+
+1. choose an Instagram account/niche such as `RespawnReels`
+2. collect candidate ideas from YouTube sources and manually entered Instagram references
+3. download/process only selected clips where the user has an appropriate reuse path
+4. export a vertical Instagram-ready Reel with the black-canvas/no-blur template
+5. copy the caption and manually publish in Instagram
+6. mark the job posted and record posted URL plus basic metrics
+
+The MVP should work without Instagram API approval. Official Meta/Instagram API integrations come after the manual queue proves useful.
 
 ## 4. Execution Principles
 
@@ -283,14 +306,148 @@ Possible future work:
 - [ ] uploaders
 - [ ] analytics
 
+### Milestone 5A: Instagram-First Manual Publish MVP
+
+Goal: Make the app useful for preparing and manually posting Instagram Reels before any API automation.
+
+Tasks:
+
+- [ ] clean up remaining YouTube-uploader-specific publish code paths
+- [ ] keep the Publish Queue focused on manual Instagram posting
+- [ ] ensure every processed Reel can be added to the Publish Queue
+- [ ] copy caption from a selected publish job
+- [ ] open the exported Reel from a selected publish job
+- [ ] mark a selected publish job as posted
+- [ ] record posted URL, posted time, views, likes, comments, shares, and content type
+- [ ] add a posted/draft filter if the queue gets hard to scan
+
+Definition of done:
+
+- A user can process a clip, add it to the Publish Queue, manually post it to Instagram, mark it posted, and record basic results without any external API setup.
+
+### Milestone 5B: Instagram Manual Source Intake
+
+Goal: Let the user track Instagram source ideas safely without raw Instagram scraping.
+
+Tasks:
+
+- [ ] add source types for `instagram_reel`, `instagram_profile`, and `instagram_hashtag`
+- [ ] allow Instagram URLs/hashtags as source references for selected accounts
+- [ ] save Instagram candidate rows as metadata/manual notes, not downloaded media
+- [ ] show Instagram candidates in the existing candidate review flow
+- [ ] allow selected Instagram candidates to become planning references for Processing/Publish Queue work
+- [ ] keep official Instagram Graph API support deferred until Meta setup is ready
+
+Definition of done:
+
+- A user can add Instagram Reel/profile/hashtag references, review them as candidate ideas, and keep them organized by account without automated Instagram scraping.
+
 ## 7. Immediate Priority Backlog
+
+Last updated: 2026-05-21
+
+### Just shipped (code done, tests passing)
+
+- Prompt rewrite: profile-branched prompt (~50 lines), replaces 130-line mega-prompt
+  - `gaming_meme` / `reaction_clip` → meme.ig style, situational POV hooks, 3-paragraph captions
+  - `story_reel` → human-interest storyteller
+  - `broad_short_form` → clean general short-form
+  - Account `writing_tone` field now feeds a tone lean
+- Caption paragraph spacing bug fixed (`\n\n` was being collapsed to a single space)
+- Ollama caption dict-wrapping bug fixed (`_clean_options` unwraps `{"caption":"..."}`)
+- **Auto smart crop fixed (verified end-to-end on the Bee Movie meme clip):**
+  - New `detect_content_rectangle` in `video.py` — temporal-variance detection finds
+    the embedded footage rectangle on all 4 sides (footage moves, canvas/text don't).
+  - `suggest_title_replacement_crop` now uses it as the primary signal; the old
+    45% cap that was discarding the correct answer is gone.
+  - Vision payload now returns a `content_box` (footage rectangle in frame
+    fractions) instead of the conservative 0.0 crop ratio.
+  - Title-band export filter made deterministic (fixed-size content pad,
+    even dimensions, resolution normalization) — fixes a VP9 mid-stream reinit crash.
+  - Result: the leftover source title/sub-line text no longer survives the crop.
+
+### Immediate next: repair real-clip generation quality
+
+Verification status from 2026-05-20:
+
+- [x] Groq connectivity works. `.env` loads the key and `scripts\test_generation.py --account 4 --limit 1` now reaches Groq.
+- [x] Groq fallback root cause found for the first failed run: Groq returned model JSON with a literal newline/control character, the strict parser rejected it, and generation fell through to Local fallback.
+- [x] Parser now accepts that common model-output issue after trying strict JSON first.
+- [x] Real-clip smoke runs completed:
+  - `.venv\Scripts\python.exe scripts\test_generation.py --account 4 --limit 5` -> `5 generated, 0 errors`
+  - `.venv\Scripts\python.exe scripts\test_generation.py --account 2 --limit 5` -> `5 generated, 0 errors`
+- [x] Structural title shape improved: outputs use "When you...", "Bro really thought...", and "POV:..." hooks.
+- [x] Caption paragraph spacing and hashtag separation work.
+- [x] Banned phrases are respected in the tested output.
+
+Observed blockers:
+
+1. Vision only ran on 2 of 10 real clips.
+   - Vision present: item 30 and item 17.
+   - Vision absent: 8 other clips, including items 29/31/32 with title `Video by meme.ig`, no transcript, and little usable metadata.
+   - Without vision, writer-only Groq has almost no grounding and produces generic repeated hooks like "When you finally understand the joke".
+   - When vision works, output becomes specific enough to use, for example `POV: You just got caught in Lecato's Elytra Drip Trap`.
+2. Captions read like Wikipedia instead of meme.ig.
+   - Current captions often start with definitions like "Minecraft is a popular sandbox game...".
+   - The prompt is over-indexing on "explainer" and explaining concepts the target audience already understands.
+   - Account metadata leaked verbatim once: `Gen Z gamers and meme fans are always on the lookout...`.
+
+#### Fix A: make vision failures visible and reduce silent writer-only output
+
+- [ ] Add provider diagnostics to `SmartDrafts.generation_meta` when Groq vision fails or is skipped:
+  - `vision_attempted`
+  - `vision_used`
+  - `vision_error`
+  - `frame_count`
+  - `writer_model`
+  - `vision_model`
+- [ ] In `scripts\test_generation.py`, print `vision_error` and `frame_count` whenever provider is `Groq Llama 3.3` but an `input_path` existed.
+- [ ] Add a `--require-vision` flag to `scripts\test_generation.py` for quality validation. When set, fail the item instead of accepting writer-only output if the item has no transcript and source title is generic.
+- [ ] Treat generic source titles as low-context:
+  - `Video by meme.ig`
+  - filenames that only repeat platform/id metadata
+  - empty or near-empty titles
+- [ ] For low-context items, prefer one of these before accepting writer-only output:
+  - retry vision once with fewer frames, such as 2 frames instead of 5
+  - use a shorter visual-summary prompt
+  - mark generation as needing visual context instead of returning generic captions
+- [ ] Add tests that simulate a Groq vision failure with generic metadata and assert the script/UI surfaces the failure instead of presenting Local fallback or generic Groq text as good output.
+
+#### Fix B: rewrite meme caption style away from textbook definitions
+
+- [ ] Remove or sharply narrow "explainer" language in the `gaming_meme` / `reaction_clip` prompt profile.
+- [ ] Add explicit caption rules for meme.ig-style accounts:
+  - Assume the viewer understands common games and internet culture.
+  - Do not define Minecraft, skins, memes, reaction videos, PvP, streamers, or other common terms.
+  - Start with the relatable situation or feeling.
+  - Keep captions concrete to the clip, not educational.
+  - Never echo audience labels like `Gen Z gamers and meme fans`.
+  - Do not write "This clip is funny because..." unless the source explicitly calls for analysis.
+- [ ] Add negative examples to the prompt:
+  - Bad: `Minecraft is a popular sandbox game...`
+  - Bad: `Gen Z gamers and meme fans are always on the lookout...`
+  - Good: `That panic when the trap finally works and nobody knows who to blame.`
+- [ ] Add tests around the generated prompt text so these banned caption openings and audience-label leaks stay blocked.
+- [ ] Re-run:
+  - `.venv\Scripts\python.exe scripts\test_generation.py --account 4 --limit 5 --require-vision`
+  - `.venv\Scripts\python.exe scripts\test_generation.py --account 2 --limit 5 --require-vision`
+- [ ] Accept only if most items use vision or clearly explain why vision is unavailable, titles are clip-specific, and captions do not start with textbook definitions.
+
+### Crop validation status
+
+- [x] Automated processing tests pass: `tests/test_processing.py` -> `32 passed`.
+- [x] Existing saved processed output for `Instagram_DYfJT5WOtzJ` is not good because it still includes the old source title and stale fallback title text.
+- [x] Fresh direct export with `suggest_title_replacement_crop` removed the old top title, kept the main video and bottom subtitle, rendered a clean new top-band title, and stayed `1080x1920`.
+- [ ] Still needs one app-level Processing run through the PyQt UI to prove the UI path selects the same replacement crop.
+
+### After generation quality is fixed
 
 Ordered next work:
 
-1. Manually validate the new crop/title behavior against a few real exported outputs
-2. Continue tuning title overlay sizing and styling against real processed videos
-3. Continue improving caption draft quality for editing, not baked output
-4. Add a later manual direct-link intake path for a single YouTube / Shorts URL when the current Processing slice is stable
+1. Remove or disable the YouTube automatic uploader path from the Instagram-first Publish Queue
+2. Finish the manual Instagram Publish Queue loop: copy caption, open Reel, mark posted, record metrics
+3. Add Instagram manual source intake for Reel/profile/hashtag references
+4. Continue tuning title overlay sizing and styling if real outputs reveal problems
 
 ## 8. Open Questions / Decision Points
 
@@ -350,16 +507,36 @@ Ordered next work:
 
 ## 12. What Not To Do Yet
 
-Do not spend time on these until the current Processing and acquisition hardening work is done:
+Do not spend time on these until the manual Instagram publishing MVP works:
 
 - embeddings / niche scoring
 - caption removal automation
 - advanced clip editing
-- TikTok or Instagram upload automation
+- TikTok support
+- Instagram upload automation through Meta APIs
+- logged-in Instagram scraping or bot automation
 - stealth / anti-detection work
 - complex scheduler logic
 - cloud sync
 
 ## 13. Recommended Next Step
 
-Manually validate the updated Processing crop/title behavior against real exported videos, then keep tightening output quality before adding the manual direct-link intake path.
+Clean up the Publish Queue so it is manual Instagram-first instead of mixed with YouTube uploader automation, then add Instagram manual source intake for Reel/profile/hashtag references.
+
+## 14. UI Upgrade Plan (Post-MVP)
+
+Decided 2026-05-20: keep Python as the single backend and replace only the UI layer, after the Instagram-first MVP ships and is packaged. Do not start UI rewrite work until Milestones 5A/5B are done and a packaged build is validated.
+
+### Phase A - Finish the MVP on PyQt6
+
+No UI-stack change. Complete the manual Instagram Publish Queue and Instagram manual source intake on the current PyQt6 UI, then package and smoke-test.
+
+### Phase B - Rewrite the UI on pywebview + web frontend
+
+- Shell: pywebview - native window via the OS webview, Python stays the main process, no local HTTP server.
+- Frontend: Vite + React + Tailwind + shadcn/ui in a new `frontend/` directory. Node is a build-time-only dependency.
+- Packaging: Vite build emits static assets, PyInstaller bundles them, pywebview loads them from the bundled path.
+- Steps: bridge spike (one screen) -> define a thin Python API/bridge layer over `core`/`db`/`processing`/`scraper` -> rebuild screens one at a time (Accounts, Scraping, Downloads, Processing, Publish Queue) -> retire PyQt6 and delete `main_window.py`.
+- Rationale: the bridge layer forces UI logic out of the 389 KB `main_window.py`; web styling is the fastest path to a minimalist look.
+
+Rejected: Next.js + Python-over-HTTP (web-server framework features go unused on desktop, heavier packaging) and Electron (second runtime, large bundle).

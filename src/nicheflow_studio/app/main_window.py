@@ -3,18 +3,24 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import re
 import shutil
+import subprocess
+import sys
 import zipfile
 import av
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from PyQt6.QtCore import QObject, QSize, QThread, QTimer, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QIcon, QImage, QPixmap
+from PyQt6.QtCore import QDate, QDateTime, QObject, QSize, QThread, QTime, QTimer, Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QIcon, QImage, QPixmap, QTextCursor
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QComboBox,
+    QDateTimeEdit,
+    QFileDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -33,6 +39,7 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem,
     QTabWidget,
     QTextEdit,
+    QApplication,
     QVBoxLayout,
     QWidget,
 )
@@ -45,17 +52,27 @@ from nicheflow_studio.core.paths import (
     logs_dir,
     processed_dir,
 )
-from nicheflow_studio.db.models import Account, DownloadItem, ScrapeCandidate, ScrapeRun, Source
+from nicheflow_studio.db.models import (
+    Account,
+    DownloadItem,
+    ScrapeCandidate,
+    ScrapeRun,
+    Source,
+    UploadJob,
+)
 from nicheflow_studio.db.session import get_session, init_db, reset_db_state
 from nicheflow_studio.processing.video import (
     CropSuggestion,
     CropSettings,
+    PreprocessingOcrDiagnostics,
     VideoProbe,
+    diagnose_preprocessing_ocr,
     suggest_crop_settings,
     export_cropped_video,
     output_dimensions,
     probe_video,
     processed_output_path,
+    suggest_title_replacement_crop,
 )
 from nicheflow_studio.processing.transcription import generate_transcript_draft_in_subprocess
 from nicheflow_studio.processing.smart_drafts import (
@@ -74,24 +91,135 @@ from nicheflow_studio.scraper.youtube import (
     rank_candidate,
     scrape_youtube_source,
 )
+from nicheflow_studio.scraper.instagram import (
+    infer_instagram_source_type,
+    instagram_source_label,
+    normalize_instagram_source_url,
+    scrape_instagram_source,
+)
+from nicheflow_studio.downloader.instagram import (
+    instagram_shortcode_from_url,
+    validate_instagram_media_url,
+)
 
 
 APP_STYLESHEET = """
 QWidget {
-    background: #101418;
+    background: #0f1318;
     color: #e6edf3;
     font-family: "Segoe UI";
     font-size: 10pt;
 }
 QFrame#panel {
-    background: #161b22;
-    border: 1px solid #273244;
-    border-radius: 14px;
+    background: #141a21;
+    border: 1px solid #242f3d;
+    border-radius: 12px;
 }
 QFrame#sidebar {
-    background: #12171e;
-    border: 1px solid #273244;
+    background: #0f151c;
+    border: 1px solid #253142;
+    border-radius: 18px;
+}
+QFrame#pageHeader {
+    background: #11161d;
+    border: 1px solid #243041;
     border-radius: 14px;
+}
+QFrame#downloadQueuePanel {
+    background: #141a21;
+    border: 1px solid #242f3d;
+    border-radius: 12px;
+}
+QWidget#downloadToolbar {
+    background: #141a21;
+}
+QLabel#downloadQueueTitle {
+    background: transparent;
+    color: #f4f7fb;
+    font-size: 10pt;
+    font-weight: 700;
+}
+QLabel#downloadQueueSummary {
+    background: transparent;
+    color: #8aa0b8;
+    font-size: 8.5pt;
+    font-weight: 600;
+}
+QLineEdit#downloadSearchInput, QComboBox#downloadFilter {
+    background: #0f151c;
+    border: 1px solid #263446;
+    border-radius: 9px;
+    color: #edf3f9;
+    padding: 8px 11px;
+}
+QPushButton#downloadToolbarButton {
+    background: #121922;
+    border: 1px solid #253142;
+    border-radius: 9px;
+    color: #c6d2df;
+    padding: 7px 11px;
+    font-weight: 600;
+}
+QPushButton#downloadToolbarButton:hover {
+    background: #192637;
+    border-color: #355a80;
+}
+QTableWidget#downloadQueueTable {
+    background: #11161d;
+    alternate-background-color: #151c25;
+    border: none;
+    border-radius: 0;
+    color: #e6edf3;
+    gridline-color: #1b2532;
+    selection-background-color: #223349;
+    selection-color: #edf3f9;
+}
+QTableWidget#downloadQueueTable QHeaderView::section {
+    background: #141a21;
+    color: #8aa0b8;
+    border: none;
+    border-bottom: 1px solid #242f3d;
+    padding: 8px 10px;
+    font-weight: 700;
+}
+QTableWidget#downloadQueueTable::item {
+    padding: 7px 8px;
+    border-bottom: 1px solid #202a37;
+}
+QProgressBar#queueStatusBar {
+    background: #273244;
+    border: none;
+    border-radius: 4px;
+    color: #d7e0ea;
+    font-size: 8pt;
+    font-weight: 700;
+    max-height: 11px;
+    text-align: center;
+}
+QProgressBar#queueStatusBar::chunk {
+    background: #4f7bd9;
+    border-radius: 4px;
+}
+QProgressBar#queueStatusBar[status="downloaded"]::chunk {
+    background: #4f7bd9;
+}
+QProgressBar#queueStatusBar[status="downloading"]::chunk {
+    background: #f0a94a;
+}
+QProgressBar#queueStatusBar[status="queued"]::chunk {
+    background: #8aa0b8;
+}
+QProgressBar#queueStatusBar[status="failed"]::chunk {
+    background: #dc5b61;
+}
+QLabel#downloadDropZone {
+    background: transparent;
+    color: #8aa0b8;
+    border: 2px dashed #2c3a4c;
+    border-radius: 10px;
+    padding: 22px;
+    font-size: 10pt;
+    font-weight: 600;
 }
 QLabel#eyebrow {
     color: #8aa0b8;
@@ -101,7 +229,7 @@ QLabel#eyebrow {
 }
 QLabel#headline {
     color: #f4f7fb;
-    font-size: 14pt;
+    font-size: 13pt;
     font-weight: 600;
 }
 QLabel#sectionTitle {
@@ -145,6 +273,40 @@ QLabel#statusLabel[tone="error"] {
     color: #ff9c9c;
     border-color: #7a2f36;
 }
+QFrame#activityBar {
+    background: #101820;
+    border: 1px solid #263446;
+    border-radius: 10px;
+}
+QFrame#activityBar[tone="success"] {
+    border-color: #2d7d5a;
+}
+QFrame#activityBar[tone="warning"] {
+    border-color: #9f7a2d;
+}
+QFrame#activityBar[tone="error"] {
+    border-color: #8f3038;
+}
+QLabel#activityStatus {
+    background: transparent;
+    color: #c6d2df;
+    font-size: 9pt;
+    font-weight: 600;
+}
+QProgressBar#activityProgress {
+    background: #0b1118;
+    border: 1px solid #263446;
+    border-radius: 4px;
+    color: #c6d2df;
+    font-size: 8pt;
+    font-weight: 600;
+    max-height: 8px;
+    text-align: center;
+}
+QProgressBar#activityProgress::chunk {
+    background: #4f7bd9;
+    border-radius: 4px;
+}
 QLabel#toast {
     background: #0f1720;
     border: 1px solid #273244;
@@ -169,11 +331,11 @@ QLabel#toast[tone="error"] {
     background: #2a1417;
 }
 QLineEdit, QComboBox {
-    background: #0f1720;
-    border: 1px solid #2c3a4c;
-    border-radius: 12px;
+    background: #0f151c;
+    border: 1px solid #263446;
+    border-radius: 10px;
     color: #edf3f9;
-    padding: 10px 14px;
+    padding: 9px 12px;
     selection-background-color: #365880;
 }
 QLineEdit:focus, QComboBox:focus {
@@ -269,19 +431,19 @@ QPushButton:disabled {
 }
 QTableWidget {
     background: #11161d;
-    alternate-background-color: #151c25;
-    border: 1px solid #273244;
-    border-radius: 12px;
-    gridline-color: #243041;
+    alternate-background-color: #131a22;
+    border: 1px solid #222d3a;
+    border-radius: 10px;
+    gridline-color: #1b2532;
     selection-background-color: #223349;
     selection-color: #edf3f9;
 }
 QHeaderView::section {
-    background: #161f2a;
+    background: #131b24;
     color: #9fb1c6;
     border: none;
-    border-bottom: 1px solid #273244;
-    padding: 12px 10px;
+    border-bottom: 1px solid #222d3a;
+    padding: 9px 10px;
     font-weight: 600;
 }
 QScrollBar:vertical {
@@ -331,8 +493,8 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
     border-radius: 7px;
 }
 QPushButton#ghostButton {
-    background: #141d27;
-    border: 1px solid #273244;
+    background: #121922;
+    border: 1px solid #253142;
     color: #c6d2df;
 }
 QPushButton#ghostButton:hover {
@@ -372,24 +534,25 @@ QPushButton#dangerButton:hover {
     background: #34171b;
 }
 QPushButton#sidebarToggle {
-    background: #141d27;
-    border: 1px solid #273244;
-    color: #9fb2c8;
-    padding: 0 10px;
-    min-height: 44px;
-    min-width: 92px;
-    max-height: 44px;
-    max-width: 112px;
-    border-radius: 14px;
-    text-align: left;
+    background: transparent;
+    border: 1px solid transparent;
+    color: #c9d7e8;
+    padding: 0;
+    min-height: 38px;
+    min-width: 38px;
+    max-height: 38px;
+    max-width: 38px;
+    border-radius: 12px;
+    text-align: center;
+    font-weight: 600;
 }
 QComboBox#sidebarAccountCombo {
-    background: #101820;
-    border: 1px solid #2d3f55;
-    border-radius: 12px;
+    background: #0c1117;
+    border: 1px solid #2a3b50;
+    border-radius: 9px;
     color: #edf3f9;
-    padding: 8px 10px;
-    min-height: 32px;
+    padding: 7px 9px;
+    min-height: 30px;
 }
 QLabel#sidebarAccountLabel {
     background: transparent;
@@ -398,33 +561,30 @@ QLabel#sidebarAccountLabel {
     font-size: 8pt;
     font-weight: 700;
     letter-spacing: 0.08em;
-    padding: 2px 2px 0 2px;
+    padding: 6px 2px 0 2px;
 }
 QPushButton#sidebarToggle:hover {
-    background: #1a2734;
-    border-color: #35506d;
+    background: #161f2a;
+    border-color: #253142;
     color: #e6edf3;
 }
 QPushButton#sidebarToggle[selected="true"] {
-    background: #1b2a3a;
-    border-color: #4b88c7;
+    background: #192637;
+    border-color: #355a80;
     color: #f4f8fc;
-    border-left: 3px solid #76b7ff;
 }
 QPushButton#sidebarToggle:checked {
-    background: #1b2a3a;
-    border-color: #4b88c7;
+    background: #192637;
+    border-color: #355a80;
     color: #f4f8fc;
-    border-left: 3px solid #76b7ff;
 }
 QLabel#sidebarBrand {
     background: transparent;
     border: none;
-    color: #8fa7c0;
-    font-size: 8pt;
-    font-weight: 700;
-    letter-spacing: 0.08em;
-    padding: 2px 2px 8px 2px;
+    color: #ffffff;
+    font-size: 15pt;
+    font-weight: 800;
+    padding: 0;
 }
 """
 
@@ -442,12 +602,17 @@ DISCOVERY_MODES = {
     "review_only": "Review Only",
     "auto_queue": "Auto Queue Top Results",
 }
+UPLOAD_PRIVACY_OPTIONS = {
+    "private": "Private",
+    "unlisted": "Unlisted",
+    "public": "Public",
+}
 MODULE_PAGES = ("scraping", "downloads", "processing", "uploads")
 TITLE_STYLE_PRESETS: dict[str, dict[str, object]] = {
     "clean_hook": {
         "label": "Clean Hook",
-        "font_size": 54,
-        "font_name": "segoe_ui",
+        "font_size": 60,
+        "font_name": "arial_bold",
         "text_color": "#FFFFFF",
         "background": "none",
     },
@@ -488,6 +653,55 @@ TITLE_STYLE_PRESETS: dict[str, dict[str, object]] = {
     },
 }
 
+PROCESSING_TEMPLATES: dict[str, dict[str, object]] = {
+    "gaming_meme_black": {
+        "label": "Gaming Meme Black",
+        "title_style": "clean_hook",
+        "layout": "top_band",
+        "font_size": 64,
+        "font_name": "arial_bold",
+        "text_color": "#FFFFFF",
+        "background": "none",
+        "prompt_profile": "gaming_meme",
+    },
+    "reaction_clip_black": {
+        "label": "Reaction Clip Black",
+        "title_style": "clean_hook",
+        "layout": "top_band",
+        "font_size": 60,
+        "font_name": "arial_bold",
+        "text_color": "#FFFFFF",
+        "background": "none",
+        "prompt_profile": "reaction_clip",
+    },
+    "story_reel_clean": {
+        "label": "Story Reel Clean",
+        "title_style": "editorial_label",
+        "layout": "top_band",
+        "font_size": 56,
+        "font_name": "arial_bold",
+        "text_color": "#FFFFFF",
+        "background": "none",
+        "prompt_profile": "story_reel",
+    },
+    "full_video_overlay": {
+        "label": "Full Video Overlay",
+        "title_style": "boxed_banner",
+        "layout": "overlay",
+        "font_size": 50,
+        "font_name": "arial_bold",
+        "text_color": "#F8FAFC",
+        "background": "dark",
+        "prompt_profile": "broad_short_form",
+    },
+}
+
+TITLE_LAYOUT_CHOICES: list[tuple[str, str]] = [
+    ("Black Canvas", "top_band"),
+    ("Overlay", "overlay"),
+    ("No Title", "no_title"),
+]
+
 TITLE_FONT_CHOICES: list[tuple[str, str]] = [
     ("Segoe UI", "segoe_ui"),
     ("Bahnschrift", "bahnschrift"),
@@ -502,12 +716,12 @@ TITLE_FONT_CHOICES: list[tuple[str, str]] = [
 class UiStrings:
     title: str = "NicheFlow Studio"
     eyebrow: str = "Download"
-    headline: str = "Paste a YouTube link or use Scrape to build the queue"
-    url_placeholder: str = "Paste a YouTube / Shorts URL..."
+    headline: str = "Paste a YouTube or Instagram link, or use Scrape to build the queue"
+    url_placeholder: str = "Paste a YouTube, Shorts, Instagram Reel, or post URL..."
     add_button: str = "Download"
-    history_title: str = "Download Queue"
-    detail_title: str = "Selected Video"
-    detail_placeholder: str = "Select a row to inspect it."
+    history_title: str = "Review Queue"
+    detail_title: str = "Review Decision"
+    detail_placeholder: str = "Select a clip to judge if it fits this niche account."
 
 
 @dataclass(frozen=True)
@@ -533,15 +747,27 @@ class ScrapeJobConfig:
 
 
 @dataclass(frozen=True)
+class InstagramDiscoverRankJobConfig:
+    username: str
+    target_account_name: str
+    min_new: int
+    limit: int
+    scrolls: int = 30
+    stall_limit: int = 8
+    wait_ms: int = 4000
+
+
+@dataclass(frozen=True)
 class ProcessJobConfig:
     input_path: Path
     output_path: Path
     crop: CropSettings
     title_text: str | None = None
-    title_font_size: int = 54
-    title_font_name: str = "segoe_ui"
+    title_font_size: int = 60
+    title_font_name: str = "arial_bold"
     title_color: str = "#FFFFFF"
     title_background: str = "none"
+    title_layout: str = "top_band"
 
 
 @dataclass(frozen=True)
@@ -560,9 +786,14 @@ class SmartDraftJobConfig:
     transcript_text: str
     source_title: str | None
     niche_label: str | None
+    source_description: str | None = None
     input_path: Path | None = None
     transcript_available: bool = False
     account_voice: dict[str, str] | None = None
+    prompt_profile: str | None = None
+    caption_style: str | None = None
+    recent_titles: list[str] | None = None
+    recent_captions: list[str] | None = None
 
 
 class ScrapeWorker(QObject):
@@ -645,6 +876,107 @@ class ScrapeWorker(QObject):
             self.failed.emit(str(exc))
 
 
+class InstagramDiscoverRankWorker(QObject):
+    log = pyqtSignal(str)
+    completed = pyqtSignal(dict)
+    failed = pyqtSignal(str)
+
+    def __init__(self, job: InstagramDiscoverRankJobConfig) -> None:
+        super().__init__()
+        self._job = job
+
+    @staticmethod
+    def _project_root() -> Path:
+        return Path(__file__).resolve().parents[3]
+
+    @staticmethod
+    def _safe_username(username: str) -> str:
+        return "".join(
+            char if char.isalnum() or char in {"-", "_", "."} else "_"
+            for char in username.strip().lstrip("@")
+        )
+
+    def _run_command(self, args: list[str]) -> None:
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        process = subprocess.Popen(
+            args,
+            cwd=self._project_root(),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        assert process.stdout is not None
+        for line in process.stdout:
+            cleaned = line.rstrip()
+            if cleaned:
+                self.log.emit(cleaned)
+        return_code = process.wait()
+        if return_code != 0:
+            raise RuntimeError(f"Command failed with exit code {return_code}: {' '.join(args)}")
+
+    def run(self) -> None:
+        try:
+            username = self._job.username.strip().lstrip("@")
+            safe_username = self._safe_username(username)
+            output_path = Path("data") / "discovered" / f"{safe_username}-urls.json"
+            profile_dir = Path("data") / "browser-profiles" / "instagram"
+            metadata_limit = max(self._job.min_new * 2, self._job.min_new, 1)
+
+            self.log.emit(f"Discovering @{username}...")
+            self._run_command(
+                [
+                    sys.executable,
+                    "scripts/instagram_discover_playwright.py",
+                    "--username",
+                    username,
+                    "--min-new",
+                    str(self._job.min_new),
+                    "--limit",
+                    str(self._job.limit),
+                    "--scrolls",
+                    str(self._job.scrolls),
+                    "--stall-limit",
+                    str(self._job.stall_limit),
+                    "--wait-ms",
+                    str(self._job.wait_ms),
+                    "--resume",
+                    "--user-data-dir",
+                    str(profile_dir),
+                    "--out",
+                    str(output_path),
+                ]
+            )
+
+            self.log.emit(f"Extracting metadata for up to {metadata_limit} new URL(s)...")
+            self._run_command(
+                [
+                    sys.executable,
+                    "scripts/instagram_scrape_urls.py",
+                    "--file",
+                    str(output_path),
+                    "--limit",
+                    str(metadata_limit),
+                    "--save-account",
+                    self._job.target_account_name,
+                    "--only-new-for-account",
+                    self._job.target_account_name,
+                ]
+            )
+            self.completed.emit(
+                {
+                    "username": username,
+                    "target_account_name": self._job.target_account_name,
+                    "output_path": str(output_path),
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
+
+
 class ProcessWorker(QObject):
     completed = pyqtSignal(dict)
     failed = pyqtSignal(str)
@@ -664,6 +996,7 @@ class ProcessWorker(QObject):
                 title_font_name=self._job.title_font_name,
                 title_color=self._job.title_color,
                 title_background=self._job.title_background,
+                title_layout=self._job.title_layout,
             )
             self.completed.emit({"output_path": str(output_path)})
         except Exception as exc:  # noqa: BLE001
@@ -681,12 +1014,20 @@ class SuggestCropWorker(QObject):
     def run(self) -> None:
         try:
             suggestion = suggest_crop_settings(self._job.input_path)
+            diagnostics: PreprocessingOcrDiagnostics | None = None
+            diagnostics_error: str | None = None
+            try:
+                diagnostics = diagnose_preprocessing_ocr(self._job.input_path)
+            except Exception as exc:  # noqa: BLE001
+                diagnostics_error = str(exc)
             self.completed.emit(
                 {
                     "crop": suggestion.crop,
                     "reasons": list(suggestion.reasons),
                     "used_border_detection": suggestion.used_border_detection,
                     "used_ocr": suggestion.used_ocr,
+                    "ocr_diagnostics": diagnostics,
+                    "ocr_diagnostics_error": diagnostics_error,
                 }
             )
         except Exception as exc:  # noqa: BLE001
@@ -731,9 +1072,14 @@ class SmartDraftWorker(QObject):
             drafts = generate_smart_drafts(
                 transcript_text=self._job.transcript_text,
                 source_title=self._job.source_title,
+                source_description=self._job.source_description,
                 niche_label=self._job.niche_label,
                 input_path=self._job.input_path,
                 account_voice=self._job.account_voice,
+                prompt_profile=self._job.prompt_profile,
+                caption_style=self._job.caption_style,
+                recent_titles=self._job.recent_titles,
+                recent_captions=self._job.recent_captions,
             )
             self.completed.emit(
                 {
@@ -752,8 +1098,27 @@ class SmartDraftWorker(QObject):
 
 class TableFocusScrollWidget(QTableWidget):
     def wheelEvent(self, event) -> None:  # noqa: ANN001
+        scrollbar = self.verticalScrollBar()
+        before = scrollbar.value()
         super().wheelEvent(event)
-        event.accept()
+        if scrollbar.value() != before or scrollbar.maximum() > 0:
+            event.accept()
+            return
+        event.ignore()
+
+
+class CurrentPageStackedWidget(QStackedWidget):
+    def sizeHint(self) -> QSize:
+        current_widget = self.currentWidget()
+        if current_widget is None:
+            return super().sizeHint()
+        return current_widget.sizeHint()
+
+    def minimumSizeHint(self) -> QSize:
+        current_widget = self.currentWidget()
+        if current_widget is None:
+            return super().minimumSizeHint()
+        return current_widget.minimumSizeHint()
 
 
 class MainWindow(QWidget):
@@ -778,6 +1143,9 @@ class MainWindow(QWidget):
         self._scrape_thread: QThread | None = None
         self._scrape_worker: ScrapeWorker | None = None
         self._scrape_in_progress = False
+        self._instagram_discover_thread: QThread | None = None
+        self._instagram_discover_worker: InstagramDiscoverRankWorker | None = None
+        self._instagram_discover_in_progress = False
         self._process_thread: QThread | None = None
         self._process_worker: ProcessWorker | None = None
         self._suggest_thread: QThread | None = None
@@ -790,15 +1158,21 @@ class MainWindow(QWidget):
         self._processing_busy_mode: str | None = None
         self._selected_processing_item_id: int | None = None
         self._processing_item_probe_cache: dict[int, tuple[str, int, int, bool]] = {}
+        self._processing_source_labels: dict[int, str] = {}
+        self._processing_clip_premises: dict[int, str] = {}
         self._processing_probe_item_id: int | None = None
         self._processing_probe: VideoProbe | None = None
         self._processing_last_output_path: Path | None = None
         self._processing_auto_crop = CropSettings()
+        self._processing_using_ai_layout_crop = False
+        self._processing_applying_ai_layout_suggestion = False
+        self._processing_ai_suggested_layout: str | None = None
         self._processing_pending_job: ProcessJobConfig | None = None
         self._processing_raw_transcript_text: str = ""
         self._processing_provider_label_text: str = ""
         self._processing_generation_meta_text: str = ""
         self._processing_vision_payload_text: str = ""
+        self._processing_vision_payload: dict[str, object] | None = None
         self._processing_generated_at_text: str = ""
         self._processing_preview_path: Path | None = None
         self._processing_preview_container: av.container.InputContainer | None = None
@@ -806,6 +1180,7 @@ class MainWindow(QWidget):
         self._processing_preview_frame_iter = None
         self._processing_preview_duration_ms: int = 0
         self._processing_preview_position_ms: int = 0
+        self._processing_preview_last_frame_ms: int | None = None
         self._processing_preview_mode: str = "source"
         self._suppress_interaction_tracking = False
         self._suppress_account_form_sync = False
@@ -836,6 +1211,26 @@ class MainWindow(QWidget):
         self._status_label = QLabel("Ready.")
         self._status_label.setObjectName("statusLabel")
 
+        self._activity_bar = QFrame()
+        self._activity_bar.setObjectName("activityBar")
+        self._activity_bar.setVisible(False)
+        activity_layout = QVBoxLayout()
+        activity_layout.setContentsMargins(12, 9, 12, 9)
+        activity_layout.setSpacing(6)
+        self._activity_status_label = QLabel("Ready.")
+        self._activity_status_label.setObjectName("activityStatus")
+        self._activity_status_label.setWordWrap(True)
+        self._activity_progress_bar = QProgressBar()
+        self._activity_progress_bar.setObjectName("activityProgress")
+        self._activity_progress_bar.setTextVisible(False)
+        self._activity_progress_bar.setVisible(False)
+        self._activity_progress_bar.setMinimum(0)
+        self._activity_progress_bar.setMaximum(1)
+        self._activity_progress_bar.setValue(0)
+        activity_layout.addWidget(self._activity_status_label)
+        activity_layout.addWidget(self._activity_progress_bar)
+        self._activity_bar.setLayout(activity_layout)
+
         self._toast_label = QLabel(self)
         self._toast_label.setObjectName("toast")
         self._toast_label.setVisible(False)
@@ -847,14 +1242,16 @@ class MainWindow(QWidget):
 
         self._download_button = QPushButton(self._ui.add_button)
         self._download_button.clicked.connect(self._on_download_clicked)
+        self._import_local_button = QPushButton("Import MP4")
+        self._import_local_button.clicked.connect(self._on_import_local_clicked)
         self._sidebar_toggle_button = QPushButton()
         self._sidebar_toggle_button.setObjectName("sidebarToggle")
         self._sidebar_toggle_button.clicked.connect(self._toggle_account_sidebar)
         self._sidebar_toggle_button.setToolTip("Open account manager")
         self._sidebar_toggle_button.setCheckable(True)
-        self._sidebar_toggle_button.setText("Manage")
-        self._sidebar_toggle_button.setIcon(self._icon("account-manager"))
-        self._sidebar_toggle_button.setIconSize(QSize(16, 16))
+        self._sidebar_toggle_button.setText("")
+        self._sidebar_toggle_button.setIcon(self._sidebar_icon("account-manager"))
+        self._sidebar_toggle_button.setIconSize(QSize(20, 20))
         self._sidebar_toggle_button.setProperty("selected", False)
         self._module_buttons: dict[str, QPushButton] = {}
         self._sidebar_account_combo = QComboBox()
@@ -867,9 +1264,10 @@ class MainWindow(QWidget):
         top_row.setSpacing(8)
         top_row.addWidget(self._url_input, stretch=1)
         top_row.addWidget(self._download_button)
+        top_row.addWidget(self._import_local_button)
 
         hero_panel = QFrame()
-        hero_panel.setObjectName("panel")
+        hero_panel.setObjectName("pageHeader")
         hero_layout = QVBoxLayout()
         hero_layout.setContentsMargins(16, 14, 16, 14)
         hero_layout.setSpacing(8)
@@ -879,13 +1277,13 @@ class MainWindow(QWidget):
         hero_layout.addWidget(self._status_label)
         hero_panel.setLayout(hero_layout)
 
-        account_title = QLabel("Account Targets")
+        account_title = QLabel("Niche Accounts")
         account_title.setObjectName("sectionTitle")
 
-        workspace_title = QLabel("Current Workspace")
+        workspace_title = QLabel("Active Niche")
         workspace_title.setObjectName("sectionTitle")
         workspace_hint = QLabel(
-            "Choose which account library you are currently working in. Downloads and review happen inside this workspace."
+            "Choose the niche account you are building content for. Scrape, downloads, drafts, and scheduling use this workspace."
         )
         workspace_hint.setObjectName("subtleLabel")
         workspace_hint.setWordWrap(True)
@@ -904,10 +1302,10 @@ class MainWindow(QWidget):
         workspace_layout.addWidget(self._current_account_combo)
         workspace_panel.setLayout(workspace_layout)
 
-        manage_title = QLabel("Manage Saved Accounts")
+        manage_title = QLabel("Manage Niches")
         manage_title.setObjectName("sectionTitle")
         manage_hint = QLabel(
-            "Keep account setup separate from the active workspace. Pick a mode below, finish the action, then return to the main view."
+            "Create a niche account, edit its content rules, or remove one you no longer use."
         )
         manage_hint.setObjectName("subtleLabel")
         manage_hint.setWordWrap(True)
@@ -917,14 +1315,14 @@ class MainWindow(QWidget):
         self._account_name_input = QLineEdit()
         self._account_name_input.setPlaceholderText("Account name")
         self._account_platform_combo = QComboBox()
-        self._account_platform_combo.addItem("youtube")
-        self._account_platform_combo.setEnabled(False)
+        self._account_platform_combo.addItem("YouTube", "youtube")
+        self._account_platform_combo.addItem("Instagram", "instagram")
         self._account_niche_input = QLineEdit()
-        self._account_niche_input.setPlaceholderText("Niche / category")
+        self._account_niche_input.setPlaceholderText("Content niche / category")
         self._account_login_input = QLineEdit()
-        self._account_login_input.setPlaceholderText("Login identifier")
+        self._account_login_input.setPlaceholderText("Handle / profile reference")
         self._account_credential_input = QLineEdit()
-        self._account_credential_input.setPlaceholderText("Credential / session note")
+        self._account_credential_input.setPlaceholderText("Private notes for this account")
         self._account_scrape_sources_input = QLineEdit()
         self._account_scrape_sources_input.setPlaceholderText("Managed from Source Intake below")
         self._account_scrape_sources_input.setReadOnly(True)
@@ -967,20 +1365,33 @@ class MainWindow(QWidget):
         self._account_title_style_notes_input.setPlaceholderText("Short rules for titles")
         self._account_caption_style_notes_input = QLineEdit()
         self._account_caption_style_notes_input.setPlaceholderText("Short rules for captions")
+        self._account_upload_timezone_input = QLineEdit()
+        self._account_upload_timezone_input.setPlaceholderText("Asia/Jakarta")
+        self._account_upload_privacy_combo = QComboBox()
+        for privacy_value, privacy_label in UPLOAD_PRIVACY_OPTIONS.items():
+            self._account_upload_privacy_combo.addItem(privacy_label, privacy_value)
+        self._account_upload_schedule_slots_input = QLineEdit()
+        self._account_upload_schedule_slots_input.setPlaceholderText("09:00, 18:00")
+        self._account_upload_made_for_kids_combo = QComboBox()
+        self._account_upload_made_for_kids_combo.addItem("No", 0)
+        self._account_upload_made_for_kids_combo.addItem("Yes", 1)
+        self._account_upload_synthetic_media_combo = QComboBox()
+        self._account_upload_synthetic_media_combo.addItem("No", 0)
+        self._account_upload_synthetic_media_combo.addItem("Yes", 1)
 
         self._account_mode_label = QLabel("Main")
         self._account_mode_label.setObjectName("sectionTitle")
         self._account_mode_hint = QLabel(
-            "Choose whether you want to create a new account, edit an existing one, or remove one."
+            "Create a new niche account, edit an existing niche, or remove one."
         )
         self._account_mode_hint.setObjectName("subtleLabel")
         self._account_mode_hint.setWordWrap(True)
 
-        self._account_main_new_button = QPushButton("New Account")
+        self._account_main_new_button = QPushButton("New Niche Account")
         self._account_main_new_button.clicked.connect(self._show_new_account_form)
-        self._account_main_edit_button = QPushButton("Edit Account")
+        self._account_main_edit_button = QPushButton("Edit Niche Account")
         self._account_main_edit_button.clicked.connect(self._show_edit_account_form)
-        self._account_main_delete_button = QPushButton("Delete Account")
+        self._account_main_delete_button = QPushButton("Delete Niche Account")
         self._account_main_delete_button.setObjectName("dangerButton")
         self._account_main_delete_button.clicked.connect(self._show_delete_account_panel)
 
@@ -993,7 +1404,7 @@ class MainWindow(QWidget):
         account_main_actions_layout.addWidget(self._account_main_delete_button)
         self._account_main_actions.setLayout(account_main_actions_layout)
 
-        self._account_picker_label = QLabel("Account")
+        self._account_picker_label = QLabel("Niche Account")
         self._account_picker_label.setObjectName("metaLabel")
         self._account_picker_panel = QWidget()
         account_picker_layout = QVBoxLayout()
@@ -1005,54 +1416,31 @@ class MainWindow(QWidget):
 
         account_form = QGridLayout()
         account_form.setHorizontalSpacing(10)
-        account_form.setVerticalSpacing(8)
+        account_form.setVerticalSpacing(10)
+        account_form.setColumnStretch(0, 0)
+        account_form.setColumnStretch(1, 1)
         account_form.addWidget(QLabel("Name"), 0, 0)
         account_form.addWidget(self._account_name_input, 0, 1)
         account_form.addWidget(QLabel("Platform"), 1, 0)
         account_form.addWidget(self._account_platform_combo, 1, 1)
-        account_form.addWidget(QLabel("Niche"), 2, 0)
+        account_form.addWidget(QLabel("Content Niche"), 2, 0)
         account_form.addWidget(self._account_niche_input, 2, 1)
-        account_form.addWidget(QLabel("Identifier"), 3, 0)
+        account_form.addWidget(QLabel("Posting Profile"), 3, 0)
         account_form.addWidget(self._account_login_input, 3, 1)
-        account_form.addWidget(QLabel("Credential"), 4, 0)
+        account_form.addWidget(QLabel("Private Notes"), 4, 0)
         account_form.addWidget(self._account_credential_input, 4, 1)
-        account_form.addWidget(QLabel("Scrape Sources"), 5, 0)
-        account_form.addWidget(self._account_scrape_sources_input, 5, 1)
-        account_form.addWidget(QLabel("Max Intake Items"), 6, 0)
-        account_form.addWidget(self._account_scrape_max_items_input, 6, 1)
-        account_form.addWidget(QLabel("Max Age Days"), 7, 0)
-        account_form.addWidget(self._account_scrape_max_age_days_input, 7, 1)
-        account_form.addWidget(QLabel("Discovery Keywords"), 8, 0)
-        account_form.addWidget(self._account_discovery_keywords_input, 8, 1)
-        account_form.addWidget(QLabel("Discovery Mode"), 9, 0)
-        account_form.addWidget(self._account_discovery_mode_combo, 9, 1)
-        account_form.addWidget(QLabel("Auto Queue Limit"), 10, 0)
-        account_form.addWidget(self._account_auto_queue_limit_input, 10, 1)
-        account_form.addWidget(QLabel("Min Views"), 11, 0)
-        account_form.addWidget(self._account_min_view_count_input, 11, 1)
-        account_form.addWidget(QLabel("Min Likes"), 12, 0)
-        account_form.addWidget(self._account_min_like_count_input, 12, 1)
-        account_form.addWidget(QLabel("Weight: Views"), 13, 0)
-        account_form.addWidget(self._account_weight_views_input, 13, 1)
-        account_form.addWidget(QLabel("Weight: Likes"), 14, 0)
-        account_form.addWidget(self._account_weight_likes_input, 14, 1)
-        account_form.addWidget(QLabel("Weight: Recency"), 15, 0)
-        account_form.addWidget(self._account_weight_recency_input, 15, 1)
-        account_form.addWidget(QLabel("Weight: Keyword Match"), 16, 0)
-        account_form.addWidget(self._account_weight_keyword_input, 16, 1)
-        account_form.addWidget(QLabel("Writing Tone"), 17, 0)
-        account_form.addWidget(self._account_writing_tone_input, 17, 1)
-        account_form.addWidget(QLabel("Target Audience"), 18, 0)
-        account_form.addWidget(self._account_target_audience_input, 18, 1)
-        account_form.addWidget(QLabel("Hook Style"), 19, 0)
-        account_form.addWidget(self._account_hook_style_input, 19, 1)
-        account_form.addWidget(QLabel("Banned Phrases"), 20, 0)
-        account_form.addWidget(self._account_banned_phrases_input, 20, 1)
-        account_form.addWidget(QLabel("Title Style Notes"), 21, 0)
-        account_form.addWidget(self._account_title_style_notes_input, 21, 1)
-        account_form.addWidget(QLabel("Caption Style Notes"), 22, 0)
-        account_form.addWidget(self._account_caption_style_notes_input, 22, 1)
-
+        account_form.addWidget(QLabel("AI Tone"), 5, 0)
+        account_form.addWidget(self._account_writing_tone_input, 5, 1)
+        account_form.addWidget(QLabel("Audience"), 6, 0)
+        account_form.addWidget(self._account_target_audience_input, 6, 1)
+        account_form.addWidget(QLabel("Hook Pattern"), 7, 0)
+        account_form.addWidget(self._account_hook_style_input, 7, 1)
+        account_form.addWidget(QLabel("Avoid Phrases"), 8, 0)
+        account_form.addWidget(self._account_banned_phrases_input, 8, 1)
+        account_form.addWidget(QLabel("Title Rules"), 9, 0)
+        account_form.addWidget(self._account_title_style_notes_input, 9, 1)
+        account_form.addWidget(QLabel("Caption Rules"), 10, 0)
+        account_form.addWidget(self._account_caption_style_notes_input, 10, 1)
         self._account_form_panel = QWidget()
         account_form_panel_layout = QVBoxLayout()
         account_form_panel_layout.setContentsMargins(0, 0, 0, 0)
@@ -1060,7 +1448,16 @@ class MainWindow(QWidget):
         account_form_panel_layout.addLayout(account_form)
         self._account_form_panel.setLayout(account_form_panel_layout)
 
-        self._account_save_button = QPushButton("Create Account")
+        self._account_form_scroll = QScrollArea()
+        self._account_form_scroll.setWidgetResizable(True)
+        self._account_form_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._account_form_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self._account_form_scroll.setMinimumHeight(360)
+        self._account_form_scroll.setWidget(self._account_form_panel)
+
+        self._account_save_button = QPushButton("Create Niche Account")
         self._account_save_button.clicked.connect(self._on_save_account_clicked)
         self._account_cancel_button = QPushButton("Back to Main")
         self._account_cancel_button.setObjectName("ghostButton")
@@ -1075,9 +1472,9 @@ class MainWindow(QWidget):
         self._account_form_actions.setLayout(account_form_actions_layout)
 
         self._account_delete_picker = QComboBox()
-        self._account_delete_picker_label = QLabel("Choose account to delete")
+        self._account_delete_picker_label = QLabel("Choose niche account to delete")
         self._account_delete_picker_label.setObjectName("metaLabel")
-        self._account_delete_button = QPushButton("Delete Selected Account")
+        self._account_delete_button = QPushButton("Delete Selected Niche")
         self._account_delete_button.setObjectName("dangerButton")
         self._account_delete_button.clicked.connect(self._on_delete_account_clicked)
         self._account_delete_cancel_button = QPushButton("Back to Main")
@@ -1099,8 +1496,12 @@ class MainWindow(QWidget):
 
         self._account_panel = QFrame()
         self._account_panel.setObjectName("panel")
-        self._account_panel.setMinimumWidth(320)
-        self._account_panel.setMaximumWidth(360)
+        self._account_panel.setMinimumWidth(520)
+        self._account_panel.setMaximumWidth(620)
+        self._account_panel.setSizePolicy(
+            QSizePolicy.Policy.Fixed,
+            QSizePolicy.Policy.Expanding,
+        )
         account_layout = QVBoxLayout()
         account_layout.setContentsMargins(16, 14, 16, 14)
         account_layout.setSpacing(10)
@@ -1112,22 +1513,22 @@ class MainWindow(QWidget):
         account_layout.addWidget(self._account_mode_hint)
         account_layout.addWidget(self._account_main_actions)
         account_layout.addWidget(self._account_picker_panel)
-        account_layout.addWidget(self._account_form_panel)
+        account_layout.addWidget(self._account_form_scroll, stretch=1)
         account_layout.addWidget(self._account_form_actions)
         account_layout.addWidget(self._account_delete_panel)
-        account_layout.addStretch(1)
         self._account_panel.setLayout(account_layout)
 
-        self._sidebar_brand = QLabel("NicheFlow")
+        self._sidebar_brand = QLabel("N")
         self._sidebar_brand.setObjectName("sidebarBrand")
-        self._sidebar_brand.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        self._sidebar_brand.setMinimumHeight(18)
+        self._sidebar_brand.setToolTip("NicheFlow")
+        self._sidebar_brand.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._sidebar_brand.setMinimumHeight(42)
 
         sidebar_modules = [
             ("scraping", "Scrape", "refresh"),
             ("downloads", "Download", "play"),
             ("processing", "Preprocess", "refresh"),
-            ("uploads", "Schedule", "check"),
+            ("uploads", "Publish", "check"),
         ]
         self._sidebar_nav = QWidget()
         sidebar_nav_layout = QVBoxLayout()
@@ -1136,12 +1537,12 @@ class MainWindow(QWidget):
         for page_name, tooltip, icon_name in sidebar_modules:
             button = QPushButton()
             button.setObjectName("sidebarToggle")
-            button.setText(tooltip)
+            button.setText("")
             button.setToolTip(tooltip)
             button.setCheckable(True)
-            button.setIcon(self._icon(icon_name))
-            button.setIconSize(QSize(16, 16))
-            button.setFixedHeight(44)
+            button.setIcon(self._sidebar_icon(icon_name))
+            button.setIconSize(QSize(18, 18))
+            button.setFixedSize(38, 38)
             button.setProperty("selected", False)
             button.clicked.connect(
                 lambda checked=False, target=page_name: self._set_current_page(target)
@@ -1149,39 +1550,53 @@ class MainWindow(QWidget):
             self._module_buttons[page_name] = button
             sidebar_nav_layout.addWidget(button)
         self._sidebar_nav.setLayout(sidebar_nav_layout)
-        self._sidebar_nav.setFixedHeight(206)
+        self._sidebar_nav.setFixedHeight(198)
 
         self._sidebar_panel = QFrame()
         self._sidebar_panel.setObjectName("sidebar")
-        self._sidebar_panel.setFixedWidth(188)
+        self._sidebar_panel.setFixedWidth(64)
+        self._sidebar_panel.setSizePolicy(
+            QSizePolicy.Policy.Fixed,
+            QSizePolicy.Policy.Expanding,
+        )
         sidebar_layout = QVBoxLayout()
-        sidebar_layout.setContentsMargins(12, 12, 12, 14)
-        sidebar_layout.setSpacing(12)
+        sidebar_layout.setContentsMargins(8, 12, 8, 12)
+        sidebar_layout.setSpacing(10)
         sidebar_layout.addWidget(self._sidebar_brand)
-        sidebar_layout.addWidget(self._sidebar_nav)
+        self._sidebar_account_label.setVisible(False)
+        self._sidebar_account_combo.setVisible(False)
+        sidebar_layout.addWidget(self._sidebar_nav, alignment=Qt.AlignmentFlag.AlignCenter)
         sidebar_layout.addStretch(1)
-        sidebar_layout.addWidget(self._sidebar_account_label)
-        sidebar_layout.addWidget(self._sidebar_account_combo)
         sidebar_layout.addWidget(
             self._sidebar_toggle_button,
-            alignment=Qt.AlignmentFlag.AlignLeft,
+            alignment=Qt.AlignmentFlag.AlignCenter,
         )
         self._sidebar_panel.setLayout(sidebar_layout)
 
         history_title = QLabel(self._ui.history_title)
-        history_title.setObjectName("sectionTitle")
+        history_title.setObjectName("downloadQueueTitle")
+
+        self._download_queue_summary = QLabel("No downloads yet.")
+        self._download_queue_summary.setObjectName("downloadQueueSummary")
 
         self._search_input = QLineEdit()
-        self._search_input.setPlaceholderText("Search title or source URL...")
+        self._search_input.setObjectName("downloadSearchInput")
+        self._search_input.setPlaceholderText("Search clips...")
+        self._search_input.setMinimumWidth(220)
+        self._search_input.setMaximumWidth(300)
         self._search_input.textChanged.connect(self._on_search_changed)
 
         self._status_filter = QComboBox()
+        self._status_filter.setObjectName("downloadFilter")
+        self._status_filter.setMinimumWidth(160)
+        self._status_filter.setMaximumWidth(190)
         self._status_filter.addItems(
             ["All statuses", "queued", "downloading", "downloaded", "failed"]
         )
         self._status_filter.currentIndexChanged.connect(self._on_status_filter_changed)
 
         self._review_filter = QComboBox()
+        self._review_filter.setObjectName("downloadFilter")
         self._review_filter.addItem("All review states", "all")
         for label, state in REVIEW_STATE_OPTIONS:
             self._review_filter.addItem(label, state)
@@ -1189,14 +1604,15 @@ class MainWindow(QWidget):
 
         filter_row = QHBoxLayout()
         filter_row.setSpacing(10)
-        filter_row.addWidget(self._search_input, stretch=1)
         filter_row.addWidget(self._status_filter)
+        filter_row.addWidget(self._search_input, stretch=1)
         self._review_filter.setVisible(False)
 
         self._table = TableFocusScrollWidget()
-        self._table.setColumnCount(6)
+        self._table.setObjectName("downloadQueueTable")
+        self._table.setColumnCount(8)
         self._table.setHorizontalHeaderLabels(
-            ["Status", "Review", "Account", "Title", "Source URL", "Output"]
+            ["Status", "Fit", "Account", "Name", "Source URL", "File", "Size", "Added"]
         )
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self._table.horizontalHeader().setStretchLastSection(True)
@@ -1207,23 +1623,28 @@ class MainWindow(QWidget):
         self._table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
         self._table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self._table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
-        self._table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._table.setWordWrap(False)
-        self._table.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        self._table.setTextElideMode(Qt.TextElideMode.ElideRight)
         self._table.verticalScrollBar().setSingleStep(18)
+        self._table.setMinimumHeight(230)
+        self._table.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
         self._table.itemSelectionChanged.connect(self._on_selection_changed)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll_changed)
 
-        self._batch_keep_button = QPushButton("Keep Selected")
+        self._batch_keep_button = QPushButton("Keep For This Account")
         self._batch_keep_button.clicked.connect(
             lambda: self._set_review_state_for_selection("kept")
         )
-        self._batch_ignore_button = QPushButton("Ignore Selected")
+        self._batch_ignore_button = QPushButton("Ignore")
         self._batch_ignore_button.setObjectName("ghostButton")
         self._batch_ignore_button.clicked.connect(
             lambda: self._set_review_state_for_selection("rejected")
         )
-        self._batch_return_button = QPushButton("Return Selected To Review")
+        self._batch_return_button = QPushButton("Needs Review")
         self._batch_return_button.setObjectName("ghostButton")
         self._batch_return_button.clicked.connect(
             lambda: self._set_review_state_for_selection("new")
@@ -1231,18 +1652,38 @@ class MainWindow(QWidget):
 
         batch_row = QHBoxLayout()
         batch_row.setSpacing(10)
+        for button in (
+            self._batch_keep_button,
+            self._batch_ignore_button,
+            self._batch_return_button,
+        ):
+            button.setObjectName("downloadToolbarButton")
         batch_row.addWidget(self._batch_keep_button)
         batch_row.addWidget(self._batch_ignore_button)
         batch_row.addWidget(self._batch_return_button)
         batch_row.addStretch(1)
 
+        toolbar = QWidget()
+        toolbar.setObjectName("downloadToolbar")
+        toolbar_layout = QHBoxLayout()
+        toolbar_layout.setContentsMargins(0, 0, 0, 0)
+        toolbar_layout.setSpacing(10)
+        toolbar_layout.addWidget(history_title)
+        toolbar_layout.addWidget(self._download_queue_summary)
+        toolbar_layout.addStretch(1)
+        toolbar_layout.addLayout(filter_row)
+        toolbar.setLayout(toolbar_layout)
+
         history_panel = QFrame()
-        history_panel.setObjectName("panel")
+        history_panel.setObjectName("downloadQueuePanel")
+        history_panel.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
         history_layout = QVBoxLayout()
-        history_layout.setContentsMargins(18, 18, 18, 18)
-        history_layout.setSpacing(12)
-        history_layout.addWidget(history_title)
-        history_layout.addLayout(filter_row)
+        history_layout.setContentsMargins(14, 12, 14, 12)
+        history_layout.setSpacing(10)
+        history_layout.addWidget(toolbar)
         self._download_advanced_row = QWidget()
         self._download_advanced_row.setLayout(batch_row)
         self._download_advanced_row.setVisible(False)
@@ -1254,21 +1695,31 @@ class MainWindow(QWidget):
         self._library_gate_label.setWordWrap(True)
         self._library_gate_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         history_layout.addWidget(self._table, stretch=1)
+        self._download_drop_zone = QLabel(
+            "Paste a YouTube or Instagram URL above, or send candidates to Download"
+        )
+        self._download_drop_zone.setObjectName("downloadDropZone")
+        self._download_drop_zone.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._download_drop_zone.setMaximumHeight(84)
+        history_layout.addWidget(self._download_drop_zone)
         history_panel.setLayout(history_layout)
 
-        intake_title = QLabel("Source Intake")
+        intake_title = QLabel("Scrape")
         intake_title.setObjectName("sectionTitle")
         intake_hint = QLabel(
-            "Fetch ranked candidates from this account's YouTube sources and automatic keyword discovery settings."
+            "Add a YouTube source or Instagram hashtag/profile, fetch candidates, then send useful clips to Download."
         )
         intake_hint.setObjectName("subtleLabel")
         intake_hint.setWordWrap(True)
+        intake_hint.setVisible(False)
         self._scrape_summary_label = QLabel("Select an account to configure source intake.")
         self._scrape_summary_label.setObjectName("subtleLabel")
         self._scrape_summary_label.setWordWrap(True)
+        self._scrape_summary_label.setVisible(False)
         self._scrape_progress_label = QLabel("")
         self._scrape_progress_label.setObjectName("subtleLabel")
         self._scrape_progress_label.setWordWrap(True)
+        self._scrape_progress_label.setVisible(False)
         self._scrape_progress_bar = QProgressBar()
         self._scrape_progress_bar.setTextVisible(True)
         self._scrape_progress_bar.setVisible(False)
@@ -1278,9 +1729,12 @@ class MainWindow(QWidget):
         self._source_summary_label = QLabel("No source selected.")
         self._source_summary_label.setObjectName("subtleLabel")
         self._source_summary_label.setWordWrap(True)
+        self._source_summary_label.setVisible(False)
         self._scrape_source_input = QLineEdit()
-        self._scrape_source_input.setPlaceholderText("Add YouTube channel/profile URL...")
-        self._scrape_add_source_button = QPushButton("Add Source")
+        self._scrape_source_input.setPlaceholderText(
+            "YouTube URL, Instagram URL, #hashtag, or keyword..."
+        )
+        self._scrape_add_source_button = QPushButton("Add")
         self._scrape_add_source_button.clicked.connect(self._on_add_scrape_source_clicked)
         self._source_filter = QComboBox()
         self._source_filter.addItem("All sources", "all")
@@ -1293,21 +1747,69 @@ class MainWindow(QWidget):
         self._source_sort.addItem("Sort: Last scraped", "last_scraped")
         self._source_sort.addItem("Sort: Label", "label")
         self._source_sort.currentIndexChanged.connect(self._on_source_filter_changed)
-        self._source_remove_button = QPushButton("Remove Source")
+        self._source_filter.setVisible(False)
+        self._source_sort.setVisible(False)
+        self._source_remove_button = QPushButton("Remove")
         self._source_remove_button.setObjectName("ghostButton")
         self._source_remove_button.clicked.connect(self._on_remove_source_clicked)
-        self._source_toggle_button = QPushButton("Disable Source")
+        self._source_toggle_button = QPushButton("Disable")
         self._source_toggle_button.setObjectName("ghostButton")
         self._source_toggle_button.clicked.connect(self._on_toggle_source_clicked)
         self._scrape_selected_button = QPushButton("Scrape Selected")
         self._scrape_selected_button.clicked.connect(self._on_scrape_selected_clicked)
-        self._scrape_button = QPushButton("Scrape All Enabled")
+        self._scrape_button = QPushButton("Scrape All")
         self._scrape_button.clicked.connect(self._on_scrape_clicked)
+        self._instagram_discover_source_combo = QComboBox()
+        self._instagram_discover_source_combo.setMinimumWidth(220)
+        self._instagram_discover_source_combo.setMaximumWidth(300)
+        self._instagram_discover_min_new_input = QSpinBox()
+        self._instagram_discover_min_new_input.setRange(1, 100)
+        self._instagram_discover_min_new_input.setValue(10)
+        self._instagram_discover_min_likes_input = QSpinBox()
+        self._instagram_discover_min_likes_input.setRange(0, 10_000_000)
+        self._instagram_discover_min_likes_input.setSingleStep(1_000)
+        self._instagram_discover_min_likes_input.setValue(20_000)
+        self._instagram_discover_min_likes_input.valueChanged.connect(
+            self._on_candidate_min_likes_filter_changed
+        )
+        self._candidate_sort_combo = QComboBox()
+        self._candidate_sort_combo.addItem("Sort: Score", "score")
+        self._candidate_sort_combo.addItem("Sort: Likes", "likes")
+        self._candidate_sort_combo.addItem("Sort: Comments", "comments")
+        self._candidate_sort_combo.addItem("Sort: Newest", "newest")
+        self._candidate_sort_combo.currentIndexChanged.connect(self._on_candidate_filter_changed)
+        self._candidate_sort_direction_combo = QComboBox()
+        self._candidate_sort_direction_combo.addItem("High to low", "desc")
+        self._candidate_sort_direction_combo.addItem("Low to high", "asc")
+        self._candidate_sort_direction_combo.currentIndexChanged.connect(
+            self._on_candidate_filter_changed
+        )
+        self._instagram_deep_search_checkbox = QCheckBox("Deep search")
+        self._instagram_deep_search_checkbox.setToolTip(
+            "Search farther through the source to find older unseen URLs. Slower, but useful when Min new is hard to reach."
+        )
+        self._instagram_discover_button = QPushButton("Discover + Rank")
+        self._instagram_discover_button.clicked.connect(self._on_instagram_discover_clicked)
+        self._instagram_discover_log = QTextEdit()
+        self._instagram_discover_log.setReadOnly(True)
+        self._instagram_discover_log.setFixedHeight(86)
+        self._instagram_discover_log.setPlaceholderText("Discovery log appears here.")
 
         intake_source_row = QHBoxLayout()
         intake_source_row.setSpacing(10)
         intake_source_row.addWidget(self._scrape_source_input, stretch=1)
         intake_source_row.addWidget(self._scrape_add_source_button)
+
+        instagram_discover_row = QHBoxLayout()
+        instagram_discover_row.setSpacing(10)
+        instagram_discover_row.addWidget(QLabel("Scrape from"))
+        instagram_discover_row.addWidget(self._instagram_discover_source_combo)
+        instagram_discover_row.addWidget(QLabel("Min new"))
+        instagram_discover_row.addWidget(self._instagram_discover_min_new_input)
+        instagram_discover_row.addWidget(self._instagram_deep_search_checkbox)
+        instagram_discover_row.addWidget(self._instagram_discover_button)
+        instagram_discover_row.addStretch(1)
+        self._instagram_discover_row = instagram_discover_row
 
         source_filter_row = QHBoxLayout()
         source_filter_row.setSpacing(10)
@@ -1318,7 +1820,7 @@ class MainWindow(QWidget):
         self._source_table = TableFocusScrollWidget()
         self._source_table.setColumnCount(6)
         self._source_table.setHorizontalHeaderLabels(
-            ["Enabled", "Label", "Type", "Source URL", "Last Scraped", "Last Status"]
+            ["On", "Source", "Type", "URL", "Last Scraped", "Status"]
         )
         self._source_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self._source_table.horizontalHeader().setStretchLastSection(True)
@@ -1327,7 +1829,16 @@ class MainWindow(QWidget):
         self._source_table.setShowGrid(True)
         self._source_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._source_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
-        self._source_table.setMinimumHeight(200)
+        self._source_table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self._source_table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._source_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._source_table.setMinimumHeight(260)
+        self._source_table.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+        self._source_table.setColumnHidden(2, True)
+        self._source_table.setColumnHidden(3, True)
         self._source_table.itemSelectionChanged.connect(self._on_source_selection_changed)
 
         source_actions = QHBoxLayout()
@@ -1338,9 +1849,19 @@ class MainWindow(QWidget):
         source_actions.addWidget(self._scrape_button)
 
         self._candidate_table = TableFocusScrollWidget()
-        self._candidate_table.setColumnCount(8)
+        self._candidate_table.setColumnCount(9)
         self._candidate_table.setHorizontalHeaderLabels(
-            ["State", "Score", "Views", "Likes", "Published", "Channel", "Title", "Match"]
+            [
+                "Status",
+                "Score",
+                "Likes",
+                "Comments",
+                "Duration",
+                "Added",
+                "Channel",
+                "Title",
+                "Match",
+            ]
         )
         self._candidate_table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Stretch
@@ -1352,31 +1873,41 @@ class MainWindow(QWidget):
         self._candidate_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._candidate_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self._candidate_table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self._candidate_table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         self._candidate_table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
-        self._candidate_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._candidate_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._candidate_table.setWordWrap(False)
-        self._candidate_table.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        self._candidate_table.setTextElideMode(Qt.TextElideMode.ElideRight)
         self._candidate_table.verticalScrollBar().setSingleStep(18)
         self._candidate_table.setMinimumHeight(340)
+        self._candidate_table.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+        self._candidate_table.setColumnHidden(8, True)
         self._candidate_table.itemSelectionChanged.connect(self._on_candidate_selection_changed)
 
-        self._candidate_queue_button = QPushButton("Queue Selected Candidate")
+        self._candidate_queue_button = QPushButton("Send To Download")
         self._candidate_queue_button.clicked.connect(self._on_candidate_queue_clicked)
         self._candidate_queue_button.setIcon(self._icon("play"))
         self._candidate_queue_button.setIconSize(QSize(16, 16))
-        self._candidate_ignore_button = QPushButton("Ignore For Now")
+        self._candidate_ignore_button = QPushButton("Ignore")
         self._candidate_ignore_button.setObjectName("ghostButton")
         self._candidate_ignore_button.clicked.connect(self._on_candidate_ignore_clicked)
         self._candidate_ignore_button.setIcon(self._icon("trash"))
         self._candidate_ignore_button.setIconSize(QSize(16, 16))
-        self._candidate_restore_button = QPushButton("Return To Review")
+        self._candidate_restore_button = QPushButton("Restore")
         self._candidate_restore_button.setObjectName("ghostButton")
         self._candidate_restore_button.clicked.connect(self._on_candidate_restore_clicked)
         self._candidate_restore_button.setIcon(self._icon("refresh"))
         self._candidate_restore_button.setIconSize(QSize(16, 16))
-        self._candidate_action_hint = QLabel("Select a candidate to review it.")
+        self._candidate_action_hint = QLabel("Select a candidate.")
         self._candidate_action_hint.setObjectName("subtleLabel")
         self._candidate_action_hint.setWordWrap(True)
+        self._candidate_action_hint.setVisible(False)
+        self._candidate_filter_label = QLabel("Showing candidates with 20,000+ likes.")
+        self._candidate_filter_label.setObjectName("subtleLabel")
+        self._candidate_filter_label.setWordWrap(True)
         self._candidate_state_filter = QComboBox()
         self._candidate_state_filter.addItem("All candidates", "all")
         self._candidate_state_filter.addItem("Ready to review", "candidate")
@@ -1384,14 +1915,20 @@ class MainWindow(QWidget):
         self._candidate_state_filter.addItem("Already downloaded", "downloaded")
         self._candidate_state_filter.addItem("Ignored for now", "ignored")
         self._candidate_state_filter.currentIndexChanged.connect(self._on_candidate_filter_changed)
+        self._candidate_state_filter.setMinimumWidth(180)
 
         intake_actions = QHBoxLayout()
         intake_actions.setSpacing(10)
+        intake_actions.addWidget(QLabel("Min likes"))
+        intake_actions.addWidget(self._instagram_discover_min_likes_input)
+        intake_actions.addWidget(self._candidate_sort_combo)
+        intake_actions.addWidget(self._candidate_sort_direction_combo)
         intake_actions.addWidget(self._candidate_state_filter)
         intake_actions.addStretch(1)
         intake_actions.addWidget(self._candidate_queue_button)
         intake_actions.addWidget(self._candidate_ignore_button)
         intake_actions.addWidget(self._candidate_restore_button)
+        self._candidate_restore_button.setVisible(False)
 
         self._run_table = TableFocusScrollWidget()
         self._run_table.setColumnCount(6)
@@ -1405,20 +1942,30 @@ class MainWindow(QWidget):
         self._run_table.setShowGrid(True)
         self._run_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._run_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
-        self._run_table.setMinimumHeight(320)
+        self._run_table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self._run_table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._run_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._run_table.setMinimumHeight(260)
+        self._run_table.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
 
         self._scrape_tabs = QTabWidget()
         self._scrape_tabs.setObjectName("panel")
+        self._scrape_tabs.setMinimumHeight(430)
+        self._scrape_tabs.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
 
         source_tab = QWidget()
         source_tab_layout = QVBoxLayout()
         source_tab_layout.setContentsMargins(0, 0, 0, 0)
         source_tab_layout.setSpacing(12)
-        source_tab_layout.addLayout(intake_source_row)
-        source_tab_layout.addLayout(source_filter_row)
         source_tab_layout.addWidget(self._source_summary_label)
-        source_tab_layout.addWidget(self._source_table, stretch=1)
         source_tab_layout.addLayout(source_actions)
+        source_tab_layout.addWidget(self._source_table, stretch=1)
         source_tab.setLayout(source_tab_layout)
 
         candidate_tab = QWidget()
@@ -1427,6 +1974,7 @@ class MainWindow(QWidget):
         candidate_tab_layout.setSpacing(12)
         candidate_tab_layout.addWidget(self._candidate_action_hint)
         candidate_tab_layout.addLayout(intake_actions)
+        candidate_tab_layout.addWidget(self._candidate_filter_label)
         candidate_tab_layout.addWidget(self._candidate_table, stretch=1)
         candidate_tab.setLayout(candidate_tab_layout)
 
@@ -1437,9 +1985,10 @@ class MainWindow(QWidget):
         run_tab_layout.addWidget(self._run_table, stretch=1)
         run_tab.setLayout(run_tab_layout)
 
-        self._scrape_tabs.addTab(source_tab, "Sources")
         self._scrape_tabs.addTab(candidate_tab, "Candidates")
+        self._scrape_tabs.addTab(source_tab, "Sources")
         self._scrape_tabs.addTab(run_tab, "Activity")
+        self._scrape_tabs.setTabVisible(2, False)
 
         intake_panel = QFrame()
         intake_panel.setObjectName("panel")
@@ -1448,11 +1997,19 @@ class MainWindow(QWidget):
         intake_layout.setSpacing(12)
         intake_layout.addWidget(intake_title)
         intake_layout.addWidget(intake_hint)
+        intake_layout.addLayout(intake_source_row)
+        intake_layout.addLayout(instagram_discover_row)
+        intake_layout.addWidget(self._instagram_discover_log)
         intake_layout.addWidget(self._scrape_summary_label)
         intake_layout.addWidget(self._scrape_progress_label)
         intake_layout.addWidget(self._scrape_progress_bar)
         intake_layout.addWidget(self._scrape_tabs, stretch=1)
         intake_panel.setLayout(intake_layout)
+        intake_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._scrape_intake_panel = intake_panel
+        self._scrape_intake_title = intake_title
+        self._scrape_intake_hint = intake_hint
+        self._scrape_intake_source_row = intake_source_row
 
         detail_title = QLabel(self._ui.detail_title)
         detail_title.setObjectName("sectionTitle")
@@ -1492,9 +2049,9 @@ class MainWindow(QWidget):
         self._detail_advanced_keys = {"created", "extractor", "video_id", "source_url", "file_path"}
         detail_keys = [
             ("Title", "title"),
-            ("Status", "status"),
-            ("Review", "review"),
-            ("Account", "account"),
+            ("Decision", "review"),
+            ("Download", "status"),
+            ("Niche Account", "account"),
             ("Created", "created"),
             ("Extractor", "extractor"),
             ("Video ID", "video_id"),
@@ -1524,7 +2081,7 @@ class MainWindow(QWidget):
         assignment_row.setSpacing(8)
         self._detail_account_combo = QComboBox()
         self._detail_account_combo.setMinimumWidth(220)
-        self._detail_assign_button = QPushButton("Save Account Assignment")
+        self._detail_assign_button = QPushButton("Save Niche Assignment")
         self._detail_assign_button.clicked.connect(self._on_detail_assign_clicked)
         self._detail_assign_button.setIcon(self._icon("check"))
         self._detail_assign_button.setIconSize(QSize(16, 16))
@@ -1598,11 +2155,11 @@ class MainWindow(QWidget):
         detail_layout.addLayout(self._detail_action_row)
 
         self._detail_panel.setLayout(detail_layout)
+        self._detail_panel.setVisible(False)
 
         library_row = QHBoxLayout()
         library_row.setSpacing(16)
-        library_row.addWidget(history_panel, stretch=2)
-        library_row.addWidget(self._detail_panel, stretch=3)
+        library_row.addWidget(history_panel, stretch=1)
 
         self._library_workspace = QWidget()
         self._library_workspace.setLayout(library_row)
@@ -1640,46 +2197,50 @@ class MainWindow(QWidget):
         workspace_content_layout = QVBoxLayout()
         workspace_content_layout.setContentsMargins(0, 0, 0, 0)
         workspace_content_layout.setSpacing(16)
-        self._workspace_stack = QStackedWidget()
+        self._workspace_stack = CurrentPageStackedWidget()
         self._workspace_stack.addWidget(self._scraping_page)
         self._workspace_stack.addWidget(self._downloads_page)
         self._workspace_stack.addWidget(self._processing_page)
         self._workspace_stack.addWidget(self._uploads_page)
-        workspace_content_layout.addWidget(self._workspace_stack, stretch=1)
+        workspace_content_layout.addWidget(self._workspace_stack)
         self._workspace_content.setLayout(workspace_content_layout)
 
         workspace_column = QVBoxLayout()
         workspace_column.setContentsMargins(0, 0, 0, 0)
         workspace_column.setSpacing(16)
         workspace_column.addWidget(self._library_gate_panel)
-        workspace_column.addWidget(self._workspace_content, stretch=1)
+        workspace_column.addWidget(self._workspace_content)
+        workspace_column.setAlignment(Qt.AlignmentFlag.AlignTop)
 
         workspace_panel = QWidget()
         workspace_panel.setLayout(workspace_column)
 
-        body_row = QHBoxLayout()
-        body_row.setSpacing(16)
-        body_row.addWidget(self._sidebar_panel, stretch=0)
-        body_row.addWidget(self._account_panel, stretch=0)
-        body_row.addWidget(workspace_panel, stretch=1)
-
-        content = QWidget()
-        root = QVBoxLayout()
-        root.setContentsMargins(20, 20, 20, 20)
-        root.setSpacing(16)
-        root.addLayout(body_row, stretch=1)
-        content.setLayout(root)
-
         self._scroll_area = QScrollArea()
         self._scroll_area.setWidgetResizable(True)
         self._scroll_area.setFrameShape(QFrame.Shape.NoFrame)
-        self._scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self._scroll_area.setWidget(content)
+        self._scroll_area.setWidget(workspace_panel)
+        self._scroll_area.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+
+        body_row = QHBoxLayout()
+        body_row.setContentsMargins(8, 16, 16, 16)
+        body_row.setSpacing(12)
+        body_row.addWidget(self._sidebar_panel, stretch=0)
+        body_row.addWidget(self._account_panel, stretch=0)
+        main_workspace_layout = QVBoxLayout()
+        main_workspace_layout.setContentsMargins(0, 0, 0, 0)
+        main_workspace_layout.setSpacing(10)
+        main_workspace_layout.addWidget(self._activity_bar)
+        main_workspace_layout.addWidget(self._scroll_area, stretch=1)
+        body_row.addLayout(main_workspace_layout, stretch=1)
 
         outer = QVBoxLayout()
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(self._scroll_area)
+        outer.addLayout(body_row, stretch=1)
 
         self.setLayout(outer)
         self.setMinimumSize(self._minimum_window_width, self._minimum_window_height)
@@ -1726,11 +2287,37 @@ class MainWindow(QWidget):
         return colors.get(review_state, (QColor("#111827"), QColor("#d7e0ea")))
 
     @staticmethod
+    def _queue_status_bar(item: DownloadItem) -> QProgressBar:
+        progress = QProgressBar()
+        progress.setObjectName("queueStatusBar")
+        progress.setProperty("status", item.status)
+        progress.setTextVisible(True)
+        progress.setMinimum(0)
+        progress.setMaximum(100)
+        progress.setValue(0)
+
+        if item.status == "downloaded":
+            progress.setValue(100)
+            progress.setFormat("Completed")
+        elif item.status == "downloading":
+            progress.setValue(35)
+            progress.setFormat("Downloading")
+        elif item.status == "failed":
+            progress.setValue(100)
+            progress.setFormat("Failed")
+        elif item.status == "queued":
+            progress.setValue(8)
+            progress.setFormat("Queued")
+        else:
+            progress.setFormat(item.status)
+        return progress
+
+    @staticmethod
     def _review_state_label(review_state: str) -> str:
         labels = {
-            "new": "ready",
-            "kept": "kept",
-            "rejected": "ignored",
+            "new": "Needs Review",
+            "kept": "Kept",
+            "rejected": "Ignored",
         }
         return labels.get(review_state, review_state)
 
@@ -1747,7 +2334,7 @@ class MainWindow(QWidget):
         if item is None:
             return "Select a library item to review it."
         if item.review_state == "new":
-            return "Ready to review. Keep it for this account or ignore it from the library."
+            return "Judge whether this clip is good for the active niche account."
         if item.review_state == "kept":
             return "Kept for this account. You can assign it, open it, or return it to review."
         if item.review_state == "rejected":
@@ -1795,15 +2382,27 @@ class MainWindow(QWidget):
     def _icon(name: str) -> QIcon:
         return QIcon(str(ICON_DIR / f"{name}.svg"))
 
+    @staticmethod
+    def _sidebar_icon(name: str) -> QIcon:
+        icon_path = ICON_DIR / f"{name}.svg"
+        try:
+            svg_text = icon_path.read_text(encoding="utf-8")
+        except OSError:
+            return QIcon(str(icon_path))
+        svg_text = svg_text.replace("currentColor", "#ffffff")
+        pixmap = QPixmap()
+        pixmap.loadFromData(svg_text.encode("utf-8"), "SVG")
+        return QIcon(pixmap)
+
     def _make_processing_page(self) -> QWidget:
         title_label = QLabel("Preprocess")
         title_label.setObjectName("sectionTitle")
         message_label = QLabel(
-            "Generate editable context, title, and caption drafts for one downloaded video, "
-            "then export the prepared clip into the local processed folder."
+            "Select a downloaded video, generate drafts, then export the processed clip."
         )
         message_label.setObjectName("metaValue")
         message_label.setWordWrap(True)
+        message_label.setVisible(False)
 
         panel = QFrame()
         panel.setObjectName("panel")
@@ -1813,19 +2412,68 @@ class MainWindow(QWidget):
         panel_layout.addWidget(title_label)
         panel_layout.addWidget(message_label)
 
-        selector_row = QHBoxLayout()
-        selector_row.setSpacing(10)
-        selector_label = QLabel("Downloaded video")
+        selector_label = QLabel("Videos")
         selector_label.setObjectName("metaLabel")
         self._processing_item_combo = QComboBox()
         self._processing_item_combo.currentIndexChanged.connect(self._on_processing_item_changed)
-        selector_row.addWidget(selector_label)
-        selector_row.addWidget(self._processing_item_combo, stretch=1)
-        panel_layout.addLayout(selector_row)
+        self._processing_item_combo.setVisible(False)
+
+        self._processing_state_filter = QComboBox()
+        self._processing_state_filter.addItem("All", "all")
+        self._processing_state_filter.addItem("Needs Processing", "needs")
+        self._processing_state_filter.addItem("Processed", "processed")
+        self._processing_state_filter.currentIndexChanged.connect(
+            self._on_processing_inbox_filter_changed
+        )
+        self._processing_search_input = QLineEdit()
+        self._processing_search_input.setPlaceholderText("Search videos...")
+        self._processing_search_input.textChanged.connect(self._on_processing_inbox_filter_changed)
+
+        inbox_header = QHBoxLayout()
+        inbox_header.setSpacing(10)
+        inbox_header.addWidget(selector_label)
+        inbox_header.addStretch(1)
+        inbox_header.addWidget(self._processing_state_filter)
+        inbox_header.addWidget(self._processing_search_input, stretch=1)
+        panel_layout.addLayout(inbox_header)
+
+        self._processing_inbox_table = TableFocusScrollWidget()
+        self._processing_inbox_table.setColumnCount(5)
+        self._processing_inbox_table.setHorizontalHeaderLabels(
+            ["Status", "Source", "Title", "Added", ""]
+        )
+        self._processing_inbox_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
+        self._processing_inbox_table.horizontalHeader().setStretchLastSection(False)
+        self._processing_inbox_table.verticalHeader().setVisible(False)
+        self._processing_inbox_table.setAlternatingRowColors(True)
+        self._processing_inbox_table.setShowGrid(False)
+        self._processing_inbox_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._processing_inbox_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self._processing_inbox_table.setVerticalScrollMode(
+            QAbstractItemView.ScrollMode.ScrollPerPixel
+        )
+        self._processing_inbox_table.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self._processing_inbox_table.setWordWrap(False)
+        self._processing_inbox_table.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self._processing_inbox_table.setMinimumHeight(220)
+        self._processing_inbox_table.setMaximumHeight(320)
+        self._processing_inbox_table.setColumnHidden(1, True)
+        self._processing_inbox_table.setColumnHidden(3, True)
+        self._processing_inbox_table.setColumnHidden(4, True)
+        self._processing_inbox_table.itemSelectionChanged.connect(
+            self._on_processing_inbox_selection_changed
+        )
+        panel_layout.addWidget(self._processing_inbox_table)
+        panel_layout.addWidget(self._processing_item_combo)
 
         self._processing_summary_label = QLabel("Select an account workspace to prepare videos.")
         self._processing_summary_label.setObjectName("subtleLabel")
         self._processing_summary_label.setWordWrap(True)
+        self._processing_summary_label.setVisible(False)
         panel_layout.addWidget(self._processing_summary_label)
 
         self._processing_progress_label = QLabel("")
@@ -1860,11 +2508,12 @@ class MainWindow(QWidget):
         preview_header.addWidget(preview_title)
         preview_header.addStretch(1)
         preview_header.addWidget(self._processing_preview_mode_combo)
+        self._processing_preview_mode_combo.setVisible(False)
         preview_layout.addLayout(preview_header)
 
         self._processing_video_widget = QLabel("Preview unavailable")
         self._processing_video_widget.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._processing_video_widget.setFixedHeight(360)
+        self._processing_video_widget.setFixedHeight(520)
         self._processing_video_widget.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
         )
@@ -1873,12 +2522,18 @@ class MainWindow(QWidget):
 
         preview_action_row = QHBoxLayout()
         preview_action_row.setSpacing(10)
-        self._processing_preview_back_button = QPushButton("-5s")
+        self._processing_preview_back_button = QPushButton("-1s")
         self._processing_preview_back_button.setObjectName("ghostButton")
         self._processing_preview_back_button.clicked.connect(
-            lambda: self._shift_processing_preview(-5000)
+            lambda: self._shift_processing_preview(-1000)
         )
         preview_action_row.addWidget(self._processing_preview_back_button)
+        self._processing_preview_back_large_button = QPushButton("-5s")
+        self._processing_preview_back_large_button.setObjectName("ghostButton")
+        self._processing_preview_back_large_button.clicked.connect(
+            lambda: self._shift_processing_preview(-5000)
+        )
+        preview_action_row.addWidget(self._processing_preview_back_large_button)
         self._processing_toggle_preview_button = QPushButton("Play Full Video")
         self._processing_toggle_preview_button.setObjectName("ghostButton")
         self._processing_toggle_preview_button.clicked.connect(
@@ -1894,10 +2549,16 @@ class MainWindow(QWidget):
         self._processing_preview_time_label = QLabel("00:00 / 00:00")
         self._processing_preview_time_label.setObjectName("subtleLabel")
         preview_action_row.addWidget(self._processing_preview_time_label)
-        self._processing_preview_forward_button = QPushButton("+5s")
+        self._processing_preview_forward_large_button = QPushButton("+5s")
+        self._processing_preview_forward_large_button.setObjectName("ghostButton")
+        self._processing_preview_forward_large_button.clicked.connect(
+            lambda: self._shift_processing_preview(5000)
+        )
+        preview_action_row.addWidget(self._processing_preview_forward_large_button)
+        self._processing_preview_forward_button = QPushButton("+1s")
         self._processing_preview_forward_button.setObjectName("ghostButton")
         self._processing_preview_forward_button.clicked.connect(
-            lambda: self._shift_processing_preview(5000)
+            lambda: self._shift_processing_preview(1000)
         )
         preview_action_row.addWidget(self._processing_preview_forward_button)
         preview_action_row.addStretch(1)
@@ -1908,6 +2569,7 @@ class MainWindow(QWidget):
         )
         self._processing_preview_meta_label.setObjectName("subtleLabel")
         self._processing_preview_meta_label.setWordWrap(True)
+        self._processing_preview_meta_label.setVisible(False)
         preview_layout.addWidget(self._processing_preview_meta_label)
 
         preview_panel.setLayout(preview_layout)
@@ -1921,17 +2583,17 @@ class MainWindow(QWidget):
 
         text_header = QHBoxLayout()
         text_header.setSpacing(10)
-        text_title = QLabel("LLM Drafts")
+        text_title = QLabel("Drafts")
         text_title.setObjectName("metaLabel")
         self._processing_loading_badge = QLabel("")
         self._processing_loading_badge.setObjectName("statusLabel")
         self._processing_loading_badge.setVisible(False)
-        self._processing_generate_drafts_button = QPushButton("Generate Drafts")
+        self._processing_generate_drafts_button = QPushButton("Generate")
         self._processing_generate_drafts_button.setObjectName("ghostButton")
         self._processing_generate_drafts_button.clicked.connect(
             self._on_generate_text_drafts_clicked
         )
-        self._processing_save_drafts_button = QPushButton("Save Text Drafts")
+        self._processing_save_drafts_button = QPushButton("Save")
         self._processing_save_drafts_button.clicked.connect(self._on_save_text_drafts_clicked)
         text_header.addWidget(text_title)
         text_header.addStretch(1)
@@ -1949,17 +2611,45 @@ class MainWindow(QWidget):
         )
         self._processing_transcript_input.setReadOnly(True)
         self._processing_transcript_input.setMinimumHeight(150)
-        text_layout.addWidget(context_label)
-        text_layout.addWidget(self._processing_transcript_input)
+        context_label.setVisible(False)
+        self._processing_transcript_input.setVisible(False)
 
-        title_draft_label = QLabel("Applied Title")
+        clip_premise_label = QLabel("Clip Premise")
+        clip_premise_label.setObjectName("metaLabel")
+        self._processing_clip_premise_input = QTextEdit()
+        self._processing_clip_premise_input.setObjectName("smartOptionEdit")
+        self._processing_clip_premise_input.setPlaceholderText(
+            "Optional: explain the joke, context, or anomaly before generating..."
+        )
+        self._processing_clip_premise_input.setMinimumHeight(72)
+        self._processing_clip_premise_input.textChanged.connect(
+            self._on_processing_clip_premise_changed
+        )
+        text_layout.addWidget(clip_premise_label)
+        text_layout.addWidget(self._processing_clip_premise_input)
+
+        caption_style_row = QHBoxLayout()
+        caption_style_row.setSpacing(10)
+        caption_style_label = QLabel("Caption Style")
+        caption_style_label.setObjectName("metaLabel")
+        self._processing_caption_style_combo = QComboBox()
+        self._processing_caption_style_combo.addItem("Context / info", "contextual_info")
+        self._processing_caption_style_combo.addItem("Relatable", "relatable")
+        self._processing_caption_style_combo.addItem("Hype", "hype")
+        self._processing_caption_style_combo.setMinimumWidth(180)
+        caption_style_row.addWidget(caption_style_label)
+        caption_style_row.addWidget(self._processing_caption_style_combo)
+        caption_style_row.addStretch(1)
+        text_layout.addLayout(caption_style_row)
+
+        title_draft_label = QLabel("Title")
         title_draft_label.setObjectName("metaLabel")
         self._processing_title_draft_input = QLineEdit()
         self._processing_title_draft_input.setPlaceholderText("Generated or edited title...")
         text_layout.addWidget(title_draft_label)
         text_layout.addWidget(self._processing_title_draft_input)
 
-        caption_draft_label = QLabel("Applied Caption")
+        caption_draft_label = QLabel("Caption")
         caption_draft_label.setObjectName("metaLabel")
         self._processing_caption_draft_input = QTextEdit()
         self._processing_caption_draft_input.setPlaceholderText("Generated or edited caption...")
@@ -1968,10 +2658,11 @@ class MainWindow(QWidget):
         text_layout.addWidget(self._processing_caption_draft_input)
 
         self._processing_draft_status_label = QLabel(
-            "Generate video-aware drafts from transcript, metadata, and sampled frames when available."
+            "Generate visual-first title and caption drafts from the selected downloaded video."
         )
         self._processing_draft_status_label.setObjectName("subtleLabel")
         self._processing_draft_status_label.setWordWrap(True)
+        self._processing_draft_status_label.setVisible(False)
         text_layout.addWidget(self._processing_draft_status_label)
 
         self._processing_smart_summary_label = QLabel(
@@ -1979,27 +2670,28 @@ class MainWindow(QWidget):
         )
         self._processing_smart_summary_label.setObjectName("metaValue")
         self._processing_smart_summary_label.setWordWrap(True)
-        text_layout.addWidget(self._processing_smart_summary_label)
+        self._processing_smart_summary_label.setVisible(False)
 
         self._processing_eval_provider_label = QLabel(
             "Provider metadata will appear here after smart generation."
         )
         self._processing_eval_provider_label.setObjectName("subtleLabel")
         self._processing_eval_provider_label.setWordWrap(True)
-        text_layout.addWidget(self._processing_eval_provider_label)
+        self._processing_eval_provider_label.setVisible(False)
 
         self._processing_usage_label = QLabel(
             "Usage budget will appear here after smart generation is configured."
         )
         self._processing_usage_label.setObjectName("subtleLabel")
         self._processing_usage_label.setWordWrap(True)
+        self._processing_usage_label.setVisible(False)
         text_layout.addWidget(self._processing_usage_label)
 
         self._processing_debug_toggle = QPushButton("Show Generation Details")
         self._processing_debug_toggle.setObjectName("ghostButton")
         self._processing_debug_toggle.setCheckable(True)
         self._processing_debug_toggle.toggled.connect(self._on_processing_debug_toggled)
-        text_layout.addWidget(self._processing_debug_toggle)
+        self._processing_debug_toggle.setVisible(False)
 
         self._processing_debug_panel = QFrame()
         self._processing_debug_panel.setObjectName("panel")
@@ -2034,6 +2726,7 @@ class MainWindow(QWidget):
         )
         self._processing_smart_cards_status_label.setObjectName("subtleLabel")
         self._processing_smart_cards_status_label.setWordWrap(True)
+        self._processing_smart_cards_status_label.setVisible(False)
         text_layout.addWidget(self._processing_smart_cards_status_label)
 
         self._processing_smart_option_buttons: list[QPushButton] = []
@@ -2065,7 +2758,7 @@ class MainWindow(QWidget):
             self._processing_smart_option_caption_inputs.append(caption_input)
             card_layout.addWidget(caption_input)
 
-            apply_button = QPushButton("Apply This Option")
+            apply_button = QPushButton("Apply")
             apply_button.setObjectName("smartOptionCard")
             apply_button.setCheckable(True)
             apply_button.clicked.connect(
@@ -2079,12 +2772,24 @@ class MainWindow(QWidget):
             smart_cards_layout.addWidget(card_panel, index // 2, index % 2)
         text_layout.addLayout(smart_cards_layout)
 
-        style_panel = QFrame()
+        self._processing_style_panel = QFrame()
+        style_panel = self._processing_style_panel
         style_panel.setObjectName("panel")
         style_layout = QGridLayout()
         style_layout.setContentsMargins(16, 16, 16, 16)
         style_layout.setHorizontalSpacing(12)
         style_layout.setVerticalSpacing(10)
+
+        template_label = QLabel("Template")
+        template_label.setObjectName("metaLabel")
+        self._processing_template_combo = QComboBox()
+        for key, config in PROCESSING_TEMPLATES.items():
+            self._processing_template_combo.addItem(str(config["label"]), key)
+        self._processing_template_combo.currentIndexChanged.connect(
+            self._on_processing_template_changed
+        )
+        style_layout.addWidget(template_label, 0, 0)
+        style_layout.addWidget(self._processing_template_combo, 0, 1)
 
         title_style_label = QLabel("Title Style")
         title_style_label.setObjectName("metaLabel")
@@ -2094,30 +2799,30 @@ class MainWindow(QWidget):
         self._processing_title_style_combo.currentIndexChanged.connect(
             self._on_title_style_preset_changed
         )
-        style_layout.addWidget(title_style_label, 0, 0)
-        style_layout.addWidget(self._processing_title_style_combo, 0, 1)
+        style_layout.addWidget(title_style_label, 1, 0)
+        style_layout.addWidget(self._processing_title_style_combo, 1, 1)
 
         title_size_label = QLabel("Title Size")
         title_size_label.setObjectName("metaLabel")
         self._processing_title_font_size = QSpinBox()
         self._processing_title_font_size.setRange(18, 144)
-        style_layout.addWidget(title_size_label, 0, 2)
-        style_layout.addWidget(self._processing_title_font_size, 0, 3)
+        style_layout.addWidget(title_size_label, 1, 2)
+        style_layout.addWidget(self._processing_title_font_size, 1, 3)
 
         title_font_label = QLabel("Title Font")
         title_font_label.setObjectName("metaLabel")
         self._processing_title_font_combo = QComboBox()
         for label, key in TITLE_FONT_CHOICES:
             self._processing_title_font_combo.addItem(label, key)
-        style_layout.addWidget(title_font_label, 1, 0)
-        style_layout.addWidget(self._processing_title_font_combo, 1, 1)
+        style_layout.addWidget(title_font_label, 2, 0)
+        style_layout.addWidget(self._processing_title_font_combo, 2, 1)
 
         title_color_label = QLabel("Title Color")
         title_color_label.setObjectName("metaLabel")
         self._processing_title_color_input = QLineEdit()
         self._processing_title_color_input.setPlaceholderText("#FFFFFF")
-        style_layout.addWidget(title_color_label, 1, 2)
-        style_layout.addWidget(self._processing_title_color_input, 1, 3)
+        style_layout.addWidget(title_color_label, 2, 2)
+        style_layout.addWidget(self._processing_title_color_input, 2, 3)
 
         title_background_label = QLabel("Title Background")
         title_background_label.setObjectName("metaLabel")
@@ -2125,25 +2830,57 @@ class MainWindow(QWidget):
         self._processing_title_background_combo.addItem("None", "none")
         self._processing_title_background_combo.addItem("Dark Box", "dark")
         self._processing_title_background_combo.addItem("Light Box", "light")
-        style_layout.addWidget(title_background_label, 2, 0)
-        style_layout.addWidget(self._processing_title_background_combo, 2, 1)
+        style_layout.addWidget(title_background_label, 3, 0)
+        style_layout.addWidget(self._processing_title_background_combo, 3, 1)
 
         self._processing_style_status_label = QLabel(
             "These controls only affect the rendered title on the processed video. Captions stay as editable metadata for later upload."
         )
         self._processing_style_status_label.setObjectName("subtleLabel")
         self._processing_style_status_label.setWordWrap(True)
-        style_layout.addWidget(self._processing_style_status_label, 3, 0, 1, 4)
+        style_layout.addWidget(self._processing_style_status_label, 4, 0, 1, 4)
         style_panel.setLayout(style_layout)
-        panel_layout.addWidget(style_panel)
+        style_panel.setVisible(False)
         text_panel.setLayout(text_layout)
         panel_layout.addWidget(text_panel)
 
         action_row = QHBoxLayout()
         action_row.setSpacing(10)
-        self._processing_export_button = QPushButton("Export Processed Video")
+        title_layout_label = QLabel("Title Layout")
+        title_layout_label.setObjectName("metaLabel")
+        self._processing_title_layout_combo = QComboBox()
+        for label, key in TITLE_LAYOUT_CHOICES:
+            self._processing_title_layout_combo.addItem(label, key)
+        self._processing_title_layout_combo.currentIndexChanged.connect(
+            self._on_processing_title_layout_changed
+        )
+        action_row.addWidget(title_layout_label)
+        action_row.addWidget(self._processing_title_layout_combo)
+        top_crop_label = QLabel("Top Crop")
+        top_crop_label.setObjectName("metaLabel")
+        top_crop_label.setVisible(False)
+        self._processing_top_crop_spin = QSpinBox()
+        self._processing_top_crop_spin.setRange(0, 2000)
+        self._processing_top_crop_spin.setSuffix(" px")
+        self._processing_top_crop_spin.valueChanged.connect(self._on_processing_manual_crop_changed)
+        self._processing_top_crop_spin.setVisible(False)
+        bottom_crop_label = QLabel("Bottom Crop")
+        bottom_crop_label.setObjectName("metaLabel")
+        bottom_crop_label.setVisible(False)
+        self._processing_bottom_crop_spin = QSpinBox()
+        self._processing_bottom_crop_spin.setRange(0, 2000)
+        self._processing_bottom_crop_spin.setSuffix(" px")
+        self._processing_bottom_crop_spin.valueChanged.connect(
+            self._on_processing_manual_crop_changed
+        )
+        self._processing_bottom_crop_spin.setVisible(False)
+        action_row.addWidget(top_crop_label)
+        action_row.addWidget(self._processing_top_crop_spin)
+        action_row.addWidget(bottom_crop_label)
+        action_row.addWidget(self._processing_bottom_crop_spin)
+        self._processing_export_button = QPushButton("Export")
         self._processing_export_button.clicked.connect(self._on_process_video_clicked)
-        self._processing_open_processed_button = QPushButton("Open Processed Folder")
+        self._processing_open_processed_button = QPushButton("Open Folder")
         self._processing_open_processed_button.setObjectName("ghostButton")
         self._processing_open_processed_button.clicked.connect(
             self._on_open_processed_folder_clicked
@@ -2160,14 +2897,22 @@ class MainWindow(QWidget):
         self._processing_latest_output_label = QLabel("No processed output yet in this session.")
         self._processing_latest_output_label.setObjectName("metaValue")
         self._processing_latest_output_label.setWordWrap(True)
-        self._processing_open_latest_output_button = QPushButton("Open Latest Output")
+        self._processing_open_latest_output_button = QPushButton("Open Video")
         self._processing_open_latest_output_button.setObjectName("ghostButton")
         self._processing_open_latest_output_button.clicked.connect(
             self._on_open_latest_processed_output_clicked
         )
+        self._processing_add_to_schedule_button = QPushButton("Add to Schedule")
+        self._processing_add_to_schedule_button.setObjectName("ghostButton")
+        self._processing_add_to_schedule_button.clicked.connect(
+            self._on_add_processed_to_schedule_clicked
+        )
         latest_output_row.addWidget(latest_output_label)
         latest_output_row.addWidget(self._processing_latest_output_label, stretch=1)
         latest_output_row.addWidget(self._processing_open_latest_output_button)
+        latest_output_row.addWidget(self._processing_add_to_schedule_button)
+        self._processing_open_latest_output_button.setVisible(False)
+        self._processing_add_to_schedule_button.setVisible(False)
         panel_layout.addLayout(latest_output_row)
 
         self._processing_suggestion_label = QLabel(
@@ -2176,12 +2921,16 @@ class MainWindow(QWidget):
         )
         self._processing_suggestion_label.setObjectName("subtleLabel")
         self._processing_suggestion_label.setWordWrap(True)
+        self._processing_suggestion_label.setVisible(False)
         panel_layout.addWidget(self._processing_suggestion_label)
+        self._processing_style_panel.setVisible(False)
+        panel_layout.addWidget(self._processing_style_panel)
 
         panel_layout.addStretch(1)
         panel.setLayout(panel_layout)
 
         self._processing_preview_timer = QTimer(self)
+        self._processing_preview_timer.setSingleShot(True)
         self._processing_preview_timer.setInterval(33)
         self._processing_preview_timer.timeout.connect(self._advance_processing_preview)
 
@@ -2191,6 +2940,7 @@ class MainWindow(QWidget):
         page_layout.setSpacing(0)
         page_layout.addWidget(panel)
         page.setLayout(page_layout)
+        page.setMinimumHeight(900)
         return page
 
     def _make_accounts_page(self) -> QWidget:
@@ -2299,10 +3049,10 @@ class MainWindow(QWidget):
         return page
 
     def _make_schedule_page(self) -> QWidget:
-        title_label = QLabel("Schedule")
+        title_label = QLabel("Publish Queue")
         title_label.setObjectName("sectionTitle")
         message_label = QLabel(
-            "Review processed drafts that are ready for a future uploader. This queue does not publish yet."
+            "Review Instagram-ready Reels, copy captions, and track manual publishing."
         )
         message_label.setObjectName("metaValue")
         message_label.setWordWrap(True)
@@ -2313,10 +3063,91 @@ class MainWindow(QWidget):
         self._schedule_summary_label.setObjectName("subtleLabel")
         self._schedule_summary_label.setWordWrap(True)
 
+        self._schedule_copy_caption_button = QPushButton("Copy Caption")
+        self._schedule_copy_caption_button.setObjectName("downloadToolbarButton")
+        self._schedule_copy_caption_button.setEnabled(False)
+        self._schedule_copy_caption_button.clicked.connect(self._on_copy_schedule_caption_clicked)
+        self._schedule_open_output_button = QPushButton("Open Reel")
+        self._schedule_open_output_button.setObjectName("downloadToolbarButton")
+        self._schedule_open_output_button.setEnabled(False)
+        self._schedule_open_output_button.clicked.connect(self._on_open_schedule_output_clicked)
+        self._schedule_copy_path_button = QPushButton("Copy Path")
+        self._schedule_copy_path_button.setObjectName("downloadToolbarButton")
+        self._schedule_copy_path_button.setEnabled(False)
+        self._schedule_copy_path_button.clicked.connect(self._on_copy_schedule_path_clicked)
+        self._schedule_open_folder_button = QPushButton("Open Folder")
+        self._schedule_open_folder_button.setObjectName("downloadToolbarButton")
+        self._schedule_open_folder_button.setEnabled(False)
+        self._schedule_open_folder_button.clicked.connect(self._on_open_schedule_folder_clicked)
+
+        schedule_action_row = QHBoxLayout()
+        schedule_action_row.setSpacing(10)
+        schedule_action_row.addWidget(self._schedule_copy_caption_button)
+        schedule_action_row.addWidget(self._schedule_open_output_button)
+        schedule_action_row.addWidget(self._schedule_copy_path_button)
+        schedule_action_row.addWidget(self._schedule_open_folder_button)
+        schedule_action_row.addStretch(1)
+
+        self._schedule_caption_combo = QComboBox()
+        self._schedule_caption_combo.addItem("Caption", "caption")
+        self._schedule_caption_combo.addItem("Title + Caption", "title_caption")
+        self._schedule_caption_combo.addItem("Title Only", "title")
+        self._schedule_caption_combo.currentIndexChanged.connect(
+            self._refresh_schedule_caption_preview
+        )
+        self._schedule_status_combo = QComboBox()
+        for label, value in (
+            ("Draft", "draft"),
+            ("Ready", "ready"),
+            ("Posted", "posted"),
+            ("Skipped", "skipped"),
+        ):
+            self._schedule_status_combo.addItem(label, value)
+        self._schedule_status_combo.setEnabled(False)
+        self._schedule_status_combo.currentIndexChanged.connect(
+            self._on_schedule_status_combo_changed
+        )
+        self._schedule_datetime_edit = QDateTimeEdit()
+        self._schedule_datetime_edit.setDisplayFormat("yyyy-MM-dd HH:mm")
+        self._schedule_datetime_edit.setCalendarPopup(True)
+        self._schedule_datetime_edit.setEnabled(False)
+        self._schedule_datetime_edit.setMinimumWidth(170)
+        self._schedule_datetime_edit.setDateTime(
+            self._datetime_to_qdatetime(dt.datetime.now().astimezone())
+        )
+        self._schedule_save_time_button = QPushButton("Save Time")
+        self._schedule_save_time_button.setObjectName("downloadToolbarButton")
+        self._schedule_save_time_button.setEnabled(False)
+        self._schedule_save_time_button.clicked.connect(self._on_save_schedule_time_clicked)
+        self._schedule_clear_time_button = QPushButton("Clear Time")
+        self._schedule_clear_time_button.setObjectName("downloadToolbarButton")
+        self._schedule_clear_time_button.setEnabled(False)
+        self._schedule_clear_time_button.clicked.connect(self._on_clear_schedule_time_clicked)
+        self._schedule_caption_preview = QTextEdit()
+        self._schedule_caption_preview.setPlaceholderText(
+            "Select a publish job to preview the caption for manual posting."
+        )
+        self._schedule_caption_preview.setReadOnly(True)
+        self._schedule_caption_preview.setMinimumHeight(120)
+
+        schedule_detail_row = QHBoxLayout()
+        schedule_detail_row.setSpacing(10)
+        schedule_detail_row.addWidget(QLabel("Copy Text"))
+        schedule_detail_row.addWidget(self._schedule_caption_combo)
+        schedule_detail_row.addWidget(self._schedule_copy_caption_button)
+        schedule_detail_row.addWidget(QLabel("Status"))
+        schedule_detail_row.addWidget(self._schedule_status_combo)
+        schedule_detail_row.addWidget(QLabel("Schedule"))
+        schedule_detail_row.addWidget(self._schedule_datetime_edit)
+        schedule_detail_row.addWidget(self._schedule_save_time_button)
+        schedule_detail_row.addWidget(self._schedule_clear_time_button)
+        schedule_detail_row.addStretch(1)
+
         self._schedule_table = TableFocusScrollWidget()
-        self._schedule_table.setColumnCount(5)
+        self._schedule_table.setObjectName("downloadQueueTable")
+        self._schedule_table.setColumnCount(7)
         self._schedule_table.setHorizontalHeaderLabels(
-            ["Account", "Video", "Title", "Caption", "Status"]
+            ["Account", "Video", "Title", "Scheduled", "Privacy", "Status", "Output"]
         )
         self._schedule_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self._schedule_table.horizontalHeader().setStretchLastSection(True)
@@ -2326,26 +3157,42 @@ class MainWindow(QWidget):
         self._schedule_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._schedule_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self._schedule_table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self._schedule_table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._schedule_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._schedule_table.setWordWrap(False)
         self._schedule_table.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self._schedule_table.setMinimumHeight(230)
+        self._schedule_table.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        self._schedule_table.itemSelectionChanged.connect(self._on_schedule_selection_changed)
 
         panel = QFrame()
-        panel.setObjectName("panel")
+        panel.setObjectName("downloadQueuePanel")
         panel_layout = QVBoxLayout()
-        panel_layout.setContentsMargins(24, 24, 24, 24)
+        panel_layout.setContentsMargins(18, 18, 18, 18)
         panel_layout.setSpacing(12)
         panel_layout.addWidget(title_label)
         panel_layout.addWidget(message_label)
         panel_layout.addWidget(self._schedule_summary_label)
+        schedule_action_row.removeWidget(self._schedule_copy_caption_button)
+        panel_layout.addLayout(schedule_detail_row)
+        panel_layout.addWidget(self._schedule_caption_preview)
+        panel_layout.addLayout(schedule_action_row)
         panel_layout.addWidget(self._schedule_table, stretch=1)
         panel.setLayout(panel_layout)
+        panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         page = QWidget()
         page_layout = QVBoxLayout()
         page_layout.setContentsMargins(0, 0, 0, 0)
         page_layout.setSpacing(0)
-        page_layout.addWidget(panel)
+        page_layout.addWidget(panel, stretch=1)
         page.setLayout(page_layout)
+        self._schedule_title_label = title_label
+        self._schedule_message_label = message_label
+        self._schedule_panel = panel
         return page
 
     def _refresh_processing_page(self) -> None:
@@ -2392,11 +3239,13 @@ class MainWindow(QWidget):
         if not items:
             self._processing_probe = None
             self._processing_probe_item_id = None
+            self._refresh_processing_inbox(items)
             self._set_processing_placeholder_state(
                 "No downloaded files are ready for processing in this account yet."
             )
             return
 
+        self._refresh_processing_inbox(items)
         self._refresh_processing_selection()
 
     def _processing_available_items(self) -> list[DownloadItem]:
@@ -2432,6 +3281,132 @@ class MainWindow(QWidget):
             available_items.append(item)
         return available_items
 
+    def _processing_source_label_map(self, items: list[DownloadItem]) -> dict[int, str]:
+        if self._current_account_id is None or not items:
+            return {}
+
+        item_keys: dict[int, set[str]] = {}
+        all_keys: set[str] = set()
+        for item in items:
+            keys = {item.source_url}
+            if item.video_id:
+                keys.add(item.video_id)
+            item_keys[item.id] = keys
+            all_keys.update(keys)
+
+        if not all_keys:
+            return {}
+
+        with get_session() as session:
+            candidates = (
+                session.query(ScrapeCandidate)
+                .filter(ScrapeCandidate.account_id == self._current_account_id)
+                .all()
+            )
+
+        matched_labels: dict[int, str] = {}
+        for item_id, keys in item_keys.items():
+            for candidate in candidates:
+                candidate_keys = {candidate.source_url}
+                if candidate.video_id:
+                    candidate_keys.add(candidate.video_id)
+                if keys & candidate_keys:
+                    matched_labels[item_id] = "Scraped"
+                    break
+            else:
+                matched_labels[item_id] = "Manual"
+        return matched_labels
+
+    def _processing_status_text(self, item: DownloadItem) -> str:
+        if item.file_path:
+            output_path = self._existing_processed_output_path_for_item(item)
+            if output_path is not None and output_path.exists():
+                return "Processed"
+        if item.title_draft or item.caption_draft or item.smart_generated_at:
+            return "Drafted"
+        return "Not Processed"
+
+    @staticmethod
+    def _processing_status_colors(status: str) -> tuple[QColor, QColor]:
+        colors = {
+            "Not Processed": (QColor("#3a1f24"), QColor("#ffd0d0")),
+            "Drafted": (QColor("#3a2b12"), QColor("#ffe0a3")),
+            "Processed": (QColor("#123521"), QColor("#9ff0bf")),
+        }
+        return colors.get(status, (QColor("#111827"), QColor("#d7e0ea")))
+
+    def _processing_action_text(self, item: DownloadItem) -> str:
+        status = self._processing_status_text(item)
+        if status == "Processed":
+            return "Reprocess"
+        if status == "Drafted":
+            return "Continue"
+        return "Preprocess"
+
+    def _matches_processing_inbox_filters(self, item: DownloadItem) -> bool:
+        selected_state = self._processing_state_filter.currentData()
+        status = self._processing_status_text(item)
+        if selected_state == "needs" and status == "Processed":
+            return False
+        if selected_state == "processed" and status != "Processed":
+            return False
+
+        query = self._processing_search_input.text().strip().lower()
+        if not query:
+            return True
+
+        source_label = self._processing_source_labels.get(item.id, "Manual")
+        haystacks = [
+            item.title or "",
+            item.source_url,
+            item.video_id or "",
+            status,
+            source_label,
+        ]
+        return any(query in value.lower() for value in haystacks)
+
+    def _refresh_processing_inbox(self, items: list[DownloadItem]) -> None:
+        self._processing_source_labels = self._processing_source_label_map(items)
+        visible_items = [item for item in items if self._matches_processing_inbox_filters(item)]
+
+        self._processing_inbox_table.blockSignals(True)
+        self._processing_inbox_table.setRowCount(0)
+        for item in visible_items:
+            row = self._processing_inbox_table.rowCount()
+            self._processing_inbox_table.insertRow(row)
+
+            values = [
+                self._processing_status_text(item),
+                self._processing_source_labels.get(item.id, "Manual"),
+                item.title or item.video_id or item.source_url,
+                self._created_text(item),
+                self._processing_action_text(item),
+            ]
+            for column, value in enumerate(values):
+                table_item = QTableWidgetItem(value)
+                table_item.setData(Qt.ItemDataRole.UserRole, item.id)
+                table_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                if column == 0:
+                    background, foreground = self._processing_status_colors(value)
+                    table_item.setBackground(background)
+                    table_item.setForeground(foreground)
+                self._processing_inbox_table.setItem(row, column, table_item)
+
+            if item.id == self._selected_processing_item_id:
+                self._processing_inbox_table.selectRow(row)
+
+        self._processing_inbox_table.resizeRowsToContents()
+        for row in range(self._processing_inbox_table.rowCount()):
+            self._processing_inbox_table.setRowHeight(row, 32)
+        self._processing_inbox_table.setColumnWidth(0, 130)
+        self._processing_inbox_table.setColumnWidth(1, 96)
+        self._processing_inbox_table.setColumnWidth(3, 150)
+        self._processing_inbox_table.setColumnWidth(4, 110)
+        self._processing_inbox_table.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.Stretch
+        )
+        self._processing_inbox_table.blockSignals(False)
+
     def _set_processing_placeholder_state(self, message: str) -> None:
         self._processing_summary_label.setText(message)
         self._processing_preview_path = None
@@ -2441,6 +3416,7 @@ class MainWindow(QWidget):
         self._processing_preview_position_slider.setRange(0, 0)
         self._processing_preview_position_slider.setValue(0)
         self._processing_preview_time_label.setText("00:00 / 00:00")
+        self._processing_preview_last_frame_ms = None
         self._processing_preview_meta_label.setText("Select a downloaded video to preview it here.")
         self._processing_video_widget.setPixmap(QPixmap())
         self._processing_video_widget.setText("Preview unavailable")
@@ -2450,18 +3426,24 @@ class MainWindow(QWidget):
         self._processing_title_draft_input.setText("")
         self._processing_caption_draft_input.setPlainText("")
         self._processing_transcript_input.setPlainText("")
+        self._set_processing_manual_crop_values(0, 0)
+        self._processing_using_ai_layout_crop = False
+        self._processing_ai_suggested_layout = None
+        self._processing_clip_premise_input.blockSignals(True)
+        self._processing_clip_premise_input.setPlainText("")
+        self._processing_clip_premise_input.blockSignals(False)
         self._processing_smart_summary_label.setText(
             "Smart draft summary will appear here after Groq generation."
         )
         self._set_processing_eval_state()
         self._refresh_processing_usage_label()
         self._set_processing_smart_options([], [])
-        self._apply_title_style_preset("clean_hook")
+        self._apply_processing_template("gaming_meme_black")
         self._processing_style_status_label.setText(
             "These controls only affect the rendered title on the processed video. Captions stay as editable metadata for later upload."
         )
         self._processing_draft_status_label.setText(
-            "Generate drafts from the selected downloaded video. Transcript context will be used automatically when available."
+            "Generate visual-first title and caption drafts from the selected downloaded video."
         )
         self._processing_suggestion_label.setText(
             "Automatic crop suggestions will use border detection now and OCR once Tesseract is installed."
@@ -2475,19 +3457,30 @@ class MainWindow(QWidget):
     def _set_processing_controls_enabled(self, enabled: bool) -> None:
         combo_enabled = enabled and not self._processing_in_progress
         self._processing_item_combo.setEnabled(combo_enabled)
+        self._processing_inbox_table.setEnabled(combo_enabled)
+        self._processing_state_filter.setEnabled(combo_enabled)
+        self._processing_search_input.setEnabled(combo_enabled)
         self._processing_export_button.setEnabled(combo_enabled)
         self._processing_open_processed_button.setEnabled(True)
         self._processing_preview_back_button.setEnabled(
             combo_enabled and self._processing_preview_path is not None
         )
+        self._processing_preview_back_large_button.setEnabled(
+            combo_enabled and self._processing_preview_path is not None
+        )
         self._processing_preview_forward_button.setEnabled(
+            combo_enabled and self._processing_preview_path is not None
+        )
+        self._processing_preview_forward_large_button.setEnabled(
             combo_enabled and self._processing_preview_path is not None
         )
         self._processing_generate_drafts_button.setEnabled(combo_enabled)
         self._processing_save_drafts_button.setEnabled(combo_enabled)
         self._processing_title_draft_input.setEnabled(combo_enabled)
         self._processing_caption_draft_input.setEnabled(combo_enabled)
+        self._processing_caption_style_combo.setEnabled(combo_enabled)
         self._processing_transcript_input.setEnabled(True)
+        self._processing_clip_premise_input.setEnabled(combo_enabled)
         for button in self._processing_smart_option_buttons:
             button.setEnabled(combo_enabled and button.isVisible())
         for title_input in self._processing_smart_option_title_inputs:
@@ -2495,6 +3488,10 @@ class MainWindow(QWidget):
         for caption_input in self._processing_smart_option_caption_inputs:
             caption_input.setEnabled(combo_enabled)
         self._processing_title_style_combo.setEnabled(combo_enabled)
+        self._processing_template_combo.setEnabled(combo_enabled)
+        self._processing_title_layout_combo.setEnabled(combo_enabled)
+        self._processing_top_crop_spin.setEnabled(combo_enabled)
+        self._processing_bottom_crop_spin.setEnabled(combo_enabled)
         self._processing_title_font_size.setEnabled(combo_enabled)
         self._processing_title_font_combo.setEnabled(combo_enabled)
         self._processing_title_color_input.setEnabled(combo_enabled)
@@ -2516,7 +3513,7 @@ class MainWindow(QWidget):
         self._processing_loading_base_text = ""
         self._processing_loading_phase = 0
         self._processing_loading_badge.setVisible(False)
-        self._processing_generate_drafts_button.setText("Generate Drafts")
+        self._processing_generate_drafts_button.setText("Generate")
 
     def _on_processing_loading_tick(self) -> None:
         if not self._processing_loading_base_text:
@@ -2538,12 +3535,43 @@ class MainWindow(QWidget):
             None,
         )
 
+    def _on_processing_clip_premise_changed(self) -> None:
+        item = self._processing_selected_item()
+        if item is None:
+            return
+        premise = self._processing_clip_premise_input.toPlainText().strip()
+        if premise:
+            self._processing_clip_premises[item.id] = premise
+        else:
+            self._processing_clip_premises.pop(item.id, None)
+
+    @staticmethod
+    def _set_text_edit_if_changed(text_edit: QTextEdit, value: str) -> None:
+        if text_edit.toPlainText() == value:
+            return
+        cursor = text_edit.textCursor()
+        position = cursor.position()
+        anchor = cursor.anchor()
+        text_edit.blockSignals(True)
+        text_edit.setPlainText(value)
+        restored_cursor = text_edit.textCursor()
+        max_position = len(value)
+        restored_cursor.setPosition(min(anchor, max_position))
+        restored_cursor.setPosition(
+            min(position, max_position),
+            QTextCursor.MoveMode.KeepAnchor,
+        )
+        text_edit.setTextCursor(restored_cursor)
+        text_edit.blockSignals(False)
+
     def _refresh_processing_selection(self) -> None:
         item = self._processing_selected_item()
         if item is None or not self._item_exists(item):
             self._processing_probe = None
             self._processing_probe_item_id = None
             self._processing_auto_crop = CropSettings()
+            self._processing_using_ai_layout_crop = False
+            self._processing_ai_suggested_layout = None
             self._processing_raw_transcript_text = ""
             self._set_processing_placeholder_state("Select a downloaded video to configure a crop.")
             return
@@ -2559,6 +3587,10 @@ class MainWindow(QWidget):
         self._processing_raw_transcript_text = item.transcript_text or ""
         self._processing_title_draft_input.setText(item.title_draft or "")
         self._processing_caption_draft_input.setPlainText(item.caption_draft or "")
+        self._set_text_edit_if_changed(
+            self._processing_clip_premise_input,
+            self._processing_clip_premises.get(item.id, ""),
+        )
         self._processing_transcript_input.setPlainText(
             self._processing_context_text(item, self._processing_raw_transcript_text)
         )
@@ -2570,7 +3602,7 @@ class MainWindow(QWidget):
             )
         else:
             self._processing_draft_status_label.setText(
-                "Generate drafts from the selected downloaded video. Transcript context will be used automatically when available."
+                "Generate visual-first title and caption drafts from the selected downloaded video."
             )
 
         if self._processing_probe_item_id != item.id:
@@ -2578,6 +3610,10 @@ class MainWindow(QWidget):
                 self._processing_probe = probe_video(path)
                 self._processing_probe_item_id = item.id
                 self._processing_auto_crop = CropSettings()
+                self._set_processing_manual_crop_ranges(self._processing_probe)
+                self._set_processing_manual_crop_values(0, 0)
+                self._processing_using_ai_layout_crop = False
+                self._processing_ai_suggested_layout = None
             except Exception as exc:  # noqa: BLE001
                 self._processing_probe = None
                 self._processing_probe_item_id = None
@@ -2596,7 +3632,7 @@ class MainWindow(QWidget):
                 f"{item.title or '(untitled)'} • "
                 f"{probe.width} x {probe.height} • "
                 f"{probe.duration_seconds:.2f}s • "
-                f"Processed output: {processed_output_path(path, processed_dir()).name}"
+                f"Processed output: {self._processed_output_path_for_item(item).name}"
             )
         )
         self._processing_suggestion_label.setText(
@@ -2625,16 +3661,143 @@ class MainWindow(QWidget):
         self._processing_title_background_combo.setCurrentIndex(
             background_index if background_index >= 0 else 0
         )
+        layout_index = self._processing_title_layout_combo.findData("top_band")
+        self._processing_title_layout_combo.setCurrentIndex(
+            layout_index if layout_index >= 0 else 0
+        )
+
+    def _set_processing_template(self, template_key: str) -> None:
+        self._processing_template_combo.blockSignals(True)
+        index = self._processing_template_combo.findData(template_key)
+        self._processing_template_combo.setCurrentIndex(index if index >= 0 else 0)
+        self._processing_template_combo.blockSignals(False)
+
+    def _apply_processing_template(self, template_key: str) -> None:
+        template = PROCESSING_TEMPLATES.get(template_key, PROCESSING_TEMPLATES["gaming_meme_black"])
+        self._set_processing_template(template_key)
+        style_key = str(template.get("title_style", "clean_hook"))
+        self._processing_title_style_combo.blockSignals(True)
+        style_index = self._processing_title_style_combo.findData(style_key)
+        self._processing_title_style_combo.setCurrentIndex(style_index if style_index >= 0 else 0)
+        self._processing_title_style_combo.blockSignals(False)
+        self._processing_title_font_size.setValue(int(template.get("font_size", 60)))
+        font_index = self._processing_title_font_combo.findData(
+            str(template.get("font_name", "arial_bold"))
+        )
+        self._processing_title_font_combo.setCurrentIndex(font_index if font_index >= 0 else 0)
+        self._processing_title_color_input.setText(str(template.get("text_color", "#FFFFFF")))
+        background_index = self._processing_title_background_combo.findData(
+            str(template.get("background", "none"))
+        )
+        self._processing_title_background_combo.setCurrentIndex(
+            background_index if background_index >= 0 else 0
+        )
+        layout_index = self._processing_title_layout_combo.findData(
+            str(template.get("layout", "top_band"))
+        )
+        self._processing_title_layout_combo.setCurrentIndex(
+            layout_index if layout_index >= 0 else 0
+        )
+
+    def _processing_prompt_profile(self) -> str:
+        template_key = str(self._processing_template_combo.currentData() or "gaming_meme_black")
+        template = PROCESSING_TEMPLATES.get(template_key, PROCESSING_TEMPLATES["gaming_meme_black"])
+        return str(template.get("prompt_profile", "broad_short_form"))
+
+    def _processing_caption_style(self) -> str:
+        return str(self._processing_caption_style_combo.currentData() or "contextual_info")
+
+    def _recent_smart_drafts_for_account(
+        self,
+        *,
+        account_id: int | None,
+        exclude_item_id: int | None,
+        limit: int = 25,
+    ) -> tuple[list[str], list[str]]:
+        if account_id is None:
+            return [], []
+        titles: list[str] = []
+        captions: list[str] = []
+        with get_session() as session:
+            query = (
+                session.query(DownloadItem.title_draft, DownloadItem.caption_draft)
+                .filter(DownloadItem.account_id == account_id)
+                .filter(
+                    (DownloadItem.title_draft.is_not(None))
+                    | (DownloadItem.caption_draft.is_not(None))
+                )
+            )
+            if exclude_item_id is not None:
+                query = query.filter(DownloadItem.id != exclude_item_id)
+            query = query.order_by(
+                DownloadItem.smart_generated_at.desc(),
+                DownloadItem.created_at.desc(),
+            ).limit(limit)
+            for title_draft, caption_draft in query.all():
+                title_text = (title_draft or "").strip()
+                caption_text = (caption_draft or "").strip()
+                if title_text:
+                    titles.append(title_text)
+                if caption_text:
+                    captions.append(caption_text)
+        return titles, captions
+
+    def _set_processing_manual_crop_ranges(self, probe: VideoProbe) -> None:
+        # Allow deep crops: meme-format sources can have footage well past the
+        # midline. Export-time output_dimensions still rejects impossible crops.
+        max_vertical_crop = max(0, int(probe.height * 0.85))
+        self._processing_top_crop_spin.setMaximum(max_vertical_crop)
+        self._processing_bottom_crop_spin.setMaximum(max_vertical_crop)
+
+    def _set_processing_manual_crop_values(self, top: int, bottom: int) -> None:
+        self._processing_top_crop_spin.blockSignals(True)
+        self._processing_bottom_crop_spin.blockSignals(True)
+        self._processing_top_crop_spin.setValue(max(0, top))
+        self._processing_bottom_crop_spin.setValue(max(0, bottom))
+        self._processing_top_crop_spin.blockSignals(False)
+        self._processing_bottom_crop_spin.blockSignals(False)
+
+    def _has_manual_crop_override(self) -> bool:
+        return (
+            self._processing_top_crop_spin.value() > 0
+            or self._processing_bottom_crop_spin.value() > 0
+        )
+
+    def _on_processing_manual_crop_changed(self) -> None:
+        self._processing_using_ai_layout_crop = False
+        self._refresh_processing_output_preview()
+
+    def _should_use_title_replacement_crop(self, item: DownloadItem) -> bool:
+        if str(self._processing_title_layout_combo.currentData() or "") != "top_band":
+            return False
+        if self._has_manual_crop_override():
+            return False
+        if "instagram.com" not in (item.source_url or "").lower():
+            return False
+        payload = self._processing_vision_payload
+        if not isinstance(payload, dict):
+            return True
+        top_text_type = str(payload.get("top_text_type") or "none").strip().lower()
+        return top_text_type in {"meme_joke", "source_title", "watermark", "channel_name", "none"}
 
     def _load_processing_style_state(self, item: DownloadItem) -> None:
+        template_key = "gaming_meme_black"
         title_preset = item.title_style_preset or "clean_hook"
-        self._apply_title_style_preset(title_preset)
 
         if item.title_style_config:
             try:
                 config = json.loads(item.title_style_config)
             except json.JSONDecodeError:
                 config = {}
+            template_key = str(config.get("template", template_key))
+        else:
+            config = {}
+        self._apply_processing_template(template_key)
+        if item.title_style_preset:
+            self._apply_title_style_preset(title_preset)
+            self._set_processing_template(template_key)
+
+        if config:
             self._processing_title_font_size.setValue(
                 int(config.get("font_size", self._processing_title_font_size.value()))
             )
@@ -2650,6 +3813,12 @@ class MainWindow(QWidget):
             )
             self._processing_title_background_combo.setCurrentIndex(
                 background_index if background_index >= 0 else 0
+            )
+            layout_index = self._processing_title_layout_combo.findData(
+                str(config.get("layout", self._processing_title_layout_combo.currentData()))
+            )
+            self._processing_title_layout_combo.setCurrentIndex(
+                layout_index if layout_index >= 0 else 0
             )
 
     def _load_processing_smart_drafts(self, item: DownloadItem) -> None:
@@ -2688,6 +3857,18 @@ class MainWindow(QWidget):
             return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
         except TypeError:
             return str(payload)
+
+    @staticmethod
+    def _parse_processing_vision_payload(raw_value: object) -> dict[str, object] | None:
+        if isinstance(raw_value, dict):
+            return raw_value
+        if not isinstance(raw_value, str) or not raw_value.strip():
+            return None
+        try:
+            parsed = json.loads(raw_value)
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
 
     def _processing_context_text(self, item: DownloadItem, transcript_text: str) -> str:
         transcript_block = (
@@ -2792,6 +3973,7 @@ class MainWindow(QWidget):
         self._processing_provider_label_text = provider_label or ""
         self._processing_generation_meta_text = generation_meta or ""
         self._processing_vision_payload_text = vision_payload or ""
+        self._processing_vision_payload = self._parse_processing_vision_payload(vision_payload)
         self._processing_generated_at_text = (
             generated_at.isoformat() if generated_at is not None else ""
         )
@@ -2879,6 +4061,21 @@ class MainWindow(QWidget):
             return max(0.0, float(raw_cost))
         return 0.0
 
+    @staticmethod
+    def _processing_generation_meta_errors(raw_meta: str | None) -> list[str]:
+        if not raw_meta:
+            return []
+        try:
+            payload = json.loads(raw_meta)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(payload, dict):
+            return []
+        raw_errors = payload.get("errors")
+        if not isinstance(raw_errors, list):
+            return []
+        return [str(error) for error in raw_errors if str(error).strip()]
+
     def _smart_generation_budget_guard_message(self) -> str | None:
         profile = _groq_limit_profile()
         summary = self._processing_monthly_usage_summary()
@@ -2896,15 +4093,82 @@ class MainWindow(QWidget):
 
     def _title_style_config_payload(self) -> str:
         payload = {
+            "template": self._processing_template_combo.currentData(),
+            "prompt_profile": self._processing_prompt_profile(),
             "font_size": self._processing_title_font_size.value(),
             "font_name": str(self._processing_title_font_combo.currentData() or "segoe_ui"),
             "text_color": self._processing_title_color_input.text().strip() or "#FFFFFF",
             "background": self._processing_title_background_combo.currentData(),
+            "layout": self._processing_title_layout_combo.currentData(),
         }
         return json.dumps(payload, sort_keys=True)
 
     def _processing_crop_settings(self) -> CropSettings:
-        return self._processing_auto_crop
+        return CropSettings(
+            left=self._processing_auto_crop.left,
+            top=(
+                self._processing_top_crop_spin.value()
+                if self._processing_top_crop_spin.value() > 0
+                else self._processing_auto_crop.top
+            ),
+            right=self._processing_auto_crop.right,
+            bottom=(
+                self._processing_bottom_crop_spin.value()
+                if self._processing_bottom_crop_spin.value() > 0
+                else self._processing_auto_crop.bottom
+            ),
+        )
+
+    def _on_processing_title_layout_changed(self) -> None:
+        if self._processing_applying_ai_layout_suggestion:
+            return
+        current_layout = str(self._processing_title_layout_combo.currentData() or "")
+        if (
+            self._processing_ai_suggested_layout is not None
+            and current_layout != self._processing_ai_suggested_layout
+        ):
+            self._processing_using_ai_layout_crop = False
+            self._processing_suggestion_label.setText(
+                "Manual title layout override active. Export will run automatic crop detection for this layout."
+            )
+            self._refresh_processing_output_preview()
+
+    def _apply_ai_layout_suggestion(self, vision_payload: object) -> None:
+        if not isinstance(vision_payload, dict):
+            return
+        if self._processing_probe is None:
+            return
+
+        layout = str(vision_payload.get("suggested_title_layout") or "").strip()
+        layout_applied = False
+        if layout in {"no_title", "top_band", "overlay"}:
+            layout_index = self._processing_title_layout_combo.findData(layout)
+            if layout_index >= 0:
+                try:
+                    self._processing_applying_ai_layout_suggestion = True
+                    self._processing_title_layout_combo.setCurrentIndex(layout_index)
+                finally:
+                    self._processing_applying_ai_layout_suggestion = False
+                layout_applied = True
+                self._processing_ai_suggested_layout = layout
+
+        # The crop is decided at export time by the heuristic content-rectangle
+        # detector (suggest_title_replacement_crop / detect_content_rectangle),
+        # which is far more reliable than the vision content_box. Do NOT pre-fill
+        # the crop fields from the vision payload here: that would register as a
+        # manual crop override and block the heuristic from ever running.
+        self._processing_using_ai_layout_crop = layout_applied
+
+        reason = str(vision_payload.get("crop_reason") or "").strip()
+        top_type = str(vision_payload.get("top_text_type") or "none")
+        bottom_type = str(vision_payload.get("bottom_text_type") or "none")
+        layout_label = self._processing_title_layout_combo.currentText()
+        reason_suffix = f" {reason}" if reason else ""
+        self._processing_suggestion_label.setText(
+            f"AI layout suggestion: {layout_label}; top={top_type}, bottom={bottom_type}. "
+            f"Crop is detected automatically on export.{reason_suffix}"
+        )
+        self._refresh_processing_output_preview()
 
     def _refresh_processing_output_preview(self) -> None:
         item = self._processing_selected_item()
@@ -2926,7 +4190,7 @@ class MainWindow(QWidget):
             self._set_processing_controls_enabled(False)
             return
 
-        output_path = processed_output_path(Path(item.file_path), processed_dir())
+        output_path = self._processed_output_path_for_item(item)
         self._refresh_processing_latest_output_state(
             output_path if output_path.exists() else self._processing_last_output_path
         )
@@ -2955,6 +4219,9 @@ class MainWindow(QWidget):
         if path is None or not path.exists():
             self._processing_latest_output_label.setText("No processed output yet in this session.")
             self._processing_open_latest_output_button.setEnabled(False)
+            self._processing_open_latest_output_button.setVisible(False)
+            self._processing_add_to_schedule_button.setEnabled(False)
+            self._processing_add_to_schedule_button.setVisible(False)
             output_index = self._processing_preview_mode_combo.findData("output")
             if output_index >= 0:
                 self._processing_preview_mode_combo.model().item(output_index).setEnabled(False)  # type: ignore[attr-defined]
@@ -2967,6 +4234,9 @@ class MainWindow(QWidget):
 
         self._processing_latest_output_label.setText(path.name)
         self._processing_open_latest_output_button.setEnabled(True)
+        self._processing_open_latest_output_button.setVisible(True)
+        self._processing_add_to_schedule_button.setEnabled(True)
+        self._processing_add_to_schedule_button.setVisible(True)
         output_index = self._processing_preview_mode_combo.findData("output")
         if output_index >= 0:
             self._processing_preview_mode_combo.model().item(output_index).setEnabled(True)  # type: ignore[attr-defined]
@@ -2999,6 +4269,27 @@ class MainWindow(QWidget):
         self._selected_processing_item_id = self._processing_item_combo.currentData()
         self._refresh_processing_selection()
 
+    def _on_processing_inbox_filter_changed(self) -> None:
+        if self._current_page != "processing":
+            return
+        self._refresh_processing_inbox(self._processing_available_items())
+
+    def _on_processing_inbox_selection_changed(self) -> None:
+        selected_items = self._processing_inbox_table.selectedItems()
+        if not selected_items:
+            return
+        item_id = selected_items[0].data(Qt.ItemDataRole.UserRole)
+        if not isinstance(item_id, int) or item_id == self._selected_processing_item_id:
+            return
+        self._selected_processing_item_id = item_id
+        combo_index = self._processing_item_combo.findData(item_id)
+        self._processing_item_combo.blockSignals(True)
+        self._processing_item_combo.setCurrentIndex(combo_index if combo_index >= 0 else 0)
+        self._processing_item_combo.blockSignals(False)
+        self._processing_probe_item_id = None
+        self._processing_last_output_path = None
+        self._refresh_processing_selection()
+
     def _on_title_style_preset_changed(self) -> None:
         preset_key = self._processing_title_style_combo.currentData()
         if isinstance(preset_key, str):
@@ -3009,6 +4300,14 @@ class MainWindow(QWidget):
 
             self._processing_style_status_label.setText(
                 "Applied the caption style preset. You can still edit the fields below it."
+            )
+
+    def _on_processing_template_changed(self) -> None:
+        template_key = self._processing_template_combo.currentData()
+        if isinstance(template_key, str):
+            self._apply_processing_template(template_key)
+            self._processing_style_status_label.setText(
+                "Applied the processing template. You can still edit the style fields below it."
             )
 
     def _start_suggest_crop_job(self, job: SuggestCropJobConfig) -> None:
@@ -3024,6 +4323,11 @@ class MainWindow(QWidget):
         self._processing_progress_bar.setVisible(True)
         self._processing_progress_bar.setRange(0, 0)
         self._processing_progress_bar.setFormat("Analyzing...")
+        self._show_activity_progress(
+            "Analyzing the video for automatic crop suggestions...",
+            maximum=0,
+            fmt="Analyzing...",
+        )
         self._set_processing_controls_enabled(False)
 
         thread = QThread(self)
@@ -3056,6 +4360,13 @@ class MainWindow(QWidget):
         self._processing_progress_bar.setRange(0, 2)
         self._processing_progress_bar.setValue(1)
         self._processing_progress_bar.setFormat("Step 1/2: Transcribing")
+        self._show_activity_progress(
+            "Generate Drafts: step 1 of 2. Transcribing speech and preparing context...",
+            maximum=2,
+            value=1,
+            text_visible=True,
+            fmt="Step 1/2: Transcribing",
+        )
         self._processing_draft_status_label.setText(
             "Transcribing audio first. If there is no speech, draft generation will fall back to metadata."
         )
@@ -3091,6 +4402,13 @@ class MainWindow(QWidget):
         self._processing_progress_bar.setRange(0, 2)
         self._processing_progress_bar.setValue(2)
         self._processing_progress_bar.setFormat("Step 2/2: Generating drafts")
+        self._show_activity_progress(
+            "Generate Drafts: step 2 of 2. Generating title and caption options...",
+            maximum=2,
+            value=2,
+            text_visible=True,
+            fmt="Step 2/2: Generating drafts",
+        )
         if job.transcript_available:
             status_text = (
                 "Using transcript context, metadata, and sampled video frames when supported "
@@ -3098,8 +4416,8 @@ class MainWindow(QWidget):
             )
         else:
             status_text = (
-                "No transcript was available. Generating smart drafts from metadata and sampled video frames when supported, "
-                "but results can still be weaker than true speech-based context."
+                "Using visual-first generation from metadata and sampled video frames. "
+                "Use transcription later only when spoken dialogue is important."
             )
         self._processing_draft_status_label.setText(status_text)
         self._set_processing_controls_enabled(False)
@@ -3131,6 +4449,11 @@ class MainWindow(QWidget):
         self._processing_progress_bar.setVisible(True)
         self._processing_progress_bar.setRange(0, 0)
         self._processing_progress_bar.setFormat("Rendering output...")
+        self._show_activity_progress(
+            "Processing cropped video...",
+            maximum=0,
+            fmt="Rendering output...",
+        )
         self._set_processing_controls_enabled(False)
 
         thread = QThread(self)
@@ -3163,6 +4486,7 @@ class MainWindow(QWidget):
         self._processing_progress_bar.setValue(0)
         self._processing_progress_bar.setFormat("")
         self._processing_progress_bar.setVisible(False)
+        self._hide_activity_progress()
         self._stop_processing_loading_state()
         self._refresh_processing_output_preview()
 
@@ -3171,8 +4495,19 @@ class MainWindow(QWidget):
         self._processing_auto_crop = crop
 
         self._finish_processing_job()
-        reason_text = "; ".join(payload.get("reasons") or ["automatic crop updated"])
-        if not payload.get("used_ocr", False):
+        reason_parts = list(payload.get("reasons") or ["automatic crop updated"])
+        ocr_diagnostics = payload.get("ocr_diagnostics")
+        if isinstance(ocr_diagnostics, PreprocessingOcrDiagnostics):
+            reason_parts.append(self._format_preprocessing_ocr_summary(ocr_diagnostics))
+        elif payload.get("ocr_diagnostics_error"):
+            reason_parts.append("OCR diagnostics skipped after an OCR error")
+        reason_text = "; ".join(reason_parts)
+        ocr_unavailable = not (
+            isinstance(ocr_diagnostics, PreprocessingOcrDiagnostics)
+            and ocr_diagnostics.ffmpeg_available
+            and ocr_diagnostics.tesseract_available
+        )
+        if not payload.get("used_ocr", False) and ocr_unavailable:
             reason_text = f"{reason_text}. Install Tesseract to add text-aware OCR suggestions."
         self._processing_suggestion_label.setText(reason_text)
         self._processing_progress_label.setText("Automatic crop suggestion applied.")
@@ -3185,8 +4520,10 @@ class MainWindow(QWidget):
                 crop=self._processing_auto_crop,
                 title_text=pending_job.title_text,
                 title_font_size=pending_job.title_font_size,
+                title_font_name=pending_job.title_font_name,
                 title_color=pending_job.title_color,
                 title_background=pending_job.title_background,
+                title_layout=pending_job.title_layout,
             )
             self._start_processing_job(auto_job)
             return
@@ -3196,13 +4533,48 @@ class MainWindow(QWidget):
         self._finish_processing_job()
         self._processing_pending_job = None
         self._processing_progress_label.setText("Automatic crop suggestion failed.")
+        self._hide_activity_bar_if_idle()
         self._notify(f"Automatic crop suggestion failed: {message}", Tone.ERROR)
+
+    @staticmethod
+    def _format_preprocessing_ocr_summary(
+        diagnostics: PreprocessingOcrDiagnostics,
+    ) -> str:
+        if not diagnostics.ffmpeg_available or not diagnostics.tesseract_available:
+            return "OCR diagnostics skipped because ffmpeg or Tesseract is unavailable"
+        detected_regions: list[str] = []
+        if diagnostics.top_text_detected:
+            detected_regions.append("top")
+        if diagnostics.bottom_text_detected:
+            detected_regions.append("bottom")
+        if not detected_regions:
+            return f"OCR diagnostics sampled {diagnostics.sample_count} frames and found no top/bottom text"
+
+        snippets = list(diagnostics.top_snippets[:2] + diagnostics.bottom_snippets[:2])
+        snippet_text = ", ".join(f'"{snippet}"' for snippet in snippets[:3])
+        confidence_text = (
+            f" at {diagnostics.average_confidence:.1f}% average confidence"
+            if diagnostics.average_confidence is not None
+            else ""
+        )
+        return (
+            f"OCR diagnostics detected {' and '.join(detected_regions)} text"
+            f"{confidence_text}: {snippet_text}"
+        )
 
     def _on_generate_text_drafts_clicked(self) -> None:
         item = self._processing_selected_item()
         if item is None or not item.file_path:
             self._notify("Select a downloaded video first.", Tone.WARNING)
             return
+        if can_generate_smart_drafts():
+            if self._try_start_followup_smart_drafts(
+                transcript_text="",
+                transcript_failure=(
+                    "Visual-first generation skips speech transcription by default."
+                ),
+            ):
+                return
         self._start_transcript_draft_job(
             TranscriptDraftJobConfig(
                 input_path=Path(item.file_path),
@@ -3227,14 +4599,23 @@ class MainWindow(QWidget):
             return
 
         account = self._active_account()
+        recent_titles, recent_captions = self._recent_smart_drafts_for_account(
+            account_id=item.account_id,
+            exclude_item_id=item.id,
+        )
         self._start_smart_draft_job(
             SmartDraftJobConfig(
                 transcript_text=transcript_text,
                 source_title=item.title,
                 niche_label=account.niche_label if account is not None else None,
+                source_description=item.source_description,
                 input_path=Path(item.file_path) if item.file_path else None,
                 transcript_available=bool(transcript_text),
-                account_voice=self._account_voice_config(account),
+                account_voice=self._processing_account_voice_config(account),
+                prompt_profile=self._processing_prompt_profile(),
+                caption_style=self._processing_caption_style(),
+                recent_titles=recent_titles,
+                recent_captions=recent_captions,
             )
         )
 
@@ -3257,6 +4638,7 @@ class MainWindow(QWidget):
             "Generated drafts from the transcript. Review them, edit if needed, then save."
         )
         self._processing_progress_label.setText("Drafts generated.")
+        self._hide_activity_bar_if_idle()
         self._notify("Generated transcript, title, and caption drafts.", Tone.SUCCESS)
 
     def _on_transcript_draft_failed(self, message: str) -> None:
@@ -3269,6 +4651,7 @@ class MainWindow(QWidget):
             return
         self._processing_draft_status_label.setText("Could not generate drafts.")
         self._processing_progress_label.setText("Draft generation failed.")
+        self._hide_activity_bar_if_idle()
         self._notify(f"Draft generation failed: {message}", Tone.ERROR)
 
     def _on_smart_draft_completed(self, payload: dict) -> None:
@@ -3286,6 +4669,10 @@ class MainWindow(QWidget):
             vision_payload=vision_payload_text,
             generated_at=dt.datetime.now(dt.timezone.utc),
         )
+        self._processing_vision_payload = self._parse_processing_vision_payload(
+            payload.get("vision_payload")
+        )
+        self._apply_ai_layout_suggestion(payload.get("vision_payload"))
         self._set_processing_smart_options(title_options, caption_options)
 
         if title_options:
@@ -3296,25 +4683,33 @@ class MainWindow(QWidget):
             self._processing_smart_option_buttons[0].setChecked(True)
 
         if used_fallback:
+            errors = self._processing_generation_meta_errors(generation_meta_text)
+            error_hint = f" Reason: {errors[0]}" if errors else ""
             self._processing_draft_status_label.setText(
-                f"Generated drafts with {provider_label}. The result may be less grounded than the primary provider path."
+                f"Generated drafts with {provider_label}. The result may be less grounded than the primary provider path.{error_hint}"
+            )
+            self._notify(
+                f"Generated fallback drafts because the primary provider failed.{error_hint}",
+                Tone.WARNING,
             )
         else:
             self._processing_draft_status_label.setText(
                 f"Generated smart draft options with {provider_label} and applied the first title/caption."
             )
+            self._notify(
+                f"Generated smart title and caption options with {provider_label}.", Tone.SUCCESS
+            )
         self._processing_progress_label.setText("Smart drafts generated.")
         item = self._processing_selected_item()
         if item is not None:
             self._persist_processing_draft_state(item.id)
-        self._notify(
-            f"Generated smart title and caption options with {provider_label}.", Tone.SUCCESS
-        )
+        self._hide_activity_bar_if_idle()
 
     def _on_smart_draft_failed(self, message: str) -> None:
         self._finish_processing_job()
         self._processing_draft_status_label.setText("Could not generate smart drafts.")
         self._processing_progress_label.setText("Smart draft generation failed.")
+        self._hide_activity_bar_if_idle()
         self._notify(f"Smart draft generation failed: {message}", Tone.ERROR)
 
     def _try_start_followup_smart_drafts(
@@ -3337,6 +4732,10 @@ class MainWindow(QWidget):
             return False
 
         account = self._active_account()
+        recent_titles, recent_captions = self._recent_smart_drafts_for_account(
+            account_id=item.account_id,
+            exclude_item_id=item.id,
+        )
         transcript_available = bool(transcript_text.strip())
         if transcript_available:
             self._processing_progress_label.setText(
@@ -3350,11 +4749,11 @@ class MainWindow(QWidget):
                 transcript_failure.strip() if transcript_failure else "No transcript was available."
             )
             self._processing_progress_label.setText(
-                "Generate Drafts: no speech found. Falling back to metadata-based generation..."
+                "Generate Drafts: using visual-first smart generation..."
             )
             self._processing_draft_status_label.setText(
-                f"{reason_text} Using source metadata to generate smart title and caption options instead. "
-                "If the available context is weak, generation may still need manual editing to match the exact moment."
+                f"{reason_text} Using source metadata and sampled frames to generate title and caption options. "
+                "Review the result against the exact visible moment before saving."
             )
 
         self._start_smart_draft_job(
@@ -3362,9 +4761,14 @@ class MainWindow(QWidget):
                 transcript_text=transcript_text.strip(),
                 source_title=item.title,
                 niche_label=account.niche_label if account is not None else None,
+                source_description=item.source_description,
                 input_path=Path(item.file_path) if item.file_path else None,
                 transcript_available=transcript_available,
-                account_voice=self._account_voice_config(account),
+                account_voice=self._processing_account_voice_config(account),
+                prompt_profile=self._processing_prompt_profile(),
+                caption_style=self._processing_caption_style(),
+                recent_titles=recent_titles,
+                recent_captions=recent_captions,
             )
         )
         return True
@@ -3447,24 +4851,54 @@ class MainWindow(QWidget):
             return
 
         try:
-            output_path = processed_output_path(Path(item.file_path), processed_dir())
+            input_path = Path(item.file_path)
+            output_path = self._processed_output_path_for_item(item)
+            title_layout = str(self._processing_title_layout_combo.currentData() or "top_band")
+            title_text = (
+                None
+                if title_layout == "no_title"
+                else self._processing_title_draft_input.text().strip() or item.title or None
+            )
+            probe = probe_video(input_path)
+            if self._should_use_title_replacement_crop(item):
+                try:
+                    replacement_crop = suggest_title_replacement_crop(input_path, probe)
+                except Exception:  # noqa: BLE001
+                    replacement_crop = CropSettings()
+                if replacement_crop != CropSettings():
+                    self._processing_auto_crop = replacement_crop
+                    self._set_processing_manual_crop_values(
+                        replacement_crop.top, replacement_crop.bottom
+                    )
+                    self._processing_using_ai_layout_crop = True
+                    self._processing_suggestion_label.setText(
+                        "Black Canvas replacement crop applied automatically: "
+                        f"t{replacement_crop.top}/b{replacement_crop.bottom}/"
+                        f"l{replacement_crop.left}/r{replacement_crop.right}px."
+                    )
             pending_job = ProcessJobConfig(
-                input_path=Path(item.file_path),
+                input_path=input_path,
                 output_path=output_path,
-                crop=CropSettings(),
-                title_text=self._processing_title_draft_input.text().strip() or item.title or None,
+                crop=self._processing_crop_settings(),
+                title_text=title_text,
                 title_font_size=self._processing_title_font_size.value(),
                 title_font_name=str(self._processing_title_font_combo.currentData() or "segoe_ui"),
                 title_color=self._processing_title_color_input.text().strip() or "#FFFFFF",
                 title_background=str(
                     self._processing_title_background_combo.currentData() or "none"
                 ),
+                title_layout=title_layout,
             )
-            probe_video(Path(item.file_path))
         except Exception as exc:  # noqa: BLE001
             self._notify(f"Could not start processing: {exc}", Tone.ERROR)
             return
 
+        if self._processing_using_ai_layout_crop:
+            self._start_processing_job(pending_job)
+            return
+        if self._has_manual_crop_override():
+            self._start_processing_job(pending_job)
+            return
         self._processing_pending_job = pending_job
         self._start_suggest_crop_job(SuggestCropJobConfig(input_path=Path(item.file_path)))
 
@@ -3480,7 +4914,7 @@ class MainWindow(QWidget):
 
         if self._processing_preview_frame_iter is None:
             self._load_processing_preview(self._processing_preview_path)
-        self._processing_preview_timer.start()
+        self._processing_preview_timer.start(1)
         self._processing_toggle_preview_button.setText("Pause Video")
 
     def _on_processing_preview_seek(self, position: int) -> None:
@@ -3490,8 +4924,12 @@ class MainWindow(QWidget):
         duration = self._processing_effective_duration_ms()
         if duration <= 0:
             return
+        was_playing = self._processing_preview_timer.isActive()
         next_position = max(0, min(self._processing_preview_position_ms + delta_ms, duration))
         self._seek_processing_preview(next_position)
+        if was_playing:
+            self._processing_preview_timer.start(1)
+            self._processing_toggle_preview_button.setText("Pause Video")
 
     def _load_processing_preview(self, path: Path) -> None:
         self._stop_processing_preview()
@@ -3529,6 +4967,7 @@ class MainWindow(QWidget):
         stream = self._processing_preview_stream
         if container is None or stream is None:
             return
+        was_playing = self._processing_preview_timer.isActive()
         self._processing_preview_timer.stop()
         if stream.time_base is not None:
             target_pts = int((position_ms / 1000) / float(stream.time_base))
@@ -3538,8 +4977,13 @@ class MainWindow(QWidget):
                 pass
         self._processing_preview_frame_iter = container.decode(video=0)
         self._processing_preview_position_ms = max(position_ms, 0)
+        self._processing_preview_last_frame_ms = None
         self._render_processing_frame_at_or_after(position_ms / 1000)
-        self._processing_toggle_preview_button.setText("Play Full Video")
+        if was_playing:
+            self._processing_preview_timer.start(1)
+            self._processing_toggle_preview_button.setText("Pause Video")
+        else:
+            self._processing_toggle_preview_button.setText("Play Full Video")
 
     def _render_processing_frame_at_or_after(self, target_seconds: float) -> None:
         if self._processing_preview_frame_iter is None:
@@ -3569,11 +5013,23 @@ class MainWindow(QWidget):
             return
         self._display_processing_frame(frame)
         frame_time = float(frame.time) if frame.time is not None else 0.0
+        previous_frame_ms = self._processing_preview_last_frame_ms
         self._processing_preview_position_ms = int(frame_time * 1000)
+        self._processing_preview_last_frame_ms = self._processing_preview_position_ms
         self._processing_preview_position_slider.setValue(self._processing_preview_position_ms)
         self._processing_preview_time_label.setText(
             f"{self._format_media_time(self._processing_preview_position_ms)} / {self._format_media_time(self._processing_effective_duration_ms())}"
         )
+        delay_ms = self._processing_next_frame_delay(previous_frame_ms)
+        self._processing_preview_timer.start(delay_ms)
+
+    def _processing_next_frame_delay(self, previous_frame_ms: int | None) -> int:
+        if previous_frame_ms is None:
+            return 16
+        frame_delta = self._processing_preview_position_ms - previous_frame_ms
+        if frame_delta <= 0:
+            return 16
+        return max(16, min(frame_delta, 80))
 
     def _display_processing_frame(self, frame) -> None:  # noqa: ANN001
         rgb_frame = frame.to_rgb()
@@ -3608,6 +5064,7 @@ class MainWindow(QWidget):
         self._processing_preview_frame_iter = None
         self._processing_preview_duration_ms = 0
         self._processing_preview_position_ms = 0
+        self._processing_preview_last_frame_ms = None
 
     def _processing_effective_duration_ms(self) -> int:
         probe_duration = (
@@ -3639,8 +5096,46 @@ class MainWindow(QWidget):
         self._processing_progress_label.setText("Processing failed.")
         self._notify(f"Processing failed: {message}", Tone.ERROR)
 
+    @staticmethod
+    def _safe_account_folder_name(account: Account | None) -> str:
+        raw_name = (account.name if account is not None else "").strip()
+        if not raw_name:
+            return "unassigned"
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_name).strip("._-")
+        return safe_name or "unassigned"
+
+    def _processed_output_dir_for_account_id(self, account_id: int | None) -> Path:
+        if account_id is None:
+            return processed_dir() / "unassigned"
+        with get_session() as session:
+            account = session.get(Account, account_id)
+            return processed_dir() / self._safe_account_folder_name(account)
+
+    def _processed_output_dir_for_current_account(self) -> Path:
+        return self._processed_output_dir_for_account_id(self._current_account_id)
+
+    def _processed_output_path_for_item(self, item: DownloadItem) -> Path | None:
+        if not item.file_path:
+            return None
+        return processed_output_path(
+            Path(item.file_path),
+            self._processed_output_dir_for_account_id(item.account_id),
+        )
+
+    def _existing_processed_output_path_for_item(self, item: DownloadItem) -> Path | None:
+        if not item.file_path:
+            return None
+        paths = [
+            processed_output_path(
+                Path(item.file_path),
+                self._processed_output_dir_for_account_id(item.account_id),
+            ),
+            processed_output_path(Path(item.file_path), processed_dir()),
+        ]
+        return next((path for path in paths if path.exists()), None)
+
     def _on_open_processed_folder_clicked(self) -> None:
-        path = processed_dir()
+        path = self._processed_output_dir_for_current_account()
         path.mkdir(parents=True, exist_ok=True)
         try:
             os.startfile(str(path))
@@ -3659,16 +5154,224 @@ class MainWindow(QWidget):
         except OSError as exc:
             self._notify(f"Could not open the processed output: {exc}", Tone.ERROR)
 
+    def _on_add_processed_to_schedule_clicked(self) -> None:
+        item = self._processing_selected_item()
+        if item is None:
+            self._notify("Select a processed video first.", Tone.WARNING)
+            return
+
+        output_path = self._processing_last_output_path
+        if (output_path is None or not output_path.exists()) and item.file_path:
+            output_path = self._existing_processed_output_path_for_item(item)
+        if output_path is None or not output_path.exists():
+            self._notify("Process the video before adding it to the schedule.", Tone.WARNING)
+            return
+        if item.account_id is None:
+            self._notify("Assign the video to an account before scheduling it.", Tone.WARNING)
+            return
+
+        title = self._processing_title_draft_input.text().strip() or item.title or None
+        description = self._processing_caption_draft_input.toPlainText().strip() or None
+        with get_session() as session:
+            account = session.get(Account, item.account_id)
+            if account is None:
+                self._notify("The selected account no longer exists.", Tone.WARNING)
+                return
+            existing_job = (
+                session.query(UploadJob)
+                .filter(UploadJob.account_id == account.id)
+                .filter(UploadJob.processed_path == str(output_path))
+                .one_or_none()
+            )
+            scheduled_at = self._next_upload_slot(account.upload_schedule_slots)
+            status = "scheduled" if scheduled_at is not None else "draft"
+            timezone_label = account.upload_timezone or "Asia/Bangkok"
+            privacy_status = account.upload_default_privacy or "private"
+            if existing_job is None:
+                session.add(
+                    UploadJob(
+                        account_id=account.id,
+                        download_item_id=item.id,
+                        processed_path=str(output_path),
+                        title=title,
+                        description=description,
+                        scheduled_at=scheduled_at,
+                        timezone=timezone_label,
+                        privacy_status=privacy_status,
+                        made_for_kids=int(account.upload_made_for_kids or 0),
+                        contains_synthetic_media=int(account.upload_contains_synthetic_media or 0),
+                        status=status,
+                    )
+                )
+            else:
+                existing_job.download_item_id = item.id
+                existing_job.title = title
+                existing_job.description = description
+                existing_job.scheduled_at = scheduled_at
+                existing_job.timezone = timezone_label
+                existing_job.privacy_status = privacy_status
+                existing_job.made_for_kids = int(account.upload_made_for_kids or 0)
+                existing_job.contains_synthetic_media = int(
+                    account.upload_contains_synthetic_media or 0
+                )
+                existing_job.status = status
+                existing_job.error_message = None
+            session.commit()
+
+        self._refresh_schedule_page()
+        self._notify_and_refresh("Added processed video to the upload schedule.", Tone.SUCCESS)
+
     def _set_current_page(self, page_name: str) -> None:
         if page_name not in MODULE_PAGES:
             return
         self._current_page = page_name
         page_index = MODULE_PAGES.index(page_name)
         self._workspace_stack.setCurrentIndex(page_index)
+        self._workspace_stack.updateGeometry()
+        self._workspace_content.updateGeometry()
         self._refresh_runtime_fields()
         self._sync_sidebar_selection()
         self._sync_account_panel_visibility()
         self._apply_refresh(force=True, preserve_status=True)
+        self._sync_workspace_page_size()
+        self._reset_workspace_scroll_to_top()
+
+    def _reset_workspace_scroll_to_top(self) -> None:
+        self._set_workspace_scroll_to_top_now()
+        if self._current_page == "processing":
+            return
+        for delay_ms in (0, 25, 100):
+            QTimer.singleShot(delay_ms, self._set_workspace_scroll_to_top_now)
+
+    def _set_workspace_scroll_to_top_now(self) -> None:
+        try:
+            self._scroll_area.verticalScrollBar().setValue(0)
+        except RuntimeError:
+            return
+
+    def _sync_workspace_page_size(self) -> None:
+        if self._current_page == "scraping" and self._workspace_content.isVisible():
+            height = max(self._scroll_area.viewport().height(), 1)
+            for widget in (
+                self._scraping_page,
+                self._workspace_stack,
+                self._workspace_content,
+                self._scroll_area.widget(),
+            ):
+                if widget is not None:
+                    widget.setFixedHeight(height)
+            self._resize_scrape_tabs_height()
+            self._scroll_area.verticalScrollBar().setValue(0)
+            return
+
+        if self._current_page == "uploads" and self._workspace_content.isVisible():
+            height = max(self._scroll_area.viewport().height(), 1)
+            for widget in (
+                self._uploads_page,
+                self._workspace_stack,
+                self._workspace_content,
+                self._scroll_area.widget(),
+            ):
+                if widget is not None:
+                    widget.setFixedHeight(height)
+            self._resize_schedule_table_height()
+            self._scroll_area.verticalScrollBar().setValue(0)
+            return
+
+        if self._current_page == "downloads" and self._workspace_content.isVisible():
+            height = max(
+                self._downloads_page.sizeHint().height(),
+                self._scroll_area.viewport().height(),
+            )
+            for widget in (
+                self._downloads_page,
+                self._workspace_stack,
+                self._workspace_content,
+                self._scroll_area.widget(),
+            ):
+                if widget is not None:
+                    widget.setFixedHeight(height)
+            self._scroll_area.verticalScrollBar().setValue(0)
+            return
+
+        if self._current_page == "processing":
+            height = max(
+                self._processing_page.sizeHint().height(),
+                self._scroll_area.viewport().height() + 260,
+                1080,
+            )
+            for widget in (
+                self._processing_page,
+                self._workspace_stack,
+                self._workspace_content,
+                self._scroll_area.widget(),
+            ):
+                if widget is not None:
+                    widget.setFixedHeight(height)
+            return
+
+        for widget in (
+            self._scraping_page,
+            self._processing_page,
+            self._downloads_page,
+            self._uploads_page,
+            self._workspace_stack,
+            self._workspace_content,
+            self._scroll_area.widget(),
+        ):
+            if widget is not None:
+                widget.setMinimumHeight(0)
+                widget.setMaximumHeight(16777215)
+                widget.updateGeometry()
+
+    def _resize_scrape_tabs_height(self) -> None:
+        if not hasattr(self, "_scrape_intake_panel"):
+            return
+
+        layout = self._scrape_intake_panel.layout()
+        margins = layout.contentsMargins()
+        spacing = layout.spacing()
+        fixed_widgets = (
+            self._scrape_intake_title,
+            self._scrape_intake_hint,
+            self._scrape_summary_label,
+            self._scrape_progress_label,
+            self._scrape_progress_bar,
+        )
+        fixed_height = sum(
+            widget.sizeHint().height() for widget in fixed_widgets if widget.isVisible()
+        )
+        source_row_height = self._scrape_intake_source_row.sizeHint().height()
+        instagram_row_height = self._instagram_discover_row.sizeHint().height()
+        instagram_log_height = (
+            self._instagram_discover_log.sizeHint().height()
+            if self._instagram_discover_log.isVisible()
+            else 0
+        )
+        visible_block_count = sum(
+            1
+            for height in (
+                fixed_height,
+                source_row_height,
+                instagram_row_height,
+                instagram_log_height,
+            )
+            if height > 0
+        )
+        reserved_height = (
+            margins.top()
+            + margins.bottom()
+            + fixed_height
+            + source_row_height
+            + instagram_row_height
+            + instagram_log_height
+            + (spacing * max(visible_block_count, 0))
+        )
+        target_height = max(
+            420,
+            self._scroll_area.viewport().height() - reserved_height - spacing,
+        )
+        self._scrape_tabs.setFixedHeight(target_height)
 
     def _sync_sidebar_selection(self) -> None:
         for page_name, button in self._module_buttons.items():
@@ -3681,6 +5384,8 @@ class MainWindow(QWidget):
     def resizeEvent(self, event) -> None:  # noqa: ANN001
         super().resizeEvent(event)
         self._position_toast()
+        if hasattr(self, "_scroll_area"):
+            self._sync_workspace_page_size()
 
     def _position_toast(self) -> None:
         if not self._toast_label.isVisible():
@@ -3700,6 +5405,45 @@ class MainWindow(QWidget):
     def _set_status(self, message: str, tone: str = Tone.INFO) -> None:
         self._status_label.setText(message)
         self._set_tone(self._status_label, tone)
+        self._activity_status_label.setText(message)
+        self._set_tone(self._activity_bar, tone)
+
+    def _show_activity_progress(
+        self,
+        message: str,
+        *,
+        minimum: int = 0,
+        maximum: int = 1,
+        value: int = 0,
+        text_visible: bool = False,
+        fmt: str = "",
+        tone: str = Tone.INFO,
+    ) -> None:
+        self._activity_bar.setVisible(True)
+        self._activity_status_label.setText(message)
+        self._set_tone(self._activity_bar, tone)
+        self._activity_progress_bar.setVisible(True)
+        self._activity_progress_bar.setTextVisible(text_visible)
+        self._activity_progress_bar.setMinimum(minimum)
+        self._activity_progress_bar.setMaximum(maximum)
+        self._activity_progress_bar.setValue(value)
+        self._activity_progress_bar.setFormat(fmt)
+
+    def _hide_activity_progress(self) -> None:
+        self._activity_progress_bar.setRange(0, 1)
+        self._activity_progress_bar.setValue(0)
+        self._activity_progress_bar.setFormat("")
+        self._activity_progress_bar.setVisible(False)
+
+    def _hide_activity_bar_if_idle(self) -> None:
+        if (
+            self._scrape_in_progress
+            or self._instagram_discover_in_progress
+            or self._processing_in_progress
+        ):
+            return
+        self._hide_activity_progress()
+        self._activity_bar.setVisible(False)
 
     def _refresh_runtime_fields(self) -> None:
         if not hasattr(self, "_runtime_fields"):
@@ -3948,12 +5692,51 @@ class MainWindow(QWidget):
         return sources
 
     def _current_selected_source(self) -> Source | None:
-        if self._selected_source_id is None:
+        source_id = self._selected_source_id
+        if source_id is None:
+            source_id = self._source_id_for_current_row()
+        if source_id is None:
             return None
         return next(
-            (source for source in self._displayed_sources if source.id == self._selected_source_id),
+            (source for source in self._displayed_sources if source.id == source_id),
             None,
         )
+
+    def _source_id_for_current_row(self) -> int | None:
+        if not hasattr(self, "_source_table"):
+            return None
+        row = self._source_table.currentRow()
+        if row < 0:
+            return None
+        for column in range(self._source_table.columnCount()):
+            item = self._source_table.item(row, column)
+            if item is None:
+                continue
+            source_id = item.data(Qt.ItemDataRole.UserRole)
+            if isinstance(source_id, int):
+                return source_id
+        return None
+
+    @staticmethod
+    def _normalize_source_for_platform(
+        source_url: str,
+        platform: str,
+    ) -> tuple[str | None, str | None]:
+        if platform == "instagram":
+            return normalize_instagram_source_url(source_url)
+        return normalize_youtube_source_url(source_url)
+
+    @staticmethod
+    def _infer_source_type_for_platform(source_url: str, platform: str) -> str:
+        if platform == "instagram":
+            return infer_instagram_source_type(source_url)
+        return infer_youtube_source_type(source_url)
+
+    @staticmethod
+    def _source_label_for_platform(source_url: str, platform: str) -> str:
+        if platform == "instagram":
+            return instagram_source_label(source_url)
+        return source_url.rstrip("/").rsplit("/", 1)[-1] or source_url
 
     def _ensure_source_rows(
         self,
@@ -3975,8 +5758,8 @@ class MainWindow(QWidget):
                     Source(
                         account_id=account_id,
                         platform=platform,
-                        source_type=infer_youtube_source_type(source_url),
-                        label=source_url.rstrip("/").rsplit("/", 1)[-1] or source_url,
+                        source_type=self._infer_source_type_for_platform(source_url, platform),
+                        label=self._source_label_for_platform(source_url, platform),
                         source_url=source_url,
                         enabled=1,
                         priority=100,
@@ -3990,7 +5773,14 @@ class MainWindow(QWidget):
         candidate = self._current_selected_candidate()
         selected_source = self._current_selected_source()
         workspace_enabled = self._current_account_id is not None
-        scrape_controls_enabled = workspace_enabled and not self._scrape_in_progress
+        scrape_controls_enabled = (
+            workspace_enabled
+            and not self._scrape_in_progress
+            and not self._instagram_discover_in_progress
+        )
+        instagram_discover_enabled = (
+            not self._scrape_in_progress and not self._instagram_discover_in_progress
+        )
         can_queue = workspace_enabled and candidate is not None and candidate.state != "queued"
         can_ignore = workspace_enabled and candidate is not None and candidate.state != "ignored"
         can_restore = workspace_enabled and candidate is not None and candidate.state == "ignored"
@@ -4005,6 +5795,15 @@ class MainWindow(QWidget):
         self._scrape_selected_button.setEnabled(can_scrape_selected)
         self._scrape_source_input.setEnabled(scrape_controls_enabled)
         self._scrape_add_source_button.setEnabled(scrape_controls_enabled)
+        self._instagram_discover_source_combo.setEnabled(instagram_discover_enabled)
+        self._instagram_discover_min_new_input.setEnabled(instagram_discover_enabled)
+        self._instagram_discover_min_likes_input.setEnabled(instagram_discover_enabled)
+        self._instagram_deep_search_checkbox.setEnabled(instagram_discover_enabled)
+        self._candidate_sort_combo.setEnabled(workspace_enabled)
+        self._candidate_sort_direction_combo.setEnabled(workspace_enabled)
+        self._instagram_discover_button.setEnabled(
+            instagram_discover_enabled and self._instagram_discover_source_combo.currentData() is not None
+        )
         self._source_table.setEnabled(workspace_enabled)
         self._source_filter.setEnabled(workspace_enabled)
         self._source_sort.setEnabled(workspace_enabled)
@@ -4015,11 +5814,9 @@ class MainWindow(QWidget):
             scrape_controls_enabled and selected_source is not None
         )
         if selected_source is None:
-            self._source_toggle_button.setText("Disable Source")
+            self._source_toggle_button.setText("Disable")
         else:
-            self._source_toggle_button.setText(
-                "Disable Source" if selected_source.enabled else "Enable Source"
-            )
+            self._source_toggle_button.setText("Disable" if selected_source.enabled else "Enable")
         self._candidate_table.setEnabled(workspace_enabled)
         self._candidate_state_filter.setEnabled(workspace_enabled)
         self._candidate_queue_button.setText(self._candidate_queue_button_text(candidate))
@@ -4040,6 +5837,12 @@ class MainWindow(QWidget):
         if self._current_account_id is None:
             return "Select an account to review intake candidates."
         if candidate is None:
+            if not self._displayed_candidates:
+                selected_source = self._current_selected_source()
+                if selected_source is not None:
+                    return "No candidates yet. Go to Sources and click Scrape Selected."
+                if self._displayed_sources:
+                    return "No candidates yet. Select a source, then add candidates from it."
             return "Select a candidate to review it."
 
         normalized_state = "candidate" if candidate.state == "new" else candidate.state
@@ -4061,7 +5864,7 @@ class MainWindow(QWidget):
         review_filter = self._review_filter.currentData()
         if self._current_account_id is None:
             return False
-        if item.account_id not in {self._current_account_id, None}:
+        if item.account_id != self._current_account_id:
             return False
 
         if status_filter != "All statuses" and item.status != status_filter:
@@ -4097,19 +5900,343 @@ class MainWindow(QWidget):
         size_kib = size_bytes / 1024
         return f"Present on disk, {size_kib:.1f} KiB"
 
-    def _schedule_status_text(self, item: DownloadItem) -> str:
-        if not self._item_exists(item):
-            return "Missing file"
-        if item.title_draft and item.caption_draft:
-            return "Ready for scheduler"
-        if item.title_draft or item.caption_draft or item.smart_summary:
-            return "Needs final edit"
-        return "Needs preprocessing"
+    def _file_size_text(self, item: DownloadItem) -> str:
+        if not item.file_path:
+            return "-"
+
+        path = Path(item.file_path)
+        if not path.exists():
+            return "Missing"
+
+        size_bytes = path.stat().st_size
+        if size_bytes >= 1024 * 1024 * 1024:
+            return f"{size_bytes / (1024 * 1024 * 1024):.2f} GiB"
+        if size_bytes >= 1024 * 1024:
+            return f"{size_bytes / (1024 * 1024):.1f} MiB"
+        return f"{size_bytes / 1024:.1f} KiB"
+
+    @staticmethod
+    def _next_upload_slot(schedule_slots: str | None) -> dt.datetime | None:
+        if not schedule_slots:
+            return None
+
+        now = dt.datetime.now().astimezone()
+        candidates: list[dt.datetime] = []
+        for raw_slot in schedule_slots.replace("\n", ",").replace(";", ",").split(","):
+            slot = raw_slot.strip()
+            if not slot:
+                continue
+            try:
+                hour_text, minute_text = slot.split(":", 1)
+                hour = int(hour_text)
+                minute = int(minute_text)
+                if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+                    continue
+            except ValueError:
+                continue
+            candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if candidate <= now:
+                candidate += dt.timedelta(days=1)
+            candidates.append(candidate)
+        if not candidates:
+            return None
+        return min(candidates)
+
+    @staticmethod
+    def _upload_scheduled_text(job: UploadJob) -> str:
+        if job.scheduled_at is None:
+            return "(unscheduled)"
+        scheduled_at = job.scheduled_at
+        if scheduled_at.tzinfo is None:
+            scheduled_at = scheduled_at.replace(tzinfo=dt.timezone.utc)
+        timezone_text = f" {job.timezone}" if job.timezone else ""
+        return f"{scheduled_at.astimezone().strftime('%Y-%m-%d %H:%M')}{timezone_text}"
+
+    @staticmethod
+    def _upload_status_text(job: UploadJob) -> str:
+        if job.status == "failed":
+            return "Failed"
+        if not Path(job.processed_path).exists():
+            return "Missing output"
+        if job.posted_at is not None:
+            return "Posted"
+        if job.status == "posted":
+            return "Posted"
+        if job.status == "uploaded":
+            return "Posted"
+        if job.status == "uploading":
+            return "Uploading"
+        if job.status == "ready":
+            return "Ready"
+        if job.status == "skipped":
+            return "Skipped"
+        if job.status == "scheduled":
+            return "Scheduled"
+        return "Draft"
+
+    @staticmethod
+    def _datetime_to_qdatetime(value: dt.datetime) -> QDateTime:
+        local_value = value.astimezone() if value.tzinfo is not None else value
+        return QDateTime(
+            QDate(local_value.year, local_value.month, local_value.day),
+            QTime(local_value.hour, local_value.minute),
+        )
+
+    @staticmethod
+    def _job_schedule_local_datetime(job: UploadJob | None) -> dt.datetime:
+        if job is None or job.scheduled_at is None:
+            now = dt.datetime.now().astimezone()
+            return (now + dt.timedelta(hours=1)).replace(second=0, microsecond=0)
+        scheduled_at = job.scheduled_at
+        if scheduled_at.tzinfo is None:
+            scheduled_at = scheduled_at.replace(tzinfo=dt.timezone.utc)
+        return scheduled_at.astimezone().replace(second=0, microsecond=0)
+
+    def _selected_schedule_job_id(self) -> int | None:
+        selected_items = self._schedule_table.selectedItems()
+        if not selected_items:
+            return None
+        job_id = selected_items[0].data(Qt.ItemDataRole.UserRole)
+        return int(job_id) if job_id is not None else None
+
+    def _on_schedule_selection_changed(self) -> None:
+        has_selection = self._selected_schedule_job_id() is not None
+        self._schedule_copy_caption_button.setEnabled(has_selection)
+        self._schedule_open_output_button.setEnabled(has_selection)
+        self._schedule_copy_path_button.setEnabled(has_selection)
+        self._schedule_open_folder_button.setEnabled(has_selection)
+        self._schedule_status_combo.setEnabled(has_selection)
+        self._schedule_datetime_edit.setEnabled(has_selection)
+        self._schedule_save_time_button.setEnabled(has_selection)
+        self._schedule_clear_time_button.setEnabled(has_selection)
+        self._refresh_schedule_caption_preview()
+        self._refresh_schedule_status_combo()
+        self._refresh_schedule_time_editor()
+
+    def _selected_schedule_job(self) -> UploadJob | None:
+        job_id = self._selected_schedule_job_id()
+        if job_id is None:
+            return None
+        with get_session() as session:
+            job = (
+                session.query(UploadJob)
+                .options(joinedload(UploadJob.download_item))
+                .filter(UploadJob.id == job_id)
+                .one_or_none()
+            )
+            if job is None:
+                return None
+            try:
+                session.expunge(job)
+            except Exception:  # noqa: BLE001
+                pass
+            return job
+
+    def _schedule_caption_text_for_job(self, job: UploadJob) -> str:
+        title = (job.title or "").strip()
+        caption = (job.description or "").strip()
+        mode = str(self._schedule_caption_combo.currentData() or "caption")
+        if mode == "title":
+            return title
+        if mode == "title_caption":
+            return "\n\n".join(part for part in (title, caption) if part)
+        return caption or title
+
+    def _refresh_schedule_caption_preview(self) -> None:
+        if not hasattr(self, "_schedule_caption_preview"):
+            return
+        job = self._selected_schedule_job()
+        if job is None:
+            self._schedule_caption_preview.clear()
+            return
+        self._schedule_caption_preview.setPlainText(self._schedule_caption_text_for_job(job))
+
+    def _refresh_schedule_status_combo(self) -> None:
+        if not hasattr(self, "_schedule_status_combo"):
+            return
+        job = self._selected_schedule_job()
+        self._schedule_status_combo.blockSignals(True)
+        if job is None:
+            self._schedule_status_combo.setCurrentIndex(0)
+        else:
+            status = "posted" if job.posted_at is not None else (job.status or "draft")
+            index = self._schedule_status_combo.findData(status)
+            self._schedule_status_combo.setCurrentIndex(index if index >= 0 else 0)
+        self._schedule_status_combo.blockSignals(False)
+
+    def _refresh_schedule_time_editor(self) -> None:
+        if not hasattr(self, "_schedule_datetime_edit"):
+            return
+        job = self._selected_schedule_job()
+        self._schedule_datetime_edit.blockSignals(True)
+        self._schedule_datetime_edit.setDateTime(
+            self._datetime_to_qdatetime(self._job_schedule_local_datetime(job))
+        )
+        self._schedule_datetime_edit.blockSignals(False)
+
+    def _on_schedule_status_combo_changed(self) -> None:
+        job_id = self._selected_schedule_job_id()
+        if job_id is None:
+            return
+        status = str(self._schedule_status_combo.currentData() or "draft")
+        with get_session() as session:
+            job = session.get(UploadJob, job_id)
+            if job is None:
+                return
+            job.status = status
+            job.posted_at = dt.datetime.now(dt.timezone.utc) if status == "posted" else None
+            job.error_message = None
+            session.commit()
+        self._refresh_schedule_page()
+        self._notify("Updated publish status.", Tone.SUCCESS)
+
+    def _on_save_schedule_time_clicked(self) -> None:
+        job_id = self._selected_schedule_job_id()
+        if job_id is None:
+            self._notify("Select a publish job first.", Tone.WARNING)
+            return
+
+        selected_datetime = self._schedule_datetime_edit.dateTime().toPyDateTime()
+        scheduled_at = selected_datetime.astimezone(dt.timezone.utc)
+        with get_session() as session:
+            job = session.get(UploadJob, job_id)
+            if job is None:
+                self._notify("The selected publish job no longer exists.", Tone.WARNING)
+                self._refresh_schedule_page()
+                return
+            job.scheduled_at = scheduled_at
+            if job.status in {None, "", "draft", "ready"}:
+                job.status = "scheduled"
+            job.error_message = None
+            session.commit()
+
+        self._refresh_schedule_page()
+        self._notify("Updated scheduled time.", Tone.SUCCESS)
+
+    def _on_clear_schedule_time_clicked(self) -> None:
+        job_id = self._selected_schedule_job_id()
+        if job_id is None:
+            self._notify("Select a publish job first.", Tone.WARNING)
+            return
+
+        with get_session() as session:
+            job = session.get(UploadJob, job_id)
+            if job is None:
+                self._notify("The selected publish job no longer exists.", Tone.WARNING)
+                self._refresh_schedule_page()
+                return
+            job.scheduled_at = None
+            if job.status == "scheduled":
+                job.status = "draft"
+            job.error_message = None
+            session.commit()
+
+        self._refresh_schedule_page()
+        self._notify("Cleared scheduled time.", Tone.SUCCESS)
+
+    def _on_copy_schedule_caption_clicked(self) -> None:
+        job = self._selected_schedule_job()
+        if job is None:
+            self._notify("Select a publish job first.", Tone.WARNING)
+            return
+
+        QApplication.clipboard().setText(self._schedule_caption_text_for_job(job))
+        self._notify("Copied caption.", Tone.SUCCESS)
+
+    def _on_copy_schedule_path_clicked(self) -> None:
+        job = self._selected_schedule_job()
+        if job is None:
+            self._notify("Select a publish job first.", Tone.WARNING)
+            return
+        QApplication.clipboard().setText(str(Path(job.processed_path)))
+        self._notify("Copied video path.", Tone.SUCCESS)
+
+    def _on_open_schedule_folder_clicked(self) -> None:
+        job = self._selected_schedule_job()
+        if job is None:
+            self._notify("Select a publish job first.", Tone.WARNING)
+            return
+        output_path = Path(job.processed_path)
+        folder = output_path.parent
+        if not folder.exists():
+            self._notify("The output folder is missing.", Tone.ERROR)
+            return
+        os.startfile(str(folder))
+        self._notify("Opened output folder.", Tone.SUCCESS)
+
+    def _on_open_schedule_output_clicked(self) -> None:
+        job_id = self._selected_schedule_job_id()
+        if job_id is None:
+            self._notify("Select a publish job first.", Tone.WARNING)
+            return
+
+        with get_session() as session:
+            job = session.get(UploadJob, job_id)
+            if job is None:
+                self._notify("The selected publish job no longer exists.", Tone.WARNING)
+                self._refresh_schedule_page()
+                return
+            output_path = Path(job.processed_path)
+
+        if not output_path.exists():
+            self._notify("Reel output file is missing.", Tone.ERROR)
+            return
+
+        os.startfile(str(output_path))
+        self._notify("Opened reel output.", Tone.SUCCESS)
+
+    def _sync_processed_outputs_to_upload_jobs(self) -> None:
+        if self._current_account_id is None:
+            return
+
+        with get_session() as session:
+            account = session.get(Account, self._current_account_id)
+            if account is None:
+                return
+
+            existing_paths = {
+                job.processed_path
+                for job in session.query(UploadJob).filter(UploadJob.account_id == account.id).all()
+            }
+            items = session.query(DownloadItem).filter(DownloadItem.account_id == account.id).all()
+            created = False
+            for item in items:
+                if not item.file_path:
+                    continue
+                output_path = self._existing_processed_output_path_for_item(item)
+                if output_path is None:
+                    continue
+                output_path_text = str(output_path)
+                if not output_path.exists() or output_path_text in existing_paths:
+                    continue
+
+                scheduled_at = self._next_upload_slot(account.upload_schedule_slots)
+                session.add(
+                    UploadJob(
+                        account_id=account.id,
+                        download_item_id=item.id,
+                        processed_path=output_path_text,
+                        title=item.title_draft or item.title,
+                        description=item.caption_draft,
+                        scheduled_at=scheduled_at,
+                        timezone=account.upload_timezone or "Asia/Bangkok",
+                        privacy_status=account.upload_default_privacy or "private",
+                        made_for_kids=int(account.upload_made_for_kids or 0),
+                        contains_synthetic_media=int(account.upload_contains_synthetic_media or 0),
+                        status="scheduled" if scheduled_at is not None else "draft",
+                    )
+                )
+                existing_paths.add(output_path_text)
+                created = True
+
+            if created:
+                session.commit()
 
     def _refresh_schedule_page(self) -> None:
         if not hasattr(self, "_schedule_table"):
             return
 
+        selected_job_id = self._selected_schedule_job_id()
         workspace_enabled = self._current_account_id is not None
         self._schedule_table.setEnabled(workspace_enabled)
         self._schedule_table.blockSignals(True)
@@ -4119,45 +6246,120 @@ class MainWindow(QWidget):
             self._schedule_summary_label.setText(
                 "Select an account workspace to review schedule drafts."
             )
+            self._schedule_caption_preview.clear()
+            self._schedule_status_combo.setEnabled(False)
+            self._resize_schedule_table_height()
             self._schedule_table.blockSignals(False)
             return
 
-        schedule_items = [
-            item
-            for item in self._displayed_items
-            if item.status == "downloaded" and item.review_state != "rejected"
-        ]
-        for item in schedule_items:
+        self._sync_processed_outputs_to_upload_jobs()
+
+        with get_session() as session:
+            schedule_jobs = (
+                session.query(UploadJob)
+                .options(joinedload(UploadJob.account), joinedload(UploadJob.download_item))
+                .filter(UploadJob.account_id == self._current_account_id)
+                .order_by(
+                    UploadJob.scheduled_at.is_(None),
+                    UploadJob.scheduled_at.asc(),
+                    UploadJob.created_at.desc(),
+                )
+                .all()
+            )
+
+        selected_row = -1
+        for job in schedule_jobs:
             row = self._schedule_table.rowCount()
             self._schedule_table.insertRow(row)
+            if job.id == selected_job_id:
+                selected_row = row
+            video_title = (
+                job.download_item.title
+                if job.download_item is not None and job.download_item.title
+                else Path(job.processed_path).stem
+            )
+            status_text = self._upload_status_text(job)
             values = [
-                item.account.name if item.account else "Unassigned",
-                item.title or "(untitled)",
-                item.title_draft or "(not drafted)",
-                item.caption_draft or "(not drafted)",
-                self._schedule_status_text(item),
+                job.account.name if job.account else "Unassigned",
+                video_title or "(untitled)",
+                job.title or "(not drafted)",
+                self._upload_scheduled_text(job),
+                job.privacy_status,
+                status_text,
+                Path(job.processed_path).name,
             ]
             for column, value in enumerate(values):
                 table_item = QTableWidgetItem(value)
                 table_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
-                table_item.setData(Qt.ItemDataRole.UserRole, item.id)
+                table_item.setData(Qt.ItemDataRole.UserRole, job.id)
+                if column == 5:
+                    self._apply_schedule_status_style(table_item, value)
                 self._schedule_table.setItem(row, column, table_item)
 
         self._schedule_table.resizeRowsToContents()
+        self._resize_schedule_table_height()
         self._schedule_table.blockSignals(False)
-        if schedule_items:
-            ready_count = sum(
-                1
-                for item in schedule_items
-                if self._schedule_status_text(item) == "Ready for scheduler"
-            )
+        if selected_row < 0 and self._schedule_table.rowCount() > 0:
+            selected_row = 0
+        if selected_row >= 0:
+            self._schedule_table.selectRow(selected_row)
+        self._on_schedule_selection_changed()
+        if schedule_jobs:
+            scheduled_count = sum(1 for job in schedule_jobs if job.scheduled_at is not None)
             self._schedule_summary_label.setText(
-                f"{len(schedule_items)} draft videos for this account. {ready_count} are ready for scheduling."
+                f"{len(schedule_jobs)} upload job(s) for this account. {scheduled_count} have a scheduled time."
             )
         else:
             self._schedule_summary_label.setText(
-                "No downloaded drafts are ready for scheduling yet. Finish Preprocess first."
+                "No publish jobs yet. Finish Preprocess, then use Add to Schedule."
             )
+
+    def _apply_schedule_status_style(self, item: QTableWidgetItem, status_text: str) -> None:
+        if status_text in {"Scheduled", "Uploaded", "Posted", "Ready"}:
+            item.setForeground(QColor("#8ee6b1"))
+            item.setBackground(QColor("#173222"))
+        elif status_text == "Uploading":
+            item.setForeground(QColor("#9fc6ff"))
+            item.setBackground(QColor("#162a45"))
+        elif status_text == "Draft":
+            item.setForeground(QColor("#f5cd79"))
+            item.setBackground(QColor("#342812"))
+        elif status_text in {"Missing output", "Failed"}:
+            item.setForeground(QColor("#ff9c9c"))
+            item.setBackground(QColor("#35171c"))
+        elif status_text == "Skipped":
+            item.setForeground(QColor("#b9c8d8"))
+            item.setBackground(QColor("#1b2430"))
+        else:
+            item.setForeground(QColor("#b9c8d8"))
+            item.setBackground(QColor("#182332"))
+
+    def _resize_schedule_table_height(self) -> None:
+        if not hasattr(self, "_schedule_panel"):
+            return
+
+        layout = self._schedule_panel.layout()
+        margins = layout.contentsMargins()
+        spacing = layout.spacing()
+        fixed_header_height = sum(
+            widget.sizeHint().height()
+            for widget in (
+                self._schedule_title_label,
+                self._schedule_message_label,
+                self._schedule_summary_label,
+                self._schedule_caption_preview,
+            )
+        )
+        reserved_height = (
+            margins.top()
+            + margins.bottom()
+            + fixed_header_height
+            + self._schedule_copy_caption_button.sizeHint().height()
+            + self._schedule_caption_combo.sizeHint().height()
+            + (spacing * 5)
+        )
+        target_height = max(230, self._scroll_area.viewport().height() - reserved_height)
+        self._schedule_table.setFixedHeight(target_height)
 
     def _created_text(self, item: DownloadItem) -> str:
         created_at = item.created_at
@@ -4177,7 +6379,7 @@ class MainWindow(QWidget):
     def _refresh_account_action_labels(self, account: Account | None) -> None:
         creating_new = account is None
         self._account_save_button.setText(
-            "Create Account" if creating_new else "Save Account Changes"
+            "Create Niche Account" if creating_new else "Save Niche Changes"
         )
         self._account_main_edit_button.setEnabled(bool(self._accounts))
         self._account_main_delete_button.setEnabled(bool(self._accounts))
@@ -4227,7 +6429,7 @@ class MainWindow(QWidget):
         self._account_mode_hint.setText(hint)
         self._account_main_actions.setVisible(show_main_actions)
         self._account_picker_panel.setVisible(show_picker)
-        self._account_form_panel.setVisible(show_form)
+        self._account_form_scroll.setVisible(show_form)
         self._account_form_actions.setVisible(show_form_actions)
         self._account_delete_panel.setVisible(show_delete_panel)
 
@@ -4249,7 +6451,7 @@ class MainWindow(QWidget):
         self._set_account_mode(
             "new",
             title="New Account",
-            hint="Create a fresh account record, then return to the main account tools.",
+            hint="Create a fresh niche account, then return to niche tools.",
             show_main_actions=False,
             show_picker=False,
             show_form=True,
@@ -4276,8 +6478,8 @@ class MainWindow(QWidget):
     def _show_delete_account_panel(self) -> None:
         self._set_account_mode(
             "delete",
-            title="Delete Account",
-            hint="Choose one saved account to remove, then return to the main account tools.",
+            title="Delete Niche Account",
+            hint="Choose one saved niche account to remove, then return to niche tools.",
             show_main_actions=False,
             show_picker=False,
             show_form=False,
@@ -4310,7 +6512,7 @@ class MainWindow(QWidget):
             self._set_detail_placeholder()
             return
 
-        self._detail_panel.setVisible(True)
+        self._detail_panel.setVisible(False)
         self._detail_placeholder.setVisible(False)
         self._toggle_detail_content(True)
         self._detail_fields["title"].setText(item.title or "(untitled)")
@@ -4324,6 +6526,9 @@ class MainWindow(QWidget):
         self._detail_fields["file_path"].setText(item.file_path or "(pending)")
         self._detail_fields["file_info"].setText(self._file_info_text(item))
         self._detail_fields["error"].setText(item.error_message or "No error.")
+        self._detail_fields["title"].setToolTip(item.title or "(untitled)")
+        self._detail_fields["source_url"].setToolTip(item.source_url)
+        self._detail_fields["file_path"].setToolTip(item.file_path or "(pending)")
         self._restore_combo_value(self._detail_account_combo, item.account_id)
         self._detail_keep_button.setEnabled(item.review_state != "kept")
         self._detail_reject_button.setEnabled(item.review_state != "rejected")
@@ -4379,6 +6584,8 @@ class MainWindow(QWidget):
                 item.ranking_score,
                 item.view_count,
                 item.like_count,
+                item.comment_count,
+                item.duration_seconds,
                 item.title,
                 item.channel_name,
                 item.published_at,
@@ -4404,14 +6611,63 @@ class MainWindow(QWidget):
             normalized_state = "candidate" if candidate.state == "new" else candidate.state
             if normalized_state == "downloaded":
                 return "Redownload Candidate"
-        return "Queue Selected Candidate"
+        return "Send To Download"
 
     def _matches_candidate_state_filter(self, candidate: ScrapeCandidate) -> bool:
+        min_likes = self._instagram_discover_min_likes_input.value()
+        account = self._active_account()
+        if (
+            account is not None
+            and account.platform == "instagram"
+            and min_likes > 0
+            and candidate.like_count is not None
+            and candidate.like_count < min_likes
+        ):
+            return False
         selected_state = self._candidate_state_filter.currentData()
         if selected_state in {None, "all"}:
             return True
         normalized_state = "candidate" if candidate.state == "new" else candidate.state
         return normalized_state == selected_state
+
+    @staticmethod
+    def _candidate_sort_datetime(value: dt.datetime | None) -> dt.datetime:
+        if value is None:
+            return dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+        if value.tzinfo is None:
+            return value.replace(tzinfo=dt.timezone.utc)
+        return value.astimezone(dt.timezone.utc)
+
+    def _candidate_sort_key(self, item: ScrapeCandidate) -> tuple[object, ...]:
+        published_at = self._candidate_sort_datetime(item.published_at)
+        sort_mode = self._candidate_sort_combo.currentData()
+        if sort_mode == "likes":
+            return (
+                item.like_count or 0,
+                item.comment_count or 0,
+                item.ranking_score or 0,
+                published_at,
+            )
+        if sort_mode == "comments":
+            return (
+                item.comment_count or 0,
+                item.like_count or 0,
+                item.ranking_score or 0,
+                published_at,
+            )
+        if sort_mode == "newest":
+            return (
+                published_at,
+                item.like_count or 0,
+                item.comment_count or 0,
+                item.ranking_score or 0,
+            )
+        return (
+            item.ranking_score or 0,
+            item.like_count or 0,
+            item.comment_count or 0,
+            published_at,
+        )
 
     def _mark_user_interacting(self) -> None:
         if self._suppress_interaction_tracking:
@@ -4434,6 +6690,37 @@ class MainWindow(QWidget):
     def _on_candidate_filter_changed(self) -> None:
         self._mark_user_interacting()
         self._refresh_candidates(force=True)
+
+    def _on_candidate_min_likes_filter_changed(self) -> None:
+        self._save_candidate_min_likes_filter()
+        self._on_candidate_filter_changed()
+
+    def _save_candidate_min_likes_filter(self) -> None:
+        if self._current_account_id is None:
+            return
+        value = self._instagram_discover_min_likes_input.value()
+        with get_session() as session:
+            account = session.get(Account, self._current_account_id)
+            if account is None:
+                return
+            account.candidate_min_like_filter = value
+            session.commit()
+        active_account = self._active_account()
+        if active_account is not None:
+            active_account.candidate_min_like_filter = value
+
+    def _refresh_candidate_min_likes_filter(self) -> None:
+        if not hasattr(self, "_instagram_discover_min_likes_input"):
+            return
+        account = self._active_account()
+        value = (
+            account.candidate_min_like_filter
+            if account is not None and account.candidate_min_like_filter is not None
+            else 20_000
+        )
+        self._instagram_discover_min_likes_input.blockSignals(True)
+        self._instagram_discover_min_likes_input.setValue(int(value))
+        self._instagram_discover_min_likes_input.blockSignals(False)
 
     def _load_accounts(self) -> list[Account]:
         with get_session() as session:
@@ -4466,8 +6753,15 @@ class MainWindow(QWidget):
         }
         return {key: value for key, value in voice_config.items() if value.strip()}
 
+    def _processing_account_voice_config(self, account: Account | None) -> dict[str, str]:
+        voice_config = self._account_voice_config(account)
+        premise = self._processing_clip_premise_input.toPlainText().strip()
+        if premise:
+            voice_config["clip_context"] = premise
+        return voice_config
+
     @staticmethod
-    def _restore_combo_value(combo: QComboBox, value: int | None) -> None:
+    def _restore_combo_value(combo: QComboBox, value: object) -> None:
         index = combo.findData(value)
         combo.setCurrentIndex(index if index >= 0 else 0)
 
@@ -4485,11 +6779,11 @@ class MainWindow(QWidget):
         self._detail_account_combo.blockSignals(True)
         self._account_delete_picker.blockSignals(True)
         self._current_account_combo.clear()
-        self._current_account_combo.addItem("Choose current account...", None)
+        self._current_account_combo.addItem("Choose active niche...", None)
         self._sidebar_account_combo.clear()
         self._sidebar_account_combo.addItem("Choose account...", None)
         self._account_picker.clear()
-        self._account_picker.addItem("Select account to edit...", None)
+        self._account_picker.addItem("Select niche account to edit...", None)
         self._detail_account_combo.clear()
         self._detail_account_combo.addItem("Unassigned", None)
         self._account_delete_picker.clear()
@@ -4515,6 +6809,7 @@ class MainWindow(QWidget):
         self._account_delete_picker.blockSignals(False)
         self._suppress_account_form_sync = False
         self._current_account_id = self._current_account_combo.currentData()
+        self._refresh_candidate_min_likes_filter()
         if self._account_mode == "edit":
             self._populate_account_form(self._current_account())
         elif self._account_mode == "new":
@@ -4531,6 +6826,7 @@ class MainWindow(QWidget):
         self._restore_combo_value(self._sidebar_account_combo, self._current_account_id)
         self._current_account_combo.blockSignals(False)
         self._sidebar_account_combo.blockSignals(False)
+        self._refresh_candidate_min_likes_filter()
         self._sync_account_panel_visibility()
         self._clear_selection()
         self._clear_source_selection()
@@ -4579,7 +6875,7 @@ class MainWindow(QWidget):
     def _populate_account_form(self, account: Account | None) -> None:
         if account is None:
             self._account_name_input.clear()
-            self._account_platform_combo.setCurrentText("youtube")
+            self._restore_combo_value(self._account_platform_combo, "youtube")
             self._account_niche_input.clear()
             self._account_login_input.clear()
             self._account_credential_input.clear()
@@ -4601,11 +6897,16 @@ class MainWindow(QWidget):
             self._account_banned_phrases_input.clear()
             self._account_title_style_notes_input.clear()
             self._account_caption_style_notes_input.clear()
+            self._account_upload_timezone_input.setText("Asia/Jakarta")
+            self._restore_combo_value(self._account_upload_privacy_combo, "private")
+            self._account_upload_schedule_slots_input.clear()
+            self._restore_combo_value(self._account_upload_made_for_kids_combo, 0)
+            self._restore_combo_value(self._account_upload_synthetic_media_combo, 0)
             self._refresh_account_action_labels(None)
             return
 
         self._account_name_input.setText(account.name)
-        self._account_platform_combo.setCurrentText(account.platform)
+        self._restore_combo_value(self._account_platform_combo, account.platform)
         self._account_niche_input.setText(account.niche_label or "")
         self._account_login_input.setText(account.login_identifier or "")
         self._account_credential_input.setText(account.credential_blob or "")
@@ -4636,6 +6937,20 @@ class MainWindow(QWidget):
         self._account_banned_phrases_input.setText(account.banned_phrases or "")
         self._account_title_style_notes_input.setText(account.title_style_notes or "")
         self._account_caption_style_notes_input.setText(account.caption_style_notes or "")
+        self._account_upload_timezone_input.setText(account.upload_timezone or "Asia/Jakarta")
+        self._restore_combo_value(
+            self._account_upload_privacy_combo,
+            account.upload_default_privacy or "private",
+        )
+        self._account_upload_schedule_slots_input.setText(account.upload_schedule_slots or "")
+        self._restore_combo_value(
+            self._account_upload_made_for_kids_combo,
+            int(account.upload_made_for_kids or 0),
+        )
+        self._restore_combo_value(
+            self._account_upload_synthetic_media_combo,
+            int(account.upload_contains_synthetic_media or 0),
+        )
         self._refresh_account_action_labels(account)
 
     def _on_account_picker_changed(self) -> None:
@@ -4649,107 +6964,39 @@ class MainWindow(QWidget):
         if not name:
             self._notify("Account name is required.", Tone.WARNING)
             return
-        try:
-            scrape_max_items = (
-                self._parse_optional_positive_int(
-                    self._account_scrape_max_items_input.text(),
-                    "Max intake items",
-                )
-                or 20
-            )
-            scrape_max_age_days = self._parse_optional_positive_int(
-                self._account_scrape_max_age_days_input.text(),
-                "Max age days",
-            )
-            auto_queue_limit = (
-                self._parse_optional_positive_int(
-                    self._account_auto_queue_limit_input.text(),
-                    "Auto queue limit",
-                )
-                or 3
-            )
-            min_view_count = (
-                self._parse_optional_nonnegative_int(
-                    self._account_min_view_count_input.text(),
-                    "Min views",
-                )
-                or 0
-            )
-            min_like_count = (
-                self._parse_optional_nonnegative_int(
-                    self._account_min_like_count_input.text(),
-                    "Min likes",
-                )
-                or 0
-            )
-            ranking_weight_views = (
-                self._parse_optional_positive_int(
-                    self._account_weight_views_input.text(),
-                    "Views weight",
-                )
-                or 35
-            )
-            ranking_weight_likes = (
-                self._parse_optional_positive_int(
-                    self._account_weight_likes_input.text(),
-                    "Likes weight",
-                )
-                or 20
-            )
-            ranking_weight_recency = (
-                self._parse_optional_positive_int(
-                    self._account_weight_recency_input.text(),
-                    "Recency weight",
-                )
-                or 25
-            )
-            ranking_weight_keyword_match = (
-                self._parse_optional_positive_int(
-                    self._account_weight_keyword_input.text(),
-                    "Keyword match weight",
-                )
-                or 20
-            )
-        except ValueError as exc:
-            self._notify(str(exc), Tone.WARNING)
-            return
+        scrape_max_items = 20
+        scrape_max_age_days = None
+        auto_queue_limit = 0
+        min_view_count = 0
+        min_like_count = 0
+        ranking_weight_views = 35
+        ranking_weight_likes = 20
+        ranking_weight_recency = 25
+        ranking_weight_keyword_match = 20
 
-        raw_scrape_source_urls = self._parse_source_urls(self._account_scrape_sources_input.text())
+        platform = self._account_platform_combo.currentData() or "youtube"
         scrape_source_urls: list[str] = []
         normalized_source_count = 0
-        for source in raw_scrape_source_urls:
-            normalized_source, validation_error = normalize_youtube_source_url(source)
-            if validation_error is not None or normalized_source is None:
-                self._notify(
-                    "Use only YouTube channel or profile URLs for source intake.", Tone.WARNING
-                )
-                return
-            if normalized_source != source.strip():
-                normalized_source_count += 1
-            scrape_source_urls.append(normalized_source)
-        discovery_keywords = self._parse_keyword_phrases(
-            self._account_discovery_keywords_input.text()
-        )
 
         selected = self._current_account() if self._account_mode == "edit" else None
         with get_session() as session:
             if selected is None:
-                account = Account(name=name, platform="youtube")
+                account = Account(name=name, platform=platform)
                 session.add(account)
             else:
                 account = session.get(Account, selected.id)
                 assert account is not None
                 account.name = name
 
-            account.platform = "youtube"
+            account.platform = platform
             account.niche_label = self._account_niche_input.text().strip() or None
             account.login_identifier = self._account_login_input.text().strip() or None
             account.credential_blob = self._account_credential_input.text().strip() or None
             account.scrape_source_urls = "\n".join(scrape_source_urls) or None
             account.scrape_max_items = scrape_max_items
             account.scrape_max_age_days = scrape_max_age_days
-            account.discovery_keywords = "\n".join(discovery_keywords) or None
-            account.discovery_mode = self._account_discovery_mode_combo.currentData()
+            account.discovery_keywords = None
+            account.discovery_mode = "review_only"
             account.auto_queue_limit = auto_queue_limit
             account.min_view_count = min_view_count
             account.min_like_count = min_like_count
@@ -4765,12 +7012,17 @@ class MainWindow(QWidget):
             account.caption_style_notes = (
                 self._account_caption_style_notes_input.text().strip() or None
             )
+            account.upload_timezone = "Asia/Jakarta"
+            account.upload_default_privacy = "private"
+            account.upload_schedule_slots = None
+            account.upload_made_for_kids = 0
+            account.upload_contains_synthetic_media = 0
             session.commit()
             saved_account_id = account.id
 
         self._ensure_source_rows(
             account_id=saved_account_id,
-            platform="youtube",
+            platform=platform,
             source_urls=scrape_source_urls,
         )
         self._sync_account_source_urls(saved_account_id)
@@ -4785,11 +7037,11 @@ class MainWindow(QWidget):
         self._clear_selection()
         if normalized_source_count > 0:
             self._notify_and_refresh(
-                "Saved account target and normalized source URLs to channel/profile roots.",
+                "Saved niche account and normalized source URLs to channel/profile roots.",
                 Tone.SUCCESS,
             )
         else:
-            self._notify_and_refresh("Saved account target.", Tone.SUCCESS)
+            self._notify_and_refresh("Saved niche account.", Tone.SUCCESS)
         self._show_account_main()
 
     def _on_delete_account_clicked(self) -> None:
@@ -4809,6 +7061,10 @@ class MainWindow(QWidget):
                 session.query(DownloadItem).filter(DownloadItem.account_id == selected.id).all()
             ):
                 item.account_id = None
+            for upload_job in (
+                session.query(UploadJob).filter(UploadJob.account_id == selected.id).all()
+            ):
+                session.delete(upload_job)
             for candidate in (
                 session.query(ScrapeCandidate)
                 .filter(ScrapeCandidate.account_id == selected.id)
@@ -4827,7 +7083,7 @@ class MainWindow(QWidget):
             self._sync_account_panel_visibility()
         self._refresh_account_controls()
         self._clear_selection()
-        self._notify_and_refresh("Deleted account target.", Tone.SUCCESS)
+        self._notify_and_refresh("Deleted niche account.", Tone.SUCCESS)
         self._show_account_main()
 
     def _on_scroll_changed(self) -> None:
@@ -4853,6 +7109,10 @@ class MainWindow(QWidget):
 
         filtered_items = [item for item in items if self._matches_filters(item)]
         signature = self._snapshot_signature(filtered_items)
+        self._download_queue_summary.setText(
+            f"{len(filtered_items)} item{'s' if len(filtered_items) != 1 else ''}"
+        )
+        self._download_drop_zone.setVisible(not filtered_items)
         if not force and signature == self._last_view_signature:
             self._displayed_items = filtered_items
             self._update_detail_panel(self._current_selected_item())
@@ -4871,20 +7131,15 @@ class MainWindow(QWidget):
             self._selected_item_id = None
 
         if not preserve_status:
-            latest_failed = next(
-                (item for item in filtered_items if item.status == "failed" and item.error_message),
-                None,
-            )
             active_account = self._active_account()
             if active_account is None:
                 self._set_status(
-                    "Create and select an account target to use the library.", Tone.WARNING
+                    "Create and select a niche account to use the library.", Tone.WARNING
                 )
-            elif latest_failed is not None:
-                self._set_status(f"Last failure: {latest_failed.error_message}", Tone.ERROR)
             elif filtered_items:
+                item_count = len(filtered_items)
                 self._set_status(
-                    f"Showing {len(filtered_items)} items for {active_account.name}.",
+                    f"Showing {item_count} item{'s' if item_count != 1 else ''} for {active_account.name}.",
                     Tone.INFO,
                 )
             else:
@@ -4893,11 +7148,14 @@ class MainWindow(QWidget):
         workspace_enabled = self._current_account_id is not None
         self._url_input.setEnabled(workspace_enabled)
         self._download_button.setEnabled(workspace_enabled)
+        self._import_local_button.setEnabled(workspace_enabled)
         self._search_input.setEnabled(workspace_enabled)
         self._status_filter.setEnabled(workspace_enabled)
         self._review_filter.setEnabled(workspace_enabled)
         self._table.setEnabled(workspace_enabled)
         self._table.setColumnHidden(2, workspace_enabled)
+        self._table.setColumnHidden(4, workspace_enabled)
+        self._table.setColumnHidden(5, workspace_enabled)
         show_workspace = workspace_enabled
         self._library_gate_panel.setVisible(not workspace_enabled)
         self._workspace_content.setVisible(show_workspace)
@@ -4910,6 +7168,8 @@ class MainWindow(QWidget):
             self._table.blockSignals(True)
             self._table.setRowCount(0)
             self._table.blockSignals(False)
+            self._download_queue_summary.setText("Choose a niche")
+            self._download_drop_zone.setVisible(True)
             self._refresh_sources()
             self._refresh_candidates(force=True)
             self._refresh_runs()
@@ -4936,6 +7196,7 @@ class MainWindow(QWidget):
 
             review_item = QTableWidgetItem(self._review_state_label(item.review_state))
             review_item.setData(Qt.ItemDataRole.UserRole, item.id)
+            review_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
             review_background, review_foreground = self._review_colors(item.review_state)
             review_item.setBackground(review_background)
             review_item.setForeground(review_foreground)
@@ -4944,10 +7205,15 @@ class MainWindow(QWidget):
             account_item.setData(Qt.ItemDataRole.UserRole, item.id)
             title_item = QTableWidgetItem(item.title or "(untitled)")
             title_item.setData(Qt.ItemDataRole.UserRole, item.id)
+            title_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
             source_item = QTableWidgetItem(item.source_url)
             source_item.setData(Qt.ItemDataRole.UserRole, item.id)
             file_item = QTableWidgetItem(self._output_text(item))
             file_item.setData(Qt.ItemDataRole.UserRole, item.id)
+            size_item = QTableWidgetItem(self._file_size_text(item))
+            size_item.setData(Qt.ItemDataRole.UserRole, item.id)
+            added_item = QTableWidgetItem(self._created_text(item))
+            added_item.setData(Qt.ItemDataRole.UserRole, item.id)
 
             self._table.setItem(row, 0, status_item)
             self._table.setItem(row, 1, review_item)
@@ -4955,11 +7221,22 @@ class MainWindow(QWidget):
             self._table.setItem(row, 3, title_item)
             self._table.setItem(row, 4, source_item)
             self._table.setItem(row, 5, file_item)
+            self._table.setItem(row, 6, size_item)
+            self._table.setItem(row, 7, added_item)
+            self._table.setCellWidget(row, 0, self._queue_status_bar(item))
 
             if self._selected_item_id == item.id:
                 self._table.selectRow(row)
 
+        self._table.setShowGrid(False)
         self._table.resizeRowsToContents()
+        for row in range(self._table.rowCount()):
+            self._table.setRowHeight(row, 34)
+        self._table.setColumnWidth(0, 132)
+        self._table.setColumnWidth(1, 128)
+        self._table.setColumnWidth(6, 96)
+        self._table.setColumnWidth(7, 150)
+        self._table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         self._table.verticalScrollBar().setValue(current_scroll)
         self._table.blockSignals(False)
         self._suppress_interaction_tracking = False
@@ -5039,7 +7316,7 @@ class MainWindow(QWidget):
                 (
                     f"Selected source: {selected_source.label} ({selected_source.source_type}, {enabled_text}). "
                     f"Last scrape: {self._source_last_scraped_text(selected_source)}. "
-                    f"Last status: {status_text}."
+                    f"Last status: {status_text}. Use Scrape Selected to fill Candidates."
                 )
             )
             return
@@ -5050,7 +7327,7 @@ class MainWindow(QWidget):
             (
                 f"Showing {len(sources)} source(s): "
                 f"{enabled_count} enabled, {disabled_count} disabled. "
-                f"Select a source to inspect or scrape it directly."
+                f"Select a source, then add candidates from it."
             )
         )
 
@@ -5073,6 +7350,7 @@ class MainWindow(QWidget):
             self._source_table.blockSignals(True)
             self._source_table.setRowCount(0)
             self._source_table.blockSignals(False)
+            self._refresh_instagram_discover_source_combo()
             self._clear_source_selection()
             return
 
@@ -5159,8 +7437,35 @@ class MainWindow(QWidget):
 
         self._source_table.resizeRowsToContents()
         self._source_table.blockSignals(False)
+        self._refresh_instagram_discover_source_combo()
         self._refresh_source_summary()
         self._refresh_candidate_action_state()
+
+    def _refresh_instagram_discover_source_combo(self) -> None:
+        if not hasattr(self, "_instagram_discover_source_combo"):
+            return
+
+        current_source_id = self._instagram_discover_source_combo.currentData()
+        sources: list[Source] = []
+        if self._current_account_id is not None:
+            sources = [
+                source
+                for source in self._load_sources_for_account(self._current_account_id)
+                if source.enabled
+                and source.platform == "instagram"
+                and source.source_type == "instagram_profile"
+            ]
+
+        self._instagram_discover_source_combo.blockSignals(True)
+        self._instagram_discover_source_combo.clear()
+        for source in sources:
+            self._instagram_discover_source_combo.addItem(source.label, source.id)
+        if sources:
+            selected_index = self._instagram_discover_source_combo.findData(current_source_id)
+            self._instagram_discover_source_combo.setCurrentIndex(
+                selected_index if selected_index >= 0 else 0
+            )
+        self._instagram_discover_source_combo.blockSignals(False)
 
     def _refresh_runs(self) -> None:
         runs = self._load_runs()
@@ -5205,6 +7510,38 @@ class MainWindow(QWidget):
             return "-"
         return f"{value:,}"
 
+    @staticmethod
+    def _candidate_duration_text(value: int | None) -> str:
+        if value is None:
+            return "-"
+        minutes, seconds = divmod(max(value, 0), 60)
+        if minutes:
+            return f"{minutes}:{seconds:02d}"
+        return f"{seconds}s"
+
+    def _candidate_filter_text(self, shown_count: int, total_count: int) -> str:
+        account = self._active_account()
+        sort_label = self._candidate_sort_combo.currentText().replace("Sort: ", "")
+        direction_label = self._candidate_sort_direction_combo.currentText().lower()
+        if account is None or account.platform != "instagram":
+            return (
+                f"Showing {shown_count} of {total_count} candidate(s), "
+                f"sorted by {sort_label} ({direction_label})."
+            )
+
+        min_likes = self._instagram_discover_min_likes_input.value()
+        if min_likes <= 0:
+            return (
+                f"Showing all {shown_count} candidate(s), "
+                f"sorted by {sort_label} ({direction_label})."
+            )
+        hidden_count = max(total_count - shown_count, 0)
+        return (
+            f"Showing {shown_count} of {total_count} candidate(s) with "
+            f"{min_likes:,}+ likes, sorted by {sort_label} ({direction_label}). "
+            f"Lower Min likes to reveal {hidden_count} hidden candidate(s)."
+        )
+
     def _sync_candidate_download_states(self, candidates: list[ScrapeCandidate]) -> None:
         linked_ids = [
             candidate.queued_download_item_id
@@ -5244,35 +7581,38 @@ class MainWindow(QWidget):
         if self._current_account_id is None:
             return []
 
-        with get_session() as session:
-            candidates = (
-                session.query(ScrapeCandidate)
-                .filter(ScrapeCandidate.account_id == self._current_account_id)
-                .all()
-            )
-
-        self._sync_candidate_download_states(candidates)
-        with get_session() as session:
-            candidates = (
-                session.query(ScrapeCandidate)
-                .filter(ScrapeCandidate.account_id == self._current_account_id)
-                .all()
-            )
+        all_candidates = self._load_all_candidates_for_current_account()
+        self._sync_candidate_download_states(all_candidates)
+        all_candidates = self._load_all_candidates_for_current_account()
 
         filtered_candidates = [
-            candidate for candidate in candidates if self._matches_candidate_state_filter(candidate)
+            candidate
+            for candidate in all_candidates
+            if self._matches_candidate_state_filter(candidate)
         ]
+        self._candidate_filter_label.setText(
+            self._candidate_filter_text(
+                shown_count=len(filtered_candidates),
+                total_count=len(all_candidates),
+            )
+        )
 
         return sorted(
             filtered_candidates,
-            key=lambda item: (
-                item.ranking_score or 0,
-                item.view_count or 0,
-                item.like_count or 0,
-                item.published_at or dt.datetime.min.replace(tzinfo=dt.timezone.utc),
-            ),
-            reverse=True,
+            key=self._candidate_sort_key,
+            reverse=self._candidate_sort_direction_combo.currentData() != "asc",
         )
+
+    def _load_all_candidates_for_current_account(self) -> list[ScrapeCandidate]:
+        if self._current_account_id is None:
+            return []
+
+        with get_session() as session:
+            return (
+                session.query(ScrapeCandidate)
+                .filter(ScrapeCandidate.account_id == self._current_account_id)
+                .all()
+            )
 
     def _refresh_candidates(self, force: bool = False) -> None:
         account = self._active_account()
@@ -5313,10 +7653,16 @@ class MainWindow(QWidget):
             state_item.setForeground(foreground)
             score_item = QTableWidgetItem(self._candidate_number_text(candidate.ranking_score))
             score_item.setData(Qt.ItemDataRole.UserRole, candidate.id)
-            views_item = QTableWidgetItem(self._candidate_number_text(candidate.view_count))
-            views_item.setData(Qt.ItemDataRole.UserRole, candidate.id)
             likes_item = QTableWidgetItem(self._candidate_number_text(candidate.like_count))
             likes_item.setData(Qt.ItemDataRole.UserRole, candidate.id)
+            comments_item = QTableWidgetItem(
+                self._candidate_number_text(candidate.comment_count)
+            )
+            comments_item.setData(Qt.ItemDataRole.UserRole, candidate.id)
+            duration_item = QTableWidgetItem(
+                self._candidate_duration_text(candidate.duration_seconds)
+            )
+            duration_item.setData(Qt.ItemDataRole.UserRole, candidate.id)
             published_item = QTableWidgetItem(self._published_text(candidate))
             published_item.setData(Qt.ItemDataRole.UserRole, candidate.id)
             channel_item = QTableWidgetItem(candidate.channel_name or "(unknown)")
@@ -5328,12 +7674,13 @@ class MainWindow(QWidget):
 
             self._candidate_table.setItem(row, 0, state_item)
             self._candidate_table.setItem(row, 1, score_item)
-            self._candidate_table.setItem(row, 2, views_item)
-            self._candidate_table.setItem(row, 3, likes_item)
-            self._candidate_table.setItem(row, 4, published_item)
-            self._candidate_table.setItem(row, 5, channel_item)
-            self._candidate_table.setItem(row, 6, title_item)
-            self._candidate_table.setItem(row, 7, match_item)
+            self._candidate_table.setItem(row, 2, likes_item)
+            self._candidate_table.setItem(row, 3, comments_item)
+            self._candidate_table.setItem(row, 4, duration_item)
+            self._candidate_table.setItem(row, 5, published_item)
+            self._candidate_table.setItem(row, 6, channel_item)
+            self._candidate_table.setItem(row, 7, title_item)
+            self._candidate_table.setItem(row, 8, match_item)
 
             if self._selected_candidate_id == candidate.id:
                 self._candidate_table.selectRow(row)
@@ -5354,6 +7701,7 @@ class MainWindow(QWidget):
     def _on_source_selection_changed(self) -> None:
         selected_items = self._source_table.selectedItems()
         if not selected_items:
+            self._selected_source_id = self._source_id_for_current_row()
             self._refresh_source_summary()
             self._refresh_candidate_action_state()
             return
@@ -5460,6 +7808,18 @@ class MainWindow(QWidget):
             self._notify_and_refresh(f"Assigned item to {account_name}.", Tone.SUCCESS)
 
     def _on_scrape_clicked(self) -> None:
+        account = self._active_account()
+        if account is not None and account.platform == "instagram":
+            source = next(
+                (
+                    source
+                    for source in self._displayed_sources
+                    if source.enabled and source.source_type == "instagram_profile"
+                ),
+                None,
+            )
+            if source is not None and self._start_instagram_discover_for_source(account, source):
+                return
         job = self._build_scrape_job_for_all_enabled_sources()
         if job is None:
             return
@@ -5468,7 +7828,7 @@ class MainWindow(QWidget):
     def _build_scrape_job_for_all_enabled_sources(self) -> ScrapeJobConfig | None:
         account = self._active_account()
         if account is None:
-            self._notify("Create and select an account target first.", Tone.WARNING)
+            self._notify("Create and select a niche account first.", Tone.WARNING)
             return None
 
         (
@@ -5506,6 +7866,10 @@ class MainWindow(QWidget):
             self._notify("Select a source first.", Tone.WARNING)
             return
 
+        if account.platform == "instagram" and source.source_type == "instagram_profile":
+            self._start_instagram_discover_for_source(account, source)
+            return
+
         (
             _sources,
             keywords,
@@ -5532,6 +7896,159 @@ class MainWindow(QWidget):
             )
         )
 
+    def _start_instagram_discover_for_source(self, account: Account, source: Source) -> bool:
+        username = self._instagram_profile_username(source.source_url)
+        if not username:
+            self._notify("Use Discover + Rank for Instagram hashtag sources.", Tone.WARNING)
+            return False
+
+        min_new = self._instagram_discover_min_new_input.value()
+        limit = self._instagram_discovery_limit(min_new)
+        scrolls = self._instagram_discovery_scrolls(min_new)
+        deep_search = self._instagram_deep_search_checkbox.isChecked()
+        if deep_search:
+            min_new = max(min_new, 20)
+            limit = max(limit, 120)
+            scrolls = max(scrolls, 50)
+
+        combo_index = self._instagram_discover_source_combo.findData(source.id)
+        if combo_index >= 0:
+            self._instagram_discover_source_combo.setCurrentIndex(combo_index)
+        self._start_instagram_discover_rank_job(
+            InstagramDiscoverRankJobConfig(
+                username=username,
+                target_account_name=account.name,
+                min_new=min_new,
+                limit=limit,
+                scrolls=scrolls,
+                stall_limit=10 if deep_search or min_new >= 20 else 8,
+                wait_ms=4500 if deep_search or min_new >= 20 else 4000,
+            )
+        )
+        return True
+
+    @staticmethod
+    def _instagram_discovery_limit(min_new: int) -> int:
+        return min(max(min_new * 8, min_new, 40), 500)
+
+    @staticmethod
+    def _instagram_discovery_scrolls(min_new: int) -> int:
+        return min(max(min_new * 3, 30), 80)
+
+    @staticmethod
+    def _instagram_profile_username(value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            return ""
+        if cleaned.startswith("@"):
+            return cleaned.lstrip("@").strip().strip("/")
+
+        parsed = urlparse(cleaned if "://" in cleaned else f"https://instagram.com/{cleaned}")
+        host = parsed.netloc.lower()
+        if "instagram.com" not in host:
+            return cleaned.strip().strip("/")
+
+        parts = [part for part in parsed.path.split("/") if part]
+        if not parts or parts[0].lower() in {"p", "reel", "tv", "stories"}:
+            return ""
+        return parts[0].lstrip("@").strip()
+
+    def _on_instagram_discover_clicked(self) -> None:
+        if self._scrape_in_progress or self._instagram_discover_in_progress:
+            self._notify("A discovery job is already running.", Tone.WARNING)
+            return
+
+        account = self._active_account()
+        if account is None:
+            self._notify("Select your niche account first.", Tone.WARNING)
+            return
+        if account.platform != "instagram":
+            self._notify("Select an Instagram niche account before discovering Instagram sources.", Tone.WARNING)
+            return
+
+        source_id = self._instagram_discover_source_combo.currentData()
+        if source_id is None:
+            self._notify("Add and enable an Instagram profile source first.", Tone.WARNING)
+            return
+
+        source = next(
+            (source for source in self._load_sources_for_account(account.id) if source.id == int(source_id)),
+            None,
+        )
+        if source is None:
+            self._notify("The selected source no longer exists.", Tone.WARNING)
+            return
+
+        self._start_instagram_discover_for_source(account, source)
+
+    def _start_instagram_discover_rank_job(self, job: InstagramDiscoverRankJobConfig) -> None:
+        self._instagram_discover_in_progress = True
+        self._instagram_discover_log.clear()
+        self._append_instagram_discover_log("Starting Instagram Discover + Rank...")
+        self._scrape_progress_label.setText("Running Instagram Discover + Rank...")
+        self._scrape_progress_bar.setVisible(False)
+        self._scrape_progress_bar.setMinimum(0)
+        self._scrape_progress_bar.setMaximum(0)
+        self._scrape_progress_bar.setFormat("Running Instagram Discover + Rank...")
+        self._show_activity_progress(
+            "Running Instagram Discover + Rank...",
+            maximum=0,
+            value=0,
+            text_visible=True,
+            fmt="Running Instagram Discover + Rank...",
+        )
+        self._refresh_candidate_action_state()
+
+        thread = QThread(self)
+        worker = InstagramDiscoverRankWorker(job)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.log.connect(self._append_instagram_discover_log)
+        worker.completed.connect(self._on_instagram_discover_completed)
+        worker.failed.connect(self._on_instagram_discover_failed)
+        worker.completed.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+
+        self._instagram_discover_thread = thread
+        self._instagram_discover_worker = worker
+        thread.start()
+
+    def _finish_instagram_discover_job(self) -> None:
+        self._instagram_discover_in_progress = False
+        self._instagram_discover_worker = None
+        self._instagram_discover_thread = None
+        self._scrape_progress_bar.setMaximum(1)
+        self._scrape_progress_bar.setValue(1)
+        self._scrape_progress_bar.setVisible(False)
+        self._hide_activity_bar_if_idle()
+        self._refresh_candidate_action_state()
+
+    def _append_instagram_discover_log(self, message: str) -> None:
+        self._instagram_discover_log.append(message)
+        self._instagram_discover_log.moveCursor(QTextCursor.MoveOperation.End)
+        self._set_status(message, Tone.INFO)
+
+    def _on_instagram_discover_completed(self, payload: dict) -> None:
+        username = str(payload.get("username") or "")
+        target_account_name = str(payload.get("target_account_name") or "")
+        self._finish_instagram_discover_job()
+        self._scrape_progress_label.setText("")
+        self._refresh_account_controls()
+        self._scrape_tabs.setCurrentIndex(0)
+        self._notify_and_refresh(
+            f"Instagram Discover + Rank completed for @{username}"
+            + (f" into {target_account_name}." if target_account_name else "."),
+            Tone.SUCCESS,
+        )
+
+    def _on_instagram_discover_failed(self, message: str) -> None:
+        self._finish_instagram_discover_job()
+        self._scrape_progress_label.setText("")
+        self._append_instagram_discover_log(f"Failed: {message}")
+        self._notify_and_refresh(f"Instagram Discover + Rank failed: {message}", Tone.ERROR)
+
     def _start_scrape_job(self, job: ScrapeJobConfig) -> None:
         if self._scrape_in_progress:
             self._notify("A scrape is already running.", Tone.WARNING)
@@ -5540,8 +8057,15 @@ class MainWindow(QWidget):
         self._scrape_in_progress = True
         self._prepare_scrape_progress(total_sources=len(job.source_ids))
         self._scrape_progress_label.setText("Preparing scrape job...")
-        self._scrape_progress_bar.setVisible(True)
+        self._scrape_progress_bar.setVisible(False)
         self._scrape_progress_bar.setFormat("Preparing scrape job...")
+        self._show_activity_progress(
+            "Preparing scrape job...",
+            maximum=max(len(job.source_ids), 1),
+            value=0,
+            text_visible=True,
+            fmt="Preparing scrape job...",
+        )
         self._refresh_candidate_action_state()
 
         thread = QThread(self)
@@ -5568,7 +8092,7 @@ class MainWindow(QWidget):
         self._refresh_candidate_action_state()
 
     def _prepare_scrape_progress(self, *, total_sources: int) -> None:
-        self._scrape_progress_bar.setVisible(True)
+        self._scrape_progress_bar.setVisible(False)
         self._scrape_progress_bar.setMinimum(0)
         self._scrape_progress_bar.setMaximum(max(total_sources, 1))
         self._scrape_progress_bar.setValue(0)
@@ -5577,10 +8101,18 @@ class MainWindow(QWidget):
         self._scrape_progress_label.setText(
             f"Scraping {payload['current']}/{payload['total']}: {payload['source_label']}"
         )
+        self._scrape_progress_label.setVisible(False)
         self._scrape_progress_bar.setMaximum(max(payload["total"], 1))
         self._scrape_progress_bar.setValue(max(payload["current"] - 1, 0))
         self._scrape_progress_bar.setFormat(
             f"{max(payload['current'] - 1, 0)}/{payload['total']} sources complete"
+        )
+        self._show_activity_progress(
+            self._scrape_progress_label.text(),
+            maximum=max(payload["total"], 1),
+            value=max(payload["current"] - 1, 0),
+            text_visible=True,
+            fmt=f"{max(payload['current'] - 1, 0)}/{payload['total']} sources complete",
         )
         self._set_status(self._scrape_progress_label.text(), Tone.INFO)
 
@@ -5592,6 +8124,7 @@ class MainWindow(QWidget):
                 f"{payload['rejected']} rejected."
             )
         )
+        self._scrape_progress_label.setVisible(False)
         completed_sources = min(
             self._scrape_progress_bar.value() + 1,
             self._scrape_progress_bar.maximum(),
@@ -5599,6 +8132,13 @@ class MainWindow(QWidget):
         self._scrape_progress_bar.setValue(completed_sources)
         self._scrape_progress_bar.setFormat(
             f"{completed_sources}/{self._scrape_progress_bar.maximum()} sources complete"
+        )
+        self._show_activity_progress(
+            self._scrape_progress_label.text(),
+            maximum=self._scrape_progress_bar.maximum(),
+            value=completed_sources,
+            text_visible=True,
+            fmt=f"{completed_sources}/{self._scrape_progress_bar.maximum()} sources complete",
         )
         self._refresh_sources()
         self._refresh_runs()
@@ -5610,6 +8150,9 @@ class MainWindow(QWidget):
         self._scrape_progress_bar.setValue(self._scrape_progress_bar.maximum())
         self._scrape_progress_bar.setFormat("Scrape complete")
         self._scrape_progress_bar.setVisible(False)
+        self._hide_activity_bar_if_idle()
+        if int(payload.get("created") or 0) + int(payload.get("refreshed") or 0) > 0:
+            self._scrape_tabs.setCurrentIndex(0)
         self._notify_and_refresh(
             (
                 f"Scraped {payload['sources']} source(s): {payload['created']} new, "
@@ -5624,6 +8167,7 @@ class MainWindow(QWidget):
         self._scrape_progress_label.setText("")
         self._scrape_progress_bar.setFormat("Scrape failed")
         self._scrape_progress_bar.setVisible(False)
+        self._hide_activity_bar_if_idle()
         self._notify_and_refresh(f"Source intake failed: {message}", Tone.ERROR)
 
     def _run_scrape_for_source(
@@ -5645,11 +8189,18 @@ class MainWindow(QWidget):
             run_id = run.id
 
         try:
-            scraped = scrape_youtube_source(
-                source_url=source.source_url,
-                max_items=max_items,
-                max_age_days=max_age_days,
-            )
+            if source.platform == "instagram":
+                scraped = scrape_instagram_source(
+                    source_url=source.source_url,
+                    max_items=max_items,
+                    max_age_days=max_age_days,
+                )
+            else:
+                scraped = scrape_youtube_source(
+                    source_url=source.source_url,
+                    max_items=max_items,
+                    max_age_days=max_age_days,
+                )
             ranked_candidates = [
                 rank_candidate(
                     candidate,
@@ -5716,15 +8267,22 @@ class MainWindow(QWidget):
     def _on_add_scrape_source_clicked(self) -> None:
         account = self._active_account()
         if account is None:
-            self._notify("Create and select an account target first.", Tone.WARNING)
+            self._notify("Create and select a niche account first.", Tone.WARNING)
             return
 
         source_url = self._scrape_source_input.text().strip()
         if not source_url:
-            self._notify("Paste a YouTube channel or profile URL first.", Tone.WARNING)
+            self._notify("Paste a source URL, hashtag, or keyword first.", Tone.WARNING)
             return
 
-        normalized_source_url, validation_error = normalize_youtube_source_url(source_url)
+        if account.platform == "instagram" and instagram_shortcode_from_url(source_url) is not None:
+            self._add_manual_instagram_candidate(account=account, source_url=source_url)
+            return
+
+        normalized_source_url, validation_error = self._normalize_source_for_platform(
+            source_url,
+            account.platform,
+        )
         if validation_error is not None:
             self._notify(validation_error, Tone.WARNING)
             return
@@ -5736,20 +8294,23 @@ class MainWindow(QWidget):
             return
 
         with get_session() as session:
-            session.add(
-                Source(
-                    account_id=account.id,
-                    platform=account.platform,
-                    source_type=infer_youtube_source_type(normalized_source_url),
-                    label=normalized_source_url.rstrip("/").rsplit("/", 1)[-1]
-                    or normalized_source_url,
-                    source_url=normalized_source_url,
-                    enabled=1,
-                    priority=100,
-                )
+            source_row = Source(
+                account_id=account.id,
+                platform=account.platform,
+                source_type=self._infer_source_type_for_platform(
+                    normalized_source_url,
+                    account.platform,
+                ),
+                label=self._source_label_for_platform(normalized_source_url, account.platform),
+                source_url=normalized_source_url,
+                enabled=1,
+                priority=100,
             )
+            session.add(source_row)
             session.commit()
+            new_source_id = source_row.id
 
+        self._selected_source_id = new_source_id
         self._sync_account_source_urls(account.id)
         self._scrape_source_input.clear()
         self._refresh_account_controls()
@@ -5773,6 +8334,88 @@ class MainWindow(QWidget):
                 return
             account_row.scrape_source_urls = "\n".join(source_urls) or None
             session.commit()
+
+    @staticmethod
+    def _normalized_instagram_media_url(url: str) -> str | None:
+        shortcode = instagram_shortcode_from_url(url)
+        if shortcode is None:
+            return None
+
+        parsed = urlparse(url.strip())
+        parts = [part for part in parsed.path.split("/") if part]
+        kind = parts[0].lower() if parts else "p"
+        if kind not in {"p", "reel", "tv"}:
+            kind = "p"
+        return f"https://www.instagram.com/{kind}/{shortcode}/"
+
+    def _add_manual_instagram_candidate(
+        self,
+        *,
+        account: Account,
+        source_url: str,
+        clear_source_input: bool = True,
+        success_message: str = "Added Instagram candidate URL.",
+    ) -> None:
+        normalized_url = self._normalized_instagram_media_url(source_url)
+        if normalized_url is None:
+            self._notify("Use an Instagram Reel or post URL.", Tone.WARNING)
+            return
+
+        shortcode = instagram_shortcode_from_url(normalized_url)
+        if shortcode is None:
+            self._notify("Use an Instagram Reel or post URL.", Tone.WARNING)
+            return
+
+        candidate_key = f"instagram:{shortcode}"
+        duplicate_item = self._find_duplicate_for_account(normalized_url, account.id)
+        if duplicate_item is not None and duplicate_item.status != "failed":
+            self._selected_item_id = duplicate_item.id
+            self._notify_and_refresh(
+                "This Instagram URL is already in this account library.",
+                Tone.WARNING,
+            )
+            return
+
+        with get_session() as session:
+            existing_candidate = next(
+                (
+                    candidate
+                    for candidate in session.query(ScrapeCandidate)
+                    .filter(ScrapeCandidate.account_id == account.id)
+                    .all()
+                    if self._candidate_video_key(candidate) == candidate_key
+                ),
+                None,
+            )
+            if existing_candidate is not None:
+                self._selected_candidate_id = existing_candidate.id
+                if clear_source_input:
+                    self._scrape_source_input.clear()
+                self._refresh_candidates(force=True)
+                self._scrape_tabs.setCurrentIndex(0)
+                self._notify("This Instagram URL is already in candidates.", Tone.WARNING)
+                return
+
+            candidate_row = ScrapeCandidate(
+                scrape_source_url=normalized_url,
+                source_url=normalized_url,
+                extractor="instagram",
+                video_id=shortcode,
+                title=f"Instagram media {shortcode}",
+                discovery_query="manual",
+                match_reason="Manual Instagram URL",
+                ranking_score=0,
+                account_id=account.id,
+            )
+            session.add(candidate_row)
+            session.commit()
+            self._selected_candidate_id = candidate_row.id
+
+        if clear_source_input:
+            self._scrape_source_input.clear()
+        self._refresh_candidates(force=True)
+        self._scrape_tabs.setCurrentIndex(0)
+        self._notify(success_message, Tone.SUCCESS)
 
     def _on_remove_source_clicked(self) -> None:
         source = self._current_selected_source()
@@ -5830,24 +8473,22 @@ class MainWindow(QWidget):
         with get_session() as session:
             all_candidates = session.query(ScrapeCandidate).all()
             candidate_by_key = {
-                (candidate.video_id or candidate.source_url): candidate
+                self._candidate_video_key(candidate)
+                if candidate.video_id
+                else candidate.source_url: candidate
                 for candidate in all_candidates
                 if candidate.account_id == account_id
             }
             all_downloads = session.query(DownloadItem).all()
             download_keys_same_account = {
-                self._youtube_video_key(item.source_url) or item.source_url
+                self._video_key(item.source_url) or item.source_url
                 for item in all_downloads
                 if item.account_id == account_id
             }
 
             for candidate in candidates:
-                candidate_key = (
-                    f"youtube:{candidate.video_id}" if candidate.video_id else candidate.source_url
-                )
-                existing_candidate = candidate_by_key.get(
-                    candidate.video_id or candidate.source_url
-                )
+                candidate_key = self._candidate_video_key(candidate)
+                existing_candidate = candidate_by_key.get(candidate_key)
                 if existing_candidate is not None:
                     existing_candidate.scrape_source_url = candidate.scrape_source_url
                     existing_candidate.source_url = candidate.source_url
@@ -5859,6 +8500,7 @@ class MainWindow(QWidget):
                     existing_candidate.description = candidate.description
                     existing_candidate.view_count = candidate.view_count
                     existing_candidate.like_count = candidate.like_count
+                    existing_candidate.comment_count = candidate.comment_count
                     existing_candidate.duration_seconds = candidate.duration_seconds
                     existing_candidate.thumbnail_url = candidate.thumbnail_url
                     existing_candidate.discovery_query = candidate.discovery_query
@@ -5888,6 +8530,7 @@ class MainWindow(QWidget):
                     description=candidate.description,
                     view_count=candidate.view_count,
                     like_count=candidate.like_count,
+                    comment_count=candidate.comment_count,
                     duration_seconds=candidate.duration_seconds,
                     thumbnail_url=candidate.thumbnail_url,
                     discovery_query=candidate.discovery_query,
@@ -5900,7 +8543,7 @@ class MainWindow(QWidget):
                     account_id=account_id,
                 )
                 session.add(candidate_row)
-                candidate_by_key[candidate.video_id or candidate.source_url] = candidate_row
+                candidate_by_key[candidate_key] = candidate_row
                 created_count += 1
                 continue
 
@@ -5938,7 +8581,11 @@ class MainWindow(QWidget):
                         candidate_row.queued_download_item_id = duplicate_item.id
                         session.commit()
                 continue
-            item_id = QueueManager.enqueue_download(url=candidate.source_url, account_id=account_id)
+            item_id = QueueManager.enqueue_download(
+                url=candidate.source_url,
+                account_id=account_id,
+                source_description=candidate.description,
+            )
             with get_session() as session:
                 candidate_row = session.get(ScrapeCandidate, candidate.id)
                 if candidate_row is None:
@@ -5983,6 +8630,7 @@ class MainWindow(QWidget):
             item_id = QueueManager.enqueue_download(
                 url=candidate.source_url,
                 account_id=self._current_account_id,
+                source_description=candidate.description,
             )
             with get_session() as session:
                 candidate_row = session.get(ScrapeCandidate, candidate.id)
@@ -6104,8 +8752,40 @@ class MainWindow(QWidget):
 
         return None
 
+    @classmethod
+    def _validate_supported_media_url(cls, url: str) -> str | None:
+        if cls._youtube_video_key(url) is not None:
+            return cls._validate_youtube_url(url)
+        if cls._instagram_video_key(url) is not None:
+            return validate_instagram_media_url(url)
+
+        parsed = urlparse(url)
+        host = parsed.netloc.lower()
+        if host.startswith("www."):
+            host = host[4:]
+        if "instagram.com" in host:
+            return "Use an Instagram Reel or post URL."
+        return cls._validate_youtube_url(url)
+
+    @staticmethod
+    def _instagram_video_key(url: str) -> str | None:
+        shortcode = instagram_shortcode_from_url(url)
+        return f"instagram:{shortcode}" if shortcode else None
+
+    @classmethod
+    def _video_key(cls, url: str) -> str | None:
+        return cls._youtube_video_key(url) or cls._instagram_video_key(url)
+
+    @classmethod
+    def _candidate_video_key(cls, candidate: ScrapedVideoCandidate) -> str:
+        if candidate.extractor == "instagram" and candidate.video_id:
+            return f"instagram:{candidate.video_id}"
+        if candidate.extractor == "youtube" and candidate.video_id:
+            return f"youtube:{candidate.video_id}"
+        return cls._video_key(candidate.source_url) or candidate.source_url
+
     def _find_duplicate_for_account(self, url: str, account_id: int) -> DownloadItem | None:
-        requested_key = self._youtube_video_key(url)
+        requested_key = self._video_key(url)
         if requested_key is None:
             return None
 
@@ -6118,9 +8798,146 @@ class MainWindow(QWidget):
             )
 
         return next(
-            (item for item in items if self._youtube_video_key(item.source_url) == requested_key),
+            (item for item in items if self._video_key(item.source_url) == requested_key),
             None,
         )
+
+    @staticmethod
+    def _safe_local_import_stem(path: Path) -> str:
+        safe = "".join(
+            char if char.isalnum() or char in {"-", "_", "."} else "_" for char in path.stem
+        ).strip("._")
+        return safe or "video"
+
+    def _local_import_destination(self, source_path: Path) -> Path:
+        import_dir = downloads_dir() / "local"
+        import_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_stem = self._safe_local_import_stem(source_path)
+        suffix = source_path.suffix.lower()
+        destination = import_dir / f"local_{timestamp}_{safe_stem}{suffix}"
+        counter = 1
+        while destination.exists():
+            destination = import_dir / f"local_{timestamp}_{safe_stem}_{counter}{suffix}"
+            counter += 1
+        return destination
+
+    @staticmethod
+    def _local_import_source_url(source_url: str | None, destination: Path) -> str:
+        reference = (source_url or "").strip()
+        if reference.lower().startswith(("http://", "https://")):
+            return reference
+        return f"local://{destination.name}"
+
+    def _link_candidate_to_download(
+        self,
+        *,
+        account_id: int,
+        source_url: str,
+        download_item_id: int,
+    ) -> None:
+        requested_key = self._video_key(source_url)
+        with get_session() as session:
+            candidates = (
+                session.query(ScrapeCandidate)
+                .filter(ScrapeCandidate.account_id == account_id)
+                .all()
+            )
+            candidate = next(
+                (
+                    row
+                    for row in candidates
+                    if (self._candidate_video_key(row) if row.video_id else row.source_url)
+                    == (requested_key or source_url)
+                ),
+                None,
+            )
+            if candidate is None:
+                return
+            candidate.state = "queued"
+            candidate.queued_download_item_id = download_item_id
+            download_item = session.get(DownloadItem, download_item_id)
+            if (
+                download_item is not None
+                and not download_item.source_description
+                and candidate.description
+            ):
+                download_item.source_description = candidate.description
+            session.commit()
+
+    def _on_import_local_clicked(self) -> None:
+        if self._current_account_id is None:
+            self._notify("Create and select a niche account first.", Tone.WARNING)
+            return
+
+        selected_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import MP4",
+            str(Path.home()),
+            "MP4 files (*.mp4);;All files (*.*)",
+        )
+        if not selected_path:
+            return
+
+        self._import_local_video_path(
+            Path(selected_path),
+            source_url=self._url_input.text().strip() or None,
+        )
+
+    def _import_local_video_path(self, source_path: Path, *, source_url: str | None = None) -> None:
+        if self._current_account_id is None:
+            self._notify("Create and select a niche account first.", Tone.WARNING)
+            return
+
+        source_path = source_path.expanduser().resolve()
+        if not source_path.exists() or not source_path.is_file():
+            self._notify("Choose an existing MP4 file to import.", Tone.WARNING)
+            return
+        if source_path.suffix.lower() != ".mp4":
+            self._notify("Only MP4 files can be imported right now.", Tone.WARNING)
+            return
+
+        destination = self._local_import_destination(source_path)
+        shutil.copy2(source_path, destination)
+        stored_source_url = self._local_import_source_url(source_url, destination)
+        account_id = self._current_account_id
+
+        with get_session() as session:
+            item = DownloadItem(
+                source_url=stored_source_url,
+                extractor="local",
+                video_id=destination.stem,
+                title=source_path.stem,
+                file_path=str(destination),
+                account_id=account_id,
+                status="downloaded",
+                review_state="new",
+            )
+            session.add(item)
+            session.flush()
+            item_id = item.id
+
+            linked_candidate = (
+                session.query(ScrapeCandidate)
+                .filter(
+                    ScrapeCandidate.account_id == account_id,
+                    ScrapeCandidate.source_url == stored_source_url,
+                )
+                .order_by(ScrapeCandidate.created_at.desc())
+                .first()
+            )
+            if linked_candidate is not None:
+                linked_candidate.state = "downloaded"
+                linked_candidate.queued_download_item_id = item_id
+                item.source_description = linked_candidate.description
+
+            session.commit()
+
+        self._selected_item_id = item_id
+        if source_url and source_url.strip() == self._url_input.text().strip():
+            self._url_input.clear()
+        self._refresh_candidates(force=True)
+        self._notify_and_refresh("Imported local MP4.", Tone.SUCCESS)
 
     def _on_download_clicked(self) -> None:
         url = self._url_input.text().strip()
@@ -6128,10 +8945,19 @@ class MainWindow(QWidget):
             self._notify("Paste a URL first.", Tone.WARNING)
             return
         if self._current_account_id is None:
-            self._notify("Create and select an account target first.", Tone.WARNING)
+            self._notify("Create and select a niche account first.", Tone.WARNING)
             return
 
-        validation_error = self._validate_youtube_url(url)
+        account = self._active_account()
+        if self._instagram_video_key(url):
+            if account is None or account.platform != "instagram":
+                self._notify(
+                    "Select or create an Instagram niche account before adding Instagram URLs.",
+                    Tone.WARNING,
+                )
+                return
+
+        validation_error = self._validate_supported_media_url(url)
         if validation_error is not None:
             self._notify(validation_error, Tone.WARNING)
             return
@@ -6146,7 +8972,12 @@ class MainWindow(QWidget):
                     "This video is already in this account library. Use Redownload from history."
                 )
             elif duplicate_item.status == "failed":
-                message = "This video already failed for this account. Use Retry from history."
+                if QueueManager.retry_item(duplicate_item.id):
+                    self._selected_item_id = duplicate_item.id
+                    self._url_input.clear()
+                    self._notify_and_refresh("Retrying download.", Tone.INFO)
+                    return
+                message = "This video already failed for this account."
             else:
                 message = "This video already exists in this account library."
             self._notify_and_refresh(message, Tone.WARNING)
@@ -6156,6 +8987,12 @@ class MainWindow(QWidget):
         try:
             item_id = QueueManager.enqueue_download(url=url, account_id=self._current_account_id)
             self._selected_item_id = item_id
+            if account is not None and account.platform == "instagram":
+                self._link_candidate_to_download(
+                    account_id=account.id,
+                    source_url=url,
+                    download_item_id=item_id,
+                )
             self._url_input.clear()
             self._notify_and_refresh("Queued download.", Tone.INFO)
         except Exception as exc:  # noqa: BLE001

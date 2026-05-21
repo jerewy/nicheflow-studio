@@ -16,6 +16,10 @@ def find_media_binary(name: str) -> Path | None:
     if os.name != "nt":
         return None
 
+    for candidate in _windows_media_binary_candidates(name):
+        if candidate.exists():
+            return candidate.resolve()
+
     local_appdata = os.environ.get("LOCALAPPDATA")
     if not local_appdata:
         return None
@@ -31,6 +35,15 @@ def find_media_binary(name: str) -> Path | None:
         reverse=True,
     )
     return candidates[0].resolve() if candidates else None
+
+
+def _windows_media_binary_candidates(name: str) -> list[Path]:
+    if name != "tesseract":
+        return []
+    return [
+        Path("C:/Program Files/Tesseract-OCR/tesseract.exe"),
+        Path("C:/Program Files (x86)/Tesseract-OCR/tesseract.exe"),
+    ]
 
 
 def ffmpeg_binary() -> Path | None:

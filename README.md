@@ -7,6 +7,8 @@ Multi-account content management (Windows-first MVP).
 - Desktop app: PyQt6
 - Local DB: SQLite (`data/nicheflow.db`)
 - YouTube ingestion: `yt-dlp` (supports YouTube Shorts URLs)
+- Instagram ingestion: public Reel/post URLs download through `yt-dlp`; manual references and MP4 import remain available as fallback paths
+- Local import: MP4 files can be copied into the library as already-downloaded clips
 - Local runtime data folder: `data/` (ignored by git)
 
 See `docs/MVP.md` for the current scope and what’s explicitly out of scope.
@@ -30,6 +32,20 @@ For smart title/caption generation, copy `.env.example` to `.env`, set `GROQ_API
 
 ```powershell
 .\scripts\check_ai_setup.ps1
+```
+
+For the stable MVP path, paste an Instagram Reel/post URL into the main URL field and click **Download**. If Instagram blocks a URL in the future, paste it into Source Intake to save it as a manual candidate, then use **Import MP4** after manually downloading the file.
+
+For Instagram sources that require a logged-in session, create an Instaloader session once and the app will reuse the newest `~\.instagram_scraper\*.session` file:
+
+```powershell
+instaloader --login YOUR_INSTAGRAM_USERNAME --sessionfile "$env:USERPROFILE\.instagram_scraper\YOUR_INSTAGRAM_USERNAME.session"
+```
+
+If Instaloader login is blocked by checkpoint or browser-cookie decryption, use the instagrapi probe to test an alternate Instagram session path:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\instagram_instagrapi_probe.py --username YOUR_INSTAGRAM_USERNAME --target meme.ig --limit 1
 ```
 
 ## Development Loop

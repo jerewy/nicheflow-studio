@@ -19,12 +19,21 @@ def _parse_source_urls(raw_value: str | None) -> list[str]:
 
 def _infer_source_type(source_url: str) -> str:
     lowered = source_url.lower()
+    if "instagram.com/explore/tags/" in lowered:
+        return "instagram_hashtag"
+    if "instagram.com/" in lowered:
+        return "instagram_profile"
     if "/@" in lowered:
         return "youtube_profile"
     return "youtube_channel"
 
 
 def _source_label(source_url: str) -> str:
+    lowered = source_url.lower()
+    if "instagram.com/explore/tags/" in lowered:
+        return f"#{source_url.rstrip('/').rsplit('/', 1)[-1]}"
+    if "instagram.com/" in lowered:
+        return f"@{source_url.rstrip('/').rsplit('/', 1)[-1]}"
     return source_url.rstrip("/").rsplit("/", 1)[-1] or source_url
 
 
@@ -86,6 +95,10 @@ def _ensure_compatibility() -> None:
             connection.execute(
                 text("ALTER TABLE download_items ADD COLUMN transcript_text VARCHAR(65535)")
             )
+        if "source_description" not in columns:
+            connection.execute(
+                text("ALTER TABLE download_items ADD COLUMN source_description VARCHAR(8192)")
+            )
         if "title_draft" not in columns:
             connection.execute(
                 text("ALTER TABLE download_items ADD COLUMN title_draft VARCHAR(1024)")
@@ -143,9 +156,7 @@ def _ensure_compatibility() -> None:
                 text("ALTER TABLE download_items ADD COLUMN review_state VARCHAR(32) DEFAULT 'new'")
             )
         if "account_id" not in columns:
-            connection.execute(
-                text("ALTER TABLE download_items ADD COLUMN account_id INTEGER")
-            )
+            connection.execute(text("ALTER TABLE download_items ADD COLUMN account_id INTEGER"))
 
         account_columns = {column["name"] for column in inspect(connection).get_columns("accounts")}
         if "scrape_source_urls" not in account_columns:
@@ -153,41 +164,33 @@ def _ensure_compatibility() -> None:
                 text("ALTER TABLE accounts ADD COLUMN scrape_source_urls VARCHAR(4096)")
             )
         if "scrape_max_items" not in account_columns:
-            connection.execute(
-                text("ALTER TABLE accounts ADD COLUMN scrape_max_items INTEGER")
-            )
+            connection.execute(text("ALTER TABLE accounts ADD COLUMN scrape_max_items INTEGER"))
         if "scrape_max_age_days" not in account_columns:
-            connection.execute(
-                text("ALTER TABLE accounts ADD COLUMN scrape_max_age_days INTEGER")
-            )
+            connection.execute(text("ALTER TABLE accounts ADD COLUMN scrape_max_age_days INTEGER"))
         if "discovery_keywords" not in account_columns:
             connection.execute(
                 text("ALTER TABLE accounts ADD COLUMN discovery_keywords VARCHAR(4096)")
             )
         if "discovery_mode" not in account_columns:
             connection.execute(
-                text("ALTER TABLE accounts ADD COLUMN discovery_mode VARCHAR(32) DEFAULT 'review_only'")
+                text(
+                    "ALTER TABLE accounts ADD COLUMN discovery_mode VARCHAR(32) DEFAULT 'review_only'"
+                )
             )
         if "auto_queue_limit" not in account_columns:
-            connection.execute(
-                text("ALTER TABLE accounts ADD COLUMN auto_queue_limit INTEGER")
-            )
+            connection.execute(text("ALTER TABLE accounts ADD COLUMN auto_queue_limit INTEGER"))
         if "min_view_count" not in account_columns:
-            connection.execute(
-                text("ALTER TABLE accounts ADD COLUMN min_view_count INTEGER")
-            )
+            connection.execute(text("ALTER TABLE accounts ADD COLUMN min_view_count INTEGER"))
         if "min_like_count" not in account_columns:
+            connection.execute(text("ALTER TABLE accounts ADD COLUMN min_like_count INTEGER"))
+        if "candidate_min_like_filter" not in account_columns:
             connection.execute(
-                text("ALTER TABLE accounts ADD COLUMN min_like_count INTEGER")
+                text("ALTER TABLE accounts ADD COLUMN candidate_min_like_filter INTEGER")
             )
         if "ranking_weight_views" not in account_columns:
-            connection.execute(
-                text("ALTER TABLE accounts ADD COLUMN ranking_weight_views INTEGER")
-            )
+            connection.execute(text("ALTER TABLE accounts ADD COLUMN ranking_weight_views INTEGER"))
         if "ranking_weight_likes" not in account_columns:
-            connection.execute(
-                text("ALTER TABLE accounts ADD COLUMN ranking_weight_likes INTEGER")
-            )
+            connection.execute(text("ALTER TABLE accounts ADD COLUMN ranking_weight_likes INTEGER"))
         if "ranking_weight_recency" not in account_columns:
             connection.execute(
                 text("ALTER TABLE accounts ADD COLUMN ranking_weight_recency INTEGER")
@@ -197,21 +200,13 @@ def _ensure_compatibility() -> None:
                 text("ALTER TABLE accounts ADD COLUMN ranking_weight_keyword_match INTEGER")
             )
         if "writing_tone" not in account_columns:
-            connection.execute(
-                text("ALTER TABLE accounts ADD COLUMN writing_tone VARCHAR(256)")
-            )
+            connection.execute(text("ALTER TABLE accounts ADD COLUMN writing_tone VARCHAR(256)"))
         if "target_audience" not in account_columns:
-            connection.execute(
-                text("ALTER TABLE accounts ADD COLUMN target_audience VARCHAR(256)")
-            )
+            connection.execute(text("ALTER TABLE accounts ADD COLUMN target_audience VARCHAR(256)"))
         if "hook_style" not in account_columns:
-            connection.execute(
-                text("ALTER TABLE accounts ADD COLUMN hook_style VARCHAR(256)")
-            )
+            connection.execute(text("ALTER TABLE accounts ADD COLUMN hook_style VARCHAR(256)"))
         if "banned_phrases" not in account_columns:
-            connection.execute(
-                text("ALTER TABLE accounts ADD COLUMN banned_phrases VARCHAR(2048)")
-            )
+            connection.execute(text("ALTER TABLE accounts ADD COLUMN banned_phrases VARCHAR(2048)"))
         if "title_style_notes" not in account_columns:
             connection.execute(
                 text("ALTER TABLE accounts ADD COLUMN title_style_notes VARCHAR(2048)")
@@ -220,19 +215,59 @@ def _ensure_compatibility() -> None:
             connection.execute(
                 text("ALTER TABLE accounts ADD COLUMN caption_style_notes VARCHAR(2048)")
             )
+        if "upload_timezone" not in account_columns:
+            connection.execute(text("ALTER TABLE accounts ADD COLUMN upload_timezone VARCHAR(64)"))
+        if "upload_default_privacy" not in account_columns:
+            connection.execute(
+                text("ALTER TABLE accounts ADD COLUMN upload_default_privacy VARCHAR(32)")
+            )
+        if "upload_schedule_slots" not in account_columns:
+            connection.execute(
+                text("ALTER TABLE accounts ADD COLUMN upload_schedule_slots VARCHAR(512)")
+            )
+        if "upload_made_for_kids" not in account_columns:
+            connection.execute(
+                text("ALTER TABLE accounts ADD COLUMN upload_made_for_kids INTEGER DEFAULT 0")
+            )
+        if "upload_contains_synthetic_media" not in account_columns:
+            connection.execute(
+                text(
+                    "ALTER TABLE accounts ADD COLUMN upload_contains_synthetic_media INTEGER DEFAULT 0"
+                )
+            )
 
-        candidate_columns = {column["name"] for column in inspect(connection).get_columns("scrape_candidates")}
+        upload_job_columns = {
+            column["name"] for column in inspect(connection).get_columns("upload_jobs")
+        }
+        if "posted_url" not in upload_job_columns:
+            connection.execute(text("ALTER TABLE upload_jobs ADD COLUMN posted_url VARCHAR(2048)"))
+        if "posted_at" not in upload_job_columns:
+            connection.execute(text("ALTER TABLE upload_jobs ADD COLUMN posted_at DATETIME"))
+        if "posted_views" not in upload_job_columns:
+            connection.execute(text("ALTER TABLE upload_jobs ADD COLUMN posted_views INTEGER"))
+        if "posted_likes" not in upload_job_columns:
+            connection.execute(text("ALTER TABLE upload_jobs ADD COLUMN posted_likes INTEGER"))
+        if "posted_comments" not in upload_job_columns:
+            connection.execute(text("ALTER TABLE upload_jobs ADD COLUMN posted_comments INTEGER"))
+        if "posted_shares" not in upload_job_columns:
+            connection.execute(text("ALTER TABLE upload_jobs ADD COLUMN posted_shares INTEGER"))
+        if "content_type" not in upload_job_columns:
+            connection.execute(text("ALTER TABLE upload_jobs ADD COLUMN content_type VARCHAR(64)"))
+
+        candidate_columns = {
+            column["name"] for column in inspect(connection).get_columns("scrape_candidates")
+        }
         if "description" not in candidate_columns:
             connection.execute(
                 text("ALTER TABLE scrape_candidates ADD COLUMN description VARCHAR(8192)")
             )
         if "view_count" not in candidate_columns:
-            connection.execute(
-                text("ALTER TABLE scrape_candidates ADD COLUMN view_count INTEGER")
-            )
+            connection.execute(text("ALTER TABLE scrape_candidates ADD COLUMN view_count INTEGER"))
         if "like_count" not in candidate_columns:
+            connection.execute(text("ALTER TABLE scrape_candidates ADD COLUMN like_count INTEGER"))
+        if "comment_count" not in candidate_columns:
             connection.execute(
-                text("ALTER TABLE scrape_candidates ADD COLUMN like_count INTEGER")
+                text("ALTER TABLE scrape_candidates ADD COLUMN comment_count INTEGER")
             )
         if "duration_seconds" not in candidate_columns:
             connection.execute(
@@ -259,9 +294,7 @@ def _ensure_compatibility() -> None:
                 text("ALTER TABLE scrape_candidates ADD COLUMN queued_download_item_id INTEGER")
             )
         if "source_id" not in candidate_columns:
-            connection.execute(
-                text("ALTER TABLE scrape_candidates ADD COLUMN source_id INTEGER")
-            )
+            connection.execute(text("ALTER TABLE scrape_candidates ADD COLUMN source_id INTEGER"))
         if "scrape_run_id" not in candidate_columns:
             connection.execute(
                 text("ALTER TABLE scrape_candidates ADD COLUMN scrape_run_id INTEGER")

@@ -201,6 +201,70 @@ def test_init_db_creates_accounts_table() -> None:
         }
 
     assert "accounts" in tables
+    assert "upload_jobs" in tables
+
+
+def test_init_db_adds_manual_publish_columns_for_existing_upload_jobs() -> None:
+    db_dir = Path.cwd() / "data"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    db_path = db_dir / "nicheflow.db"
+
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at DATETIME,
+                updated_at DATETIME,
+                name VARCHAR(128),
+                platform VARCHAR(32),
+                niche_label VARCHAR(128),
+                login_identifier VARCHAR(256),
+                credential_blob VARCHAR(2048)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE download_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at DATETIME,
+                source_url VARCHAR(2048) NOT NULL,
+                status VARCHAR(32)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE upload_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at DATETIME,
+                updated_at DATETIME,
+                account_id INTEGER NOT NULL,
+                processed_path VARCHAR(2048) NOT NULL,
+                title VARCHAR(1024),
+                description VARCHAR(65535),
+                status VARCHAR(32)
+            )
+            """
+        )
+        connection.commit()
+
+    init_db()
+
+    with sqlite3.connect(db_path) as connection:
+        upload_job_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(upload_jobs)").fetchall()
+        }
+
+    assert "posted_url" in upload_job_columns
+    assert "posted_at" in upload_job_columns
+    assert "posted_views" in upload_job_columns
+    assert "posted_likes" in upload_job_columns
+    assert "posted_comments" in upload_job_columns
+    assert "posted_shares" in upload_job_columns
+    assert "content_type" in upload_job_columns
 
 
 def test_init_db_adds_scrape_columns_and_creates_candidates_table() -> None:
@@ -264,6 +328,7 @@ def test_init_db_adds_scrape_columns_and_creates_candidates_table() -> None:
     assert "auto_queue_limit" in account_columns
     assert "min_view_count" in account_columns
     assert "min_like_count" in account_columns
+    assert "candidate_min_like_filter" in account_columns
     assert "ranking_weight_views" in account_columns
     assert "ranking_weight_likes" in account_columns
     assert "ranking_weight_recency" in account_columns
@@ -274,9 +339,15 @@ def test_init_db_adds_scrape_columns_and_creates_candidates_table() -> None:
     assert "banned_phrases" in account_columns
     assert "title_style_notes" in account_columns
     assert "caption_style_notes" in account_columns
+    assert "upload_timezone" in account_columns
+    assert "upload_default_privacy" in account_columns
+    assert "upload_schedule_slots" in account_columns
+    assert "upload_made_for_kids" in account_columns
+    assert "upload_contains_synthetic_media" in account_columns
     assert "scrape_candidates" in tables
     assert "sources" in tables
     assert "scrape_runs" in tables
+    assert "upload_jobs" in tables
 
     with sqlite3.connect(db_path) as connection:
         candidate_columns = {
@@ -287,6 +358,7 @@ def test_init_db_adds_scrape_columns_and_creates_candidates_table() -> None:
     assert "description" in candidate_columns
     assert "view_count" in candidate_columns
     assert "like_count" in candidate_columns
+    assert "comment_count" in candidate_columns
     assert "duration_seconds" in candidate_columns
     assert "thumbnail_url" in candidate_columns
     assert "discovery_query" in candidate_columns

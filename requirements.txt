@@ -7,7 +7,15 @@ SQLAlchemy==2.0.25
 
 # Video Processing
 yt-dlp==2026.3.17
+instaloader==4.15
+instagrapi==2.5.15
+playwright==1.56.0
 faster-whisper==1.2.1
+
+# Upload Integrations
+google-api-python-client==2.169.0
+google-auth-oauthlib==1.2.1
+google-auth-httplib2==0.2.0
 
 # Development
 pytest==7.4.3

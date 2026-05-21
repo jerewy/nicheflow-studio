@@ -1,4 +1,4 @@
-# NicheFlow Studio — MVP Scope (Windows-first)
+# NicheFlow Studio - MVP Scope (Windows-first)
 
 This MVP is designed to be runnable and useful quickly, while keeping the codebase structured for later growth.
 
@@ -8,19 +8,37 @@ This MVP is designed to be runnable and useful quickly, while keeping the codeba
 - Local runtime directory: `data/` (ignored by git)
   - SQLite DB: `data/nicheflow.db`
   - Downloads: `data/downloads/`
+  - Processed Reels: `data/processed/`
   - Logs: `data/logs/`
-- YouTube ingestion via `yt-dlp` (including YouTube Shorts URLs)
-  - Paste URL → download → record in DB → show status in UI
+- Instagram-first publishing workflow:
+  - prepare Instagram-ready vertical Reels
+  - copy captions
+  - open the exported Reel
+  - mark posts as posted
+  - manually track posted URL and basic metrics
+- YouTube ingestion via `yt-dlp` as a source pipeline, including YouTube Shorts URLs:
+  - paste URL -> download -> record in DB -> show status in UI
+- Instagram source intake via `instaloader`:
+  - save Instagram Reel/profile/hashtag references as candidate ideas
+  - download selected Instagram Reel/post URLs through the normal queue
+  - review them alongside other candidates
+  - reuse a saved Instaloader session when one exists under `~/.instagram_scraper/`
+- Processing workflow:
+  - black-canvas/no-blur vertical template
+  - clean title rendering
+  - editable caption metadata
+  - processed output can be added to the Publish Queue
 
 ## Out of Scope (Later)
 
-- TikTok/Instagram ingestion
-- “Stealth” automation (fingerprinting, human-sim input)
-- ML verification pipeline (embeddings, drift detection, Whisper)
-- Analytics dashboards
+- Official Instagram Graph API intake and publishing automation
+- TikTok ingestion
+- "Stealth" automation such as fingerprinting, human-sim input, or logged-in scraping
+- Reposting Instagram content without rights
+- ML verification pipeline such as embeddings, drift detection, or Whisper
+- Analytics dashboards beyond manual metric tracking
 
 ## Non-Goals
 
-- Cross-platform packaging in MVP (we’ll keep code mostly portable, but ship Windows first)
-- Perfect UI/UX polish (functional > pretty for now)
-
+- Cross-platform packaging in MVP; keep code mostly portable, but ship Windows first
+- Perfect UI/UX polish; functional and reliable comes first

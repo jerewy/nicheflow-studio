@@ -9,6 +9,10 @@ from typing import Callable
 from nicheflow_studio.core.paths import downloads_dir
 from nicheflow_studio.db.models import DownloadItem
 from nicheflow_studio.db.session import get_session
+from nicheflow_studio.downloader.instagram import (
+    download_instagram_url,
+    instagram_shortcode_from_url,
+)
 from nicheflow_studio.downloader.youtube import download_youtube_url
 
 
@@ -47,8 +51,18 @@ def _sanitize_error_message(exc: Exception) -> str:
         return "YouTube blocked the download request. Try updating yt-dlp."
     if "ffmpeg is not installed" in lowered:
         return "ffmpeg is not installed."
+    if "instaloader is not installed" in lowered:
+        return "Instaloader is not installed. Run pip install -r requirements.txt."
+    if "please wait a few minutes" in lowered or "too many requests" in lowered:
+        return "Instagram rate-limited the request. Wait a few minutes and try again."
 
     return normalized[:200]
+
+
+def _download_url(*, url: str):
+    if instagram_shortcode_from_url(url) is not None:
+        return download_instagram_url(url=url, output_dir=downloads_dir() / "instagram")
+    return download_youtube_url(url=url, output_dir=downloads_dir())
 
 
 class QueueManager:
@@ -60,9 +74,15 @@ class QueueManager:
         url: str,
         callback: Callable[[DownloadItem], None] | None = None,
         account_id: int | None = None,
+        source_description: str | None = None,
     ) -> int:
         with get_session() as session:
-            item = DownloadItem(source_url=url, status="queued", account_id=account_id)
+            item = DownloadItem(
+                source_url=url,
+                status="queued",
+                account_id=account_id,
+                source_description=source_description,
+            )
             session.add(item)
             session.commit()
             item_id = item.id
@@ -89,7 +109,9 @@ class QueueManager:
         return True
 
     @classmethod
-    def _run_download(cls, item_id: int, url: str, callback: Callable[[DownloadItem], None] | None) -> None:
+    def _run_download(
+        cls, item_id: int, url: str, callback: Callable[[DownloadItem], None] | None
+    ) -> None:
         with get_session() as session:
             item = session.get(DownloadItem, item_id)
             if item is None:
@@ -99,7 +121,7 @@ class QueueManager:
             session.commit()
 
         try:
-            result = download_youtube_url(url=url, output_dir=downloads_dir())
+            result = _download_url(url=url)
             with get_session() as session:
                 item = session.get(DownloadItem, item_id)
                 if item is None:

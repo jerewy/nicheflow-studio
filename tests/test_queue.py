@@ -39,6 +39,7 @@ def test_enqueue_download_persists_success_and_callback(monkeypatch) -> None:
     item_id = QueueManager.enqueue_download(
         url="https://youtube.com/watch?v=abc123",
         callback=callback,
+        source_description="Original scraped caption with useful context.",
     )
 
     with get_session() as session:
@@ -49,9 +50,40 @@ def test_enqueue_download_persists_success_and_callback(monkeypatch) -> None:
     assert item.extractor == "youtube"
     assert item.video_id == "abc123"
     assert item.title == "Test title"
+    assert item.source_description == "Original scraped caption with useful context."
     assert item.file_path == str(output_file)
     assert item.error_message is None
     assert callback_states == [("downloaded", None)]
+
+
+def test_enqueue_download_routes_instagram_urls(monkeypatch) -> None:
+    output_file = Path.cwd() / "data" / "downloads" / "instagram" / "reel.mp4"
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    output_file.touch()
+
+    def fake_download(*, url: str, output_dir: Path):
+        assert url == "https://www.instagram.com/reel/abc123/"
+        assert output_dir.name == "instagram"
+        return DownloadResult(
+            extractor="instagram",
+            video_id="abc123",
+            title="Instagram clip",
+            file_path=output_file,
+        )
+
+    monkeypatch.setattr(QueueManager, "_executor", ImmediateExecutor())
+    monkeypatch.setattr("nicheflow_studio.queue.download_instagram_url", fake_download)
+
+    item_id = QueueManager.enqueue_download(url="https://www.instagram.com/reel/abc123/")
+
+    with get_session() as session:
+        item = session.get(DownloadItem, item_id)
+
+    assert item is not None
+    assert item.status == "downloaded"
+    assert item.extractor == "instagram"
+    assert item.video_id == "abc123"
+    assert item.file_path == str(output_file)
 
 
 def test_enqueue_download_persists_failed_status_and_sanitized_error(monkeypatch) -> None:
@@ -122,7 +154,9 @@ def test_enqueue_download_maps_requested_format_error(monkeypatch) -> None:
 
     assert item is not None
     assert item.status == "failed"
-    assert item.error_message == "This video format is not available right now. Try updating yt-dlp."
+    assert (
+        item.error_message == "This video format is not available right now. Try updating yt-dlp."
+    )
 
 
 def test_enqueue_download_maps_http_403_error(monkeypatch) -> None:
@@ -193,6 +227,8 @@ def test_run_download_ignores_missing_item_without_crashing(monkeypatch) -> None
 
     monkeypatch.setattr("nicheflow_studio.queue.download_youtube_url", fake_download)
 
-    QueueManager._run_download(item_id=999, url="https://youtube.com/watch?v=missing", callback=None)
+    QueueManager._run_download(
+        item_id=999, url="https://youtube.com/watch?v=missing", callback=None
+    )
 
     assert called["value"] is False
