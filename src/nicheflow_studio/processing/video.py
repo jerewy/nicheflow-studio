@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import random
 import re
 import subprocess
 import tempfile
@@ -33,6 +34,19 @@ class CropSettings:
     top: int = 0
     right: int = 0
     bottom: int = 0
+
+
+@dataclass(frozen=True)
+class AudioAlterParams:
+    """Subtle audio alteration applied per export to keep copies non-identical.
+
+    All defaults are no-ops, so an unset instance leaves audio unchanged.
+    """
+
+    tempo: float = 1.0
+    pitch: float = 1.0
+    delay_ms: int = 0
+    volume: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -1207,6 +1221,95 @@ def _average_confidence(confidences: list[float]) -> float | None:
     return round(sum(confidences) / len(confidences), 1)
 
 
+# --- Audio alteration -------------------------------------------------------
+# Light, randomized audio changes used when re-publishing the same source clip
+# to multiple accounts. Goal: (1) make each account's copy a genuinely
+# different file (different audio fingerprint), and (2) reduce the chance the
+# upload reads as recycled. Bounds are deliberately small so spoken/historical
+# audio stays fully intelligible.
+AUDIO_ALTER_TEMPO_RANGE = (0.98, 1.02)
+AUDIO_ALTER_PITCH_RANGE = (0.985, 1.015)
+AUDIO_ALTER_DELAY_MS_RANGE = (0, 60)
+AUDIO_ALTER_VOLUME_RANGE = (0.97, 1.03)
+_AUDIO_SAMPLE_RATE = 44100
+_VALID_AUDIO_MODES = {"keep", "alter"}
+
+
+def random_audio_alter_params(rng: random.Random | None = None) -> AudioAlterParams:
+    """Pick subtle, in-bounds audio alteration values.
+
+    Pass a seeded ``random.Random`` (e.g. derived from an account id + clip id)
+    when a copy must be regenerated identically.
+    """
+    chooser = rng or random.Random()
+    return AudioAlterParams(
+        tempo=round(chooser.uniform(*AUDIO_ALTER_TEMPO_RANGE), 4),
+        pitch=round(chooser.uniform(*AUDIO_ALTER_PITCH_RANGE), 4),
+        delay_ms=chooser.randint(*AUDIO_ALTER_DELAY_MS_RANGE),
+        volume=round(chooser.uniform(*AUDIO_ALTER_VOLUME_RANGE), 4),
+    )
+
+
+def build_audio_filter(
+    params: AudioAlterParams, *, sample_rate: int = _AUDIO_SAMPLE_RATE
+) -> str:
+    """Build an ffmpeg audio filtergraph for the given alteration.
+
+    Pitch is shifted via ``asetrate`` (which also changes speed); the sample
+    rate is then restored and ``atempo`` corrects net duration back to the
+    intended ``tempo``. An all-default ``AudioAlterParams`` yields ``anull``.
+    """
+    chain: list[str] = []
+    if params.pitch != 1.0:
+        chain.append(f"asetrate={int(round(sample_rate * params.pitch))}")
+        chain.append(f"aresample={sample_rate}")
+        net_tempo = params.tempo / params.pitch
+    else:
+        net_tempo = params.tempo
+    if abs(net_tempo - 1.0) > 1e-4:
+        chain.append(f"atempo={round(net_tempo, 6)}")
+    if params.volume != 1.0:
+        chain.append(f"volume={round(params.volume, 4)}")
+    if params.delay_ms > 0:
+        chain.append(f"adelay={params.delay_ms}:all=1")
+    if not chain:
+        return "anull"
+    return ",".join(chain)
+
+
+def has_audio_stream(file_path: Path) -> bool:
+    """Return True if ``file_path`` has at least one audio stream.
+
+    Falls back to True when ffprobe is unavailable so the caller defers to
+    ffmpeg's optional ``0:a?`` mapping instead of wrongly dropping audio.
+    """
+    ffprobe_path = ffprobe_binary()
+    if ffprobe_path is None:
+        return True
+    try:
+        result = subprocess.run(
+            [
+                str(ffprobe_path),
+                "-v",
+                "error",
+                "-select_streams",
+                "a",
+                "-show_entries",
+                "stream=index",
+                "-of",
+                "csv=p=0",
+                str(file_path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            **subprocess_run_kwargs(),
+        )
+    except Exception:  # noqa: BLE001
+        return True
+    return bool(result.stdout.strip())
+
+
 def export_cropped_video(
     *,
     input_path: Path,
@@ -1219,9 +1322,15 @@ def export_cropped_video(
     title_background: str = "none",
     title_layout: str = "overlay",
     enable_bold_keywords: bool = False,
+    audio_mode: str = "keep",
+    audio_alter_params: AudioAlterParams | None = None,
 ) -> Path:
     resolved_input = input_path.expanduser().resolve()
     resolved_output = output_path.expanduser().resolve()
+    if audio_mode not in _VALID_AUDIO_MODES:
+        raise ValueError(
+            f"Unknown audio_mode {audio_mode!r}; expected one of {sorted(_VALID_AUDIO_MODES)}."
+        )
     ffmpeg_path = ffmpeg_binary()
     if ffmpeg_path is None:
         raise RuntimeError("ffmpeg is not installed.")
@@ -1306,6 +1415,12 @@ def export_cropped_video(
                     )
                 )
 
+        audio_filter: str | None = None
+        if audio_mode == "alter":
+            resolved_audio_params = audio_alter_params or random_audio_alter_params()
+            if has_audio_stream(resolved_input):
+                audio_filter = build_audio_filter(resolved_audio_params)
+
         command = [
             str(ffmpeg_path),
             "-y",
@@ -1313,18 +1428,17 @@ def export_cropped_video(
             str(resolved_input),
         ]
         if complex_filter is not None:
-            command.extend(
-                [
-                    "-filter_complex",
-                    complex_filter,
-                    "-map",
-                    "[vout]",
-                    "-map",
-                    "0:a?",
-                ]
-            )
+            graph = complex_filter
+            if audio_filter is not None:
+                graph = f"{complex_filter};[0:a]{audio_filter}[aout]"
+                audio_map = ["-map", "[aout]"]
+            else:
+                audio_map = ["-map", "0:a?"]
+            command.extend(["-filter_complex", graph, "-map", "[vout]", *audio_map])
         else:
             command.extend(["-vf", ",".join(filter_parts)])
+            if audio_filter is not None:
+                command.extend(["-af", audio_filter])
         command.extend(
             [
                 "-c:v",
