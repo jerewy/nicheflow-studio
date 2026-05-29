@@ -953,6 +953,7 @@ class ProcessJobConfig:
     title_layout: str = "top_band"
     enable_bold_keywords: bool = False
     watermark_replacement_text: str | None = None
+    audio_mode: str = "keep"
 
 
 @dataclass(frozen=True)
@@ -1324,6 +1325,7 @@ class ProcessWorker(QObject):
                 title_background=self._job.title_background,
                 title_layout=self._job.title_layout,
                 enable_bold_keywords=self._job.enable_bold_keywords,
+                audio_mode=self._job.audio_mode,
             )
             watermark_payload: dict[str, object] = {
                 "watermark_replaced": False,
@@ -3414,6 +3416,14 @@ class MainWindow(QWidget):
         action_row.addWidget(self._processing_top_crop_spin)
         action_row.addWidget(bottom_crop_label)
         action_row.addWidget(self._processing_bottom_crop_spin)
+        self._processing_alter_audio_checkbox = QCheckBox("Alter audio")
+        self._processing_alter_audio_checkbox.setToolTip(
+            "Apply subtle, randomized audio changes on export so the same clip "
+            "posted to different accounts is a non-identical file. Leave off to "
+            "keep the original audio unchanged (use this for clips where the "
+            "audio is the point)."
+        )
+        action_row.addWidget(self._processing_alter_audio_checkbox)
         self._processing_export_button = QPushButton("Export")
         self._processing_export_button.clicked.connect(self._on_process_video_clicked)
         self._processing_open_processed_button = QPushButton("Open Folder")
@@ -5804,6 +5814,7 @@ class MainWindow(QWidget):
                 title_layout=pending_job.title_layout,
                 enable_bold_keywords=pending_job.enable_bold_keywords,
                 watermark_replacement_text=pending_job.watermark_replacement_text,
+                audio_mode=pending_job.audio_mode,
             )
             self._start_processing_job(auto_job)
             return
@@ -6214,6 +6225,11 @@ class MainWindow(QWidget):
                 title_layout=title_layout,
                 enable_bold_keywords=self._current_template_enables_bold(),
                 watermark_replacement_text=self._processing_watermark_replacement_text(item),
+                audio_mode=(
+                    "alter"
+                    if self._processing_alter_audio_checkbox.isChecked()
+                    else "keep"
+                ),
             )
         except Exception as exc:  # noqa: BLE001
             self._notify(f"Could not start processing: {exc}", Tone.ERROR)

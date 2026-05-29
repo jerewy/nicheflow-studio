@@ -789,6 +789,41 @@ def test_process_worker_replaces_detected_watermark(monkeypatch, tmp_path: Path)
     assert completed[0]["watermark_detected_text"] == "@comedyslam"
 
 
+def test_process_worker_forwards_audio_mode(monkeypatch, tmp_path: Path) -> None:
+    input_path = tmp_path / "input.mp4"
+    output_path = tmp_path / "output.mp4"
+    input_path.write_bytes(b"input")
+
+    captured: dict = {}
+
+    def fake_export_cropped_video(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+        output = kwargs["output_path"]
+        output.write_bytes(b"exported")
+        return output
+
+    monkeypatch.setattr(
+        "nicheflow_studio.app.main_window.export_cropped_video",
+        fake_export_cropped_video,
+    )
+
+    worker = ProcessWorker(
+        ProcessJobConfig(
+            input_path=input_path,
+            output_path=output_path,
+            crop=CropSettings(),
+            audio_mode="alter",
+        )
+    )
+    completed: list[dict] = []
+    worker.completed.connect(completed.append)
+
+    worker.run()
+
+    assert captured["audio_mode"] == "alter"
+    assert completed and completed[0]["output_path"] == str(output_path)
+
+
 def test_processing_page_can_switch_preview_to_processed_output(
     monkeypatch,
     qt_app,
