@@ -1,14 +1,23 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 from pathlib import Path
 
 import pytest
 from PyQt6.QtCore import QItemSelectionModel, Qt
 from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QLabel, QSizePolicy
+from PyQt6.QtWidgets import QSizePolicy, QTextEdit
 
-from nicheflow_studio.app.main_window import MainWindow, SuggestCropJobConfig
+from nicheflow_studio.app.main_window import (
+    InstagramDiscoverRankJobConfig,
+    InstagramDiscoverRankWorker,
+    MainWindow,
+    ProcessJobConfig,
+    ProcessWorker,
+    SuggestCropJobConfig,
+    parse_pasted_smart_draft,
+)
 from nicheflow_studio.core.paths import downloads_dir, processed_dir
 from nicheflow_studio.processing.video import CropSettings, PreprocessingOcrDiagnostics, VideoProbe
 from nicheflow_studio.db.models import (
@@ -20,7 +29,7 @@ from nicheflow_studio.db.models import (
     UploadJob,
 )
 from nicheflow_studio.db.session import get_session, init_db
-from nicheflow_studio.scraper.youtube import ScrapedVideoCandidate
+from nicheflow_studio.scraper.youtube import DiscoveryWeights, ScrapedVideoCandidate
 
 
 @pytest.fixture(autouse=True)
@@ -56,6 +65,7 @@ def _run_scrape_job_immediately(window: MainWindow, job) -> None:  # noqa: ANN00
             min_view_count=job.min_view_count,
             min_like_count=job.min_like_count,
             weights=job.weights,
+            archive_backfill=job.archive_backfill,
         )
         total_created += created_count
         total_refreshed += refreshed_count
@@ -142,6 +152,14 @@ def _complete_smart_draft_job_immediately(window: MainWindow, job) -> None:  # n
                 "This elephant stole the whole clip",
                 "Wait for the elephant reveal",
             ],
+            "recommended_title_index": 1,
+            "recommended_caption_index": 1,
+            "recommendation_reason": "Best fit because it names the reveal clearly.",
+            "option_notes": [
+                "Fastest direct hook.",
+                "Best overall for reach.",
+                "Backup broader hook.",
+            ],
             "provider_label": "Groq Scout + Llama 3.3",
             "used_fallback": False,
             "vision_payload": {
@@ -158,6 +176,14 @@ def _complete_smart_draft_job_immediately(window: MainWindow, job) -> None:  # n
                 "writer_model": "llama-3.3-70b-versatile",
                 "vision_model": "meta-llama/llama-4-scout-17b-16e-instruct",
                 "frame_count": 3,
+                "recommended_title_option_index": 1,
+                "recommended_caption_option_index": 1,
+                "recommendation_reason": "Best fit because it names the reveal clearly.",
+                "option_notes": [
+                    "Fastest direct hook.",
+                    "Best overall for reach.",
+                    "Backup broader hook.",
+                ],
             },
         }
     )
@@ -347,7 +373,7 @@ def test_source_intake_persists_candidates_for_selected_account(monkeypatch, qt_
 
         assert window._candidate_table.rowCount() == 1
         assert window._candidate_table.item(0, 0).text() == "ready"
-        assert window._candidate_table.item(0, 7).text() == "Intake clip"
+        assert window._candidate_table.item(0, 8).text() == "Intake clip"
         assert window._scrape_summary_label.text().startswith(
             "1 of 1 source(s) enabled, 1 keyword(s)"
         )
@@ -572,6 +598,7 @@ def test_processing_page_can_export_cropped_video(
         captured["title_text"] = job.title_text
         captured["title_font_size"] = job.title_font_size
         captured["title_layout"] = job.title_layout
+        captured["watermark_replacement_text"] = job.watermark_replacement_text
         job.output_path.parent.mkdir(parents=True, exist_ok=True)
         job.output_path.write_bytes(b"processed")
         _complete_processing_job_immediately(window, job)
@@ -592,24 +619,174 @@ def test_processing_page_can_export_cropped_video(
         qt_app.processEvents()
 
         assert captured["input_path"] == video_path
-        assert str(captured["output_path"]).endswith("clip_cropped.mp4")
+        assert Path(captured["output_path"]).name == "reel_001.mp4"
+        assert Path(captured["output_path"]).suffix == ".mp4"
         assert captured["crop"].top == 24
         assert captured["crop"].bottom == 96
         assert captured["title_text"] == "Hook Title"
         assert captured["title_font_size"] == window._processing_title_font_size.value()
         assert captured["title_layout"] == "top_band"
         assert window._processing_progress_label.text() == "Processing complete."
-        assert window._status_label.text() == "Processed video saved to clip_cropped.mp4."
-        assert window._processing_latest_output_label.text() == "clip_cropped.mp4"
+        assert window._status_label.text() == "Processed video saved to reel_001.mp4."
+        assert window._status_label.text().endswith(".mp4.")
+        assert window._processing_latest_output_label.text() == "reel_001.mp4"
+        assert window._processing_latest_output_label.text().endswith(".mp4")
         assert window._processing_open_latest_output_button.isEnabled() is True
         assert window._processing_open_latest_output_button.isVisible() is True
         assert window._processing_open_latest_output_button.text() == "Open Video"
         assert window._processing_preview_mode_combo.findData("output") >= 0
+        assert captured.get("watermark_replacement_text") is None
     finally:
         window._refresh_timer.stop()
         window._toast_timer.stop()
         window._hide_toast()
         window.close()
+
+
+def test_processing_instagram_account_passes_watermark_handle(
+    monkeypatch,
+    qt_app,
+    tmp_path: Path,
+) -> None:
+    init_db()
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"video")
+
+    with get_session() as session:
+        account = Account(
+            name="Memeists Daily",
+            platform="instagram",
+            login_identifier="@memeistsdaily",
+        )
+        session.add(account)
+        session.flush()
+        session.add(
+            DownloadItem(
+                source_url="https://instagram.com/reel/test/",
+                title="Export Clip",
+                status="downloaded",
+                account_id=account.id,
+                file_path=str(video_path),
+            )
+        )
+        session.commit()
+
+    monkeypatch.setattr(
+        "nicheflow_studio.app.main_window.probe_video",
+        lambda _: VideoProbe(width=720, height=1280, duration_seconds=10.0),
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_start_processing_job(window: MainWindow, job) -> None:  # noqa: ANN001
+        captured["watermark_replacement_text"] = job.watermark_replacement_text
+        job.output_path.parent.mkdir(parents=True, exist_ok=True)
+        job.output_path.write_bytes(b"processed")
+        _complete_processing_job_immediately(window, job)
+
+    monkeypatch.setattr(MainWindow, "_start_suggest_crop_job", _complete_suggest_job_immediately)
+    monkeypatch.setattr(MainWindow, "_start_processing_job", fake_start_processing_job)
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._current_account_combo.setCurrentIndex(1)
+        window._set_current_page("processing")
+        qt_app.processEvents()
+
+        window._on_process_video_clicked()
+        qt_app.processEvents()
+
+        assert captured["watermark_replacement_text"] == "@memeistsdaily"
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_processing_completion_mentions_replaced_watermark(qt_app, tmp_path: Path) -> None:
+    init_db()
+    output_path = tmp_path / "clip_cropped.mp4"
+    output_path.write_bytes(b"processed")
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._processing_in_progress = True
+
+        window._on_processing_completed(
+            {
+                "output_path": str(output_path),
+                "watermark_replaced": True,
+                "watermark_detected_text": "@comedyslam",
+                "watermark_replacement_text": "@memeistsdaily",
+            }
+        )
+
+        assert (
+            window._processing_progress_label.text()
+            == "Processing complete. Replaced @comedyslam with @memeistsdaily."
+        )
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_process_worker_replaces_detected_watermark(monkeypatch, tmp_path: Path) -> None:
+    input_path = tmp_path / "input.mp4"
+    output_path = tmp_path / "output.mp4"
+    input_path.write_bytes(b"input")
+
+    def fake_export_cropped_video(**kwargs):  # noqa: ANN003
+        output = kwargs["output_path"]
+        output.write_bytes(b"exported")
+        return output
+
+    class FakeReplacement:
+        output_path = tmp_path / "output_watermark.mp4"
+        skipped_reason = None
+        replacement_text = "@memeistsdaily"
+
+        class region:
+            text = "@comedyslam"
+
+    def fake_replace_detected_watermark(path, *, replacement_text, output_path, sample_count=3):  # noqa: ANN001
+        assert path == output_path.parent / "output.mp4"
+        assert replacement_text == "@memeistsdaily"
+        output_path.write_bytes(b"watermarked")
+        replacement = FakeReplacement()
+        replacement.output_path = output_path
+        return replacement
+
+    monkeypatch.setattr(
+        "nicheflow_studio.app.main_window.export_cropped_video",
+        fake_export_cropped_video,
+    )
+    monkeypatch.setattr(
+        "nicheflow_studio.app.main_window.replace_detected_watermark",
+        fake_replace_detected_watermark,
+    )
+    worker = ProcessWorker(
+        ProcessJobConfig(
+            input_path=input_path,
+            output_path=output_path,
+            crop=CropSettings(),
+            watermark_replacement_text="@memeistsdaily",
+        )
+    )
+    completed: list[dict] = []
+    worker.completed.connect(completed.append)
+
+    worker.run()
+
+    assert output_path.read_bytes() == b"watermarked"
+    assert completed[0]["watermark_replaced"] is True
+    assert completed[0]["watermark_detected_text"] == "@comedyslam"
 
 
 def test_processing_page_can_switch_preview_to_processed_output(
@@ -676,7 +853,8 @@ def test_processing_page_can_switch_preview_to_processed_output(
         window._processing_preview_mode_combo.setCurrentIndex(output_index)
         qt_app.processEvents()
 
-        assert loaded_paths[-1].name == "clip_cropped.mp4"
+        assert loaded_paths[-1].name == "reel_001.mp4"
+        assert loaded_paths[-1].suffix == ".mp4"
     finally:
         window._refresh_timer.stop()
         window._toast_timer.stop()
@@ -981,6 +1159,248 @@ def test_processing_open_video_button_opens_latest_processed_file(
         window.close()
 
 
+def test_open_video_re_resolves_latest_export_for_selected_item_after_re_export(
+    monkeypatch,
+    qt_app,
+    tmp_path: Path,
+) -> None:
+    """Exporting the same item twice should make Open Video open the NEW file.
+
+    The second export updates ``item.processed_path`` in the DB and refreshes
+    the panel state. Even if some intermediate refresh leaves the in-memory
+    cache pointing at the first file, the click handler re-resolves from the
+    current item's DB record and opens the latest export.
+    """
+    init_db()
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"video")
+    output_dir = processed_dir() / "AccountA"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    first_output = output_dir / "reel_001.mp4"
+    second_output = output_dir / "reel_002.mp4"
+    first_output.write_bytes(b"first")
+    second_output.write_bytes(b"second")
+
+    with get_session() as session:
+        account = Account(name="AccountA", platform="instagram")
+        session.add(account)
+        session.flush()
+        item = DownloadItem(
+            source_url="https://instagram.com/reel/a/",
+            title="Clip A",
+            status="downloaded",
+            account_id=account.id,
+            file_path=str(video_path),
+            processed_path=str(second_output),  # latest export wins
+        )
+        session.add(item)
+        session.commit()
+        item_id = item.id
+
+    opened_paths: list[str] = []
+    monkeypatch.setattr(
+        "nicheflow_studio.app.main_window.os.startfile",
+        lambda path: opened_paths.append(path),
+        raising=False,
+    )
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._selected_processing_item_id = item_id
+        # Cache is stale (still points at the first export). The click handler
+        # MUST re-resolve from the item's DB record and open the second one.
+        window._processing_last_output_path = first_output
+
+        window._on_open_latest_processed_output_clicked()
+
+        assert opened_paths == [str(second_output)]
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_open_video_state_does_not_carry_over_when_switching_to_unexported_item(
+    monkeypatch,
+    qt_app,
+    tmp_path: Path,
+) -> None:
+    """Selecting a never-exported item must clear the previous item's state.
+
+    Without this, the panel kept showing the previous item's filename and the
+    Open Video button stayed enabled — clicking it opened a file from a
+    different video.
+    """
+    init_db()
+    exported_video = tmp_path / "exported.mp4"
+    exported_video.write_bytes(b"video")
+    fresh_video = tmp_path / "fresh.mp4"
+    fresh_video.write_bytes(b"video")
+    output_dir = processed_dir() / "AccountA"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    exported_output = output_dir / "reel_001.mp4"
+    exported_output.write_bytes(b"processed")
+
+    with get_session() as session:
+        account = Account(name="AccountA", platform="instagram")
+        session.add(account)
+        session.flush()
+        exported_item = DownloadItem(
+            source_url="https://instagram.com/reel/exp/",
+            title="Exported Clip",
+            status="downloaded",
+            account_id=account.id,
+            file_path=str(exported_video),
+            processed_path=str(exported_output),
+        )
+        fresh_item = DownloadItem(
+            source_url="https://instagram.com/reel/fresh/",
+            title="Fresh Clip",
+            status="downloaded",
+            account_id=account.id,
+            file_path=str(fresh_video),
+        )
+        session.add_all([exported_item, fresh_item])
+        session.commit()
+        exported_id = exported_item.id
+        fresh_id = fresh_item.id
+
+    monkeypatch.setattr(
+        "nicheflow_studio.app.main_window.probe_video",
+        lambda _: VideoProbe(width=720, height=1280, duration_seconds=10.0),
+    )
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._current_account_combo.setCurrentIndex(1)
+        window._set_current_page("processing")
+        qt_app.processEvents()
+        # Start with the exported item — state should show its output.
+        window._selected_processing_item_id = exported_id
+        window._refresh_processing_output_preview()
+        qt_app.processEvents()
+        assert window._processing_latest_output_label.text() == "reel_001.mp4"
+        assert window._processing_last_output_path == exported_output
+        assert window._processing_open_latest_output_button.isVisible() is True
+
+        # Switch to the never-exported item — state must clear, button hidden,
+        # cache reset so no Open Video click can leak the previous file.
+        window._selected_processing_item_id = fresh_id
+        window._refresh_processing_output_preview()
+        qt_app.processEvents()
+        assert window._processing_last_output_path is None
+        assert (
+            window._processing_latest_output_label.text()
+            == "No processed output yet in this session."
+        )
+        assert window._processing_open_latest_output_button.isVisible() is False
+        assert window._processing_open_latest_output_button.isEnabled() is False
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_open_video_opens_each_items_own_latest_export_after_round_trip(
+    monkeypatch,
+    qt_app,
+    tmp_path: Path,
+) -> None:
+    """A → B → A: clicking Open Video on each must open THAT item's export.
+
+    Previously the panel fell back to ``_latest_numbered_processed_output_path``
+    on the account folder, which meant when you came back to item A the Open
+    Video button pointed at item B's most recent file instead of A's.
+    """
+    init_db()
+    video_a = tmp_path / "video_a.mp4"
+    video_b = tmp_path / "video_b.mp4"
+    video_a.write_bytes(b"a")
+    video_b.write_bytes(b"b")
+    output_dir = processed_dir() / "AccountA"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_a = output_dir / "reel_001.mp4"
+    output_b = output_dir / "reel_002.mp4"
+    output_a.write_bytes(b"export a")
+    output_b.write_bytes(b"export b")
+
+    with get_session() as session:
+        account = Account(name="AccountA", platform="instagram")
+        session.add(account)
+        session.flush()
+        item_a = DownloadItem(
+            source_url="https://instagram.com/reel/a/",
+            title="Clip A",
+            status="downloaded",
+            account_id=account.id,
+            file_path=str(video_a),
+            processed_path=str(output_a),
+        )
+        item_b = DownloadItem(
+            source_url="https://instagram.com/reel/b/",
+            title="Clip B",
+            status="downloaded",
+            account_id=account.id,
+            file_path=str(video_b),
+            processed_path=str(output_b),
+        )
+        session.add_all([item_a, item_b])
+        session.commit()
+        item_a_id = item_a.id
+        item_b_id = item_b.id
+
+    opened_paths: list[str] = []
+    monkeypatch.setattr(
+        "nicheflow_studio.app.main_window.os.startfile",
+        lambda path: opened_paths.append(path),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "nicheflow_studio.app.main_window.probe_video",
+        lambda _: VideoProbe(width=720, height=1280, duration_seconds=10.0),
+    )
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+
+        # A → Open Video should open A's file.
+        window._selected_processing_item_id = item_a_id
+        window._refresh_processing_output_preview()
+        qt_app.processEvents()
+        window._on_open_latest_processed_output_clicked()
+
+        # B → Open Video should open B's file.
+        window._selected_processing_item_id = item_b_id
+        window._refresh_processing_output_preview()
+        qt_app.processEvents()
+        window._on_open_latest_processed_output_clicked()
+
+        # Back to A → Open Video should open A's file again (not B's).
+        window._selected_processing_item_id = item_a_id
+        window._refresh_processing_output_preview()
+        qt_app.processEvents()
+        window._on_open_latest_processed_output_clicked()
+
+        assert opened_paths == [
+            str(output_a),
+            str(output_b),
+            str(output_a),
+        ]
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
 def test_processing_preview_player_has_larger_review_controls(qt_app) -> None:
     init_db()
 
@@ -1256,6 +1676,368 @@ def test_processing_page_saves_and_restores_style_settings(
         assert window._processing_title_color_input.text() == "#FFD700"
         assert window._processing_title_background_combo.currentData() == "light"
         assert window._processing_title_layout_combo.currentData() == "overlay"
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_processing_page_can_apply_cinematic_study_template(
+    qt_app,
+    tmp_path: Path,
+) -> None:
+    init_db()
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"video")
+
+    with get_session() as session:
+        account = Account(name="Cinema Files Daily", platform="instagram")
+        session.add(account)
+        session.flush()
+        session.add(
+            DownloadItem(
+                source_url="https://www.instagram.com/p/DVvuv6jEryy/",
+                title="Cinema Clip",
+                status="downloaded",
+                account_id=account.id,
+                file_path=str(video_path),
+            )
+        )
+        session.commit()
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._current_account_combo.setCurrentIndex(1)
+        window._set_current_page("processing")
+        qt_app.processEvents()
+
+        window._processing_template_combo.setCurrentIndex(
+            window._processing_template_combo.findData("cinematic_study")
+        )
+
+        assert window._processing_template_combo.currentData() == "cinematic_study"
+        assert window._processing_title_style_combo.currentData() == "cinematic_soft_italic"
+        assert window._processing_title_layout_combo.currentData() == "top_band"
+        assert window._processing_title_font_combo.currentData() == "comic_italic"
+        assert window._processing_title_color_input.text() == "#F7F3EA"
+        assert window._processing_title_font_size.value() == 58
+        assert window._processing_prompt_profile() == "cinema_study"
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_processing_preferences_persist_per_account_across_switches(
+    qt_app,
+) -> None:
+    """Each account remembers its own Processing widget snapshot (template,
+    caption style, title style, font, size, colour, background, layout)
+    so the user doesn't have to re-pick niche-appropriate styles every
+    time they switch accounts. Switching back must restore the original
+    snapshot — not bleed in values from the other account."""
+    import json
+
+    init_db()
+    with get_session() as session:
+        session.add(Account(name="Cinema A", platform="instagram"))
+        session.add(Account(name="Meme B", platform="instagram"))
+        session.commit()
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._set_current_page("processing")
+        qt_app.processEvents()
+
+        # Activate Cinema A and pick the cinema template. The change
+        # signals fire _save_processing_preferences_for_current_account,
+        # which writes the snapshot to that account row.
+        window._current_account_combo.setCurrentIndex(1)
+        qt_app.processEvents()
+        cinema_idx = window._processing_template_combo.findData("cinematic_study")
+        window._processing_template_combo.setCurrentIndex(cinema_idx)
+        qt_app.processEvents()
+        cinema_caption_idx = window._processing_caption_style_combo.findData("cinema_hook")
+        window._processing_caption_style_combo.setCurrentIndex(cinema_caption_idx)
+        qt_app.processEvents()
+        cinema_template = window._processing_template_combo.currentData()
+        cinema_caption = window._processing_caption_style_combo.currentData()
+        cinema_font_size = window._processing_title_font_size.value()
+        cinema_font = window._processing_title_font_combo.currentData()
+        cinema_color = window._processing_title_color_input.text()
+
+        # Activate Meme B and pick gaming meme. Meme B's first change
+        # triggers its own save — the cinema snapshot for Cinema A must
+        # NOT be overwritten by Meme B's selections.
+        window._current_account_combo.setCurrentIndex(2)
+        qt_app.processEvents()
+        meme_idx = window._processing_template_combo.findData("gaming_meme_black")
+        window._processing_template_combo.setCurrentIndex(meme_idx)
+        qt_app.processEvents()
+        meme_caption_idx = window._processing_caption_style_combo.findData("meme_friend_group")
+        window._processing_caption_style_combo.setCurrentIndex(meme_caption_idx)
+        qt_app.processEvents()
+
+        # Sanity: both rows have distinct stored snapshots in the DB.
+        with get_session() as session:
+            cinema_row = session.query(Account).filter(Account.name == "Cinema A").one()
+            meme_row = session.query(Account).filter(Account.name == "Meme B").one()
+        cinema_prefs = json.loads(cinema_row.processing_preferences or "{}")
+        meme_prefs = json.loads(meme_row.processing_preferences or "{}")
+        assert cinema_prefs.get("template") == "cinematic_study"
+        assert cinema_prefs.get("caption_style") == "cinema_hook"
+        assert meme_prefs.get("template") == "gaming_meme_black"
+        assert meme_prefs.get("caption_style") == "meme_friend_group"
+
+        # Switch back to Cinema A — every cinema-side widget value must
+        # be restored from the snapshot, not left at Meme B's values.
+        window._current_account_combo.setCurrentIndex(1)
+        qt_app.processEvents()
+        assert window._processing_template_combo.currentData() == cinema_template
+        assert window._processing_caption_style_combo.currentData() == cinema_caption
+        assert window._processing_title_font_size.value() == cinema_font_size
+        assert window._processing_title_font_combo.currentData() == cinema_font
+        assert window._processing_title_color_input.text() == cinema_color
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_loading_fresh_video_inherits_account_style_without_clobbering(
+    qt_app,
+) -> None:
+    """Regression: in real usage an account HAS downloaded videos, so a
+    refresh selects one and runs ``_load_processing_style_state``. That used to
+    (a) overwrite the account's saved style with the video's gaming-meme
+    fallback (the per-account snapshot was destroyed every refresh) and
+    (b) reset the widgets to gaming_meme_black instead of the account's style.
+
+    A fresh video (no per-video ``title_style_config``) must instead inherit
+    the account's saved default style, and loading it must NOT change the
+    account's stored preferences."""
+    import json
+
+    init_db()
+    with get_session() as session:
+        session.add(Account(name="Cinema A", platform="instagram"))
+        session.commit()
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._set_current_page("processing")
+        qt_app.processEvents()
+
+        # Activate Cinema A and set its niche style (persists to the account).
+        window._current_account_combo.setCurrentIndex(1)
+        qt_app.processEvents()
+        cinema_idx = window._processing_template_combo.findData("cinematic_study")
+        window._processing_template_combo.setCurrentIndex(cinema_idx)
+        qt_app.processEvents()
+
+        with get_session() as session:
+            account_id = session.query(Account).filter(Account.name == "Cinema A").one().id
+            saved_before = (
+                session.query(Account).filter(Account.id == account_id).one().processing_preferences
+            )
+        assert json.loads(saved_before).get("template") == "cinematic_study"
+
+        # Simulate selecting a freshly downloaded video with no saved style.
+        fresh_item = DownloadItem(
+            source_url="https://instagram.com/reel/fresh/",
+            title="Fresh Clip",
+            status="downloaded",
+            account_id=account_id,
+            title_style_config=None,
+            title_style_preset=None,
+        )
+        window._load_processing_style_state(fresh_item)
+        qt_app.processEvents()
+
+        # (b) The fresh video inherited the account's style, not gaming_meme.
+        assert window._processing_template_combo.currentData() == "cinematic_study"
+        # (a) Loading the video did NOT overwrite the account's saved snapshot.
+        with get_session() as session:
+            saved_after = (
+                session.query(Account).filter(Account.id == account_id).one().processing_preferences
+            )
+        assert json.loads(saved_after).get("template") == "cinematic_study"
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_processing_combo_boxes_ignore_mouse_wheel_so_page_scroll_is_safe(
+    qt_app,
+) -> None:
+    """Regression: rolling the wheel over a QComboBox normally changes the
+    selection. With the processing panel inside a scroll area, every page
+    scroll that crossed a combo silently flipped Template / Style / Font.
+
+    Verifies the NoScrollComboBox + NoScrollSpinBox subclasses ignore
+    wheelEvent (so the event bubbles up to the scroll area) instead of
+    consuming it and changing value."""
+    from PyQt6.QtCore import QEvent, QPoint, QPointF, Qt
+    from PyQt6.QtGui import QWheelEvent
+
+    init_db()
+    with get_session() as session:
+        session.add(Account(name="Wheel Account", platform="instagram"))
+        session.commit()
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._current_account_combo.setCurrentIndex(1)
+        window._set_current_page("processing")
+        qt_app.processEvents()
+
+        # Sample a few representative widgets across the processing panel.
+        combos = [
+            window._processing_template_combo,
+            window._processing_title_style_combo,
+            window._processing_title_font_combo,
+            window._processing_title_layout_combo,
+        ]
+        spins = [
+            window._processing_title_font_size,
+        ]
+
+        def _send_wheel(widget, delta: int) -> None:
+            event = QWheelEvent(
+                QPointF(5, 5),
+                widget.mapToGlobal(QPoint(5, 5)).toPointF()
+                if hasattr(widget.mapToGlobal(QPoint(5, 5)), "toPointF")
+                else QPointF(widget.mapToGlobal(QPoint(5, 5))),
+                QPoint(0, delta),
+                QPoint(0, delta),
+                Qt.MouseButton.NoButton,
+                Qt.KeyboardModifier.NoModifier,
+                Qt.ScrollPhase.NoScrollPhase,
+                False,
+            )
+            qt_app.sendEvent(widget, event)
+
+        for combo in combos:
+            assert combo.count() > 1, f"combo {combo} should have >1 entries"
+            original_index = combo.currentIndex()
+            _send_wheel(combo, 120)
+            _send_wheel(combo, -120)
+            assert combo.currentIndex() == original_index, (
+                f"combo {combo} index changed from {original_index} to "
+                f"{combo.currentIndex()} after wheel event — scroll should be ignored"
+            )
+
+        for spin in spins:
+            original_value = spin.value()
+            _send_wheel(spin, 120)
+            _send_wheel(spin, -120)
+            assert spin.value() == original_value, (
+                f"spinbox value changed from {original_value} to {spin.value()} "
+                "after wheel event"
+            )
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_processing_style_panel_shows_template_and_hides_manual_title_overrides(
+    qt_app,
+) -> None:
+    """Regression: the style panel hosting Template / Title Style / Font /
+    Size / Color / Background was set to ``setVisible(False)`` in two places
+    and never flipped on, so the user couldn't see (or pick) the Cinema
+    Viral Bold template the source code already shipped. The test we had
+    before (``…_can_apply_cinema_viral_bold_template``) passed only because
+    Qt lets you set values on hidden widgets programmatically — it didn't
+    catch that the dropdown was invisible to humans."""
+    init_db()
+    # An account is needed because the workspace is hidden behind the
+    # library gate panel until one is selected.
+    with get_session() as session:
+        session.add(Account(name="Test Account", platform="instagram"))
+        session.commit()
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._current_account_combo.setCurrentIndex(1)
+        window._set_current_page("processing")
+        qt_app.processEvents()
+        assert window._processing_style_panel.isVisible(), (
+            "style panel is hidden — Template/Style/Font dropdowns unreachable"
+        )
+        assert window._processing_template_combo.isVisible()
+        assert not window._processing_title_style_combo.isVisible()
+        assert not window._processing_title_font_combo.isVisible()
+        assert not window._processing_title_font_size.isVisible()
+        assert not window._processing_title_color_input.isVisible()
+        assert not window._processing_title_background_combo.isVisible()
+        assert not window._processing_title_layout_combo.isVisible()
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_processing_page_can_apply_cinema_viral_bold_template(
+    qt_app,
+    tmp_path: Path,
+) -> None:
+    init_db()
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"video")
+
+    with get_session() as session:
+        account = Account(name="Cinema Files Daily", platform="instagram")
+        session.add(account)
+        session.flush()
+        session.add(
+            DownloadItem(
+                source_url="https://www.instagram.com/p/DWTz3EgATbi/",
+                title="Cinema Clip",
+                status="downloaded",
+                account_id=account.id,
+                file_path=str(video_path),
+            )
+        )
+        session.commit()
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._current_account_combo.setCurrentIndex(1)
+        window._set_current_page("processing")
+        qt_app.processEvents()
+
+        window._processing_template_combo.setCurrentIndex(
+            window._processing_template_combo.findData("cinema_viral_bold")
+        )
+
+        assert window._processing_template_combo.currentData() == "cinema_viral_bold"
+        assert window._processing_title_style_combo.currentData() == "cinema_bold_rounded"
+        assert window._processing_title_layout_combo.currentData() == "top_band"
+        assert window._processing_title_font_combo.currentData() == "arial_rounded_bold"
+        assert window._processing_title_color_input.text() == "#FFFFFF"
+        assert window._processing_title_font_size.value() == 56
+        assert window._processing_prompt_profile() == "cinema_study"
     finally:
         window._refresh_timer.stop()
         window._toast_timer.stop()
@@ -1580,24 +2362,34 @@ def test_processing_page_can_generate_and_apply_smart_drafts(
             window._processing_smart_option_caption_inputs[0].toPlainText()
             == "This elephant stole the whole clip"
         )
-        assert window._processing_title_draft_input.text() == "Elephant Chaos"
+        assert "Recommended Pick: Title Option 2 + Caption Option 2" in (
+            window._processing_smart_recommendation_label.text()
+        )
+        assert "Best fit because it names the reveal clearly." in (
+            window._processing_smart_recommendation_label.text()
+        )
+        assert window._processing_smart_option_note_labels[1].text() == "Best overall for reach."
+        assert window._processing_smart_option_buttons[1].text() == "Apply Recommended"
+        assert window._processing_smart_option_buttons[1].isChecked()
+        assert window._processing_title_draft_input.text() == "Zoo Hook"
         assert (
             window._processing_caption_draft_input.toPlainText()
-            == "This elephant stole the whole clip"
+            == "Wait for the elephant reveal"
         )
         window._apply_refresh(force=True)
         window._set_current_page("processing")
         qt_app.processEvents()
-        assert window._processing_title_draft_input.text() == "Elephant Chaos"
+        assert window._processing_title_draft_input.text() == "Zoo Hook"
         assert (
             window._processing_caption_draft_input.toPlainText()
-            == "This elephant stole the whole clip"
+            == "Wait for the elephant reveal"
         )
+
+        window._on_processing_smart_option_clicked(0)
+        assert window._processing_title_draft_input.text() == "Elephant Chaos"
 
         window._on_processing_smart_option_clicked(1)
         assert window._processing_title_draft_input.text() == "Zoo Hook"
-
-        window._on_processing_smart_option_clicked(1)
         assert (
             window._processing_caption_draft_input.toPlainText() == "Wait for the elephant reveal"
         )
@@ -1614,6 +2406,190 @@ def test_processing_page_can_generate_and_apply_smart_drafts(
         assert "scene_summary" in (saved.smart_vision_payload or "")
         assert "Elephant Chaos" in (saved.smart_title_options or "")
         assert "Wait for the elephant reveal" in (saved.smart_caption_options or "")
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_processing_smart_draft_multiline_title_survives_apply_save_reload(
+    monkeypatch,
+    qt_app,
+    tmp_path: Path,
+) -> None:
+    init_db()
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"video")
+    multiline_title = 'Friend: "stop sending me reels"\n\nMe:'
+
+    with get_session() as session:
+        account = Account(name="Memeists Daily", platform="instagram", niche_label="gaming memes")
+        session.add(account)
+        session.flush()
+        session.add(
+            DownloadItem(
+                source_url="https://instagram.com/reel/multiline/",
+                title="Source title",
+                status="downloaded",
+                account_id=account.id,
+                file_path=str(video_path),
+            )
+        )
+        session.commit()
+
+    monkeypatch.setattr(
+        "nicheflow_studio.app.main_window.probe_video",
+        lambda _: VideoProbe(width=1080, height=1920, duration_seconds=8.0),
+    )
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._current_account_combo.setCurrentIndex(1)
+        window._set_current_page("processing")
+        qt_app.processEvents()
+
+        window._set_processing_smart_options(
+            [multiline_title],
+            ["That friend who keeps sending reels even after the warning."],
+        )
+
+        assert window._processing_smart_option_title_inputs[0].text() == multiline_title
+        assert "\n\n" in window._processing_smart_option_title_inputs[0].text()
+
+        window._on_processing_smart_option_clicked(0)
+        assert window._processing_title_draft_input.text() == multiline_title
+        assert "\n\n" in window._processing_title_draft_input.text()
+
+        window._on_save_text_drafts_clicked()
+        qt_app.processEvents()
+
+        with get_session() as session:
+            saved = session.query(DownloadItem).one()
+            assert saved.title_draft == multiline_title
+            assert json.loads(saved.smart_title_options or "[]") == [multiline_title]
+
+        window._apply_refresh(force=True)
+        window._set_current_page("processing")
+        qt_app.processEvents()
+
+        assert window._processing_title_draft_input.text() == multiline_title
+        assert window._processing_smart_option_title_inputs[0].text() == multiline_title
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_processing_smart_option_edits_survive_save_reload(
+    monkeypatch,
+    qt_app,
+    tmp_path: Path,
+) -> None:
+    init_db()
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"video")
+
+    with get_session() as session:
+        account = Account(name="Memeists Daily", platform="instagram", niche_label="movie memes")
+        session.add(account)
+        session.flush()
+        session.add(
+            DownloadItem(
+                source_url="https://instagram.com/reel/edit-options/",
+                title="Source title",
+                status="downloaded",
+                account_id=account.id,
+                file_path=str(video_path),
+            )
+        )
+        session.commit()
+
+    monkeypatch.setattr(
+        "nicheflow_studio.app.main_window.probe_video",
+        lambda _: VideoProbe(width=1080, height=1920, duration_seconds=8.0),
+    )
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._current_account_combo.setCurrentIndex(1)
+        window._set_current_page("processing")
+        qt_app.processEvents()
+
+        window._set_processing_smart_options(
+            ["POV: you thought 'Migration' was a kid's movie"],
+            ["Old caption about Migration."],
+        )
+        title_input = window._processing_smart_option_title_inputs[0]
+        caption_input = window._processing_smart_option_caption_inputs[0]
+        title_input.setFocus()
+        qt_app.processEvents()
+        QTest.keyClick(title_input, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier)
+        QTest.keyClicks(title_input, "POV: you thought 'Hoppers' was a kid's movie")
+        caption_input.setFocus()
+        qt_app.processEvents()
+        QTest.keyClick(caption_input, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier)
+        QTest.keyClicks(caption_input, "Corrected caption about Hoppers.")
+
+        assert title_input.text() == "POV: you thought 'Hoppers' was a kid's movie"
+        assert caption_input.toPlainText() == "Corrected caption about Hoppers."
+
+        window._request_refresh()
+        qt_app.processEvents()
+
+        assert title_input.text() == "POV: you thought 'Hoppers' was a kid's movie"
+        assert caption_input.toPlainText() == "Corrected caption about Hoppers."
+
+        window._on_save_text_drafts_clicked()
+        qt_app.processEvents()
+
+        with get_session() as session:
+            saved = session.query(DownloadItem).one()
+            assert json.loads(saved.smart_title_options or "[]") == [
+                "POV: you thought 'Hoppers' was a kid's movie"
+            ]
+            assert json.loads(saved.smart_caption_options or "[]") == [
+                "Corrected caption about Hoppers."
+            ]
+
+        window._apply_refresh(force=True)
+        window._set_current_page("processing")
+        qt_app.processEvents()
+
+        assert (
+            window._processing_smart_option_title_inputs[0].text()
+            == "POV: you thought 'Hoppers' was a kid's movie"
+        )
+        assert (
+            window._processing_smart_option_caption_inputs[0].toPlainText()
+            == "Corrected caption about Hoppers."
+        )
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_processing_smart_option_title_editors_have_bounded_height(qt_app) -> None:
+    init_db()
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+
+        for title_input in window._processing_smart_option_title_inputs:
+            assert title_input.minimumHeight() == 58
+            assert title_input.maximumHeight() == 92
+            assert title_input.sizePolicy().verticalPolicy() == QSizePolicy.Policy.Fixed
+
+        assert window._processing_title_draft_input.maximumHeight() == 118
     finally:
         window._refresh_timer.stop()
         window._toast_timer.stop()
@@ -2119,6 +3095,7 @@ def test_account_writing_preferences_persist(qt_app) -> None:
         window._show_new_account_form()
         window._account_name_input.setText("YT Main")
         window._account_niche_input.setText("animal comedy")
+        window._account_instagram_profile_input.setText("alt1")
         window._account_writing_tone_input.setText("playful")
         window._account_target_audience_input.setText("short-form animal fans")
         window._account_hook_style_input.setText("reaction-first")
@@ -2136,6 +3113,7 @@ def test_account_writing_preferences_persist(qt_app) -> None:
         assert account.banned_phrases == "like and follow"
         assert account.title_style_notes == "short punchy hooks"
         assert account.caption_style_notes == "comment-style reactions"
+        assert account.instagram_profile == "alt1"
         assert account.scrape_max_items == 20
         assert account.scrape_max_age_days is None
         assert account.discovery_mode == "review_only"
@@ -2212,6 +3190,289 @@ def test_processing_page_adds_processed_video_to_upload_schedule(qt_app, tmp_pat
         assert job.timezone == "Asia/Bangkok"
         assert job.status == "scheduled"
         assert job.scheduled_at is not None
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_processing_export_path_is_unique_per_run(
+    monkeypatch,
+    qt_app,
+    tmp_path: Path,
+) -> None:
+    init_db()
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"video")
+
+    with get_session() as session:
+        account = Account(name="IG Main", platform="instagram")
+        session.add(account)
+        session.flush()
+        item = DownloadItem(
+            source_url="https://instagram.com/reel/clip/",
+            title="Original Clip",
+            status="downloaded",
+            account_id=account.id,
+            file_path=str(video_path),
+        )
+        session.add(item)
+        session.commit()
+        item_id = item.id
+
+    monkeypatch.setattr(
+        "nicheflow_studio.app.main_window.probe_video",
+        lambda _: VideoProbe(width=720, height=1280, duration_seconds=10.0),
+    )
+    captured_paths: list[Path] = []
+
+    def fake_start_processing_job(window: MainWindow, job) -> None:  # noqa: ANN001
+        captured_paths.append(job.output_path)
+        job.output_path.parent.mkdir(parents=True, exist_ok=True)
+        job.output_path.write_bytes(b"processed")
+
+    monkeypatch.setattr(MainWindow, "_start_suggest_crop_job", _complete_suggest_job_immediately)
+    monkeypatch.setattr(MainWindow, "_start_processing_job", fake_start_processing_job)
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._current_account_combo.setCurrentIndex(1)
+        window._set_current_page("processing")
+        qt_app.processEvents()
+        window._selected_processing_item_id = item_id
+
+        window._on_process_video_clicked()
+        window._on_process_video_clicked()
+
+        assert captured_paths[0].name == "reel_001.mp4"
+        assert captured_paths[1].name == "reel_002.mp4"
+        assert captured_paths[0] != captured_paths[1]
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_processing_export_path_counts_existing_legacy_exports(
+    monkeypatch,
+    qt_app,
+    tmp_path: Path,
+) -> None:
+    init_db()
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"video")
+
+    with get_session() as session:
+        account = Account(name="Memeists Daily", platform="instagram")
+        session.add(account)
+        session.flush()
+        item = DownloadItem(
+            source_url="https://instagram.com/reel/clip/",
+            title="Original Clip",
+            status="downloaded",
+            account_id=account.id,
+            file_path=str(video_path),
+        )
+        session.add(item)
+        session.commit()
+        item_id = item.id
+
+    output_dir = processed_dir() / "Memeists_Daily"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for index in range(5):
+        (output_dir / f"Instagram_old_{index}_cropped.mp4").write_bytes(b"processed")
+
+    monkeypatch.setattr(
+        "nicheflow_studio.app.main_window.probe_video",
+        lambda _: VideoProbe(width=720, height=1280, duration_seconds=10.0),
+    )
+    captured_paths: list[Path] = []
+
+    def fake_start_processing_job(window: MainWindow, job) -> None:  # noqa: ANN001
+        captured_paths.append(job.output_path)
+
+    monkeypatch.setattr(MainWindow, "_start_suggest_crop_job", _complete_suggest_job_immediately)
+    monkeypatch.setattr(MainWindow, "_start_processing_job", fake_start_processing_job)
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._current_account_combo.setCurrentIndex(1)
+        window._set_current_page("processing")
+        qt_app.processEvents()
+        window._selected_processing_item_id = item_id
+
+        window._on_process_video_clicked()
+
+        assert captured_paths[0] == output_dir / "reel_006.mp4"
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_processing_export_persists_latest_numbered_output_for_queue(
+    monkeypatch,
+    qt_app,
+    tmp_path: Path,
+) -> None:
+    init_db()
+    video_path = tmp_path / "degenerate.mp4"
+    video_path.write_bytes(b"video")
+
+    with get_session() as session:
+        account = Account(name="LifeLagDaily", platform="instagram")
+        session.add(account)
+        session.flush()
+        item = DownloadItem(
+            source_url="https://instagram.com/reel/degenerate/",
+            title="degenerate",
+            status="downloaded",
+            account_id=account.id,
+            file_path=str(video_path),
+        )
+        session.add(item)
+        session.commit()
+        item_id = item.id
+
+    output_dir = processed_dir() / "LifeLagDaily"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for index in range(1, 6):
+        (output_dir / f"reel_{index:03d}.mp4").write_bytes(b"old")
+
+    monkeypatch.setattr(
+        "nicheflow_studio.app.main_window.probe_video",
+        lambda _: VideoProbe(width=720, height=1280, duration_seconds=10.0),
+    )
+
+    def fake_start_processing_job(window: MainWindow, job) -> None:  # noqa: ANN001
+        job.output_path.parent.mkdir(parents=True, exist_ok=True)
+        job.output_path.write_bytes(b"processed")
+        _complete_processing_job_immediately(window, job)
+
+    monkeypatch.setattr(MainWindow, "_start_suggest_crop_job", _complete_suggest_job_immediately)
+    monkeypatch.setattr(MainWindow, "_start_processing_job", fake_start_processing_job)
+
+    first_window = MainWindow()
+    try:
+        first_window.show()
+        qt_app.processEvents()
+        first_window._current_account_combo.setCurrentIndex(1)
+        first_window._set_current_page("processing")
+        qt_app.processEvents()
+        first_window._selected_processing_item_id = item_id
+
+        first_window._on_process_video_clicked()
+        qt_app.processEvents()
+
+        expected_output = output_dir / "reel_006.mp4"
+        assert expected_output.exists()
+        assert first_window._processing_latest_output_label.text() == "reel_006.mp4"
+        with get_session() as session:
+            saved_item = session.get(DownloadItem, item_id)
+            assert saved_item is not None
+            assert saved_item.processed_path == str(expected_output)
+    finally:
+        first_window._refresh_timer.stop()
+        first_window._toast_timer.stop()
+        first_window._hide_toast()
+        first_window.close()
+
+    second_window = MainWindow()
+    try:
+        second_window.show()
+        qt_app.processEvents()
+        second_window._current_account_combo.setCurrentIndex(1)
+        second_window._set_current_page("processing")
+        qt_app.processEvents()
+        second_window._selected_processing_item_id = item_id
+        second_window._refresh_processing_output_preview()
+        qt_app.processEvents()
+
+        assert second_window._processing_latest_output_label.text() == "reel_006.mp4"
+        assert second_window._processing_add_to_schedule_button.isEnabled() is True
+
+        second_window._on_add_processed_to_schedule_clicked()
+
+        with get_session() as session:
+            job = session.query(UploadJob).one()
+
+        assert job.download_item_id == item_id
+        assert job.processed_path == str(expected_output)
+    finally:
+        second_window._refresh_timer.stop()
+        second_window._toast_timer.stop()
+        second_window._hide_toast()
+        second_window.close()
+
+
+def test_processing_page_adds_latest_export_as_new_selected_publish_job(
+    monkeypatch,
+    qt_app,
+    tmp_path: Path,
+) -> None:
+    init_db()
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"video")
+    first_output = processed_dir() / "reel_001.mp4"
+    second_output = processed_dir() / "reel_002.mp4"
+    first_output.parent.mkdir(parents=True, exist_ok=True)
+    first_output.write_bytes(b"first")
+    second_output.write_bytes(b"second")
+
+    with get_session() as session:
+        account = Account(name="IG Main", platform="instagram")
+        session.add(account)
+        session.flush()
+        item = DownloadItem(
+            source_url="https://instagram.com/reel/clip/",
+            title="Original Clip",
+            status="downloaded",
+            account_id=account.id,
+            file_path=str(video_path),
+        )
+        session.add(item)
+        session.commit()
+        item_id = item.id
+
+    monkeypatch.setattr(
+        "nicheflow_studio.app.main_window.probe_video",
+        lambda _: VideoProbe(width=720, height=1280, duration_seconds=10.0),
+    )
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._current_account_combo.setCurrentIndex(1)
+        window._set_current_page("processing")
+        qt_app.processEvents()
+        window._selected_processing_item_id = item_id
+
+        window._processing_last_output_path = first_output
+        window._processing_title_draft_input.setText("first title")
+        window._processing_caption_draft_input.setPlainText("first caption")
+        window._on_add_processed_to_schedule_clicked()
+
+        window._processing_last_output_path = second_output
+        window._processing_title_draft_input.setText("second title")
+        window._processing_caption_draft_input.setPlainText("second caption")
+        window._on_add_processed_to_schedule_clicked()
+
+        with get_session() as session:
+            jobs = session.query(UploadJob).order_by(UploadJob.created_at.asc()).all()
+
+        assert len(jobs) == 2
+        assert jobs[0].processed_path == str(first_output)
+        assert jobs[1].processed_path == str(second_output)
+        assert window._selected_schedule_job_id() == jobs[1].id
+        assert window._schedule_caption_preview.toPlainText() == "second caption"
     finally:
         window._refresh_timer.stop()
         window._toast_timer.stop()
@@ -2345,7 +3606,73 @@ def test_publish_queue_has_manual_instagram_actions(qt_app, tmp_path: Path) -> N
 
         assert window._schedule_copy_caption_button.isEnabled() is True
         assert window._schedule_open_output_button.isEnabled() is True
+        assert window._schedule_instagram_assist_button.isEnabled() is True
         assert window._schedule_status_combo.isEnabled() is True
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_publish_queue_assisted_instagram_upload_opens_profile_and_copies_caption(
+    qt_app,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    init_db()
+    output_path = tmp_path / "reel.mp4"
+    output_path.write_bytes(b"processed")
+    opened_paths: list[str] = []
+    launched_profiles: list[str] = []
+
+    with get_session() as session:
+        account = Account(
+            name="Memeists Daily",
+            platform="instagram",
+            instagram_profile="alt1",
+        )
+        session.add(account)
+        session.flush()
+        session.add(
+            UploadJob(
+                account_id=account.id,
+                processed_path=str(output_path),
+                title="Cope title",
+                description="Cope caption #memes",
+                privacy_status="public",
+                status="draft",
+            )
+        )
+        session.commit()
+
+    monkeypatch.setattr(
+        "nicheflow_studio.app.main_window.os.startfile",
+        lambda path: opened_paths.append(str(path)),
+    )
+    monkeypatch.setattr(
+        "nicheflow_studio.app.main_window.launch_instagram_upload_assist",
+        lambda *, profile_name: launched_profiles.append(profile_name),
+    )
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._current_account_combo.setCurrentIndex(1)
+        window._set_current_page("uploads")
+        qt_app.processEvents()
+        window._schedule_table.selectRow(0)
+        qt_app.processEvents()
+
+        qt_app.clipboard().clear()
+        window._schedule_instagram_assist_button.click()
+        qt_app.processEvents()
+
+        assert qt_app.clipboard().text() == "Cope caption #memes"
+        assert opened_paths == [str(output_path.parent)]
+        assert launched_profiles == ["alt1"]
+        assert "Caption copied" in window._status_label.text()
     finally:
         window._refresh_timer.stop()
         window._toast_timer.stop()
@@ -2895,19 +4222,24 @@ def test_processing_generate_drafts_uses_visual_first_smart_drafts(
         window._processing_clip_premise_input.setPlainText(
             "The elephant is reacting to a zoo keeper's bucket."
         )
-        style_index = window._processing_caption_style_combo.findData("hype")
+        style_index = window._processing_caption_style_combo.findData("meme_friend_group")
         window._processing_caption_style_combo.setCurrentIndex(style_index)
+        title_style_index = window._processing_prompt_title_style_combo.findData(
+            "meme_setup_punchline"
+        )
+        window._processing_prompt_title_style_combo.setCurrentIndex(title_style_index)
 
         window._on_generate_text_drafts_clicked()
         qt_app.processEvents()
 
-        assert window._processing_title_draft_input.text() == "Elephant Chaos"
+        assert window._processing_title_draft_input.text() == "Zoo Hook"
         assert (
             "No speech transcript is available" in window._processing_transcript_input.toPlainText()
         )
         assert captured_jobs
         assert captured_jobs[0].prompt_profile == "gaming_meme"
-        assert captured_jobs[0].caption_style == "hype"
+        assert captured_jobs[0].caption_style == "meme_friend_group"
+        assert captured_jobs[0].title_style == "meme_setup_punchline"
         assert captured_jobs[0].source_description == (
             "Original caption says the elephant reacts to the keeper."
         )
@@ -2921,6 +4253,167 @@ def test_processing_generate_drafts_uses_visual_first_smart_drafts(
         )
         assert len(window._processing_smart_option_buttons) == 3
         assert "smart draft options" in window._processing_draft_status_label.text().lower()
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_processing_copy_chat_prompt_includes_local_file_and_niche_context(
+    monkeypatch,
+    qt_app,
+    tmp_path: Path,
+) -> None:
+    init_db()
+    video_path = tmp_path / "past_moments_clip.mp4"
+    video_path.write_bytes(b"video")
+
+    with get_session() as session:
+        account = Account(
+            name="Past Moments Daily",
+            platform="instagram",
+            niche_label="history moments, old clips, and strange facts",
+            writing_tone="curious, clear, factual",
+            target_audience="history and curiosity viewers",
+            hook_style="specific subject-first history hook",
+            banned_phrases="you won't believe, shocking",
+            title_style_notes="5-11 word lost archive hooks",
+            caption_style_notes="3 short paragraphs with factual context",
+        )
+        session.add(account)
+        session.flush()
+        session.add(
+            DownloadItem(
+                source_url="https://instagram.com/reel/example",
+                title="Old footage with a strange backstory",
+                source_description="Original post mentions a forgotten TV moment.",
+                status="downloaded",
+                account_id=account.id,
+                file_path=str(video_path),
+                transcript_text="A narrator describes the old clip.",
+            )
+        )
+        session.commit()
+        account_id = account.id
+
+    monkeypatch.setattr(
+        "nicheflow_studio.app.main_window.probe_video",
+        lambda _: VideoProbe(width=1080, height=1920, duration_seconds=18.0),
+    )
+    qt_app.clipboard().clear()
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        account_index = window._current_account_combo.findData(account_id)
+        window._current_account_combo.setCurrentIndex(account_index)
+        window._set_current_page("processing")
+        qt_app.processEvents()
+
+        window._apply_processing_template("lost_archive_black")
+        caption_index = window._processing_caption_style_combo.findData(
+            "history_lost_archive"
+        )
+        window._processing_caption_style_combo.setCurrentIndex(caption_index)
+        title_index = window._processing_prompt_title_style_combo.findData(
+            "history_lost_archive"
+        )
+        window._processing_prompt_title_style_combo.setCurrentIndex(title_index)
+        window._processing_clip_premise_input.setPlainText(
+            "Focus on why the clip feels like a recovered file."
+        )
+
+        window._on_copy_generation_chat_prompt_clicked()
+        prompt = qt_app.clipboard().text()
+
+        assert "Please analyze this local NicheFlow video" in prompt
+        assert str(video_path.resolve()) in prompt
+        assert "File URL: file:///" in prompt
+        assert "Past Moments Daily" in prompt
+        assert "history moments, old clips, and strange facts" in prompt
+        assert "Past Moments Black" in prompt
+        assert "history_lost_archive" in prompt
+        assert "Original post mentions a forgotten TV moment." in prompt
+        assert "Focus on why the clip feels like a recovered file." in prompt
+        assert "Style contract copied from NicheFlow smart drafts" in prompt
+        assert "Caption word target: 90-150" in prompt
+        assert "PAST MOMENTS DAILY" in prompt
+        assert "5-11 words" in prompt
+        assert "Do not use generic filler hashtags like #fyp" in prompt
+        assert "Generate 3 on-screen title options and 3 caption options" in prompt
+        assert "recommend the strongest title/caption pair" in prompt
+        assert "Recommended Pick:" in prompt
+        assert "Selection Notes:" in prompt
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_processing_copy_chat_prompt_includes_cinema_visual_style_recommendations(
+    monkeypatch,
+    qt_app,
+    tmp_path: Path,
+) -> None:
+    init_db()
+    video_path = tmp_path / "cinema_clip.mp4"
+    video_path.write_bytes(b"video")
+
+    with get_session() as session:
+        account = Account(
+            name="Cinema Files Daily",
+            platform="instagram",
+            niche_label="Movie scenes, film recommendations, cinematic moments",
+        )
+        session.add(account)
+        session.flush()
+        session.add(
+            DownloadItem(
+                source_url="https://www.instagram.com/p/DWTz3EgATbi/",
+                title="Beautiful transition scene",
+                source_description="Test category: beautiful cinematography.",
+                status="downloaded",
+                account_id=account.id,
+                file_path=str(video_path),
+            )
+        )
+        session.commit()
+        account_id = account.id
+
+    monkeypatch.setattr(
+        "nicheflow_studio.app.main_window.probe_video",
+        lambda _: VideoProbe(width=1080, height=1920, duration_seconds=18.0),
+    )
+    qt_app.clipboard().clear()
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        account_index = window._current_account_combo.findData(account_id)
+        window._current_account_combo.setCurrentIndex(account_index)
+        window._set_current_page("processing")
+        qt_app.processEvents()
+
+        window._apply_processing_template("cinema_viral_bold")
+        caption_index = window._processing_caption_style_combo.findData("cinema_hook")
+        window._processing_caption_style_combo.setCurrentIndex(caption_index)
+
+        window._on_copy_generation_chat_prompt_clicked()
+        prompt = qt_app.clipboard().text()
+
+        assert "Cinema visual style recommendation:" in prompt
+        assert "Editorial Italic = use Cinematic Study / Cinematic Soft Italic" in prompt
+        assert "Bold Rounded = use Cinema Viral Bold / Cinema Bold Rounded" in prompt
+        assert "beautiful cinematography -> Bold Rounded" in prompt
+        assert "twist scene -> Editorial Italic" in prompt
+        assert "Cinema Normal" in prompt
+        assert "Recommended Style 1:" in prompt
+        assert "Recommended Style 2:" in prompt
+        assert "Recommended Style 3:" in prompt
     finally:
         window._refresh_timer.stop()
         window._toast_timer.stop()
@@ -3033,10 +4526,10 @@ def test_processing_generate_drafts_uses_visual_first_for_silent_clips(
         qt_app.processEvents()
 
         assert len(window._processing_smart_option_buttons) == 3
-        assert window._processing_title_draft_input.text() == "Elephant Chaos"
+        assert window._processing_title_draft_input.text() == "Zoo Hook"
         assert (
             window._processing_caption_draft_input.toPlainText()
-            == "This elephant stole the whole clip"
+            == "Wait for the elephant reveal"
         )
         assert "smart draft options" in window._processing_draft_status_label.text().lower()
     finally:
@@ -3358,7 +4851,75 @@ def test_keyword_discovery_auto_queues_top_ranked_candidate(monkeypatch, qt_app)
         assert captured["account_id"] is not None
         assert window._candidate_table.rowCount() == 1
         assert window._candidate_table.item(0, 0).text() == "queued"
-        assert window._candidate_table.item(0, 8).text() != "(none)"
+        assert window._candidate_table.item(0, 9).text() != "(none)"
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_failed_instagram_source_scrape_does_not_advance_last_scraped_at(
+    qt_app, monkeypatch
+) -> None:
+    init_db()
+    previous_scrape = dt.datetime(2026, 5, 20, 12, 0, tzinfo=dt.timezone.utc)
+
+    with get_session() as session:
+        account = Account(name="IG Main", platform="instagram")
+        session.add(account)
+        session.flush()
+        source = Source(
+            account_id=account.id,
+            platform="instagram",
+            source_type="instagram_profile",
+            label="@meme.ig",
+            source_url="https://www.instagram.com/meme.ig/",
+            enabled=1,
+            priority=100,
+            last_scraped_at=previous_scrape,
+        )
+        session.add(source)
+        session.commit()
+        account_id = account.id
+        source_id = source.id
+
+    def fail_apify_source(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise RuntimeError("Apify source scrape failed")
+
+    monkeypatch.setattr(
+        "nicheflow_studio.app.main_window.scrape_instagram_source_apify",
+        fail_apify_source,
+    )
+
+    window = MainWindow()
+    try:
+        with get_session() as session:
+            source_row = session.get(Source, source_id)
+            assert source_row is not None
+
+        with pytest.raises(RuntimeError, match="Apify source scrape failed"):
+            window._run_scrape_for_source(
+                account_id=account_id,
+                source=source_row,
+                keywords=[],
+                max_items=5,
+                max_age_days=None,
+                min_view_count=0,
+                min_like_count=0,
+                weights=DiscoveryWeights(),
+            )
+
+        with get_session() as session:
+            failed_source = session.get(Source, source_id)
+            assert failed_source is not None
+            assert failed_source.last_scraped_at is not None
+            restored_scrape = failed_source.last_scraped_at
+            if restored_scrape.tzinfo is None:
+                restored_scrape = restored_scrape.replace(tzinfo=dt.timezone.utc)
+            assert restored_scrape == previous_scrape
+            assert failed_source.last_run_status == "failed"
+            assert failed_source.last_error_summary == "Apify source scrape failed"
     finally:
         window._refresh_timer.stop()
         window._toast_timer.stop()
@@ -3449,6 +5010,7 @@ def test_activity_progress_bar_tracks_source_level_progress(qt_app) -> None:
         qt_app.processEvents()
         window._current_account_combo.setCurrentIndex(1)
         window._set_current_page("scraping")
+        window._candidate_sort_combo.setCurrentIndex(window._candidate_sort_combo.findData("newest"))
         qt_app.processEvents()
 
         job = window._build_scrape_job_for_all_enabled_sources()
@@ -4312,6 +5874,51 @@ def test_account_management_modes_switch_cleanly(qt_app) -> None:
         window.close()
 
 
+def test_account_form_bottom_fields_scroll_above_actions(qt_app) -> None:
+    init_db()
+
+    window = MainWindow()
+    try:
+        window.resize(620, 650)
+        window.show()
+        qt_app.processEvents()
+
+        window._show_new_account_form()
+        qt_app.processEvents()
+
+        long_strategy_text = (
+            "relatable life-lag humor for people who feel brain-foggy, behind on life, "
+            "chronically buffering, and likely to send the reel to a friend"
+        )
+        window._account_niche_input.setText(long_strategy_text)
+        qt_app.processEvents()
+
+        assert window._account_panel.maximumWidth() == 760
+        assert window._account_form_scroll.minimumHeight() == 420
+        assert window._account_niche_input.lineWrapMode() == QTextEdit.LineWrapMode.WidgetWidth
+        assert window._account_niche_input.minimumHeight() >= 82
+
+        scroll_bar = window._account_form_scroll.verticalScrollBar()
+        scroll_bar.setValue(scroll_bar.maximum())
+        qt_app.processEvents()
+
+        caption_bottom = window._account_caption_style_notes_input.mapTo(
+            window,
+            window._account_caption_style_notes_input.rect().bottomLeft(),
+        ).y()
+        actions_top = window._account_form_actions.mapTo(
+            window,
+            window._account_form_actions.rect().topLeft(),
+        ).y()
+
+        assert caption_bottom < actions_top
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
 def test_sidebar_toggle_and_compact_library_behavior(qt_app) -> None:
     init_db()
 
@@ -4362,18 +5969,22 @@ def test_sidebar_toggle_and_compact_library_behavior(qt_app) -> None:
         window.close()
 
 
-def test_sidebar_brand_is_display_only(qt_app) -> None:
+def test_sidebar_account_manager_replaces_brand_slot(qt_app) -> None:
     window = MainWindow()
     try:
         window.show()
         qt_app.processEvents()
 
-        assert isinstance(window._sidebar_brand, QLabel)
-        assert window._sidebar_brand.objectName() == "sidebarBrand"
-        assert window._sidebar_brand.text() == "N"
-        assert window._sidebar_brand.toolTip() == "NicheFlow"
-        assert window._sidebar_brand.alignment() == Qt.AlignmentFlag.AlignCenter
-        assert window._sidebar_brand.minimumHeight() >= 40
+        sidebar_layout = window._sidebar_panel.layout()
+        assert sidebar_layout is not None
+        top_widget = sidebar_layout.itemAt(0).widget()
+
+        assert top_widget is window._sidebar_toggle_button
+        assert window._sidebar_toggle_button.text() == ""
+        assert window._sidebar_toggle_button.toolTip() == "Hide account manager"
+        assert window._sidebar_toggle_button.objectName() == "sidebarToggle"
+        assert window._sidebar_toggle_button.width() <= 40
+        assert not hasattr(window, "_sidebar_brand")
     finally:
         window._refresh_timer.stop()
         window._toast_timer.stop()
@@ -4754,7 +6365,7 @@ def test_account_form_draft_is_not_reset_by_library_refresh(qt_app) -> None:
         qt_app.processEvents()
 
         assert window._account_name_input.text() == "Draft account name"
-        assert window._account_niche_input.text() == "draft niche"
+        assert window._account_niche_input.toPlainText() == "draft niche"
     finally:
         window._refresh_timer.stop()
         window._toast_timer.stop()
@@ -4944,8 +6555,41 @@ def test_instagram_account_adds_hashtag_source(qt_app) -> None:
         window.close()
 
 
-def test_instagram_account_adds_direct_post_candidate(qt_app) -> None:
+def test_instagram_account_adds_direct_post_candidate(qt_app, monkeypatch) -> None:
     init_db()
+
+    def fake_scrape_instagram_urls_apify(
+        urls: list[str],
+        *,
+        results_limit: int | None = None,
+        timeout_secs: int = 300,
+    ):
+        assert urls == ["https://www.instagram.com/p/DYdxGRpO7Am/"]
+        assert results_limit == 1
+        return [
+            ScrapedVideoCandidate(
+                scrape_source_url=urls[0],
+                source_url="https://www.instagram.com/reel/DYdxGRpO7Am/",
+                extractor="apify:instagram",
+                video_id="DYdxGRpO7Am",
+                title="when the group chat goes quiet",
+                channel_name="meme.ig",
+                published_at=dt.datetime(2026, 5, 21, tzinfo=dt.timezone.utc),
+                description="when the group chat goes quiet",
+                view_count=250_000,
+                like_count=42_000,
+                comment_count=900,
+                duration_seconds=18,
+                thumbnail_url="https://example.test/thumb.jpg",
+                discovery_query="manual",
+                match_reason="instagram video",
+            )
+        ]
+
+    monkeypatch.setattr(
+        "nicheflow_studio.app.main_window.scrape_instagram_urls_apify",
+        fake_scrape_instagram_urls_apify,
+    )
 
     with get_session() as session:
         account = Account(name="IG Main", platform="instagram")
@@ -4971,13 +6615,176 @@ def test_instagram_account_adds_direct_post_candidate(qt_app) -> None:
         assert sources == []
         assert len(candidates) == 1
         candidate = candidates[0]
-        assert candidate.extractor == "instagram"
+        assert candidate.extractor == "apify:instagram"
         assert candidate.video_id == "DYdxGRpO7Am"
-        assert candidate.source_url == "https://www.instagram.com/p/DYdxGRpO7Am/"
-        assert candidate.match_reason == "Manual Instagram URL"
+        assert candidate.source_url == "https://www.instagram.com/reel/DYdxGRpO7Am/"
+        assert candidate.title == "when the group chat goes quiet"
+        assert candidate.channel_name == "meme.ig"
+        assert candidate.view_count == 250_000
+        assert candidate.like_count == 42_000
+        assert candidate.comment_count == 900
+        assert candidate.duration_seconds == 18
+        assert candidate.discovery_query == "manual"
+        assert candidate.ranking_score is not None
+        assert candidate.ranking_score > 0
         assert candidate.state == "candidate"
         assert window._candidate_table.rowCount() == 1
         assert "Added Instagram candidate URL." in window._status_label.text()
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_instagram_account_adds_plural_reels_candidate_and_scrolls_to_it(
+    qt_app,
+    monkeypatch,
+) -> None:
+    init_db()
+
+    shortcode = "DYLhdxWBmHB"
+    newer_date = dt.datetime(2026, 5, 22, tzinfo=dt.timezone.utc)
+    older_date = dt.datetime(2026, 5, 11, tzinfo=dt.timezone.utc)
+
+    def fake_scrape_instagram_urls_apify(
+        urls: list[str],
+        *,
+        results_limit: int | None = None,
+        timeout_secs: int = 300,
+    ):
+        assert urls == [f"https://www.instagram.com/reel/{shortcode}/"]
+        return [
+            ScrapedVideoCandidate(
+                scrape_source_url=urls[0],
+                source_url=urls[0],
+                extractor="apify:instagram",
+                video_id=shortcode,
+                title="the cackle at the end",
+                channel_name="strongblacklead",
+                published_at=older_date,
+                description="the cackle at the end",
+                view_count=9_000_000,
+                like_count=2_571_225,
+                comment_count=12_346,
+                duration_seconds=8,
+                thumbnail_url="https://example.test/thumb.jpg",
+                discovery_query="manual",
+                match_reason="instagram video",
+            )
+        ]
+
+    monkeypatch.setattr(
+        "nicheflow_studio.app.main_window.scrape_instagram_urls_apify",
+        fake_scrape_instagram_urls_apify,
+    )
+
+    with get_session() as session:
+        account = Account(name="IG Main", platform="instagram", candidate_min_like_filter=100)
+        session.add(account)
+        session.flush()
+        session.add(
+            ScrapeCandidate(
+                scrape_source_url="https://www.instagram.com/reel/newer/",
+                source_url="https://www.instagram.com/reel/newer/",
+                extractor="instagram",
+                video_id="newer",
+                title="newer reel",
+                channel_name="meme.ig",
+                published_at=newer_date,
+                like_count=1_000,
+                comment_count=5,
+                duration_seconds=10,
+                ranking_score=20,
+                account_id=account.id,
+            )
+        )
+        session.commit()
+
+    window = MainWindow()
+    scrolled_to: list[int] = []
+
+    def fake_scroll_selected_candidate_into_view() -> None:
+        scrolled_to.append(window._selected_candidate_id)
+
+    window._scroll_selected_candidate_into_view = fake_scroll_selected_candidate_into_view  # type: ignore[method-assign]
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._current_account_combo.setCurrentIndex(1)
+        window._set_current_page("scraping")
+        window._candidate_sort_combo.setCurrentIndex(window._candidate_sort_combo.findData("newest"))
+        qt_app.processEvents()
+
+        window._scrape_source_input.setText(f"https://www.instagram.com/reels/{shortcode}/")
+        window._on_add_scrape_source_clicked()
+        qt_app.processEvents()
+
+        with get_session() as session:
+            candidate = (
+                session.query(ScrapeCandidate)
+                .filter(ScrapeCandidate.video_id == shortcode)
+                .one()
+            )
+
+        assert candidate.source_url == f"https://www.instagram.com/reel/{shortcode}/"
+        assert window._candidate_table.rowCount() == 2
+        assert window._candidate_table.horizontalHeaderItem(5).text() == "Added"
+        assert window._candidate_table.horizontalHeaderItem(6).text() == "Published"
+        assert window._candidate_table.item(0, 5).text() == MainWindow._candidate_added_text(
+            candidate
+        )
+        assert window._candidate_table.item(0, 6).text() == "2026-05-11"
+        assert window._candidate_table.item(0, 8).text() == "the cackle at the end"
+        assert window._selected_candidate_id == candidate.id
+        assert scrolled_to[-1] == candidate.id
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_instagram_account_adds_direct_post_candidate_when_metadata_fails(
+    qt_app,
+    monkeypatch,
+) -> None:
+    init_db()
+
+    def fake_scrape_instagram_urls_apify(*args, **kwargs):  # noqa: ANN002, ANN003
+        from nicheflow_studio.scraper.instagram_apify import ApifyScrapeError
+
+        raise ApifyScrapeError("metadata unavailable")
+
+    monkeypatch.setattr(
+        "nicheflow_studio.app.main_window.scrape_instagram_urls_apify",
+        fake_scrape_instagram_urls_apify,
+    )
+
+    with get_session() as session:
+        account = Account(name="IG Main", platform="instagram")
+        session.add(account)
+        session.commit()
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._current_account_combo.setCurrentIndex(1)
+        window._set_current_page("scraping")
+        qt_app.processEvents()
+
+        window._scrape_source_input.setText("https://www.instagram.com/p/DYdxGRpO7Am/")
+        window._on_add_scrape_source_clicked()
+        qt_app.processEvents()
+
+        with get_session() as session:
+            candidate = session.query(ScrapeCandidate).one()
+
+        assert candidate.source_url == "https://www.instagram.com/p/DYdxGRpO7Am/"
+        assert candidate.title == "Instagram media DYdxGRpO7Am"
+        assert candidate.match_reason == "Manual Instagram URL"
+        assert candidate.ranking_score == 0
     finally:
         window._refresh_timer.stop()
         window._toast_timer.stop()
@@ -5047,20 +6854,87 @@ def test_instagram_candidate_min_likes_and_sort_controls(qt_app) -> None:
 
         assert window._candidate_table.rowCount() == 2
         assert "Showing all 2 candidate(s)" in window._candidate_filter_label.text()
-        assert window._candidate_table.item(0, 7).text() == "Low like clip"
+        assert window._candidate_table.item(0, 8).text() == "Low like clip"
 
         window._candidate_sort_combo.setCurrentIndex(window._candidate_sort_combo.findData("likes"))
         qt_app.processEvents()
 
-        assert window._candidate_table.item(0, 7).text() == "Viral clip"
+        assert window._candidate_table.item(0, 8).text() == "Viral clip"
 
         window._candidate_sort_direction_combo.setCurrentIndex(
             window._candidate_sort_direction_combo.findData("asc")
         )
         qt_app.processEvents()
 
-        assert window._candidate_table.item(0, 7).text() == "Low like clip"
+        assert window._candidate_table.item(0, 8).text() == "Low like clip"
         assert "low to high" in window._candidate_filter_label.text()
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_instagram_candidate_source_filter_limits_visible_rows(qt_app) -> None:
+    init_db()
+
+    with get_session() as session:
+        account = Account(name="IG Main", platform="instagram", candidate_min_like_filter=0)
+        session.add(account)
+        session.flush()
+        session.add_all(
+            [
+                ScrapeCandidate(
+                    scrape_source_url="https://www.instagram.com/family.guy.reels/",
+                    source_url="https://www.instagram.com/reel/family1/",
+                    extractor="instagram",
+                    video_id="family1",
+                    title="Family clip",
+                    channel_name="family.guy.reels",
+                    account_id=account.id,
+                    state="candidate",
+                    ranking_score=80,
+                    like_count=12_000,
+                    comment_count=120,
+                ),
+                ScrapeCandidate(
+                    scrape_source_url="https://www.instagram.com/meme.ig/",
+                    source_url="https://www.instagram.com/reel/meme1/",
+                    extractor="instagram",
+                    video_id="meme1",
+                    title="Meme clip",
+                    channel_name="meme.ig",
+                    account_id=account.id,
+                    state="candidate",
+                    ranking_score=90,
+                    like_count=50_000,
+                    comment_count=300,
+                ),
+            ]
+        )
+        session.commit()
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._current_account_combo.setCurrentIndex(
+            window._current_account_combo.findText("IG Main (instagram)")
+        )
+        window._set_current_page("scraping")
+        qt_app.processEvents()
+
+        assert window._candidate_table.rowCount() == 2
+        source_index = window._candidate_source_filter.findData("family.guy.reels")
+        assert source_index >= 0
+
+        window._candidate_source_filter.setCurrentIndex(source_index)
+        qt_app.processEvents()
+
+        assert window._candidate_table.rowCount() == 1
+        assert window._candidate_table.item(0, 7).text() == "family.guy.reels"
+        assert window._candidate_table.item(0, 8).text() == "Family clip"
+        assert "from family.guy.reels" in window._candidate_filter_label.text()
     finally:
         window._refresh_timer.stop()
         window._toast_timer.stop()
@@ -5163,8 +7037,8 @@ def test_instagram_candidate_newest_sort_handles_mixed_timezone_datetimes(qt_app
         qt_app.processEvents()
 
         assert window._candidate_table.rowCount() == 2
-        assert window._candidate_table.item(0, 7).text() == "Naive clip"
-        assert window._candidate_table.item(1, 7).text() == "Aware clip"
+        assert window._candidate_table.item(0, 8).text() == "Naive clip"
+        assert window._candidate_table.item(1, 8).text() == "Aware clip"
     finally:
         window._refresh_timer.stop()
         window._toast_timer.stop()
@@ -5172,7 +7046,7 @@ def test_instagram_candidate_newest_sort_handles_mixed_timezone_datetimes(qt_app
         window.close()
 
 
-def test_instagram_discover_uses_selected_source_and_min_new_volume(
+def test_instagram_discover_uses_selected_source_and_requested_result_limit(
     qt_app, monkeypatch
 ) -> None:
     init_db()
@@ -5200,6 +7074,9 @@ def test_instagram_discover_uses_selected_source_and_min_new_volume(
             priority=90,
         )
         session.add_all([first_source, second_source])
+        session.flush()
+        account_id = account.id
+        second_source_id = second_source.id
         session.commit()
 
     captured: dict[str, object] = {}
@@ -5207,7 +7084,8 @@ def test_instagram_discover_uses_selected_source_and_min_new_volume(
     def fake_start(self, job) -> None:  # noqa: ANN001, ARG001
         captured["job"] = job
 
-    monkeypatch.setattr(MainWindow, "_start_instagram_discover_rank_job", fake_start)
+    monkeypatch.setattr(MainWindow, "_start_scrape_job", fake_start)
+    monkeypatch.setattr(MainWindow, "_confirm_instagram_scrape", lambda self, **kwargs: True)
 
     window = MainWindow()
     try:
@@ -5220,23 +7098,229 @@ def test_instagram_discover_uses_selected_source_and_min_new_volume(
         window._instagram_discover_source_combo.setCurrentIndex(
             window._instagram_discover_source_combo.findText("@meme.ig")
         )
-        window._instagram_discover_min_new_input.setValue(20)
-        window._instagram_deep_search_checkbox.setChecked(True)
+        window._instagram_result_limit_input.setValue(20)
         window._on_instagram_discover_clicked()
 
         job = captured["job"]
-        assert job.username == "meme.ig"
-        assert job.target_account_name == "IG Main"
-        assert job.min_new == 20
-        assert job.limit == 160
-        assert job.scrolls == 60
-        assert job.stall_limit == 10
-        assert job.wait_ms == 4500
+        assert job.account_id == account_id
+        assert job.source_ids == [second_source_id]
+        assert job.max_items == 20
+        assert job.min_like_count == 0
     finally:
         window._refresh_timer.stop()
         window._toast_timer.stop()
         window._hide_toast()
         window.close()
+
+
+def test_instagram_archive_backfill_uses_selected_depth_and_disables_hard_filters(
+    qt_app,
+    monkeypatch,
+) -> None:
+    init_db()
+
+    with get_session() as session:
+        account = Account(
+            name="IG Main",
+            platform="instagram",
+            scrape_max_items=20,
+            scrape_max_age_days=7,
+            min_view_count=50_000,
+            min_like_count=5_000,
+        )
+        session.add(account)
+        session.flush()
+        source = Source(
+            account_id=account.id,
+            platform="instagram",
+            source_type="instagram_profile",
+            label="@epicfunnypage",
+            source_url="https://www.instagram.com/epicfunnypage/",
+            enabled=1,
+            priority=100,
+        )
+        session.add(source)
+        session.flush()
+        account_id = account.id
+        source_id = source.id
+        session.commit()
+
+    captured: dict[str, object] = {}
+
+    def fake_start(self, job) -> None:  # noqa: ANN001, ARG001
+        captured["job"] = job
+
+    monkeypatch.setattr(MainWindow, "_start_scrape_job", fake_start)
+    monkeypatch.setattr(MainWindow, "_confirm_instagram_scrape", lambda self, **kwargs: True)
+    confirmations: list[dict[str, object]] = []
+
+    def fake_confirm(self, **kwargs):  # noqa: ANN001
+        confirmations.append(kwargs)
+        return True
+
+    monkeypatch.setattr(MainWindow, "_confirm_instagram_scrape", fake_confirm)
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._current_account_combo.setCurrentIndex(1)
+        window._set_current_page("scraping")
+        qt_app.processEvents()
+
+        window._instagram_discover_source_combo.setCurrentIndex(
+            window._instagram_discover_source_combo.findText("@epicfunnypage")
+        )
+        window._instagram_result_limit_input.setValue(500)
+        window._on_instagram_archive_clicked()
+
+        job = captured["job"]
+        assert job.account_id == account_id
+        assert job.source_ids == [source_id]
+        assert job.max_items == 500
+        assert job.max_age_days is None
+        assert job.min_view_count == 0
+        assert job.min_like_count == 0
+        assert job.archive_backfill is True
+        assert confirmations == [
+            {
+                "mode_label": "Search Archive",
+                "result_limit": 500,
+                "uses_latest_cursor": False,
+            }
+        ]
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_instagram_archive_backfill_skips_latest_since_cursor(qt_app, monkeypatch) -> None:
+    init_db()
+    previous_scrape = dt.datetime(2026, 5, 20, 12, 0, tzinfo=dt.timezone.utc)
+    captured: dict[str, object] = {}
+
+    with get_session() as session:
+        account = Account(name="IG Main", platform="instagram")
+        session.add(account)
+        session.flush()
+        source = Source(
+            account_id=account.id,
+            platform="instagram",
+            source_type="instagram_profile",
+            label="@epicfunnypage",
+            source_url="https://www.instagram.com/epicfunnypage/",
+            enabled=1,
+            priority=100,
+            last_scraped_at=previous_scrape,
+        )
+        session.add(source)
+        session.commit()
+        account_id = account.id
+        source_id = source.id
+
+    def fake_scrape_instagram_source_apify(
+        *,
+        source_url: str,
+        max_items: int,
+        max_age_days: int | None,
+        since: dt.datetime | None = None,
+    ) -> list[ScrapedVideoCandidate]:
+        captured["source_url"] = source_url
+        captured["max_items"] = max_items
+        captured["max_age_days"] = max_age_days
+        captured["since"] = since
+        return [
+            ScrapedVideoCandidate(
+                scrape_source_url=source_url,
+                source_url="https://www.instagram.com/p/archive1/",
+                extractor="apify:instagram",
+                video_id="archive1",
+                title="Archive clip",
+                channel_name="epicfunnypage",
+                published_at=dt.datetime(2026, 4, 1, tzinfo=dt.timezone.utc),
+                description="funny archive clip",
+                view_count=10,
+                like_count=2,
+                comment_count=1,
+            )
+        ]
+
+    monkeypatch.setattr(
+        "nicheflow_studio.app.main_window.scrape_instagram_source_apify",
+        fake_scrape_instagram_source_apify,
+    )
+
+    window = MainWindow()
+    try:
+        with get_session() as session:
+            source_row = session.get(Source, source_id)
+            assert source_row is not None
+
+        created, refreshed, skipped, rejected = window._run_scrape_for_source(
+            account_id=account_id,
+            source=source_row,
+            keywords=["funny"],
+            max_items=100,
+            max_age_days=None,
+            min_view_count=0,
+            min_like_count=0,
+            weights=DiscoveryWeights(),
+            archive_backfill=True,
+        )
+
+        assert (created, refreshed, skipped, rejected) == (1, 0, 0, 0)
+        assert captured == {
+            "source_url": "https://www.instagram.com/epicfunnypage/",
+            "max_items": 100,
+            "max_age_days": None,
+            "since": None,
+        }
+        with get_session() as session:
+            candidate = session.query(ScrapeCandidate).filter_by(video_id="archive1").one()
+            assert candidate.ranking_score is not None
+            assert candidate.ranking_score > 0
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_instagram_discover_account_cache_path_is_account_scoped() -> None:
+    assert InstagramDiscoverRankWorker._account_cache_output_path(
+        account_id=42,
+        account_name="Memeists Daily",
+        username="meme.ig",
+    ) == Path("data") / "discovered" / "accounts" / "42-memeists-daily" / "meme.ig-urls.json"
+
+
+def test_instagram_discover_worker_caps_metadata_extraction(qt_app, monkeypatch) -> None:
+    commands: list[list[str]] = []
+    failures: list[str] = []
+    job = InstagramDiscoverRankJobConfig(
+        username="meme.ig",
+        target_account_id=42,
+        target_account_name="Memeists Daily",
+        min_new=100,
+        limit=500,
+    )
+    worker = InstagramDiscoverRankWorker(job)
+
+    def fake_run_command(args: list[str]) -> None:
+        commands.append(args)
+
+    monkeypatch.setattr(worker, "_run_command", fake_run_command)
+    worker.failed.connect(failures.append)
+
+    worker.run()
+
+    assert commands == []
+    assert failures == [
+        "Legacy Instagram Playwright discovery is disabled. "
+        "Use the normal Scrape flow, which uses Apify without Instagram login cookies."
+    ]
 
 
 def test_local_mp4_import_creates_downloaded_library_item(qt_app, tmp_path: Path) -> None:
@@ -5590,7 +7674,7 @@ def test_candidate_state_filter_and_downloaded_color_are_visible(qt_app) -> None
 
         assert window._candidate_table.rowCount() == 1
         assert window._candidate_table.item(0, 0).text() == "downloaded"
-        assert window._candidate_table.item(0, 7).text() == "Downloaded clip"
+        assert window._candidate_table.item(0, 8).text() == "Downloaded clip"
         assert window._candidate_table.item(0, 0).background().color().name() == "#11271a"
     finally:
         window._refresh_timer.stop()
@@ -5952,9 +8036,10 @@ def test_scraping_page_uses_tabs_and_source_enabled_dropdown_updates_state(qt_ap
         window.close()
 
 
-def test_instagram_profile_source_scrape_selected_uses_discover_rank(qt_app, monkeypatch) -> None:
+def test_instagram_profile_source_scrape_selected_uses_safe_scrape_job(qt_app, monkeypatch) -> None:
     init_db()
 
+    account_id = 0
     with get_session() as session:
         account = Account(name="IG Main", platform="instagram")
         session.add(account)
@@ -5969,6 +8054,9 @@ def test_instagram_profile_source_scrape_selected_uses_discover_rank(qt_app, mon
             priority=100,
         )
         session.add(source)
+        session.flush()
+        account_id = account.id
+        source_id = source.id
         session.commit()
 
     captured: dict[str, object] = {}
@@ -5976,7 +8064,8 @@ def test_instagram_profile_source_scrape_selected_uses_discover_rank(qt_app, mon
     def fake_start(self, job) -> None:  # noqa: ANN001, ARG001
         captured["job"] = job
 
-    monkeypatch.setattr(MainWindow, "_start_instagram_discover_rank_job", fake_start)
+    monkeypatch.setattr(MainWindow, "_start_scrape_job", fake_start)
+    monkeypatch.setattr(MainWindow, "_confirm_instagram_scrape", lambda self, **kwargs: True)
 
     window = MainWindow()
     try:
@@ -5992,8 +8081,8 @@ def test_instagram_profile_source_scrape_selected_uses_discover_rank(qt_app, mon
         window._on_scrape_selected_clicked()
 
         job = captured["job"]
-        assert job.username == "meme.ig"
-        assert job.target_account_name == "IG Main"
+        assert job.account_id == account_id
+        assert job.source_ids == [source_id]
     finally:
         window._refresh_timer.stop()
         window._toast_timer.stop()
@@ -6069,3 +8158,96 @@ def test_removing_download_resets_linked_candidate_state(qt_app) -> None:
         window._toast_timer.stop()
         window._hide_toast()
         window.close()
+
+
+_PASTED_DRAFT_BLOB = """Title Option 1:
+That kind of **sacrifice** that makes a silent hero feel heavier than an army.
+
+Recommended Style 1:
+Editorial Italic
+
+Caption Option 1:
+The glowing Mind Stone... and hope becomes a burden.
+
+Marvel Zombies (2025), directed by Bryan Andrews, is a zombie superhero series.
+
+#MarvelZombies #BlackPanther
+
+Title Option 2:
+The moment that **reframes** the fight.
+
+Recommended Style 2:
+Bold Rounded
+
+Caption Option 2:
+That Infinity Gauntlet... and Wakanda becomes the last line.
+
+#MarvelZombies #Wakanda
+
+Title Option 3:
+One stone. One king. The whole ending becomes a **farewell**.
+
+Recommended Style 3:
+Cinema Normal
+
+Caption Option 3:
+T'Challa's raised claws... and sacrifice answers the silence.
+
+#MarvelZombies #TChalla
+
+Recommended Pick:
+Title Option 1 + Caption Option 1
+
+Why:
+This pair keeps the emotional focus on sacrifice.
+
+Selection Notes:
+Option 1: Best for a tragic, character-led post.
+Option 2: Best if you want higher readability.
+Option 3: Best for a quieter rewatch-style post.
+"""
+
+
+def test_parse_pasted_smart_draft_extracts_all_sections() -> None:
+    draft = parse_pasted_smart_draft(_PASTED_DRAFT_BLOB)
+
+    assert len(draft.title_options) == 3
+    assert draft.title_options[0] == (
+        "That kind of **sacrifice** that makes a silent hero feel heavier than an army."
+    )
+    assert draft.title_options[2].endswith("**farewell**.")
+    assert draft.recommended_styles == ["Editorial Italic", "Bold Rounded", "Cinema Normal"]
+    assert draft.recommended_title_index == 0
+    assert draft.recommended_caption_index == 0
+    assert draft.reason == "This pair keeps the emotional focus on sacrifice."
+    assert draft.option_notes[0] == "Best for a tragic, character-led post."
+    assert draft.option_notes[2] == "Best for a quieter rewatch-style post."
+
+
+def test_parse_pasted_smart_draft_preserves_caption_paragraphs() -> None:
+    draft = parse_pasted_smart_draft(_PASTED_DRAFT_BLOB)
+
+    caption_one = draft.caption_options[0]
+    # The hook, the synopsis paragraph, and the hashtag line stay as separate
+    # paragraphs (blank-line separated) and the hashtags survive at the end.
+    assert "\n\n" in caption_one
+    assert caption_one.startswith("The glowing Mind Stone")
+    assert caption_one.rstrip().endswith("#MarvelZombies #BlackPanther")
+
+
+def test_parse_pasted_smart_draft_handles_missing_footer() -> None:
+    minimal = "Title Option 1:\nA simple title\n\nCaption Option 1:\nA simple caption"
+    draft = parse_pasted_smart_draft(minimal)
+
+    assert draft.title_options == ["A simple title"]
+    assert draft.caption_options == ["A simple caption"]
+    assert draft.recommended_title_index is None
+    assert draft.reason is None
+
+
+def test_parse_pasted_smart_draft_empty_text_is_safe() -> None:
+    draft = parse_pasted_smart_draft("")
+
+    assert draft.title_options == []
+    assert draft.caption_options == []
+    assert draft.recommended_title_index is None

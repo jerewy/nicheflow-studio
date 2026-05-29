@@ -52,7 +52,7 @@ def _sanitize_error_message(exc: Exception) -> str:
     if "ffmpeg is not installed" in lowered:
         return "ffmpeg is not installed."
     if "instaloader is not installed" in lowered:
-        return "Instaloader is not installed. Run pip install -r requirements.txt."
+        return "Legacy Instagram metadata extraction is unavailable. Use the Apify path instead."
     if "please wait a few minutes" in lowered or "too many requests" in lowered:
         return "Instagram rate-limited the request. Wait a few minutes and try again."
 

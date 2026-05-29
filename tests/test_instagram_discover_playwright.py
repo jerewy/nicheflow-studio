@@ -1,14 +1,30 @@
 from __future__ import annotations
 
 import json
+import sys
 
-from scripts.instagram_discover_playwright import count_new_urls, normalize_instagram_media_url, profile_url
+from nicheflow_studio.core import instagram_session
+from scripts.instagram_discover_playwright import (
+    count_new_urls,
+    effective_resume_limit,
+    normalize_instagram_media_url,
+    normalize_instagram_reel_url,
+    profile_url,
+    save_candidates,
+    should_fast_forward_through_cache,
+)
 from scripts.instagram_discover_playwright import merge_urls, read_url_file, write_urls
 from scripts.instagram_inject_cookies import normalize_cookie_editor_export
 from scripts.instagram_save_cookies import save_cookie_export
-from scripts.instagram_scrape_urls import _filter_new_urls_for_account, _read_urls
+from scripts.instagram_scrape_urls import (
+    _extract_instagram_metadata,
+    _filter_new_urls_for_account,
+    _read_urls,
+    main,
+)
 from nicheflow_studio.db.models import Account, ScrapeCandidate
 from nicheflow_studio.db.session import get_session, init_db
+from nicheflow_studio.scraper.instagram import InstagramRateLimitError, InstagramScrapeStats
 
 
 def test_normalize_instagram_media_url_accepts_profile_prefixed_reel() -> None:
@@ -20,6 +36,14 @@ def test_normalize_instagram_media_url_accepts_profile_prefixed_reel() -> None:
 
 def test_normalize_instagram_media_url_rejects_profile_root() -> None:
     assert normalize_instagram_media_url("https://www.instagram.com/meme.ig/") is None
+
+
+def test_normalize_instagram_reel_url_rejects_posts() -> None:
+    assert normalize_instagram_reel_url("https://www.instagram.com/p/DYfgIZvRato/") is None
+    assert (
+        normalize_instagram_reel_url("https://www.instagram.com/meme.ig/reel/DYd2ApxOjyx/")
+        == "https://www.instagram.com/reel/DYd2ApxOjyx/"
+    )
 
 
 def test_profile_url_normalizes_username() -> None:
@@ -74,9 +98,22 @@ def test_discovery_resume_reads_existing_json_urls(tmp_path) -> None:
     )
 
     assert read_url_file(url_file) == [
-        "https://www.instagram.com/meme.ig/reel/DYd2ApxOjyx/",
+        "https://www.instagram.com/reel/DYd2ApxOjyx/",
         "https://www.instagram.com/reel/DYdxGRpO7Am/",
     ]
+
+
+def test_discovery_resume_filters_cached_posts_to_reels(tmp_path) -> None:
+    url_file = tmp_path / "urls.json"
+    write_urls(
+        url_file,
+        [
+            "https://www.instagram.com/reel/DYd2ApxOjyx/",
+            "https://www.instagram.com/p/DYfgIZvRato/",
+        ],
+    )
+
+    assert read_url_file(url_file) == ["https://www.instagram.com/reel/DYd2ApxOjyx/"]
 
 
 def test_merge_urls_dedupes_by_normalized_media_url() -> None:
@@ -96,6 +133,38 @@ def test_count_new_urls_uses_normalized_media_urls() -> None:
             ],
         )
         == 1
+    )
+
+
+def test_resume_limit_adds_capacity_beyond_cached_urls() -> None:
+    assert effective_resume_limit(requested_limit=160, initial_count=120) == 280
+    assert effective_resume_limit(requested_limit=160, initial_count=0) == 160
+
+
+def test_fast_forward_only_while_cache_has_no_new_urls() -> None:
+    assert (
+        should_fast_forward_through_cache(
+            baseline_count=120,
+            new_this_run=0,
+            previous_new_this_run=0,
+        )
+        is True
+    )
+    assert (
+        should_fast_forward_through_cache(
+            baseline_count=120,
+            new_this_run=1,
+            previous_new_this_run=0,
+        )
+        is False
+    )
+    assert (
+        should_fast_forward_through_cache(
+            baseline_count=0,
+            new_this_run=0,
+            previous_new_this_run=0,
+        )
+        is False
     )
 
 
@@ -127,6 +196,255 @@ def test_cookie_editor_export_normalizes_for_playwright() -> None:
             "expires": 1800000000,
         }
     ]
+
+
+def test_cookie_editor_export_converts_to_yt_dlp_cookiefile(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "instagram-cookies.json"
+    dest = tmp_path / "instagram-cookies.txt"
+    source.write_text(
+        json.dumps(
+            [
+                {
+                    "name": "sessionid",
+                    "value": "secret",
+                    "domain": "instagram.com",
+                    "path": "/",
+                    "secure": True,
+                    "expirationDate": 1800000000.1,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(instagram_session, "_COOKIES_JSON_PATH", source)
+    monkeypatch.setattr(instagram_session, "_COOKIES_TXT_PATH", dest)
+
+    cookiefile = instagram_session.get_instagram_yt_dlp_cookiefile()
+
+    assert cookiefile == str(dest)
+    assert dest.read_text(encoding="utf-8") == (
+        "# Netscape HTTP Cookie File\n"
+        ".instagram.com\tTRUE\t/\tTRUE\t1800000000\tsessionid\tsecret\n"
+    )
+    status = instagram_session.instagram_yt_dlp_cookie_status()
+    assert status.cookiefile == str(dest)
+    assert status.has_sessionid is True
+
+
+def test_cookie_status_rejects_cookiefile_without_sessionid(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "instagram-cookies.json"
+    dest = tmp_path / "instagram-cookies.txt"
+    source.write_text(
+        json.dumps(
+            [
+                {
+                    "name": "csrftoken",
+                    "value": "token",
+                    "domain": "instagram.com",
+                    "path": "/",
+                    "secure": True,
+                    "expirationDate": 1800000000,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(instagram_session, "_COOKIES_JSON_PATH", source)
+    monkeypatch.setattr(instagram_session, "_COOKIES_TXT_PATH", dest)
+
+    status = instagram_session.instagram_yt_dlp_cookie_status()
+
+    assert status.cookiefile == str(dest)
+    assert status.has_sessionid is False
+
+
+def test_metadata_script_rate_limit_without_candidates_exits_cleanly(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    url_file = tmp_path / "urls.json"
+    url_file.write_text(
+        json.dumps(["https://www.instagram.com/reel/rateLimited/"]),
+        encoding="utf-8",
+    )
+
+    def raise_rate_limit(*args, **kwargs):  # noqa: ANN001, ARG001
+        raise InstagramRateLimitError(
+            "Instagram rate limit hit. Wait 15-30 min before running again.",
+            [],
+            InstagramScrapeStats(input_urls=1, extraction_limit=1, attempted=1, failed_rate_limited=1),
+        )
+
+    monkeypatch.setattr(
+        "scripts.instagram_scrape_urls.scrape_instagram_urls_instaloader",
+        raise_rate_limit,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "instagram_scrape_urls.py",
+            "--file",
+            str(url_file),
+            "--save-account",
+            "meme.ig",
+            "--metadata-extractor",
+            "instaloader",
+        ],
+    )
+
+    assert main() == 0
+    output = capsys.readouterr().out
+    assert "WARNING: Instagram rate limit hit. Wait 15-30 min before running again." in output
+    assert "Metadata funnel:" in output
+    assert "- attempted: 1" in output
+    assert "- stopped by rate limit: yes" in output
+    assert "No candidates collected before rate limit. Nothing to save." in output
+
+
+def test_metadata_extraction_defaults_to_apify(monkeypatch, capsys) -> None:
+    expected_candidates = [object()]
+
+    def fake_apify(urls, *, results_limit):  # noqa: ANN001
+        assert urls == ["https://www.instagram.com/reel/abc/"]
+        assert results_limit == 1
+        return expected_candidates
+
+    def fail_instaloader(*args, **kwargs):  # noqa: ANN001, ARG001
+        raise AssertionError("instaloader should not run by default")
+
+    monkeypatch.setattr("scripts.instagram_scrape_urls.scrape_instagram_urls_apify", fake_apify)
+    monkeypatch.setattr("scripts.instagram_scrape_urls.scrape_instagram_urls_instaloader", fail_instaloader)
+
+    candidates, stats, extractor_name, used_fallback = _extract_instagram_metadata(
+        ["https://www.instagram.com/reel/abc/"],
+        extraction_limit=1,
+        max_age_days=None,
+    )
+
+    assert candidates == expected_candidates
+    assert stats.input_urls == 1
+    assert stats.extraction_limit == 1
+    assert stats.attempted == 1
+    assert stats.extracted == 1
+    assert extractor_name == "apify"
+    assert used_fallback is False
+    output = capsys.readouterr().out
+    assert "metadata extractor: apify" in output
+
+
+def test_metadata_extraction_can_use_instaloader_explicitly(monkeypatch, capsys) -> None:
+    expected_stats = InstagramScrapeStats(input_urls=1, extraction_limit=1, attempted=1, extracted=1)
+    expected_candidates = [object()]
+
+    def fake_instaloader(*args, **kwargs):  # noqa: ANN001, ARG001
+        return expected_candidates, expected_stats, True
+
+    def fail_yt_dlp(*args, **kwargs):  # noqa: ANN001, ARG001
+        raise AssertionError("yt-dlp fallback should not run when instaloader succeeds")
+
+    monkeypatch.setattr("scripts.instagram_scrape_urls.scrape_instagram_urls_instaloader", fake_instaloader)
+    monkeypatch.setattr("scripts.instagram_scrape_urls.scrape_instagram_urls_with_stats", fail_yt_dlp)
+
+    candidates, stats, extractor_name, used_fallback = _extract_instagram_metadata(
+        ["https://www.instagram.com/reel/abc/"],
+        extraction_limit=1,
+        max_age_days=None,
+        metadata_extractor="instaloader",
+    )
+
+    assert candidates == expected_candidates
+    assert stats == expected_stats
+    assert extractor_name == "instaloader"
+    assert used_fallback is False
+    output = capsys.readouterr().out
+    assert "metadata extractor: instaloader" in output
+    assert "instaloader Playwright sessionid injected: yes" in output
+
+
+def test_metadata_extraction_falls_back_to_yt_dlp(monkeypatch, capsys) -> None:
+    expected_stats = InstagramScrapeStats(input_urls=1, extraction_limit=1, attempted=1, extracted=1)
+    expected_candidates = [object()]
+
+    def fail_instaloader(*args, **kwargs):  # noqa: ANN001, ARG001
+        raise RuntimeError("instaloader unavailable")
+
+    def fake_yt_dlp(*args, **kwargs):  # noqa: ANN001, ARG001
+        return expected_candidates, expected_stats
+
+    monkeypatch.setattr("scripts.instagram_scrape_urls.scrape_instagram_urls_instaloader", fail_instaloader)
+    monkeypatch.setattr("scripts.instagram_scrape_urls.scrape_instagram_urls_with_stats", fake_yt_dlp)
+
+    candidates, stats, extractor_name, used_fallback = _extract_instagram_metadata(
+        ["https://www.instagram.com/reel/abc/"],
+        extraction_limit=1,
+        max_age_days=None,
+        metadata_extractor="instaloader",
+    )
+
+    assert candidates == expected_candidates
+    assert stats == expected_stats
+    assert extractor_name == "yt-dlp"
+    assert used_fallback is True
+    output = capsys.readouterr().out
+    assert "falling back to yt-dlp" in output
+    assert "metadata extractor: yt-dlp fallback" in output
+
+
+def test_metadata_extraction_can_use_apify(monkeypatch, capsys) -> None:
+    expected_candidates = [object()]
+
+    def fake_apify(urls, *, results_limit):  # noqa: ANN001
+        assert urls == ["https://www.instagram.com/reel/abc/"]
+        assert results_limit == 1
+        return expected_candidates
+
+    def fail_instaloader(*args, **kwargs):  # noqa: ANN001, ARG001
+        raise AssertionError("instaloader should not run when apify is selected")
+
+    monkeypatch.setattr("scripts.instagram_scrape_urls.scrape_instagram_urls_apify", fake_apify)
+    monkeypatch.setattr("scripts.instagram_scrape_urls.scrape_instagram_urls_instaloader", fail_instaloader)
+
+    candidates, stats, extractor_name, used_fallback = _extract_instagram_metadata(
+        ["https://www.instagram.com/reel/abc/"],
+        extraction_limit=1,
+        max_age_days=None,
+        metadata_extractor="apify",
+    )
+
+    assert candidates == expected_candidates
+    assert stats.input_urls == 1
+    assert stats.extraction_limit == 1
+    assert stats.attempted == 1
+    assert stats.extracted == 1
+    assert extractor_name == "apify"
+    assert used_fallback is False
+    output = capsys.readouterr().out
+    assert "metadata extractor: apify" in output
+
+
+def test_discovery_save_candidates_passes_metadata_extractor(tmp_path, monkeypatch) -> None:
+    calls = []
+
+    def fake_run(command, *, check):  # noqa: ANN001
+        calls.append((command, check))
+
+    monkeypatch.setattr("scripts.instagram_discover_playwright.subprocess.run", fake_run)
+    url_file = tmp_path / "urls.json"
+
+    save_candidates(
+        url_file=url_file,
+        limit=5,
+        account_name="pastmomentsdaily",
+        metadata_extractor="apify",
+    )
+
+    assert len(calls) == 1
+    command, check = calls[0]
+    assert check is True
+    assert "--metadata-extractor" in command
+    assert command[command.index("--metadata-extractor") + 1] == "apify"
 
 
 def test_save_cookie_export_requires_sessionid(tmp_path) -> None:

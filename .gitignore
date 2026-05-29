@@ -44,3 +44,8 @@ data/
 # Local diagnostics / screenshots
 *.log
 *.png
+
+# Local agent / browser tooling
+.claude/
+.playwright-cli/
+.playwright-mcp/

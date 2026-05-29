@@ -6,10 +6,12 @@ Usage:
     .venv/Scripts/python.exe scripts/test_generation.py
 
 Optional filters:
-    --account 4          only process items for account id 4
-    --limit 5            stop after 5 items
+    --account 4             only process items for account id 4
+    --limit 5               stop after 5 items
     --profile gaming_meme   force a prompt profile
-    --no-regen           skip items that already have drafts
+    --no-regen              skip items that already have drafts
+    --require-vision        fail low-context items where vision didn't run
+                            instead of accepting writer-only output
 """
 from __future__ import annotations
 
@@ -32,7 +34,10 @@ if _env_file.exists():
 
 import nicheflow_studio.db.session as db_session
 from nicheflow_studio.db.models import Account, DownloadItem
-from nicheflow_studio.processing.smart_drafts import generate_smart_drafts
+from nicheflow_studio.processing.smart_drafts import (
+    VisionRequiredError,
+    generate_smart_drafts,
+)
 
 # ---------------------------------------------------------------------------
 # Account voice presets — edit these to match what the account should sound like
@@ -83,7 +88,38 @@ def _print_result(item: DownloadItem, drafts, profile: str) -> None:
     print(f"Item [{item.id}] | account={item.account_id} | profile={profile}")
     print(f"Source title : {item.title or '(none)'}")
     print(f"Provider     : {drafts.provider_label}")
+    _print_generation_diagnostics(item, drafts)
     print()
+
+
+def _print_generation_diagnostics(item: DownloadItem, drafts) -> None:
+    """Surface vision_attempted / vision_used / vision_error / frame_count.
+
+    This is the visibility Fix A is meant to give: when a real-clip run uses
+    writer-only Groq because vision silently failed, the operator now sees
+    *why* instead of only seeing a generic hook.
+    """
+    meta = drafts.generation_meta or {}
+    frame_count = meta.get("frame_count", 0)
+    vision_attempted = meta.get("vision_attempted", False)
+    vision_used = meta.get("vision_used", False)
+    vision_retry = meta.get("vision_retry_attempted", False)
+    low_context = meta.get("low_context", False)
+    vision_error = meta.get("vision_error")
+    print(
+        "Diagnostics  : "
+        f"frames={frame_count} "
+        f"vision_attempted={vision_attempted} "
+        f"vision_used={vision_used} "
+        f"retry={vision_retry} "
+        f"low_context={low_context}"
+    )
+    # Print the error whenever the writer ran without vision grounding on a
+    # clip that DID have an input file — that's the "silent vision failure"
+    # case Fix A is built to expose.
+    had_input = bool(item.file_path)
+    if had_input and not vision_used and vision_error:
+        print(f"Vision error : {vision_error}")
 
     if drafts.vision_payload:
         vp = drafts.vision_payload
@@ -121,6 +157,15 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument("--profile", type=str, default=None)
     parser.add_argument("--no-regen", action="store_true")
+    parser.add_argument(
+        "--require-vision",
+        action="store_true",
+        help=(
+            "Fail low-context items (generic title + no transcript) instead of "
+            "accepting writer-only output. Use this to validate that vision is "
+            "actually running on clips where it matters."
+        ),
+    )
     args = parser.parse_args()
 
     api_key = os.environ.get("GROQ_API_KEY")
@@ -141,6 +186,7 @@ def main() -> None:
 
     processed = 0
     errors = 0
+    vision_required_failures = 0
     for item in items:
         if args.no_regen and item.smart_title_options:
             continue
@@ -170,9 +216,13 @@ def main() -> None:
                 api_key=api_key,
                 account_voice=account_voice if account_voice else None,
                 prompt_profile=profile,
+                require_vision=args.require_vision,
             )
             _print_result(item, drafts, profile)
             processed += 1
+        except VisionRequiredError as exc:
+            print(f"  VISION-REQUIRED FAILURE: {exc}")
+            vision_required_failures += 1
         except Exception as exc:  # noqa: BLE001
             import traceback
             print(f"  ERROR: {exc}")
@@ -180,7 +230,10 @@ def main() -> None:
             errors += 1
 
     print(_separator("═"))
-    print(f"Done. {processed} generated, {errors} errors.")
+    print(
+        f"Done. {processed} generated, {errors} errors, "
+        f"{vision_required_failures} vision-required failures."
+    )
 
 
 if __name__ == "__main__":

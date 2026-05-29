@@ -6,15 +6,14 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import zipfile
 import av
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from PyQt6.QtCore import QDate, QDateTime, QObject, QSize, QThread, QTime, QTimer, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QIcon, QImage, QPixmap, QTextCursor
+from PyQt6.QtCore import QDate, QDateTime, QObject, QSize, QThread, QTime, QTimer, QUrl, Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QDesktopServices, QIcon, QImage, QPixmap, QTextCursor
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -27,6 +26,7 @@ from PyQt6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QProgressBar,
     QScrollArea,
@@ -74,11 +74,20 @@ from nicheflow_studio.processing.video import (
     processed_output_path,
     suggest_title_replacement_crop,
 )
+from nicheflow_studio.processing.watermark import replace_detected_watermark
+from nicheflow_studio.publisher.instagram_web import launch_instagram_upload_assist
 from nicheflow_studio.processing.transcription import generate_transcript_draft_in_subprocess
 from nicheflow_studio.processing.smart_drafts import (
     SMART_DRAFT_OPTION_COUNT,
     SmartDrafts,
+    _caption_hashtag_target,
+    _caption_paragraph_rule,
+    _caption_style_line,
+    _caption_style_title_rules,
+    _caption_word_target,
     _groq_limit_profile,
+    _profile_style_block,
+    _title_style_rules,
     can_generate_smart_drafts,
     generate_smart_drafts,
 )
@@ -95,12 +104,42 @@ from nicheflow_studio.scraper.instagram import (
     infer_instagram_source_type,
     instagram_source_label,
     normalize_instagram_source_url,
-    scrape_instagram_source,
+)
+from nicheflow_studio.scraper.instagram_apify import (
+    ApifyConfigError,
+    ApifyScrapeError,
+    scrape_instagram_source_apify,
+    scrape_instagram_urls_apify,
 )
 from nicheflow_studio.downloader.instagram import (
     instagram_shortcode_from_url,
     validate_instagram_media_url,
 )
+
+
+class NoScrollComboBox(QComboBox):
+    """QComboBox that ignores mouse wheel events.
+
+    The processing/accounts/scheduling pages live inside a scroll area
+    packed with combos and spinboxes. With Qt's default behavior, rolling
+    the wheel over a combo silently changes the selection — so users
+    scrolling the page accidentally flip the Template, Title Style, or
+    Font without realising it. Ignoring the wheel event here lets the
+    event bubble up to the scroll area, which is what the user expects.
+    The combo still opens normally on click and accepts keyboard input
+    when focused.
+    """
+
+    def wheelEvent(self, event) -> None:  # noqa: ANN001 — Qt event type
+        event.ignore()
+
+
+class NoScrollSpinBox(QSpinBox):
+    """QSpinBox that ignores mouse wheel events for the same reason as
+    NoScrollComboBox. Click + type or use the up/down arrows to change."""
+
+    def wheelEvent(self, event) -> None:  # noqa: ANN001 — Qt event type
+        event.ignore()
 
 
 APP_STYLESHEET = """
@@ -253,6 +292,11 @@ QLabel#metaValue {
     border: none;
     border-bottom: 1px solid #223042;
     padding: 7px 4px 10px 4px;
+}
+QLabel#videoPreview {
+    background: #10161d;
+    border: none;
+    padding: 0px;
 }
 QLabel#statusLabel {
     background: #111827;
@@ -578,14 +622,6 @@ QPushButton#sidebarToggle:checked {
     border-color: #355a80;
     color: #f4f8fc;
 }
-QLabel#sidebarBrand {
-    background: transparent;
-    border: none;
-    color: #ffffff;
-    font-size: 15pt;
-    font-weight: 800;
-    padding: 0;
-}
 """
 
 
@@ -608,6 +644,7 @@ UPLOAD_PRIVACY_OPTIONS = {
     "public": "Public",
 }
 MODULE_PAGES = ("scraping", "downloads", "processing", "uploads")
+INSTAGRAM_MAX_RESULT_LIMIT = 1000
 TITLE_STYLE_PRESETS: dict[str, dict[str, object]] = {
     "clean_hook": {
         "label": "Clean Hook",
@@ -637,6 +674,34 @@ TITLE_STYLE_PRESETS: dict[str, dict[str, object]] = {
         "text_color": "#F8FAFC",
         "background": "dark",
     },
+    "cinematic_serif": {
+        "label": "Cinematic Serif",
+        "font_size": 44,
+        "font_name": "georgia_italic",
+        "text_color": "#F2E8D0",
+        "background": "none",
+    },
+    "cinematic_soft_italic": {
+        "label": "Cinematic Soft Italic",
+        "font_size": 58,
+        "font_name": "comic_italic",
+        "text_color": "#F7F3EA",
+        "background": "none",
+    },
+    "cinema_bold_rounded": {
+        "label": "Cinema Bold Rounded",
+        "font_size": 56,
+        "font_name": "arial_rounded_bold",
+        "text_color": "#FFFFFF",
+        "background": "none",
+    },
+    "cinema_georgia_clean": {
+        "label": "Cinema Georgia Clean",
+        "font_size": 54,
+        "font_name": "georgia",
+        "text_color": "#F2E8D0",
+        "background": "none",
+    },
     "lilita_style": {
         "label": "Lilita One Style",
         "font_size": 50,
@@ -652,6 +717,63 @@ TITLE_STYLE_PRESETS: dict[str, dict[str, object]] = {
         "background": "none",
     },
 }
+
+
+class _PlainPasteTextEdit(QTextEdit):
+    """QTextEdit base that always pastes plain text and replaces the current
+    selection. The default Qt behavior should already replace a selection on
+    paste, but we override insertFromMimeData explicitly so the behavior is
+    deterministic regardless of clipboard MIME shape (HTML, RTF, image+text
+    bundles) or focus quirks — a select-all then paste must overwrite the old
+    value, never append next to it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setAcceptRichText(False)
+
+    def insertFromMimeData(self, source) -> None:  # noqa: N802 - Qt override.
+        text = source.text() if source is not None and source.hasText() else ""
+        if not text:
+            return
+        self.textCursor().insertText(text)
+
+
+class MultilineTitleEdit(_PlainPasteTextEdit):
+    """Plain-text title editor that preserves setup/punchline line breaks."""
+
+    def __init__(self, *, min_height: int = 58, max_height: int = 92) -> None:
+        super().__init__()
+        self.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        self.setMinimumHeight(min_height)
+        self.setMaximumHeight(max_height)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+
+    def text(self) -> str:
+        return self.toPlainText()
+
+    def setText(self, text: str) -> None:  # noqa: N802 - mirrors QLineEdit API.
+        self.setPlainText(text)
+
+
+class MultilineCaptionEdit(_PlainPasteTextEdit):
+    """Multi-line caption editor with plain-text paste and selection-replace."""
+
+    def __init__(
+        self,
+        *,
+        min_height: int | None = None,
+        size_policy: tuple[QSizePolicy.Policy, QSizePolicy.Policy] | None = None,
+    ) -> None:
+        super().__init__()
+        if min_height is not None:
+            self.setMinimumHeight(min_height)
+        if size_policy is not None:
+            self.setSizePolicy(*size_policy)
+
 
 PROCESSING_TEMPLATES: dict[str, dict[str, object]] = {
     "gaming_meme_black": {
@@ -684,6 +806,61 @@ PROCESSING_TEMPLATES: dict[str, dict[str, object]] = {
         "background": "none",
         "prompt_profile": "story_reel",
     },
+    "lost_archive_black": {
+        "label": "Past Moments Black",
+        "title_style": "editorial_label",
+        "layout": "top_band",
+        # Smaller body so the editorial caption reads calm and sits well clear
+        # of the phone safe-area edges (a 56px title wrapped close to the canvas
+        # edge and felt shouty); 46px keeps it readable with comfortable margins.
+        "font_size": 46,
+        "font_name": "arial_bold",
+        "text_color": "#FFFFFF",
+        "background": "none",
+        "prompt_profile": "past_moments",
+    },
+    "cinematic_study": {
+        "label": "Cinematic Study",
+        "title_style": "cinematic_soft_italic",
+        "layout": "top_band",
+        "font_size": 58,
+        "font_name": "comic_italic",
+        "text_color": "#F7F3EA",
+        "background": "none",
+        "prompt_profile": "cinema_study",
+    },
+    "cinema_viral_bold": {
+        "label": "Cinema Viral Bold",
+        "title_style": "cinema_bold_rounded",
+        "layout": "top_band",
+        "font_size": 56,
+        "font_name": "arial_rounded_bold",
+        "text_color": "#FFFFFF",
+        "background": "none",
+        "prompt_profile": "cinema_study",
+    },
+    "cinema_normal": {
+        "label": "Cinema Normal",
+        "title_style": "cinema_georgia_clean",
+        "layout": "top_band",
+        "font_size": 54,
+        "font_name": "georgia",
+        "text_color": "#F2E8D0",
+        "background": "none",
+        "prompt_profile": "cinema_study",
+    },
+    "cinema_bold_keywords": {
+        "label": "Cinema Bold Keywords",
+        "title_style": "cinema_georgia_clean",
+        "prompt_title_style": "cinema_bold_keywords",
+        "layout": "top_band",
+        "font_size": 54,
+        "font_name": "georgia",
+        "text_color": "#F2E8D0",
+        "background": "none",
+        "prompt_profile": "cinema_study",
+        "bold_keywords": True,
+    },
     "full_video_overlay": {
         "label": "Full Video Overlay",
         "title_style": "boxed_banner",
@@ -706,7 +883,11 @@ TITLE_FONT_CHOICES: list[tuple[str, str]] = [
     ("Segoe UI", "segoe_ui"),
     ("Bahnschrift", "bahnschrift"),
     ("Arial Bold", "arial_bold"),
+    ("Arial Rounded Bold", "arial_rounded_bold"),
     ("Impact", "impact"),
+    ("Comic Sans Italic", "comic_italic"),
+    ("Georgia Italic", "georgia_italic"),
+    ("Georgia", "georgia"),
     ("Lilita One Style", "lilita_one_style"),
     ("Grobold Style", "grobold_style"),
 ]
@@ -744,11 +925,13 @@ class ScrapeJobConfig:
     min_view_count: int
     min_like_count: int
     weights: DiscoveryWeights
+    archive_backfill: bool = False
 
 
 @dataclass(frozen=True)
 class InstagramDiscoverRankJobConfig:
     username: str
+    target_account_id: int
     target_account_name: str
     min_new: int
     limit: int
@@ -768,6 +951,8 @@ class ProcessJobConfig:
     title_color: str = "#FFFFFF"
     title_background: str = "none"
     title_layout: str = "top_band"
+    enable_bold_keywords: bool = False
+    watermark_replacement_text: str | None = None
 
 
 @dataclass(frozen=True)
@@ -792,8 +977,153 @@ class SmartDraftJobConfig:
     account_voice: dict[str, str] | None = None
     prompt_profile: str | None = None
     caption_style: str | None = None
+    title_style: str | None = None
     recent_titles: list[str] | None = None
     recent_captions: list[str] | None = None
+
+
+@dataclass(frozen=True)
+class DraftRecommendation:
+    title_index: int | None
+    caption_index: int | None
+    reason: str | None = None
+    option_notes: list[str] | None = None
+
+
+@dataclass(frozen=True)
+class PastedSmartDraft:
+    """Structured result of parsing a copy-pasted smart-draft text blob."""
+
+    title_options: list[str]
+    caption_options: list[str]
+    option_notes: list[str]
+    recommended_styles: list[str]
+    recommended_title_index: int | None
+    recommended_caption_index: int | None
+    reason: str | None
+
+
+# Section headers in the generated text blob. ``title``/``caption``/``style``
+# carry a 1-based option number; ``pick``/``why``/``notes`` are singletons.
+_PASTED_DRAFT_HEADERS: list[tuple[str, re.Pattern[str]]] = [
+    ("title", re.compile(r"^title\s*option\s*(\d+)\s*:\s*(.*)$", re.IGNORECASE)),
+    ("caption", re.compile(r"^caption\s*option\s*(\d+)\s*:\s*(.*)$", re.IGNORECASE)),
+    ("style", re.compile(r"^recommended\s*style\s*(\d+)\s*:\s*(.*)$", re.IGNORECASE)),
+    ("pick", re.compile(r"^recommended\s*pick\s*:\s*(.*)$", re.IGNORECASE)),
+    ("why", re.compile(r"^why\s*:\s*(.*)$", re.IGNORECASE)),
+    ("notes", re.compile(r"^selection\s*notes\s*:\s*(.*)$", re.IGNORECASE)),
+]
+
+_PASTED_NOTE_LINE = re.compile(r"^option\s*(\d+)\s*:\s*(.*)$", re.IGNORECASE)
+
+
+def parse_pasted_smart_draft(text: str) -> PastedSmartDraft:
+    """Parse a generated smart-draft text blob into structured options.
+
+    Recognises ``Title Option N:`` / ``Caption Option N:`` /
+    ``Recommended Style N:`` blocks plus the ``Recommended Pick:`` / ``Why:`` /
+    ``Selection Notes:`` footer. Title/style content is collapsed to one line;
+    caption content keeps its paragraph breaks. Bold ``**word**`` markers are
+    preserved verbatim. Indices in the result are 0-based.
+    """
+    titles: dict[int, list[str]] = {}
+    captions: dict[int, list[str]] = {}
+    styles: dict[int, list[str]] = {}
+    pick_buf: list[str] = []
+    why_buf: list[str] = []
+    notes_buf: list[str] = []
+    indexed = {"title": titles, "caption": captions, "style": styles}
+    singletons = {"pick": pick_buf, "why": why_buf, "notes": notes_buf}
+
+    active_kind: str | None = None
+    active_index: int | None = None
+    buffer: list[str] = []
+
+    def flush() -> None:
+        nonlocal buffer
+        if active_kind in indexed and active_index is not None:
+            indexed[active_kind].setdefault(active_index, []).extend(buffer)
+        elif active_kind in singletons:
+            singletons[active_kind].extend(buffer)
+        buffer = []
+
+    for raw_line in (text or "").splitlines():
+        stripped = raw_line.strip()
+        header_match = None
+        for kind, pattern in _PASTED_DRAFT_HEADERS:
+            match = pattern.match(stripped)
+            if match:
+                header_match = (kind, match)
+                break
+        if header_match is None:
+            buffer.append(raw_line.rstrip())
+            continue
+        flush()
+        kind, match = header_match
+        if kind in indexed:
+            active_kind = kind
+            active_index = int(match.group(1))
+            inline = match.group(2).strip()
+        else:
+            active_kind = kind
+            active_index = None
+            inline = match.group(1).strip()
+        buffer = [inline] if inline else []
+    flush()
+
+    def _join_line(lines: list[str]) -> str:
+        return " ".join(part.strip() for part in lines if part.strip()).strip()
+
+    def _join_caption(lines: list[str]) -> str:
+        joined = "\n".join(lines).strip()
+        return re.sub(r"\n{3,}", "\n\n", joined)
+
+    max_index = max([*titles, *captions, *styles], default=0)
+    title_options = [_join_line(titles.get(i, [])) for i in range(1, max_index + 1)]
+    caption_options = [_join_caption(captions.get(i, [])) for i in range(1, max_index + 1)]
+    recommended_styles = [_join_line(styles.get(i, [])) for i in range(1, max_index + 1)]
+
+    # Drop trailing options that carry neither a title nor a caption.
+    while title_options and not title_options[-1] and not caption_options[-1]:
+        title_options.pop()
+        caption_options.pop()
+        if recommended_styles:
+            recommended_styles.pop()
+
+    note_map: dict[int, list[str]] = {}
+    last_note_index: int | None = None
+    for note_line in notes_buf:
+        note_text = note_line.strip()
+        if not note_text:
+            continue
+        note_match = _PASTED_NOTE_LINE.match(note_text)
+        if note_match:
+            last_note_index = int(note_match.group(1))
+            note_map.setdefault(last_note_index, []).append(note_match.group(2).strip())
+        elif last_note_index is not None:
+            note_map[last_note_index].append(note_text)
+    note_count = max([len(title_options), *note_map.keys()], default=0)
+    option_notes = [
+        " ".join(part for part in note_map.get(i, []) if part).strip()
+        for i in range(1, note_count + 1)
+    ]
+
+    pick_text = " ".join(pick_buf)
+    title_pick = re.search(r"title\s*option\s*(\d+)", pick_text, re.IGNORECASE)
+    caption_pick = re.search(r"caption\s*option\s*(\d+)", pick_text, re.IGNORECASE)
+    recommended_title_index = int(title_pick.group(1)) - 1 if title_pick else None
+    recommended_caption_index = int(caption_pick.group(1)) - 1 if caption_pick else None
+    reason = _join_line(why_buf) or None
+
+    return PastedSmartDraft(
+        title_options=title_options,
+        caption_options=caption_options,
+        option_notes=option_notes,
+        recommended_styles=recommended_styles,
+        recommended_title_index=recommended_title_index,
+        recommended_caption_index=recommended_caption_index,
+        reason=reason,
+    )
 
 
 class ScrapeWorker(QObject):
@@ -840,6 +1170,7 @@ class ScrapeWorker(QObject):
                     min_view_count=self._job.min_view_count,
                     min_like_count=self._job.min_like_count,
                     weights=self._job.weights,
+                    archive_backfill=self._job.archive_backfill,
                 )
                 total_created += created_count
                 total_refreshed += refreshed_count
@@ -896,6 +1227,50 @@ class InstagramDiscoverRankWorker(QObject):
             for char in username.strip().lstrip("@")
         )
 
+    @staticmethod
+    def _safe_path_part(value: str) -> str:
+        cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip()).strip("-._")
+        return cleaned.lower() or "account"
+
+    @staticmethod
+    def _url_cache_count(path: Path) -> int:
+        if not path.exists():
+            return 0
+        try:
+            raw_text = path.read_text(encoding="utf-8").strip().strip("\ufeff")
+            if not raw_text:
+                return 0
+            if path.suffix.lower() == ".json":
+                loaded = json.loads(raw_text)
+                return len(loaded) if isinstance(loaded, list) else 0
+            return len(
+                [
+                    line
+                    for line in raw_text.splitlines()
+                    if line.strip() and not line.strip().startswith("#")
+                ]
+            )
+        except Exception:  # noqa: BLE001
+            return 0
+
+    @classmethod
+    def _account_cache_output_path(
+        cls,
+        *,
+        account_id: int,
+        account_name: str,
+        username: str,
+    ) -> Path:
+        safe_account = cls._safe_path_part(account_name)
+        safe_username = cls._safe_username(username)
+        return (
+            Path("data")
+            / "discovered"
+            / "accounts"
+            / f"{account_id}-{safe_account}"
+            / f"{safe_username}-urls.json"
+        )
+
     def _run_command(self, args: list[str]) -> None:
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
@@ -920,58 +1295,9 @@ class InstagramDiscoverRankWorker(QObject):
 
     def run(self) -> None:
         try:
-            username = self._job.username.strip().lstrip("@")
-            safe_username = self._safe_username(username)
-            output_path = Path("data") / "discovered" / f"{safe_username}-urls.json"
-            profile_dir = Path("data") / "browser-profiles" / "instagram"
-            metadata_limit = max(self._job.min_new * 2, self._job.min_new, 1)
-
-            self.log.emit(f"Discovering @{username}...")
-            self._run_command(
-                [
-                    sys.executable,
-                    "scripts/instagram_discover_playwright.py",
-                    "--username",
-                    username,
-                    "--min-new",
-                    str(self._job.min_new),
-                    "--limit",
-                    str(self._job.limit),
-                    "--scrolls",
-                    str(self._job.scrolls),
-                    "--stall-limit",
-                    str(self._job.stall_limit),
-                    "--wait-ms",
-                    str(self._job.wait_ms),
-                    "--resume",
-                    "--user-data-dir",
-                    str(profile_dir),
-                    "--out",
-                    str(output_path),
-                ]
-            )
-
-            self.log.emit(f"Extracting metadata for up to {metadata_limit} new URL(s)...")
-            self._run_command(
-                [
-                    sys.executable,
-                    "scripts/instagram_scrape_urls.py",
-                    "--file",
-                    str(output_path),
-                    "--limit",
-                    str(metadata_limit),
-                    "--save-account",
-                    self._job.target_account_name,
-                    "--only-new-for-account",
-                    self._job.target_account_name,
-                ]
-            )
-            self.completed.emit(
-                {
-                    "username": username,
-                    "target_account_name": self._job.target_account_name,
-                    "output_path": str(output_path),
-                }
+            raise RuntimeError(
+                "Legacy Instagram Playwright discovery is disabled. "
+                "Use the normal Scrape flow, which uses Apify without Instagram login cookies."
             )
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
@@ -997,8 +1323,30 @@ class ProcessWorker(QObject):
                 title_color=self._job.title_color,
                 title_background=self._job.title_background,
                 title_layout=self._job.title_layout,
+                enable_bold_keywords=self._job.enable_bold_keywords,
             )
-            self.completed.emit({"output_path": str(output_path)})
+            watermark_payload: dict[str, object] = {
+                "watermark_replaced": False,
+                "watermark_skipped_reason": None,
+                "watermark_detected_text": None,
+                "watermark_replacement_text": self._job.watermark_replacement_text,
+            }
+            if self._job.watermark_replacement_text:
+                temp_output = output_path.with_stem(output_path.stem + "_watermark")
+                replacement = replace_detected_watermark(
+                    output_path,
+                    replacement_text=self._job.watermark_replacement_text,
+                    output_path=temp_output,
+                )
+                watermark_payload["watermark_skipped_reason"] = replacement.skipped_reason
+                watermark_payload["watermark_detected_text"] = (
+                    replacement.region.text if replacement.region is not None else None
+                )
+                watermark_payload["watermark_replacement_text"] = replacement.replacement_text
+                if replacement.output_path is not None:
+                    Path(replacement.output_path).replace(output_path)
+                    watermark_payload["watermark_replaced"] = True
+            self.completed.emit({"output_path": str(output_path), **watermark_payload})
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
 
@@ -1078,6 +1426,7 @@ class SmartDraftWorker(QObject):
                 account_voice=self._job.account_voice,
                 prompt_profile=self._job.prompt_profile,
                 caption_style=self._job.caption_style,
+                title_style=self._job.title_style,
                 recent_titles=self._job.recent_titles,
                 recent_captions=self._job.recent_captions,
             )
@@ -1086,6 +1435,10 @@ class SmartDraftWorker(QObject):
                     "summary": drafts.summary,
                     "title_options": drafts.title_options,
                     "caption_options": drafts.caption_options,
+                    "recommended_title_index": drafts.recommended_title_index,
+                    "recommended_caption_index": drafts.recommended_caption_index,
+                    "recommendation_reason": drafts.recommendation_reason,
+                    "option_notes": drafts.option_notes,
                     "provider_label": drafts.provider_label,
                     "used_fallback": drafts.used_fallback,
                     "vision_payload": drafts.vision_payload,
@@ -1157,12 +1510,14 @@ class MainWindow(QWidget):
         self._processing_in_progress = False
         self._processing_busy_mode: str | None = None
         self._selected_processing_item_id: int | None = None
+        self._processing_style_loaded_for_item_id: int | None = None
         self._processing_item_probe_cache: dict[int, tuple[str, int, int, bool]] = {}
         self._processing_source_labels: dict[int, str] = {}
         self._processing_clip_premises: dict[int, str] = {}
         self._processing_probe_item_id: int | None = None
         self._processing_probe: VideoProbe | None = None
         self._processing_last_output_path: Path | None = None
+        self._last_created_schedule_job_id: int | None = None
         self._processing_auto_crop = CropSettings()
         self._processing_using_ai_layout_crop = False
         self._processing_applying_ai_layout_suggestion = False
@@ -1174,6 +1529,9 @@ class MainWindow(QWidget):
         self._processing_vision_payload_text: str = ""
         self._processing_vision_payload: dict[str, object] | None = None
         self._processing_generated_at_text: str = ""
+        self._processing_dirty_item_id: int | None = None
+        self._suppress_processing_text_dirty = False
+        self._processing_last_generated_titles: list[str] = []
         self._processing_preview_path: Path | None = None
         self._processing_preview_container: av.container.InputContainer | None = None
         self._processing_preview_stream = None
@@ -1252,9 +1610,10 @@ class MainWindow(QWidget):
         self._sidebar_toggle_button.setText("")
         self._sidebar_toggle_button.setIcon(self._sidebar_icon("account-manager"))
         self._sidebar_toggle_button.setIconSize(QSize(20, 20))
+        self._sidebar_toggle_button.setFixedSize(38, 38)
         self._sidebar_toggle_button.setProperty("selected", False)
         self._module_buttons: dict[str, QPushButton] = {}
-        self._sidebar_account_combo = QComboBox()
+        self._sidebar_account_combo = NoScrollComboBox()
         self._sidebar_account_combo.setObjectName("sidebarAccountCombo")
         self._sidebar_account_combo.currentIndexChanged.connect(self._on_sidebar_account_changed)
         self._sidebar_account_label = QLabel("Account")
@@ -1289,7 +1648,11 @@ class MainWindow(QWidget):
         workspace_hint.setWordWrap(True)
 
         self._current_account_id: int | None = None
-        self._current_account_combo = QComboBox()
+        # Set True while we're WRITING widget values from a saved account
+        # snapshot — prevents the change signals we just programmatically
+        # emitted from feeding straight back into another save and looping.
+        self._suppress_processing_prefs_save = False
+        self._current_account_combo = NoScrollComboBox()
         self._current_account_combo.currentIndexChanged.connect(self._on_current_account_changed)
 
         workspace_panel = QFrame()
@@ -1310,19 +1673,17 @@ class MainWindow(QWidget):
         manage_hint.setObjectName("subtleLabel")
         manage_hint.setWordWrap(True)
 
-        self._account_picker = QComboBox()
+        self._account_picker = NoScrollComboBox()
         self._account_picker.currentIndexChanged.connect(self._on_account_picker_changed)
         self._account_name_input = QLineEdit()
         self._account_name_input.setPlaceholderText("Account name")
-        self._account_platform_combo = QComboBox()
+        self._account_platform_combo = NoScrollComboBox()
         self._account_platform_combo.addItem("YouTube", "youtube")
         self._account_platform_combo.addItem("Instagram", "instagram")
-        self._account_niche_input = QLineEdit()
-        self._account_niche_input.setPlaceholderText("Content niche / category")
         self._account_login_input = QLineEdit()
         self._account_login_input.setPlaceholderText("Handle / profile reference")
-        self._account_credential_input = QLineEdit()
-        self._account_credential_input.setPlaceholderText("Private notes for this account")
+        self._account_instagram_profile_input = QLineEdit()
+        self._account_instagram_profile_input.setPlaceholderText("main")
         self._account_scrape_sources_input = QLineEdit()
         self._account_scrape_sources_input.setPlaceholderText("Managed from Source Intake below")
         self._account_scrape_sources_input.setReadOnly(True)
@@ -1334,7 +1695,7 @@ class MainWindow(QWidget):
         self._account_discovery_keywords_input.setPlaceholderText(
             "Keywords / phrases (comma separated)"
         )
-        self._account_discovery_mode_combo = QComboBox()
+        self._account_discovery_mode_combo = NoScrollComboBox()
         for mode_value, mode_label in DISCOVERY_MODES.items():
             self._account_discovery_mode_combo.addItem(mode_label, mode_value)
         self._account_auto_queue_limit_input = QLineEdit()
@@ -1351,31 +1712,48 @@ class MainWindow(QWidget):
         self._account_weight_recency_input.setPlaceholderText("25")
         self._account_weight_keyword_input = QLineEdit()
         self._account_weight_keyword_input.setPlaceholderText("20")
-        self._account_writing_tone_input = QLineEdit()
-        self._account_writing_tone_input.setPlaceholderText("playful, direct, dramatic...")
-        self._account_target_audience_input = QLineEdit()
-        self._account_target_audience_input.setPlaceholderText(
+
+        def account_strategy_input(placeholder: str) -> QTextEdit:
+            editor = QTextEdit()
+            editor.setAcceptRichText(False)
+            editor.setPlaceholderText(placeholder)
+            editor.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+            editor.setTabChangesFocus(True)
+            editor.setMinimumHeight(82)
+            editor.setMaximumHeight(132)
+            editor.setSizePolicy(
+                QSizePolicy.Policy.Expanding,
+                QSizePolicy.Policy.Fixed,
+            )
+            return editor
+
+        self._account_niche_input = account_strategy_input("Content niche / category")
+        self._account_credential_input = account_strategy_input("Private notes for this account")
+        self._account_writing_tone_input = account_strategy_input(
+            "playful, direct, dramatic..."
+        )
+        self._account_target_audience_input = account_strategy_input(
             "Who this account is trying to reach"
         )
-        self._account_hook_style_input = QLineEdit()
-        self._account_hook_style_input.setPlaceholderText("reaction-first, curiosity, payoff...")
-        self._account_banned_phrases_input = QLineEdit()
-        self._account_banned_phrases_input.setPlaceholderText("Phrases to avoid")
-        self._account_title_style_notes_input = QLineEdit()
-        self._account_title_style_notes_input.setPlaceholderText("Short rules for titles")
-        self._account_caption_style_notes_input = QLineEdit()
-        self._account_caption_style_notes_input.setPlaceholderText("Short rules for captions")
+        self._account_hook_style_input = account_strategy_input(
+            "reaction-first, curiosity, payoff..."
+        )
+        self._account_banned_phrases_input = account_strategy_input("Phrases to avoid")
+        self._account_title_style_notes_input = account_strategy_input("Short rules for titles")
+        self._account_caption_style_notes_input = account_strategy_input(
+            "Short rules for captions"
+        )
         self._account_upload_timezone_input = QLineEdit()
         self._account_upload_timezone_input.setPlaceholderText("Asia/Jakarta")
-        self._account_upload_privacy_combo = QComboBox()
+        self._account_upload_privacy_combo = NoScrollComboBox()
         for privacy_value, privacy_label in UPLOAD_PRIVACY_OPTIONS.items():
             self._account_upload_privacy_combo.addItem(privacy_label, privacy_value)
         self._account_upload_schedule_slots_input = QLineEdit()
         self._account_upload_schedule_slots_input.setPlaceholderText("09:00, 18:00")
-        self._account_upload_made_for_kids_combo = QComboBox()
+        self._account_upload_made_for_kids_combo = NoScrollComboBox()
         self._account_upload_made_for_kids_combo.addItem("No", 0)
         self._account_upload_made_for_kids_combo.addItem("Yes", 1)
-        self._account_upload_synthetic_media_combo = QComboBox()
+        self._account_upload_synthetic_media_combo = NoScrollComboBox()
         self._account_upload_synthetic_media_combo.addItem("No", 0)
         self._account_upload_synthetic_media_combo.addItem("Yes", 1)
 
@@ -1427,25 +1805,28 @@ class MainWindow(QWidget):
         account_form.addWidget(self._account_niche_input, 2, 1)
         account_form.addWidget(QLabel("Posting Profile"), 3, 0)
         account_form.addWidget(self._account_login_input, 3, 1)
-        account_form.addWidget(QLabel("Private Notes"), 4, 0)
-        account_form.addWidget(self._account_credential_input, 4, 1)
-        account_form.addWidget(QLabel("AI Tone"), 5, 0)
-        account_form.addWidget(self._account_writing_tone_input, 5, 1)
-        account_form.addWidget(QLabel("Audience"), 6, 0)
-        account_form.addWidget(self._account_target_audience_input, 6, 1)
-        account_form.addWidget(QLabel("Hook Pattern"), 7, 0)
-        account_form.addWidget(self._account_hook_style_input, 7, 1)
-        account_form.addWidget(QLabel("Avoid Phrases"), 8, 0)
-        account_form.addWidget(self._account_banned_phrases_input, 8, 1)
-        account_form.addWidget(QLabel("Title Rules"), 9, 0)
-        account_form.addWidget(self._account_title_style_notes_input, 9, 1)
-        account_form.addWidget(QLabel("Caption Rules"), 10, 0)
-        account_form.addWidget(self._account_caption_style_notes_input, 10, 1)
+        account_form.addWidget(QLabel("IG Browser Profile"), 4, 0)
+        account_form.addWidget(self._account_instagram_profile_input, 4, 1)
+        account_form.addWidget(QLabel("Private Notes"), 5, 0)
+        account_form.addWidget(self._account_credential_input, 5, 1)
+        account_form.addWidget(QLabel("AI Tone"), 6, 0)
+        account_form.addWidget(self._account_writing_tone_input, 6, 1)
+        account_form.addWidget(QLabel("Audience"), 7, 0)
+        account_form.addWidget(self._account_target_audience_input, 7, 1)
+        account_form.addWidget(QLabel("Hook Pattern"), 8, 0)
+        account_form.addWidget(self._account_hook_style_input, 8, 1)
+        account_form.addWidget(QLabel("Avoid Phrases"), 9, 0)
+        account_form.addWidget(self._account_banned_phrases_input, 9, 1)
+        account_form.addWidget(QLabel("Title Rules"), 10, 0)
+        account_form.addWidget(self._account_title_style_notes_input, 10, 1)
+        account_form.addWidget(QLabel("Caption Rules"), 11, 0)
+        account_form.addWidget(self._account_caption_style_notes_input, 11, 1)
         self._account_form_panel = QWidget()
         account_form_panel_layout = QVBoxLayout()
         account_form_panel_layout.setContentsMargins(0, 0, 0, 0)
         account_form_panel_layout.setSpacing(10)
         account_form_panel_layout.addLayout(account_form)
+        account_form_panel_layout.addSpacing(150)
         self._account_form_panel.setLayout(account_form_panel_layout)
 
         self._account_form_scroll = QScrollArea()
@@ -1454,7 +1835,7 @@ class MainWindow(QWidget):
         self._account_form_scroll.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
-        self._account_form_scroll.setMinimumHeight(360)
+        self._account_form_scroll.setMinimumHeight(420)
         self._account_form_scroll.setWidget(self._account_form_panel)
 
         self._account_save_button = QPushButton("Create Niche Account")
@@ -1471,7 +1852,7 @@ class MainWindow(QWidget):
         account_form_actions_layout.addWidget(self._account_cancel_button)
         self._account_form_actions.setLayout(account_form_actions_layout)
 
-        self._account_delete_picker = QComboBox()
+        self._account_delete_picker = NoScrollComboBox()
         self._account_delete_picker_label = QLabel("Choose niche account to delete")
         self._account_delete_picker_label.setObjectName("metaLabel")
         self._account_delete_button = QPushButton("Delete Selected Niche")
@@ -1496,8 +1877,8 @@ class MainWindow(QWidget):
 
         self._account_panel = QFrame()
         self._account_panel.setObjectName("panel")
-        self._account_panel.setMinimumWidth(520)
-        self._account_panel.setMaximumWidth(620)
+        self._account_panel.setMinimumWidth(600)
+        self._account_panel.setMaximumWidth(760)
         self._account_panel.setSizePolicy(
             QSizePolicy.Policy.Fixed,
             QSizePolicy.Policy.Expanding,
@@ -1517,12 +1898,6 @@ class MainWindow(QWidget):
         account_layout.addWidget(self._account_form_actions)
         account_layout.addWidget(self._account_delete_panel)
         self._account_panel.setLayout(account_layout)
-
-        self._sidebar_brand = QLabel("N")
-        self._sidebar_brand.setObjectName("sidebarBrand")
-        self._sidebar_brand.setToolTip("NicheFlow")
-        self._sidebar_brand.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._sidebar_brand.setMinimumHeight(42)
 
         sidebar_modules = [
             ("scraping", "Scrape", "refresh"),
@@ -1562,15 +1937,14 @@ class MainWindow(QWidget):
         sidebar_layout = QVBoxLayout()
         sidebar_layout.setContentsMargins(8, 12, 8, 12)
         sidebar_layout.setSpacing(10)
-        sidebar_layout.addWidget(self._sidebar_brand)
-        self._sidebar_account_label.setVisible(False)
-        self._sidebar_account_combo.setVisible(False)
-        sidebar_layout.addWidget(self._sidebar_nav, alignment=Qt.AlignmentFlag.AlignCenter)
-        sidebar_layout.addStretch(1)
         sidebar_layout.addWidget(
             self._sidebar_toggle_button,
             alignment=Qt.AlignmentFlag.AlignCenter,
         )
+        self._sidebar_account_label.setVisible(False)
+        self._sidebar_account_combo.setVisible(False)
+        sidebar_layout.addWidget(self._sidebar_nav, alignment=Qt.AlignmentFlag.AlignCenter)
+        sidebar_layout.addStretch(1)
         self._sidebar_panel.setLayout(sidebar_layout)
 
         history_title = QLabel(self._ui.history_title)
@@ -1586,7 +1960,7 @@ class MainWindow(QWidget):
         self._search_input.setMaximumWidth(300)
         self._search_input.textChanged.connect(self._on_search_changed)
 
-        self._status_filter = QComboBox()
+        self._status_filter = NoScrollComboBox()
         self._status_filter.setObjectName("downloadFilter")
         self._status_filter.setMinimumWidth(160)
         self._status_filter.setMaximumWidth(190)
@@ -1595,7 +1969,7 @@ class MainWindow(QWidget):
         )
         self._status_filter.currentIndexChanged.connect(self._on_status_filter_changed)
 
-        self._review_filter = QComboBox()
+        self._review_filter = NoScrollComboBox()
         self._review_filter.setObjectName("downloadFilter")
         self._review_filter.addItem("All review states", "all")
         for label, state in REVIEW_STATE_OPTIONS:
@@ -1736,12 +2110,12 @@ class MainWindow(QWidget):
         )
         self._scrape_add_source_button = QPushButton("Add")
         self._scrape_add_source_button.clicked.connect(self._on_add_scrape_source_clicked)
-        self._source_filter = QComboBox()
+        self._source_filter = NoScrollComboBox()
         self._source_filter.addItem("All sources", "all")
         self._source_filter.addItem("Enabled only", "enabled")
         self._source_filter.addItem("Disabled only", "disabled")
         self._source_filter.currentIndexChanged.connect(self._on_source_filter_changed)
-        self._source_sort = QComboBox()
+        self._source_sort = NoScrollComboBox()
         self._source_sort.addItem("Sort: Priority", "priority")
         self._source_sort.addItem("Sort: Status", "status")
         self._source_sort.addItem("Sort: Last scraped", "last_scraped")
@@ -1759,37 +2133,41 @@ class MainWindow(QWidget):
         self._scrape_selected_button.clicked.connect(self._on_scrape_selected_clicked)
         self._scrape_button = QPushButton("Scrape All")
         self._scrape_button.clicked.connect(self._on_scrape_clicked)
-        self._instagram_discover_source_combo = QComboBox()
+        self._instagram_discover_source_combo = NoScrollComboBox()
         self._instagram_discover_source_combo.setMinimumWidth(220)
         self._instagram_discover_source_combo.setMaximumWidth(300)
-        self._instagram_discover_min_new_input = QSpinBox()
-        self._instagram_discover_min_new_input.setRange(1, 100)
-        self._instagram_discover_min_new_input.setValue(10)
-        self._instagram_discover_min_likes_input = QSpinBox()
+        self._instagram_result_limit_input = NoScrollSpinBox()
+        self._instagram_result_limit_input.setRange(1, INSTAGRAM_MAX_RESULT_LIMIT)
+        self._instagram_result_limit_input.setValue(10)
+        self._instagram_result_limit_input.setToolTip(
+            "Maximum Apify results to request for either latest scan or archive backfill."
+        )
+        self._instagram_discover_min_likes_input = NoScrollSpinBox()
         self._instagram_discover_min_likes_input.setRange(0, 10_000_000)
         self._instagram_discover_min_likes_input.setSingleStep(1_000)
         self._instagram_discover_min_likes_input.setValue(20_000)
         self._instagram_discover_min_likes_input.valueChanged.connect(
             self._on_candidate_min_likes_filter_changed
         )
-        self._candidate_sort_combo = QComboBox()
+        self._candidate_sort_combo = NoScrollComboBox()
         self._candidate_sort_combo.addItem("Sort: Score", "score")
         self._candidate_sort_combo.addItem("Sort: Likes", "likes")
         self._candidate_sort_combo.addItem("Sort: Comments", "comments")
         self._candidate_sort_combo.addItem("Sort: Newest", "newest")
         self._candidate_sort_combo.currentIndexChanged.connect(self._on_candidate_filter_changed)
-        self._candidate_sort_direction_combo = QComboBox()
+        self._candidate_sort_direction_combo = NoScrollComboBox()
         self._candidate_sort_direction_combo.addItem("High to low", "desc")
         self._candidate_sort_direction_combo.addItem("Low to high", "asc")
         self._candidate_sort_direction_combo.currentIndexChanged.connect(
             self._on_candidate_filter_changed
         )
-        self._instagram_deep_search_checkbox = QCheckBox("Deep search")
-        self._instagram_deep_search_checkbox.setToolTip(
-            "Search farther through the source to find older unseen URLs. Slower, but useful when Min new is hard to reach."
-        )
-        self._instagram_discover_button = QPushButton("Discover + Rank")
+        self._instagram_discover_button = QPushButton("Find Latest")
         self._instagram_discover_button.clicked.connect(self._on_instagram_discover_clicked)
+        self._instagram_archive_button = QPushButton("Search Archive")
+        self._instagram_archive_button.setToolTip(
+            "Fetch a larger archive window with Apify, dedupe locally, then rank candidates."
+        )
+        self._instagram_archive_button.clicked.connect(self._on_instagram_archive_clicked)
         self._instagram_discover_log = QTextEdit()
         self._instagram_discover_log.setReadOnly(True)
         self._instagram_discover_log.setFixedHeight(86)
@@ -1804,10 +2182,10 @@ class MainWindow(QWidget):
         instagram_discover_row.setSpacing(10)
         instagram_discover_row.addWidget(QLabel("Scrape from"))
         instagram_discover_row.addWidget(self._instagram_discover_source_combo)
-        instagram_discover_row.addWidget(QLabel("Min new"))
-        instagram_discover_row.addWidget(self._instagram_discover_min_new_input)
-        instagram_discover_row.addWidget(self._instagram_deep_search_checkbox)
+        instagram_discover_row.addWidget(QLabel("Results"))
+        instagram_discover_row.addWidget(self._instagram_result_limit_input)
         instagram_discover_row.addWidget(self._instagram_discover_button)
+        instagram_discover_row.addWidget(self._instagram_archive_button)
         instagram_discover_row.addStretch(1)
         self._instagram_discover_row = instagram_discover_row
 
@@ -1849,7 +2227,7 @@ class MainWindow(QWidget):
         source_actions.addWidget(self._scrape_button)
 
         self._candidate_table = TableFocusScrollWidget()
-        self._candidate_table.setColumnCount(9)
+        self._candidate_table.setColumnCount(10)
         self._candidate_table.setHorizontalHeaderLabels(
             [
                 "Status",
@@ -1858,6 +2236,7 @@ class MainWindow(QWidget):
                 "Comments",
                 "Duration",
                 "Added",
+                "Published",
                 "Channel",
                 "Title",
                 "Match",
@@ -1884,8 +2263,13 @@ class MainWindow(QWidget):
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Expanding,
         )
-        self._candidate_table.setColumnHidden(8, True)
+        self._candidate_table.setColumnHidden(9, True)
         self._candidate_table.itemSelectionChanged.connect(self._on_candidate_selection_changed)
+        # Double-click any cell in a candidate row → open the Instagram post in
+        # the default browser so the user can preview it before downloading.
+        self._candidate_table.cellDoubleClicked.connect(
+            self._on_candidate_row_double_clicked
+        )
 
         self._candidate_queue_button = QPushButton("Send To Download")
         self._candidate_queue_button.clicked.connect(self._on_candidate_queue_clicked)
@@ -1908,7 +2292,7 @@ class MainWindow(QWidget):
         self._candidate_filter_label = QLabel("Showing candidates with 20,000+ likes.")
         self._candidate_filter_label.setObjectName("subtleLabel")
         self._candidate_filter_label.setWordWrap(True)
-        self._candidate_state_filter = QComboBox()
+        self._candidate_state_filter = NoScrollComboBox()
         self._candidate_state_filter.addItem("All candidates", "all")
         self._candidate_state_filter.addItem("Ready to review", "candidate")
         self._candidate_state_filter.addItem("Queued for download", "queued")
@@ -1916,6 +2300,10 @@ class MainWindow(QWidget):
         self._candidate_state_filter.addItem("Ignored for now", "ignored")
         self._candidate_state_filter.currentIndexChanged.connect(self._on_candidate_filter_changed)
         self._candidate_state_filter.setMinimumWidth(180)
+        self._candidate_source_filter = NoScrollComboBox()
+        self._candidate_source_filter.addItem("Source: All", "all")
+        self._candidate_source_filter.currentIndexChanged.connect(self._on_candidate_filter_changed)
+        self._candidate_source_filter.setMinimumWidth(220)
 
         intake_actions = QHBoxLayout()
         intake_actions.setSpacing(10)
@@ -1924,6 +2312,7 @@ class MainWindow(QWidget):
         intake_actions.addWidget(self._candidate_sort_combo)
         intake_actions.addWidget(self._candidate_sort_direction_combo)
         intake_actions.addWidget(self._candidate_state_filter)
+        intake_actions.addWidget(self._candidate_source_filter)
         intake_actions.addStretch(1)
         intake_actions.addWidget(self._candidate_queue_button)
         intake_actions.addWidget(self._candidate_ignore_button)
@@ -2079,7 +2468,7 @@ class MainWindow(QWidget):
         detail_layout.addWidget(self._detail_advanced_toggle)
         assignment_row = QVBoxLayout()
         assignment_row.setSpacing(8)
-        self._detail_account_combo = QComboBox()
+        self._detail_account_combo = NoScrollComboBox()
         self._detail_account_combo.setMinimumWidth(220)
         self._detail_assign_button = QPushButton("Save Niche Assignment")
         self._detail_assign_button.clicked.connect(self._on_detail_assign_clicked)
@@ -2414,11 +2803,11 @@ class MainWindow(QWidget):
 
         selector_label = QLabel("Videos")
         selector_label.setObjectName("metaLabel")
-        self._processing_item_combo = QComboBox()
+        self._processing_item_combo = NoScrollComboBox()
         self._processing_item_combo.currentIndexChanged.connect(self._on_processing_item_changed)
         self._processing_item_combo.setVisible(False)
 
-        self._processing_state_filter = QComboBox()
+        self._processing_state_filter = NoScrollComboBox()
         self._processing_state_filter.addItem("All", "all")
         self._processing_state_filter.addItem("Needs Processing", "needs")
         self._processing_state_filter.addItem("Processed", "processed")
@@ -2499,7 +2888,7 @@ class MainWindow(QWidget):
         preview_header.setSpacing(10)
         preview_title = QLabel("Preview")
         preview_title.setObjectName("metaLabel")
-        self._processing_preview_mode_combo = QComboBox()
+        self._processing_preview_mode_combo = NoScrollComboBox()
         self._processing_preview_mode_combo.addItem("Original Video", "source")
         self._processing_preview_mode_combo.addItem("Processed Output", "output")
         self._processing_preview_mode_combo.currentIndexChanged.connect(
@@ -2517,8 +2906,11 @@ class MainWindow(QWidget):
         self._processing_video_widget.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
         )
-        self._processing_video_widget.setObjectName("metaValue")
-        preview_layout.addWidget(self._processing_video_widget)
+        self._processing_video_widget.setObjectName("videoPreview")
+        video_row = QHBoxLayout()
+        video_row.setContentsMargins(12, 0, 12, 0)
+        video_row.addWidget(self._processing_video_widget)
+        preview_layout.addLayout(video_row)
 
         preview_action_row = QHBoxLayout()
         preview_action_row.setSpacing(10)
@@ -2593,12 +2985,21 @@ class MainWindow(QWidget):
         self._processing_generate_drafts_button.clicked.connect(
             self._on_generate_text_drafts_clicked
         )
+        self._processing_copy_chat_prompt_button = QPushButton("Copy Chat Prompt")
+        self._processing_copy_chat_prompt_button.setObjectName("ghostButton")
+        self._processing_copy_chat_prompt_button.setToolTip(
+            "Copy a chat-ready prompt with the selected local video path and current niche context."
+        )
+        self._processing_copy_chat_prompt_button.clicked.connect(
+            self._on_copy_generation_chat_prompt_clicked
+        )
         self._processing_save_drafts_button = QPushButton("Save")
         self._processing_save_drafts_button.clicked.connect(self._on_save_text_drafts_clicked)
         text_header.addWidget(text_title)
         text_header.addStretch(1)
         text_header.addWidget(self._processing_loading_badge)
         text_header.addWidget(self._processing_generate_drafts_button)
+        text_header.addWidget(self._processing_copy_chat_prompt_button)
         text_header.addWidget(self._processing_save_drafts_button)
         text_layout.addLayout(text_header)
 
@@ -2632,28 +3033,100 @@ class MainWindow(QWidget):
         caption_style_row.setSpacing(10)
         caption_style_label = QLabel("Caption Style")
         caption_style_label.setObjectName("metaLabel")
-        self._processing_caption_style_combo = QComboBox()
-        self._processing_caption_style_combo.addItem("Context / info", "contextual_info")
-        self._processing_caption_style_combo.addItem("Relatable", "relatable")
-        self._processing_caption_style_combo.addItem("Hype", "hype")
-        self._processing_caption_style_combo.setMinimumWidth(180)
+        self._processing_caption_style_combo = NoScrollComboBox()
+        self._processing_caption_style_combo.addItem("(Meme) Context / info", "contextual_info")
+        self._processing_caption_style_combo.addItem("(Meme) Friend Group", "meme_friend_group")
+        self._processing_caption_style_combo.addItem(
+            "(Meme) Bro / Main Character", "meme_bro_main_character"
+        )
+        self._processing_caption_style_combo.addItem(
+            "(Meme) Chronically Online", "meme_chronically_online"
+        )
+        self._processing_caption_style_combo.addItem(
+            "(Meme) Reaction / Situation", "meme_reaction_situation"
+        )
+        self._processing_caption_style_combo.addItem("(Meme) Daily Cope", "meme_daily_cope")
+        self._processing_caption_style_combo.addItem(
+            "(Movie) Cinema Atmospheric", "cinema_hook"
+        )
+        self._processing_caption_style_combo.addItem(
+            "(History) Past Moments", "history_lost_archive"
+        )
+        self._processing_caption_style_combo.setMinimumWidth(240)
         caption_style_row.addWidget(caption_style_label)
         caption_style_row.addWidget(self._processing_caption_style_combo)
         caption_style_row.addStretch(1)
         text_layout.addLayout(caption_style_row)
 
+        # Title Style is decoupled from Caption Style so users can mix any
+        # title format (e.g. the IGHT "When ...:" setup-punchline meme hook)
+        # with any caption template. "Auto" preserves the previous behavior
+        # of deriving the title rules from the caption_style selection.
+        title_style_row = QHBoxLayout()
+        title_style_row.setSpacing(10)
+        title_style_label = QLabel("Title Style")
+        title_style_label.setObjectName("metaLabel")
+        self._processing_prompt_title_style_combo = NoScrollComboBox()
+        # "Auto" -> empty string sentinel; getter normalizes to None so
+        # smart_drafts falls back to caption-style-derived title rules.
+        self._processing_prompt_title_style_combo.addItem("Auto (match caption style)", "")
+        # The IGHT setup-punchline pattern: 'When ...:' / 'POV: ...:' /
+        # 'Me ...:' framing where the video footage delivers the punchline.
+        self._processing_prompt_title_style_combo.addItem(
+            "(Meme) Setup -> Punchline", "meme_setup_punchline"
+        )
+        # Keep only the niche styles we actually use day to day.
+        self._processing_prompt_title_style_combo.addItem(
+            "(Meme) Relatable Hook", "meme_relatable"
+        )
+        self._processing_prompt_title_style_combo.addItem(
+            "(Meme) Friend Group", "meme_friend_group"
+        )
+        self._processing_prompt_title_style_combo.addItem(
+            "(Meme) Bro / Main Character", "meme_bro_main_character"
+        )
+        self._processing_prompt_title_style_combo.addItem(
+            "(Meme) Chronically Online", "meme_chronically_online"
+        )
+        self._processing_prompt_title_style_combo.addItem(
+            "(Meme) Reaction / Situation", "meme_reaction_situation"
+        )
+        self._processing_prompt_title_style_combo.addItem(
+            "(Meme) Daily Cope", "meme_daily_cope"
+        )
+        self._processing_prompt_title_style_combo.addItem(
+            "(Movie) Cinema Atmospheric", "cinema_hook"
+        )
+        self._processing_prompt_title_style_combo.addItem(
+            "(Movie) Cinema Bold Keywords", "cinema_bold_keywords"
+        )
+        self._processing_prompt_title_style_combo.addItem(
+            "(History) Past Moments", "history_lost_archive"
+        )
+        self._processing_prompt_title_style_combo.setMinimumWidth(240)
+        title_style_row.addWidget(title_style_label)
+        title_style_row.addWidget(self._processing_prompt_title_style_combo)
+        title_style_row.addStretch(1)
+        text_layout.addLayout(title_style_row)
+
         title_draft_label = QLabel("Title")
         title_draft_label.setObjectName("metaLabel")
-        self._processing_title_draft_input = QLineEdit()
+        self._processing_title_draft_input = MultilineTitleEdit(min_height=68, max_height=118)
+        self._processing_title_draft_input.setObjectName("smartOptionEdit")
         self._processing_title_draft_input.setPlaceholderText("Generated or edited title...")
+        self._processing_title_draft_input.textChanged.connect(
+            self._mark_processing_text_dirty
+        )
         text_layout.addWidget(title_draft_label)
         text_layout.addWidget(self._processing_title_draft_input)
 
         caption_draft_label = QLabel("Caption")
         caption_draft_label.setObjectName("metaLabel")
-        self._processing_caption_draft_input = QTextEdit()
+        self._processing_caption_draft_input = MultilineCaptionEdit(min_height=120)
         self._processing_caption_draft_input.setPlaceholderText("Generated or edited caption...")
-        self._processing_caption_draft_input.setMinimumHeight(120)
+        self._processing_caption_draft_input.textChanged.connect(
+            self._mark_processing_text_dirty
+        )
         text_layout.addWidget(caption_draft_label)
         text_layout.addWidget(self._processing_caption_draft_input)
 
@@ -2671,6 +3144,14 @@ class MainWindow(QWidget):
         self._processing_smart_summary_label.setObjectName("metaValue")
         self._processing_smart_summary_label.setWordWrap(True)
         self._processing_smart_summary_label.setVisible(False)
+
+        self._processing_smart_recommendation_label = QLabel(
+            "Recommended draft pick will appear here after generation."
+        )
+        self._processing_smart_recommendation_label.setObjectName("metaValue")
+        self._processing_smart_recommendation_label.setWordWrap(True)
+        self._processing_smart_recommendation_label.setVisible(False)
+        text_layout.addWidget(self._processing_smart_recommendation_label)
 
         self._processing_eval_provider_label = QLabel(
             "Provider metadata will appear here after smart generation."
@@ -2729,9 +3210,29 @@ class MainWindow(QWidget):
         self._processing_smart_cards_status_label.setVisible(False)
         text_layout.addWidget(self._processing_smart_cards_status_label)
 
+        paste_draft_row = QHBoxLayout()
+        paste_draft_row.setSpacing(10)
+        self._processing_paste_draft_button = QPushButton("Paste Draft From Clipboard")
+        self._processing_paste_draft_button.setObjectName("ghostButton")
+        self._processing_paste_draft_button.setIcon(self._icon("refresh"))
+        self._processing_paste_draft_button.setIconSize(QSize(16, 16))
+        self._processing_paste_draft_button.clicked.connect(
+            self._on_paste_smart_draft_clicked
+        )
+        paste_draft_hint = QLabel(
+            "Copy a generated draft (Title/Caption Options + Recommended Pick), "
+            "then paste it into the option cards below."
+        )
+        paste_draft_hint.setObjectName("subtleLabel")
+        paste_draft_hint.setWordWrap(True)
+        paste_draft_row.addWidget(self._processing_paste_draft_button)
+        paste_draft_row.addWidget(paste_draft_hint, stretch=1)
+        text_layout.addLayout(paste_draft_row)
+
         self._processing_smart_option_buttons: list[QPushButton] = []
-        self._processing_smart_option_title_inputs: list[QLineEdit] = []
+        self._processing_smart_option_title_inputs: list[MultilineTitleEdit] = []
         self._processing_smart_option_caption_inputs: list[QTextEdit] = []
+        self._processing_smart_option_note_labels: list[QLabel] = []
         self._processing_smart_option_pairs: list[tuple[str | None, str | None]] = []
         smart_cards_layout = QGridLayout()
         smart_cards_layout.setHorizontalSpacing(10)
@@ -2739,6 +3240,10 @@ class MainWindow(QWidget):
         for index in range(SMART_DRAFT_OPTION_COUNT):
             card_panel = QFrame()
             card_panel.setObjectName("panel")
+            card_panel.setSizePolicy(
+                QSizePolicy.Policy.Expanding,
+                QSizePolicy.Policy.Fixed,
+            )
             card_layout = QVBoxLayout()
             card_layout.setContentsMargins(14, 14, 14, 14)
             card_layout.setSpacing(8)
@@ -2746,15 +3251,30 @@ class MainWindow(QWidget):
             card_label.setObjectName("metaLabel")
             card_layout.addWidget(card_label)
 
-            title_input = QLineEdit()
+            option_note_label = QLabel("")
+            option_note_label.setObjectName("subtleLabel")
+            option_note_label.setWordWrap(True)
+            option_note_label.setVisible(False)
+            self._processing_smart_option_note_labels.append(option_note_label)
+            card_layout.addWidget(option_note_label)
+
+            title_input = MultilineTitleEdit()
+            title_input.setObjectName("smartOptionEdit")
             title_input.setPlaceholderText("Generated title option...")
+            title_input.textChanged.connect(self._mark_processing_text_dirty)
             self._processing_smart_option_title_inputs.append(title_input)
             card_layout.addWidget(title_input)
 
-            caption_input = QTextEdit()
+            caption_input = MultilineCaptionEdit(
+                min_height=88,
+                size_policy=(
+                    QSizePolicy.Policy.Expanding,
+                    QSizePolicy.Policy.Expanding,
+                ),
+            )
             caption_input.setObjectName("smartOptionEdit")
             caption_input.setPlaceholderText("Generated caption option...")
-            caption_input.setMinimumHeight(88)
+            caption_input.textChanged.connect(self._mark_processing_text_dirty)
             self._processing_smart_option_caption_inputs.append(caption_input)
             card_layout.addWidget(caption_input)
 
@@ -2782,7 +3302,7 @@ class MainWindow(QWidget):
 
         template_label = QLabel("Template")
         template_label.setObjectName("metaLabel")
-        self._processing_template_combo = QComboBox()
+        self._processing_template_combo = NoScrollComboBox()
         for key, config in PROCESSING_TEMPLATES.items():
             self._processing_template_combo.addItem(str(config["label"]), key)
         self._processing_template_combo.currentIndexChanged.connect(
@@ -2793,7 +3313,7 @@ class MainWindow(QWidget):
 
         title_style_label = QLabel("Title Style")
         title_style_label.setObjectName("metaLabel")
-        self._processing_title_style_combo = QComboBox()
+        self._processing_title_style_combo = NoScrollComboBox()
         for key, config in TITLE_STYLE_PRESETS.items():
             self._processing_title_style_combo.addItem(str(config["label"]), key)
         self._processing_title_style_combo.currentIndexChanged.connect(
@@ -2804,14 +3324,14 @@ class MainWindow(QWidget):
 
         title_size_label = QLabel("Title Size")
         title_size_label.setObjectName("metaLabel")
-        self._processing_title_font_size = QSpinBox()
+        self._processing_title_font_size = NoScrollSpinBox()
         self._processing_title_font_size.setRange(18, 144)
         style_layout.addWidget(title_size_label, 1, 2)
         style_layout.addWidget(self._processing_title_font_size, 1, 3)
 
         title_font_label = QLabel("Title Font")
         title_font_label.setObjectName("metaLabel")
-        self._processing_title_font_combo = QComboBox()
+        self._processing_title_font_combo = NoScrollComboBox()
         for label, key in TITLE_FONT_CHOICES:
             self._processing_title_font_combo.addItem(label, key)
         style_layout.addWidget(title_font_label, 2, 0)
@@ -2826,21 +3346,35 @@ class MainWindow(QWidget):
 
         title_background_label = QLabel("Title Background")
         title_background_label.setObjectName("metaLabel")
-        self._processing_title_background_combo = QComboBox()
+        self._processing_title_background_combo = NoScrollComboBox()
         self._processing_title_background_combo.addItem("None", "none")
         self._processing_title_background_combo.addItem("Dark Box", "dark")
         self._processing_title_background_combo.addItem("Light Box", "light")
         style_layout.addWidget(title_background_label, 3, 0)
         style_layout.addWidget(self._processing_title_background_combo, 3, 1)
+        for manual_title_widget in (
+            title_style_label,
+            self._processing_title_style_combo,
+            title_size_label,
+            self._processing_title_font_size,
+            title_font_label,
+            self._processing_title_font_combo,
+            title_color_label,
+            self._processing_title_color_input,
+            title_background_label,
+            self._processing_title_background_combo,
+        ):
+            manual_title_widget.setVisible(False)
 
         self._processing_style_status_label = QLabel(
-            "These controls only affect the rendered title on the processed video. Captions stay as editable metadata for later upload."
+            "Template controls the rendered title style. Edit the title text and caption below."
         )
         self._processing_style_status_label.setObjectName("subtleLabel")
         self._processing_style_status_label.setWordWrap(True)
         style_layout.addWidget(self._processing_style_status_label, 4, 0, 1, 4)
         style_panel.setLayout(style_layout)
-        style_panel.setVisible(False)
+        # Keep this panel visible for Template only. The hidden title controls
+        # still store template-applied values for save/export compatibility.
         text_panel.setLayout(text_layout)
         panel_layout.addWidget(text_panel)
 
@@ -2848,7 +3382,7 @@ class MainWindow(QWidget):
         action_row.setSpacing(10)
         title_layout_label = QLabel("Title Layout")
         title_layout_label.setObjectName("metaLabel")
-        self._processing_title_layout_combo = QComboBox()
+        self._processing_title_layout_combo = NoScrollComboBox()
         for label, key in TITLE_LAYOUT_CHOICES:
             self._processing_title_layout_combo.addItem(label, key)
         self._processing_title_layout_combo.currentIndexChanged.connect(
@@ -2856,10 +3390,12 @@ class MainWindow(QWidget):
         )
         action_row.addWidget(title_layout_label)
         action_row.addWidget(self._processing_title_layout_combo)
+        title_layout_label.setVisible(False)
+        self._processing_title_layout_combo.setVisible(False)
         top_crop_label = QLabel("Top Crop")
         top_crop_label.setObjectName("metaLabel")
         top_crop_label.setVisible(False)
-        self._processing_top_crop_spin = QSpinBox()
+        self._processing_top_crop_spin = NoScrollSpinBox()
         self._processing_top_crop_spin.setRange(0, 2000)
         self._processing_top_crop_spin.setSuffix(" px")
         self._processing_top_crop_spin.valueChanged.connect(self._on_processing_manual_crop_changed)
@@ -2867,7 +3403,7 @@ class MainWindow(QWidget):
         bottom_crop_label = QLabel("Bottom Crop")
         bottom_crop_label.setObjectName("metaLabel")
         bottom_crop_label.setVisible(False)
-        self._processing_bottom_crop_spin = QSpinBox()
+        self._processing_bottom_crop_spin = NoScrollSpinBox()
         self._processing_bottom_crop_spin.setRange(0, 2000)
         self._processing_bottom_crop_spin.setSuffix(" px")
         self._processing_bottom_crop_spin.valueChanged.connect(
@@ -2923,8 +3459,24 @@ class MainWindow(QWidget):
         self._processing_suggestion_label.setWordWrap(True)
         self._processing_suggestion_label.setVisible(False)
         panel_layout.addWidget(self._processing_suggestion_label)
-        self._processing_style_panel.setVisible(False)
+        # NOTE: removed the matching setVisible(False) here; see the comment
+        # next to style_panel.setLayout above.
         panel_layout.addWidget(self._processing_style_panel)
+
+        # Per-account preference persistence: any change to one of these
+        # widgets snapshots the full Processing state and writes it to the
+        # current account. The reverse path (loading on account switch)
+        # runs from _set_current_account_from_combo.
+        save = self._save_processing_preferences_for_current_account
+        self._processing_template_combo.currentIndexChanged.connect(save)
+        self._processing_caption_style_combo.currentIndexChanged.connect(save)
+        self._processing_prompt_title_style_combo.currentIndexChanged.connect(save)
+        self._processing_title_style_combo.currentIndexChanged.connect(save)
+        self._processing_title_font_combo.currentIndexChanged.connect(save)
+        self._processing_title_font_size.valueChanged.connect(save)
+        self._processing_title_color_input.editingFinished.connect(save)
+        self._processing_title_background_combo.currentIndexChanged.connect(save)
+        self._processing_title_layout_combo.currentIndexChanged.connect(save)
 
         panel_layout.addStretch(1)
         panel.setLayout(panel_layout)
@@ -3079,6 +3631,12 @@ class MainWindow(QWidget):
         self._schedule_open_folder_button.setObjectName("downloadToolbarButton")
         self._schedule_open_folder_button.setEnabled(False)
         self._schedule_open_folder_button.clicked.connect(self._on_open_schedule_folder_clicked)
+        self._schedule_instagram_assist_button = QPushButton("Open Instagram Upload")
+        self._schedule_instagram_assist_button.setObjectName("downloadToolbarButton")
+        self._schedule_instagram_assist_button.setEnabled(False)
+        self._schedule_instagram_assist_button.clicked.connect(
+            self._on_open_instagram_assist_clicked
+        )
 
         schedule_action_row = QHBoxLayout()
         schedule_action_row.setSpacing(10)
@@ -3086,16 +3644,17 @@ class MainWindow(QWidget):
         schedule_action_row.addWidget(self._schedule_open_output_button)
         schedule_action_row.addWidget(self._schedule_copy_path_button)
         schedule_action_row.addWidget(self._schedule_open_folder_button)
+        schedule_action_row.addWidget(self._schedule_instagram_assist_button)
         schedule_action_row.addStretch(1)
 
-        self._schedule_caption_combo = QComboBox()
+        self._schedule_caption_combo = NoScrollComboBox()
         self._schedule_caption_combo.addItem("Caption", "caption")
         self._schedule_caption_combo.addItem("Title + Caption", "title_caption")
         self._schedule_caption_combo.addItem("Title Only", "title")
         self._schedule_caption_combo.currentIndexChanged.connect(
             self._refresh_schedule_caption_preview
         )
-        self._schedule_status_combo = QComboBox()
+        self._schedule_status_combo = NoScrollComboBox()
         for label, value in (
             ("Draft", "draft"),
             ("Ready", "ready"),
@@ -3426,6 +3985,8 @@ class MainWindow(QWidget):
         self._processing_title_draft_input.setText("")
         self._processing_caption_draft_input.setPlainText("")
         self._processing_transcript_input.setPlainText("")
+        self._processing_last_generated_titles = []
+        self._processing_dirty_item_id = None
         self._set_processing_manual_crop_values(0, 0)
         self._processing_using_ai_layout_crop = False
         self._processing_ai_suggested_layout = None
@@ -3435,12 +3996,13 @@ class MainWindow(QWidget):
         self._processing_smart_summary_label.setText(
             "Smart draft summary will appear here after Groq generation."
         )
+        self._set_processing_smart_recommendation(None)
         self._set_processing_eval_state()
         self._refresh_processing_usage_label()
         self._set_processing_smart_options([], [])
         self._apply_processing_template("gaming_meme_black")
         self._processing_style_status_label.setText(
-            "These controls only affect the rendered title on the processed video. Captions stay as editable metadata for later upload."
+            "Template controls the rendered title style. Edit the title text and caption below."
         )
         self._processing_draft_status_label.setText(
             "Generate visual-first title and caption drafts from the selected downloaded video."
@@ -3475,10 +4037,12 @@ class MainWindow(QWidget):
             combo_enabled and self._processing_preview_path is not None
         )
         self._processing_generate_drafts_button.setEnabled(combo_enabled)
+        self._processing_copy_chat_prompt_button.setEnabled(combo_enabled)
         self._processing_save_drafts_button.setEnabled(combo_enabled)
         self._processing_title_draft_input.setEnabled(combo_enabled)
         self._processing_caption_draft_input.setEnabled(combo_enabled)
         self._processing_caption_style_combo.setEnabled(combo_enabled)
+        self._processing_prompt_title_style_combo.setEnabled(combo_enabled)
         self._processing_transcript_input.setEnabled(True)
         self._processing_clip_premise_input.setEnabled(combo_enabled)
         for button in self._processing_smart_option_buttons:
@@ -3535,6 +4099,20 @@ class MainWindow(QWidget):
             None,
         )
 
+    def _mark_processing_text_dirty(self) -> None:
+        if self._suppress_processing_text_dirty:
+            return
+        if self._selected_processing_item_id is not None:
+            self._processing_dirty_item_id = self._selected_processing_item_id
+        self._mark_user_interacting()
+
+    def _processing_has_unsaved_text_edits(self) -> bool:
+        return (
+            self._current_page == "processing"
+            and self._selected_processing_item_id is not None
+            and self._processing_dirty_item_id == self._selected_processing_item_id
+        )
+
     def _on_processing_clip_premise_changed(self) -> None:
         item = self._processing_selected_item()
         if item is None:
@@ -3544,6 +4122,14 @@ class MainWindow(QWidget):
             self._processing_clip_premises[item.id] = premise
         else:
             self._processing_clip_premises.pop(item.id, None)
+
+    @staticmethod
+    def _caption_for_save(raw_text: str) -> str | None:
+        """Preserve the caption verbatim (blank lines, trailing newlines,
+        indentation) when persisting. Only collapse to None when the field
+        is empty or contains nothing but whitespace, so the DB column stays
+        NULL instead of holding an empty/whitespace-only string."""
+        return raw_text if raw_text.strip() else None
 
     @staticmethod
     def _set_text_edit_if_changed(text_edit: QTextEdit, value: str) -> None:
@@ -3569,6 +4155,7 @@ class MainWindow(QWidget):
         if item is None or not self._item_exists(item):
             self._processing_probe = None
             self._processing_probe_item_id = None
+            self._processing_style_loaded_for_item_id = None
             self._processing_auto_crop = CropSettings()
             self._processing_using_ai_layout_crop = False
             self._processing_ai_suggested_layout = None
@@ -3584,18 +4171,30 @@ class MainWindow(QWidget):
             self._load_processing_preview(preview_path)
             self._processing_toggle_preview_button.setText("Play Full Video")
             self._processing_preview_position_slider.setValue(0)
-        self._processing_raw_transcript_text = item.transcript_text or ""
-        self._processing_title_draft_input.setText(item.title_draft or "")
-        self._processing_caption_draft_input.setPlainText(item.caption_draft or "")
-        self._set_text_edit_if_changed(
-            self._processing_clip_premise_input,
-            self._processing_clip_premises.get(item.id, ""),
-        )
-        self._processing_transcript_input.setPlainText(
-            self._processing_context_text(item, self._processing_raw_transcript_text)
-        )
-        self._load_processing_smart_drafts(item)
-        self._load_processing_style_state(item)
+        if not self._processing_has_unsaved_text_edits():
+            self._suppress_processing_text_dirty = True
+            try:
+                self._processing_raw_transcript_text = item.transcript_text or ""
+                self._processing_title_draft_input.setText(item.title_draft or "")
+                self._processing_caption_draft_input.setPlainText(item.caption_draft or "")
+                self._set_text_edit_if_changed(
+                    self._processing_clip_premise_input,
+                    self._processing_clip_premises.get(item.id, ""),
+                )
+                self._processing_transcript_input.setPlainText(
+                    self._processing_context_text(item, self._processing_raw_transcript_text)
+                )
+                self._load_processing_smart_drafts(item)
+                # Only re-apply the item's saved style on a real item switch.
+                # Auto-refresh ticks on the same item must not clobber the
+                # template/font/colour the user just picked in the dropdown.
+                # Account-level preferences (saved on every template change)
+                # remain the source of truth for the in-session selection.
+                if self._processing_style_loaded_for_item_id != item.id:
+                    self._load_processing_style_state(item)
+                    self._processing_style_loaded_for_item_id = item.id
+            finally:
+                self._suppress_processing_text_dirty = False
         if item.transcript_text:
             self._processing_draft_status_label.setText(
                 "Saved text drafts are loaded for this video."
@@ -3672,32 +4271,226 @@ class MainWindow(QWidget):
         self._processing_template_combo.setCurrentIndex(index if index >= 0 else 0)
         self._processing_template_combo.blockSignals(False)
 
+    # ------------------------------------------------------------------
+    # Per-account Processing preference persistence.
+    #
+    # Goal: when the user switches between niche accounts (Cinema vs Meme
+    # vs History), the Processing page restores that account's last-used
+    # template / caption style / title style / font / colour / etc., so
+    # they aren't re-picking the niche aesthetic every time.
+    #
+    # Storage: a single ``processing_preferences`` JSON column on Account.
+    # ``_processing_preferences_snapshot`` reads current widget state into
+    # a dict; ``_save_processing_preferences_for_current_account`` writes
+    # it to the DB; ``_apply_processing_preferences_for_account`` reads it
+    # back and applies it to the widgets when the account is selected.
+    #
+    # Looping guard: ``_suppress_processing_prefs_save`` is True while we
+    # programmatically set widget values from a snapshot, so the change
+    # signals we emit don't feed straight back into another save.
+    # ------------------------------------------------------------------
+
+    _PROCESSING_PREFERENCE_KEYS: tuple[str, ...] = (
+        "template",
+        "caption_style",
+        "prompt_title_style",
+        "title_style_preset",
+        "font_name",
+        "font_size",
+        "text_color",
+        "background",
+        "layout",
+    )
+
+    def _processing_preferences_snapshot(self) -> dict[str, object]:
+        """Read current Processing widget values into a snapshot dict."""
+        return {
+            "template": self._processing_template_combo.currentData() or "",
+            "caption_style": self._processing_caption_style_combo.currentData() or "",
+            "prompt_title_style": (
+                self._processing_prompt_title_style_combo.currentData() or ""
+            ),
+            "title_style_preset": self._processing_title_style_combo.currentData() or "",
+            "font_name": self._processing_title_font_combo.currentData() or "",
+            "font_size": int(self._processing_title_font_size.value()),
+            "text_color": self._processing_title_color_input.text().strip(),
+            "background": self._processing_title_background_combo.currentData() or "",
+            "layout": self._processing_title_layout_combo.currentData() or "",
+        }
+
+    def _save_processing_preferences_for_current_account(self) -> None:
+        """Persist the current widget snapshot to the active account."""
+        if self._suppress_processing_prefs_save:
+            return
+        if self._current_account_id is None:
+            return
+        snapshot = self._processing_preferences_snapshot()
+        try:
+            payload = json.dumps(snapshot, ensure_ascii=False)
+        except (TypeError, ValueError):
+            # snapshot values are primitives — JSON encoding should never
+            # fail, but if a future field is added without thinking about
+            # serialisation, skip the save instead of crashing the UI.
+            return
+        try:
+            with get_session() as session:
+                account = session.get(Account, self._current_account_id)
+                if account is None:
+                    return
+                if account.processing_preferences == payload:
+                    return  # no change → skip the write
+                account.processing_preferences = payload
+                session.commit()
+        except Exception:  # noqa: BLE001 — DB write must never crash the UI
+            return
+
+    def _apply_processing_preferences_for_account(self, account_id: int | None) -> bool:
+        """Restore the saved snapshot for ``account_id`` onto the Processing
+        widgets. Returns True when a snapshot was applied, False when the
+        account has no saved preferences yet — so callers can fall back to a
+        template default. No-op (returns False) for first-time accounts, which
+        keep whatever defaults the UI already shows."""
+        if account_id is None:
+            return False
+        try:
+            with get_session() as session:
+                account = session.get(Account, account_id)
+                payload = account.processing_preferences if account else None
+        except Exception:  # noqa: BLE001
+            return False
+        if not payload:
+            return False
+        try:
+            snapshot = json.loads(payload)
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(snapshot, dict):
+            return False
+
+        widgets = [
+            self._processing_template_combo,
+            self._processing_caption_style_combo,
+            self._processing_prompt_title_style_combo,
+            self._processing_title_style_combo,
+            self._processing_title_font_combo,
+            self._processing_title_font_size,
+            self._processing_title_color_input,
+            self._processing_title_background_combo,
+            self._processing_title_layout_combo,
+        ]
+        previous_suppress = self._suppress_processing_prefs_save
+        self._suppress_processing_prefs_save = True
+        for widget in widgets:
+            widget.blockSignals(True)
+        try:
+            template_value = str(snapshot.get("template", "") or "")
+            if template_value:
+                index = self._processing_template_combo.findData(template_value)
+                if index >= 0:
+                    self._processing_template_combo.setCurrentIndex(index)
+
+            caption_value = str(snapshot.get("caption_style", "") or "")
+            if caption_value:
+                index = self._processing_caption_style_combo.findData(caption_value)
+                if index >= 0:
+                    self._processing_caption_style_combo.setCurrentIndex(index)
+
+            prompt_title_value = str(snapshot.get("prompt_title_style", "") or "")
+            # Empty string is a real value here ("Auto") so always restore it.
+            index = self._processing_prompt_title_style_combo.findData(prompt_title_value)
+            if index >= 0:
+                self._processing_prompt_title_style_combo.setCurrentIndex(index)
+
+            title_style_value = str(snapshot.get("title_style_preset", "") or "")
+            if title_style_value:
+                index = self._processing_title_style_combo.findData(title_style_value)
+                if index >= 0:
+                    self._processing_title_style_combo.setCurrentIndex(index)
+
+            font_value = str(snapshot.get("font_name", "") or "")
+            if font_value:
+                index = self._processing_title_font_combo.findData(font_value)
+                if index >= 0:
+                    self._processing_title_font_combo.setCurrentIndex(index)
+
+            font_size_value = snapshot.get("font_size")
+            if isinstance(font_size_value, int) and 18 <= font_size_value <= 144:
+                self._processing_title_font_size.setValue(font_size_value)
+
+            color_value = str(snapshot.get("text_color", "") or "").strip()
+            if color_value:
+                self._processing_title_color_input.setText(color_value)
+
+            background_value = str(snapshot.get("background", "") or "")
+            if background_value:
+                index = self._processing_title_background_combo.findData(background_value)
+                if index >= 0:
+                    self._processing_title_background_combo.setCurrentIndex(index)
+
+            layout_value = str(snapshot.get("layout", "") or "")
+            if layout_value:
+                index = self._processing_title_layout_combo.findData(layout_value)
+                if index >= 0:
+                    self._processing_title_layout_combo.setCurrentIndex(index)
+        finally:
+            for widget in widgets:
+                widget.blockSignals(False)
+            self._suppress_processing_prefs_save = previous_suppress
+        return True
+
     def _apply_processing_template(self, template_key: str) -> None:
         template = PROCESSING_TEMPLATES.get(template_key, PROCESSING_TEMPLATES["gaming_meme_black"])
-        self._set_processing_template(template_key)
-        style_key = str(template.get("title_style", "clean_hook"))
-        self._processing_title_style_combo.blockSignals(True)
-        style_index = self._processing_title_style_combo.findData(style_key)
-        self._processing_title_style_combo.setCurrentIndex(style_index if style_index >= 0 else 0)
-        self._processing_title_style_combo.blockSignals(False)
-        self._processing_title_font_size.setValue(int(template.get("font_size", 60)))
-        font_index = self._processing_title_font_combo.findData(
-            str(template.get("font_name", "arial_bold"))
-        )
-        self._processing_title_font_combo.setCurrentIndex(font_index if font_index >= 0 else 0)
-        self._processing_title_color_input.setText(str(template.get("text_color", "#FFFFFF")))
-        background_index = self._processing_title_background_combo.findData(
-            str(template.get("background", "none"))
-        )
-        self._processing_title_background_combo.setCurrentIndex(
-            background_index if background_index >= 0 else 0
-        )
-        layout_index = self._processing_title_layout_combo.findData(
-            str(template.get("layout", "top_band"))
-        )
-        self._processing_title_layout_combo.setCurrentIndex(
-            layout_index if layout_index >= 0 else 0
-        )
+        # Applying a template programmatically mutates several style widgets,
+        # each of which fires the per-account save signal. Suppress those
+        # cascaded saves so a template reset never overwrites the account's
+        # stored preferences. A genuine user template pick still persists via
+        # the template combo's own ``save`` connection, which fires after this
+        # method returns (with the flag restored to its prior value).
+        previous_suppress = self._suppress_processing_prefs_save
+        self._suppress_processing_prefs_save = True
+        try:
+            self._set_processing_template(template_key)
+            style_key = str(template.get("title_style", "clean_hook"))
+            self._processing_title_style_combo.blockSignals(True)
+            style_index = self._processing_title_style_combo.findData(style_key)
+            self._processing_title_style_combo.setCurrentIndex(style_index if style_index >= 0 else 0)
+            self._processing_title_style_combo.blockSignals(False)
+            self._processing_title_font_size.setValue(int(template.get("font_size", 60)))
+            font_index = self._processing_title_font_combo.findData(
+                str(template.get("font_name", "arial_bold"))
+            )
+            self._processing_title_font_combo.setCurrentIndex(font_index if font_index >= 0 else 0)
+            self._processing_title_color_input.setText(str(template.get("text_color", "#FFFFFF")))
+            background_index = self._processing_title_background_combo.findData(
+                str(template.get("background", "none"))
+            )
+            self._processing_title_background_combo.setCurrentIndex(
+                background_index if background_index >= 0 else 0
+            )
+            layout_index = self._processing_title_layout_combo.findData(
+                str(template.get("layout", "top_band"))
+            )
+            self._processing_title_layout_combo.setCurrentIndex(
+                layout_index if layout_index >= 0 else 0
+            )
+            # Templates may pin the LLM title style (e.g. the bold-keyword
+            # template wants the model to emit ``**word**`` markers). Only
+            # override when the template specifies one so other templates leave
+            # the user's choice be.
+            prompt_title_style = template.get("prompt_title_style")
+            if prompt_title_style is not None:
+                prompt_index = self._processing_prompt_title_style_combo.findData(
+                    str(prompt_title_style)
+                )
+                if prompt_index >= 0:
+                    self._processing_prompt_title_style_combo.setCurrentIndex(prompt_index)
+        finally:
+            self._suppress_processing_prefs_save = previous_suppress
+
+    def _current_template_enables_bold(self) -> bool:
+        template_key = str(self._processing_template_combo.currentData() or "")
+        template = PROCESSING_TEMPLATES.get(template_key, {})
+        return bool(template.get("bold_keywords", False))
 
     def _processing_prompt_profile(self) -> str:
         template_key = str(self._processing_template_combo.currentData() or "gaming_meme_black")
@@ -3706,6 +4499,19 @@ class MainWindow(QWidget):
 
     def _processing_caption_style(self) -> str:
         return str(self._processing_caption_style_combo.currentData() or "contextual_info")
+
+    def _processing_title_style(self) -> str | None:
+        """Return the explicit title style, or None for Auto.
+
+        Auto is the empty-string sentinel set on the dropdown; smart_drafts
+        treats None as "fall back to caption-style-derived title rules" so
+        the previous behavior is preserved when the user does not pick a
+        specific title style.
+        """
+        value = self._processing_prompt_title_style_combo.currentData()
+        if not value:
+            return None
+        return str(value)
 
     def _recent_smart_drafts_for_account(
         self,
@@ -3781,45 +4587,64 @@ class MainWindow(QWidget):
         return top_text_type in {"meme_joke", "source_title", "watermark", "channel_name", "none"}
 
     def _load_processing_style_state(self, item: DownloadItem) -> None:
-        template_key = "gaming_meme_black"
-        title_preset = item.title_style_preset or "clean_hook"
+        # Loading a video's style into the widgets is a programmatic refresh,
+        # not a user edit, so suppress the per-account save signals throughout —
+        # otherwise selecting a video would overwrite the account's stored
+        # default style with that video's (or the gaming-meme fallback's) values.
+        previous_suppress = self._suppress_processing_prefs_save
+        self._suppress_processing_prefs_save = True
+        try:
+            title_preset = item.title_style_preset or "clean_hook"
+            config: dict[str, object] = {}
+            if item.title_style_config:
+                try:
+                    config = json.loads(item.title_style_config)
+                except json.JSONDecodeError:
+                    config = {}
+                if not isinstance(config, dict):
+                    config = {}
 
-        if item.title_style_config:
-            try:
-                config = json.loads(item.title_style_config)
-            except json.JSONDecodeError:
-                config = {}
-            template_key = str(config.get("template", template_key))
-        else:
-            config = {}
-        self._apply_processing_template(template_key)
-        if item.title_style_preset:
-            self._apply_title_style_preset(title_preset)
-            self._set_processing_template(template_key)
+            # Template, caption-style, and prompt-title-style combos always
+            # reflect the account's saved preferences so they never jump
+            # unexpectedly when clicking between inbox videos.
+            if not self._apply_processing_preferences_for_account(self._current_account_id):
+                self._apply_processing_template("gaming_meme_black")
 
-        if config:
-            self._processing_title_font_size.setValue(
-                int(config.get("font_size", self._processing_title_font_size.value()))
-            )
-            font_index = self._processing_title_font_combo.findData(
-                str(config.get("font_name", self._processing_title_font_combo.currentData()))
-            )
-            self._processing_title_font_combo.setCurrentIndex(font_index if font_index >= 0 else 0)
-            self._processing_title_color_input.setText(
-                str(config.get("text_color", self._processing_title_color_input.text()))
-            )
-            background_index = self._processing_title_background_combo.findData(
-                str(config.get("background", self._processing_title_background_combo.currentData()))
-            )
-            self._processing_title_background_combo.setCurrentIndex(
-                background_index if background_index >= 0 else 0
-            )
-            layout_index = self._processing_title_layout_combo.findData(
-                str(config.get("layout", self._processing_title_layout_combo.currentData()))
-            )
-            self._processing_title_layout_combo.setCurrentIndex(
-                layout_index if layout_index >= 0 else 0
-            )
+            if config:
+                # Video has saved visual details — overlay font/size/colour/
+                # background/layout on top of the account's combo settings.
+                self._processing_title_font_size.setValue(
+                    int(config.get("font_size", self._processing_title_font_size.value()))
+                )
+                font_index = self._processing_title_font_combo.findData(
+                    str(config.get("font_name", self._processing_title_font_combo.currentData()))
+                )
+                self._processing_title_font_combo.setCurrentIndex(
+                    font_index if font_index >= 0 else 0
+                )
+                self._processing_title_color_input.setText(
+                    str(config.get("text_color", self._processing_title_color_input.text()))
+                )
+                background_index = self._processing_title_background_combo.findData(
+                    str(config.get("background", self._processing_title_background_combo.currentData()))
+                )
+                self._processing_title_background_combo.setCurrentIndex(
+                    background_index if background_index >= 0 else 0
+                )
+                layout_index = self._processing_title_layout_combo.findData(
+                    str(config.get("layout", self._processing_title_layout_combo.currentData()))
+                )
+                self._processing_title_layout_combo.setCurrentIndex(
+                    layout_index if layout_index >= 0 else 0
+                )
+            else:
+                # No per-video style saved — account prefs already applied
+                # above; additionally apply the item's title-style preset
+                # visual settings if one is recorded.
+                if item.title_style_preset:
+                    self._apply_title_style_preset(title_preset)
+        finally:
+            self._suppress_processing_prefs_save = previous_suppress
 
     def _load_processing_smart_drafts(self, item: DownloadItem) -> None:
         self._processing_smart_summary_label.setText(
@@ -3827,7 +4652,18 @@ class MainWindow(QWidget):
         )
         title_options = self._parse_saved_options(item.smart_title_options)
         caption_options = self._parse_saved_options(item.smart_caption_options)
-        self._set_processing_smart_options(title_options, caption_options)
+        recommendation = self._smart_recommendation_from_meta(
+            item.smart_generation_meta,
+            title_options=title_options,
+            caption_options=caption_options,
+        )
+        self._set_processing_smart_recommendation(recommendation)
+        self._set_processing_smart_options(
+            title_options,
+            caption_options,
+            option_notes=recommendation.option_notes if recommendation else None,
+            recommended_index=recommendation.title_index if recommendation else None,
+        )
         self._set_processing_eval_state(
             provider_label=item.smart_provider_label,
             generation_meta=item.smart_generation_meta,
@@ -3870,6 +4706,198 @@ class MainWindow(QWidget):
             return None
         return parsed if isinstance(parsed, dict) else None
 
+    @staticmethod
+    def _chat_prompt_section(label: str, value: str | None) -> str:
+        cleaned = (value or "").strip()
+        return f"{label}: {cleaned if cleaned else '(none)'}"
+
+    @staticmethod
+    def _truncate_chat_prompt_context(value: str, *, max_chars: int = 6000) -> str:
+        cleaned = value.strip()
+        if len(cleaned) <= max_chars:
+            return cleaned
+        return cleaned[:max_chars].rstrip() + "\n...[truncated for prompt]"
+
+    def _processing_chat_prompt_style_contract(self) -> str:
+        caption_style = self._processing_caption_style()
+        title_style = self._processing_title_style()
+        prompt_profile = self._processing_prompt_profile()
+        profile_block = _profile_style_block(prompt_profile)
+        title_rules = _title_style_rules(title_style) or _caption_style_title_rules(
+            caption_style
+        )
+        title_rule_text = "\n".join(title_rules)
+
+        return "\n".join(
+            [
+                "Style contract copied from NicheFlow smart drafts:",
+                self._chat_prompt_section("Prompt profile", prompt_profile),
+                self._chat_prompt_section("Profile voice", profile_block.get("style")),
+                self._chat_prompt_section("Profile caption guidance", profile_block.get("caption")),
+                self._chat_prompt_section("Caption word target", _caption_word_target(caption_style)),
+                self._chat_prompt_section(
+                    "Caption hashtag target", _caption_hashtag_target(caption_style)
+                ),
+                "Caption style rule:",
+                _caption_style_line(caption_style),
+                "",
+                "Caption structure rule:",
+                _caption_paragraph_rule(caption_style),
+                "",
+                "Title rules:",
+                title_rule_text,
+                "",
+                "Quality bar:",
+                "- Do not write tiny one-line captions unless the style contract explicitly asks for it.",
+                "- Do not use generic filler hashtags like #fyp, #viral, #genz, or #explore as padding.",
+                "- Make every option meaningfully different: different angle, different setup, different caption opener.",
+                "- If the clip premise and visible video disagree, trust the visible video and mention the uncertainty.",
+                "- Do not copy the source title or caption; transform the idea into this account's style.",
+            ]
+        )
+
+    def _processing_visual_style_recommendation_contract(self) -> str:
+        caption_style = self._processing_caption_style()
+        prompt_profile = self._processing_prompt_profile()
+        template_key = str(self._processing_template_combo.currentData() or "")
+        if not (
+            prompt_profile in {"cinema_study", "cinematic_study"}
+            or caption_style == "cinema_hook"
+            or template_key.startswith("cinema")
+            or template_key.startswith("cinematic")
+        ):
+            return ""
+        return "\n".join(
+            [
+                "Cinema visual style recommendation:",
+                "- Recommend exactly one render style for each title option: Editorial Italic, Cinema Normal, or Bold Rounded.",
+                "- Editorial Italic = use Cinematic Study / Cinematic Soft Italic. Best for twist scenes, emotional scenes, rewatch details, quiet dialogue, tragic reveals, and reflective movie moments.",
+                "- Cinema Normal = use Cinema Normal / Cinema Georgia Clean. Best for calm re-watch content, character studies, understated observations, and scenes where restrained elegance beats drama.",
+                "- Bold Rounded = use Cinema Viral Bold / Cinema Bold Rounded. Best for beautiful cinematography, visually stunning transitions, iconic shots, simple broad hooks, and high-readability viral discovery posts.",
+                "- For a 3-post pilot, prefer: twist scene -> Editorial Italic; beautiful cinematography -> Bold Rounded; character/calm re-watch -> Cinema Normal.",
+                "- Do not choose based on personal taste only; choose based on what the clip needs viewers to notice first: feeling/story = Editorial Italic, quiet elegance = Cinema Normal, visual spectacle/readability = Bold Rounded.",
+            ]
+        )
+
+    def _processing_generation_chat_prompt(self, item: DownloadItem) -> str:
+        path = Path(item.file_path or "").expanduser().resolve()
+        account = self._active_account()
+        account_voice = self._processing_account_voice_config(account)
+        voice_lines = [
+            self._chat_prompt_section("Tone", account_voice.get("tone")),
+            self._chat_prompt_section("Target audience", account_voice.get("target_audience")),
+            self._chat_prompt_section("Hook style", account_voice.get("hook_style")),
+            self._chat_prompt_section("Banned phrases", account_voice.get("banned_phrases")),
+            self._chat_prompt_section("Account title rules", account_voice.get("title_style")),
+            self._chat_prompt_section("Account caption rules", account_voice.get("caption_style")),
+            self._chat_prompt_section("Clip premise", account_voice.get("clip_context")),
+        ]
+        context_text = self._truncate_chat_prompt_context(
+            self._processing_transcript_input.toPlainText()
+        )
+        title_style_label = self._processing_prompt_title_style_combo.currentText().strip()
+        if self._processing_title_style() is None:
+            title_style_label = "Auto (match caption style)"
+        visual_style_contract = self._processing_visual_style_recommendation_contract()
+        visual_style_task_lines = (
+            [
+                "- For each option, include one recommended render style: Editorial Italic, Cinema Normal, or Bold Rounded."
+            ]
+            if visual_style_contract
+            else []
+        )
+        visual_style_return_lines = (
+            ["Recommended Style 1:"]
+            if visual_style_contract
+            else []
+        )
+        visual_style_return_lines_2 = (
+            ["Recommended Style 2:"]
+            if visual_style_contract
+            else []
+        )
+        visual_style_return_lines_3 = (
+            ["Recommended Style 3:"]
+            if visual_style_contract
+            else []
+        )
+
+        return "\n".join(
+            [
+                "Please analyze this local NicheFlow video and generate Instagram-ready drafts.",
+                "",
+                "You can access the media directly from this local path:",
+                f'"{path}"',
+                f"File URL: {QUrl.fromLocalFile(str(path)).toString()}",
+                "",
+                "Account / niche context:",
+                self._chat_prompt_section("Account", account.name if account else None),
+                self._chat_prompt_section("Platform", account.platform if account else None),
+                self._chat_prompt_section("Niche", account.niche_label if account else None),
+                self._chat_prompt_section("Source title", item.title),
+                self._chat_prompt_section("Source URL", item.source_url),
+                self._chat_prompt_section("Source description", item.source_description),
+                self._chat_prompt_section(
+                    "Processing template",
+                    self._processing_template_combo.currentText(),
+                ),
+                self._chat_prompt_section("Prompt profile", self._processing_prompt_profile()),
+                self._chat_prompt_section(
+                    "Caption style",
+                    f"{self._processing_caption_style_combo.currentText()} "
+                    f"({self._processing_caption_style()})",
+                ),
+                self._chat_prompt_section(
+                    "Title style",
+                    f"{title_style_label} ({self._processing_title_style() or 'auto'})",
+                ),
+                "",
+                "Account voice fields:",
+                *voice_lines,
+                "",
+                "Existing transcript / context from NicheFlow:",
+                context_text or "(none)",
+                "",
+                self._processing_chat_prompt_style_contract(),
+                visual_style_contract,
+                "",
+                "Task:",
+                "- Inspect the local video file if possible before writing.",
+                "- Generate 3 on-screen title options and 3 caption options.",
+                "- After the 3 options, recommend the strongest title/caption pair for this account and explain why in 1-2 sentences.",
+                "- Add a short selection note for each option so the user understands when to choose it.",
+                *visual_style_task_lines,
+                "- Follow the Style contract exactly; it overrides any generic caption habits.",
+                "- Use the clip premise as guidance, but do not invent unsupported facts.",
+                "- Keep the result ready to paste back into NicheFlow.",
+                "",
+                "Return format:",
+                "Title Option 1:",
+                *visual_style_return_lines,
+                "Caption Option 1:",
+                "Title Option 2:",
+                *visual_style_return_lines_2,
+                "Caption Option 2:",
+                "Title Option 3:",
+                *visual_style_return_lines_3,
+                "Caption Option 3:",
+                "Recommended Pick:",
+                "Why:",
+                "Selection Notes:",
+            ]
+        )
+
+    def _on_copy_generation_chat_prompt_clicked(self) -> None:
+        item = self._processing_selected_item()
+        if item is None:
+            self._notify("Select a downloaded video first.", Tone.WARNING)
+            return
+        if not item.file_path:
+            self._notify("Selected video has no local file path yet.", Tone.WARNING)
+            return
+        QApplication.clipboard().setText(self._processing_generation_chat_prompt(item))
+        self._notify("Copied chat-ready generation prompt.", Tone.SUCCESS)
+
     def _processing_context_text(self, item: DownloadItem, transcript_text: str) -> str:
         transcript_block = (
             transcript_text.strip()
@@ -3882,8 +4910,130 @@ class MainWindow(QWidget):
             f"Speech / transcript context:\n{transcript_block}"
         )
 
+    def _set_processing_smart_recommendation(
+        self, recommendation: DraftRecommendation | None
+    ) -> None:
+        if recommendation is None or recommendation.title_index is None:
+            self._processing_smart_recommendation_label.setText("")
+            self._processing_smart_recommendation_label.setVisible(False)
+            return
+        title_number = recommendation.title_index + 1
+        caption_number = (
+            recommendation.caption_index + 1
+            if recommendation.caption_index is not None
+            else title_number
+        )
+        pick_text = (
+            f"Recommended Pick: Title Option {title_number} + "
+            f"Caption Option {caption_number}"
+        )
+        if recommendation.reason:
+            pick_text = f"{pick_text}\nWhy: {recommendation.reason}"
+        self._processing_smart_recommendation_label.setText(pick_text)
+        self._processing_smart_recommendation_label.setVisible(True)
+
+    @staticmethod
+    def _valid_smart_option_index(value: object) -> int | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            index = int(value)
+        except (TypeError, ValueError):
+            return None
+        if 0 <= index < SMART_DRAFT_OPTION_COUNT:
+            return index
+        if 1 <= index <= SMART_DRAFT_OPTION_COUNT:
+            return index - 1
+        return None
+
+    def _smart_recommendation_from_payload(
+        self,
+        payload: dict,
+        *,
+        title_options: list[str],
+        caption_options: list[str],
+    ) -> DraftRecommendation | None:
+        title_index = self._valid_smart_option_index(payload.get("recommended_title_index"))
+        caption_index = self._valid_smart_option_index(payload.get("recommended_caption_index"))
+        reason = str(payload.get("recommendation_reason") or "").strip() or None
+        raw_notes = payload.get("option_notes") or []
+        option_notes = [str(note).strip() for note in raw_notes if str(note).strip()]
+        return self._normalize_smart_recommendation(
+            title_index=title_index,
+            caption_index=caption_index,
+            reason=reason,
+            option_notes=option_notes,
+            title_options=title_options,
+            caption_options=caption_options,
+        )
+
+    def _smart_recommendation_from_meta(
+        self,
+        raw_meta: str | None,
+        *,
+        title_options: list[str],
+        caption_options: list[str],
+    ) -> DraftRecommendation | None:
+        if not raw_meta:
+            return None
+        try:
+            meta = json.loads(raw_meta)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(meta, dict):
+            return None
+        raw_notes = meta.get("option_notes") or []
+        option_notes = [str(note).strip() for note in raw_notes if str(note).strip()]
+        return self._normalize_smart_recommendation(
+            title_index=self._valid_smart_option_index(
+                meta.get("recommended_title_option_index")
+            ),
+            caption_index=self._valid_smart_option_index(
+                meta.get("recommended_caption_option_index")
+            ),
+            reason=str(meta.get("recommendation_reason") or "").strip() or None,
+            option_notes=option_notes,
+            title_options=title_options,
+            caption_options=caption_options,
+        )
+
+    def _normalize_smart_recommendation(
+        self,
+        *,
+        title_index: int | None,
+        caption_index: int | None,
+        reason: str | None,
+        option_notes: list[str],
+        title_options: list[str],
+        caption_options: list[str],
+    ) -> DraftRecommendation | None:
+        max_options = max(len(title_options), len(caption_options))
+        if max_options <= 0:
+            return None
+        if title_index is not None and title_index >= len(title_options):
+            title_index = None
+        if caption_index is not None and caption_index >= len(caption_options):
+            caption_index = None
+        if title_index is None and caption_index is not None:
+            title_index = caption_index if caption_index < len(title_options) else None
+        if caption_index is None and title_index is not None:
+            caption_index = title_index if title_index < len(caption_options) else None
+        if title_index is None and caption_index is None and not option_notes:
+            return None
+        return DraftRecommendation(
+            title_index=title_index,
+            caption_index=caption_index,
+            reason=reason,
+            option_notes=option_notes[:SMART_DRAFT_OPTION_COUNT] or None,
+        )
+
     def _set_processing_smart_options(
-        self, title_options: list[str], caption_options: list[str]
+        self,
+        title_options: list[str],
+        caption_options: list[str],
+        *,
+        option_notes: list[str] | None = None,
+        recommended_index: int | None = None,
     ) -> None:
         self._processing_smart_option_pairs = []
         max_options = max(
@@ -3899,24 +5049,42 @@ class MainWindow(QWidget):
         while len(self._processing_smart_option_pairs) < SMART_DRAFT_OPTION_COUNT:
             self._processing_smart_option_pairs.append((None, None))
 
-        for index, button in enumerate(self._processing_smart_option_buttons):
-            title_input = self._processing_smart_option_title_inputs[index]
-            caption_input = self._processing_smart_option_caption_inputs[index]
-            button.blockSignals(True)
-            button.setChecked(False)
-            title_option, caption_option = self._processing_smart_option_pairs[index]
-            has_content = bool(title_option or caption_option)
-            if has_content:
-                title_input.setText(title_option or "")
-                caption_input.setPlainText(caption_option or "")
-                button.setEnabled(not self._processing_in_progress)
-                button.setText(f"Apply Option {index + 1}")
-            else:
-                title_input.setText("")
-                caption_input.setPlainText("")
-                button.setEnabled(False)
-                button.setText(f"Option {index + 1} unavailable")
-            button.blockSignals(False)
+        self._suppress_processing_text_dirty = True
+        try:
+            for index, button in enumerate(self._processing_smart_option_buttons):
+                title_input = self._processing_smart_option_title_inputs[index]
+                caption_input = self._processing_smart_option_caption_inputs[index]
+                note_label = self._processing_smart_option_note_labels[index]
+                button.blockSignals(True)
+                button.setChecked(False)
+                title_option, caption_option = self._processing_smart_option_pairs[index]
+                note_text = (
+                    option_notes[index].strip()
+                    if option_notes and index < len(option_notes)
+                    else ""
+                )
+                has_content = bool(title_option or caption_option)
+                if has_content:
+                    title_input.setText(title_option or "")
+                    caption_input.setPlainText(caption_option or "")
+                    note_label.setText(note_text)
+                    note_label.setVisible(bool(note_text))
+                    button.setEnabled(not self._processing_in_progress)
+                    button.setText(
+                        "Apply Recommended"
+                        if recommended_index is not None and index == recommended_index
+                        else f"Apply Option {index + 1}"
+                    )
+                else:
+                    title_input.setText("")
+                    caption_input.setPlainText("")
+                    note_label.setText("")
+                    note_label.setVisible(False)
+                    button.setEnabled(False)
+                    button.setText(f"Option {index + 1} unavailable")
+                button.blockSignals(False)
+        finally:
+            self._suppress_processing_text_dirty = False
 
         if any(title or caption for title, caption in self._processing_smart_option_pairs):
             self._processing_smart_cards_status_label.setText(
@@ -3925,14 +5093,104 @@ class MainWindow(QWidget):
         else:
             self._processing_smart_cards_status_label.setText("")
 
+    def _sync_processing_smart_option_pairs_from_inputs(self) -> None:
+        self._processing_smart_option_pairs = [
+            (
+                self._processing_smart_option_title_inputs[index].text().strip() or None,
+                self._caption_for_save(
+                    self._processing_smart_option_caption_inputs[index].toPlainText()
+                ),
+            )
+            for index in range(len(self._processing_smart_option_buttons))
+        ]
+
+    def _on_paste_smart_draft_clicked(self) -> None:
+        clipboard = QApplication.clipboard()
+        text = clipboard.text() if clipboard is not None else ""
+        if not text.strip():
+            self._notify(
+                "Clipboard is empty — copy the generated draft first.", Tone.WARNING
+            )
+            return
+        draft = parse_pasted_smart_draft(text)
+        has_content = any(option.strip() for option in draft.title_options) or any(
+            option.strip() for option in draft.caption_options
+        )
+        if not has_content:
+            self._notify(
+                "No 'Title Option' or 'Caption Option' sections found in the pasted text.",
+                Tone.WARNING,
+            )
+            return
+        option_count = max(
+            len(draft.title_options),
+            len(draft.caption_options),
+            len(draft.option_notes),
+            len(draft.recommended_styles),
+        )
+        display_notes: list[str] = []
+        for index in range(option_count):
+            style = (
+                draft.recommended_styles[index]
+                if index < len(draft.recommended_styles)
+                else ""
+            )
+            note = draft.option_notes[index] if index < len(draft.option_notes) else ""
+            if style and note:
+                display_notes.append(f"Style: {style}. {note}")
+            elif style:
+                display_notes.append(f"Style: {style}.")
+            else:
+                display_notes.append(note)
+        self._set_processing_smart_options(
+            draft.title_options,
+            draft.caption_options,
+            option_notes=display_notes,
+            recommended_index=draft.recommended_title_index,
+        )
+        caption_index = (
+            draft.recommended_caption_index
+            if draft.recommended_caption_index is not None
+            else draft.recommended_title_index
+        )
+        recommendation = DraftRecommendation(
+            title_index=draft.recommended_title_index,
+            caption_index=caption_index,
+            reason=draft.reason,
+            option_notes=[note for note in display_notes if note] or None,
+        )
+        self._set_processing_smart_recommendation(recommendation)
+        # Persist the pick + per-option notes through generation meta so a
+        # reload rebuilds them exactly like a Groq-generated draft would.
+        self._processing_generation_meta_text = json.dumps(
+            {
+                "recommended_title_option_index": draft.recommended_title_index,
+                "recommended_caption_option_index": caption_index,
+                "recommendation_reason": draft.reason,
+                "option_notes": display_notes,
+                "source": "manual_paste",
+            },
+            ensure_ascii=False,
+        )
+        item = self._processing_selected_item()
+        if item is None:
+            self._notify(
+                "Pasted draft into the option cards. Select a downloaded video to save it.",
+                Tone.INFO,
+            )
+            return
+        self._persist_processing_draft_state(item.id)
+        self._notify("Pasted draft saved. Apply the option you want to use.", Tone.SUCCESS)
+
     def _persist_processing_draft_state(self, item_id: int) -> None:
+        self._sync_processing_smart_option_pairs_from_inputs()
         with get_session() as session:
             item_row = session.get(DownloadItem, item_id)
             if item_row is None:
                 return
             item_row.title_draft = self._processing_title_draft_input.text().strip() or None
-            item_row.caption_draft = (
-                self._processing_caption_draft_input.toPlainText().strip() or None
+            item_row.caption_draft = self._caption_for_save(
+                self._processing_caption_draft_input.toPlainText()
             )
             item_row.transcript_text = self._processing_raw_transcript_text.strip() or None
             item_row.smart_summary = self._processing_smart_summary_label.text().strip() or None
@@ -3946,7 +5204,7 @@ class MainWindow(QWidget):
             )
             item_row.smart_caption_options = json.dumps(
                 [
-                    self._processing_smart_option_caption_inputs[index].toPlainText().strip()
+                    self._processing_smart_option_caption_inputs[index].toPlainText()
                     for index in range(len(self._processing_smart_option_pairs))
                     if self._processing_smart_option_caption_inputs[index].toPlainText().strip()
                 ],
@@ -3961,6 +5219,8 @@ class MainWindow(QWidget):
                 else None
             )
             session.commit()
+        if self._processing_dirty_item_id == item_id:
+            self._processing_dirty_item_id = None
 
     def _set_processing_eval_state(
         self,
@@ -4190,9 +5450,16 @@ class MainWindow(QWidget):
             self._set_processing_controls_enabled(False)
             return
 
-        output_path = self._processed_output_path_for_item(item)
+        output_path = self._new_processed_output_path_for_item(item)
+        if output_path is None:
+            output_path = self._processed_output_path_for_item(item)
+        # Resolve the "Open Video" / "Add to Schedule" target strictly per-item.
+        # Earlier this used the cross-account folder mtime fallback and an
+        # ``or self._processing_last_output_path`` carryover, both of which
+        # leaked another item's most-recent export into this item's panel and
+        # made Open Video open the wrong file when switching between items.
         self._refresh_processing_latest_output_state(
-            output_path if output_path.exists() else self._processing_last_output_path
+            self._existing_processed_output_path_for_item(item)
         )
         preview_path = self._processing_preview_target_path(Path(item.file_path))
         preview_path_changed = self._processing_preview_path != preview_path
@@ -4217,6 +5484,11 @@ class MainWindow(QWidget):
 
     def _refresh_processing_latest_output_state(self, path: Path | None) -> None:
         if path is None or not path.exists():
+            # Clear the cache too — without this, switching from an exported
+            # item to a never-exported item leaves the previous item's path
+            # behind, and the preview "output" mode / Open Video click can
+            # still target a file that doesn't belong to the new selection.
+            self._processing_last_output_path = None
             self._processing_latest_output_label.setText("No processed output yet in this session.")
             self._processing_open_latest_output_button.setEnabled(False)
             self._processing_open_latest_output_button.setVisible(False)
@@ -4232,6 +5504,7 @@ class MainWindow(QWidget):
                     self._processing_preview_mode_combo.blockSignals(False)
             return
 
+        self._processing_last_output_path = path
         self._processing_latest_output_label.setText(path.name)
         self._processing_open_latest_output_button.setEnabled(True)
         self._processing_open_latest_output_button.setVisible(True)
@@ -4267,6 +5540,11 @@ class MainWindow(QWidget):
 
     def _on_processing_item_changed(self) -> None:
         self._selected_processing_item_id = self._processing_item_combo.currentData()
+        # Drop the previously selected item's cached output path so the new
+        # item starts from a clean slate — the refresh below resolves the
+        # right path per-item, but this guards against any UI control that
+        # reads the cache before the refresh completes.
+        self._processing_last_output_path = None
         self._refresh_processing_selection()
 
     def _on_processing_inbox_filter_changed(self) -> None:
@@ -4295,11 +5573,11 @@ class MainWindow(QWidget):
         if isinstance(preset_key, str):
             self._apply_title_style_preset(preset_key)
             self._processing_style_status_label.setText(
-                "Applied the title style preset. You can still edit the fields below it."
+                "Applied the template title style."
             )
 
             self._processing_style_status_label.setText(
-                "Applied the caption style preset. You can still edit the fields below it."
+                "Applied the template title style."
             )
 
     def _on_processing_template_changed(self) -> None:
@@ -4307,7 +5585,7 @@ class MainWindow(QWidget):
         if isinstance(template_key, str):
             self._apply_processing_template(template_key)
             self._processing_style_status_label.setText(
-                "Applied the processing template. You can still edit the style fields below it."
+                "Applied the processing template."
             )
 
     def _start_suggest_crop_job(self, job: SuggestCropJobConfig) -> None:
@@ -4524,6 +5802,8 @@ class MainWindow(QWidget):
                 title_color=pending_job.title_color,
                 title_background=pending_job.title_background,
                 title_layout=pending_job.title_layout,
+                enable_bold_keywords=pending_job.enable_bold_keywords,
+                watermark_replacement_text=pending_job.watermark_replacement_text,
             )
             self._start_processing_job(auto_job)
             return
@@ -4614,6 +5894,7 @@ class MainWindow(QWidget):
                 account_voice=self._processing_account_voice_config(account),
                 prompt_profile=self._processing_prompt_profile(),
                 caption_style=self._processing_caption_style(),
+                title_style=self._processing_title_style(),
                 recent_titles=recent_titles,
                 recent_captions=recent_captions,
             )
@@ -4673,14 +5954,46 @@ class MainWindow(QWidget):
             payload.get("vision_payload")
         )
         self._apply_ai_layout_suggestion(payload.get("vision_payload"))
-        self._set_processing_smart_options(title_options, caption_options)
+        recommendation = self._smart_recommendation_from_payload(
+            payload,
+            title_options=title_options,
+            caption_options=caption_options,
+        )
+        self._set_processing_smart_recommendation(recommendation)
+        apply_index = (
+            recommendation.title_index
+            if recommendation is not None and recommendation.title_index is not None
+            else 0
+        )
+        self._set_processing_smart_options(
+            title_options,
+            caption_options,
+            option_notes=recommendation.option_notes if recommendation else None,
+            recommended_index=apply_index if title_options or caption_options else None,
+        )
 
         if title_options:
-            self._processing_title_draft_input.setText(title_options[0])
+            current_title = self._processing_title_draft_input.text().strip()
+            title_was_manually_edited = (
+                bool(current_title)
+                and current_title not in self._processing_last_generated_titles
+            )
+            if not title_was_manually_edited:
+                title_index = apply_index if apply_index < len(title_options) else 0
+                self._processing_title_draft_input.setText(title_options[title_index])
+            self._processing_last_generated_titles = list(title_options)
         if caption_options:
-            self._processing_caption_draft_input.setPlainText(caption_options[0])
+            caption_index = (
+                recommendation.caption_index
+                if recommendation is not None and recommendation.caption_index is not None
+                else apply_index
+            )
+            if caption_index >= len(caption_options):
+                caption_index = 0
+            self._processing_caption_draft_input.setPlainText(caption_options[caption_index])
         if self._processing_smart_option_buttons and (title_options or caption_options):
-            self._processing_smart_option_buttons[0].setChecked(True)
+            checked_index = apply_index if apply_index < len(self._processing_smart_option_buttons) else 0
+            self._processing_smart_option_buttons[checked_index].setChecked(True)
 
         if used_fallback:
             errors = self._processing_generation_meta_errors(generation_meta_text)
@@ -4694,7 +6007,7 @@ class MainWindow(QWidget):
             )
         else:
             self._processing_draft_status_label.setText(
-                f"Generated smart draft options with {provider_label} and applied the first title/caption."
+                f"Generated smart draft options with {provider_label} and applied the recommended title/caption."
             )
             self._notify(
                 f"Generated smart title and caption options with {provider_label}.", Tone.SUCCESS
@@ -4767,6 +6080,7 @@ class MainWindow(QWidget):
                 account_voice=self._processing_account_voice_config(account),
                 prompt_profile=self._processing_prompt_profile(),
                 caption_style=self._processing_caption_style(),
+                title_style=self._processing_title_style(),
                 recent_titles=recent_titles,
                 recent_captions=recent_captions,
             )
@@ -4776,6 +6090,7 @@ class MainWindow(QWidget):
     def _on_processing_smart_option_clicked(self, option_index: int) -> None:
         if option_index >= len(self._processing_smart_option_pairs):
             return
+        self._sync_processing_smart_option_pairs_from_inputs()
         title_option = self._processing_smart_option_title_inputs[option_index].text().strip()
         caption_option = (
             self._processing_smart_option_caption_inputs[option_index].toPlainText().strip()
@@ -4800,14 +6115,15 @@ class MainWindow(QWidget):
             self._notify("Select a downloaded video first.", Tone.WARNING)
             return
 
+        self._sync_processing_smart_option_pairs_from_inputs()
         with get_session() as session:
             item_row = session.get(DownloadItem, item.id)
             if item_row is None:
                 self._notify("Could not find the selected video.", Tone.ERROR)
                 return
             item_row.title_draft = self._processing_title_draft_input.text().strip() or None
-            item_row.caption_draft = (
-                self._processing_caption_draft_input.toPlainText().strip() or None
+            item_row.caption_draft = self._caption_for_save(
+                self._processing_caption_draft_input.toPlainText()
             )
             item_row.transcript_text = self._processing_raw_transcript_text.strip() or None
             item_row.title_style_preset = self._processing_title_style_combo.currentData()
@@ -4838,6 +6154,8 @@ class MainWindow(QWidget):
                 else None
             )
             session.commit()
+        if self._processing_dirty_item_id == item.id:
+            self._processing_dirty_item_id = None
 
         self._processing_draft_status_label.setText(
             "Saved text drafts and style settings for this video."
@@ -4852,7 +6170,13 @@ class MainWindow(QWidget):
 
         try:
             input_path = Path(item.file_path)
-            output_path = self._processed_output_path_for_item(item)
+            output_path = self._new_processed_output_path_for_item(item)
+            if output_path is None:
+                self._notify(
+                    "Select a downloaded video with a local file before processing.",
+                    Tone.WARNING,
+                )
+                return
             title_layout = str(self._processing_title_layout_combo.currentData() or "top_band")
             title_text = (
                 None
@@ -4888,6 +6212,8 @@ class MainWindow(QWidget):
                     self._processing_title_background_combo.currentData() or "none"
                 ),
                 title_layout=title_layout,
+                enable_bold_keywords=self._current_template_enables_bold(),
+                watermark_replacement_text=self._processing_watermark_replacement_text(item),
             )
         except Exception as exc:  # noqa: BLE001
             self._notify(f"Could not start processing: {exc}", Tone.ERROR)
@@ -5087,9 +6413,59 @@ class MainWindow(QWidget):
         self._finish_processing_job()
         output_path = Path(payload["output_path"])
         self._processing_last_output_path = output_path
+        # Persist the new processed_path BEFORE refreshing the preview. The
+        # refresh reads item.processed_path back from the DB to resolve the
+        # "Open Video" target; if we refresh first, it sees the previous
+        # export's path, clobbers _processing_last_output_path, and the
+        # Open Video button ends up opening the prior file instead of the
+        # one we just produced.
+        self._save_processed_output_for_selected_item(output_path)
         self._refresh_processing_output_preview()
-        self._processing_progress_label.setText("Processing complete.")
+        if payload.get("watermark_replaced"):
+            detected = str(payload.get("watermark_detected_text") or "detected watermark")
+            replacement = str(payload.get("watermark_replacement_text") or "account handle")
+            self._processing_progress_label.setText(
+                f"Processing complete. Replaced {detected} with {replacement}."
+            )
+        else:
+            self._processing_progress_label.setText("Processing complete.")
         self._notify(f"Processed video saved to {output_path.name}.", Tone.SUCCESS)
+
+    def _save_processed_output_for_selected_item(self, output_path: Path) -> None:
+        item_id = self._selected_processing_item_id
+        if item_id is None:
+            return
+        with get_session() as session:
+            item = session.get(DownloadItem, item_id)
+            if item is None:
+                return
+            item.processed_path = str(output_path)
+            session.commit()
+        # Keep ``_displayed_items`` in sync so the next per-item resolution
+        # (e.g. _existing_processed_output_path_for_item, called immediately
+        # after this from _refresh_processing_output_preview) sees the new
+        # path. Without this, the cached DownloadItem still reports its old
+        # ``processed_path`` and Open Video / the latest-output label keep
+        # pointing at the previous export.
+        for cached in self._displayed_items:
+            if cached.id == item_id:
+                cached.processed_path = str(output_path)
+                break
+
+    def _processing_watermark_replacement_text(self, item: DownloadItem) -> str | None:
+        account_id = item.account_id or self._current_account_id
+        if account_id is None:
+            return None
+        with get_session() as session:
+            account = session.get(Account, account_id)
+            if account is None:
+                return None
+            if (account.platform or "").casefold() != "instagram":
+                return None
+            handle = (account.login_identifier or "").strip()
+            if not handle:
+                return None
+            return handle if handle.startswith("@") else f"@{handle}"
 
     def _on_processing_failed(self, message: str) -> None:
         self._finish_processing_job()
@@ -5122,9 +6498,66 @@ class MainWindow(QWidget):
             self._processed_output_dir_for_account_id(item.account_id),
         )
 
-    def _existing_processed_output_path_for_item(self, item: DownloadItem) -> Path | None:
+    def _new_processed_output_path_for_item(self, item: DownloadItem) -> Path | None:
         if not item.file_path:
             return None
+        output_dir = self._processed_output_dir_for_account_id(item.account_id)
+        return self._next_incremental_processed_output_path(output_dir)
+
+    def _next_incremental_processed_output_path(self, output_dir: Path) -> Path:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        numbered_ids: list[int] = []
+        for path in output_dir.glob("reel_*.mp4"):
+            match = re.fullmatch(r"reel_(\d+)\.mp4", path.name)
+            if match:
+                numbered_ids.append(int(match.group(1)))
+
+        if numbered_ids:
+            next_id = max(numbered_ids) + 1
+        else:
+            next_id = sum(1 for path in output_dir.glob("*.mp4") if path.is_file()) + 1
+
+        while True:
+            candidate = output_dir / f"reel_{next_id:03d}.mp4"
+            if not candidate.exists():
+                return candidate
+            next_id += 1
+
+    def _latest_numbered_processed_output_path_for_account_id(
+        self,
+        account_id: int | None,
+    ) -> Path | None:
+        output_dir = self._processed_output_dir_for_account_id(account_id)
+        candidates = [
+            path for path in output_dir.glob("reel_*.mp4") if path.is_file()
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda path: path.stat().st_mtime)
+
+    def _existing_processed_output_path_for_item(
+        self,
+        item: DownloadItem,
+        *,
+        allow_latest_numbered_fallback: bool = False,
+    ) -> Path | None:
+        if not item.file_path:
+            return None
+        if item.processed_path:
+            processed_path = Path(item.processed_path)
+            if processed_path.exists():
+                return processed_path
+        with get_session() as session:
+            job = (
+                session.query(UploadJob)
+                .filter(UploadJob.download_item_id == item.id)
+                .order_by(UploadJob.created_at.desc())
+                .first()
+            )
+            if job is not None:
+                processed_path = Path(job.processed_path)
+                if processed_path.exists():
+                    return processed_path
         paths = [
             processed_output_path(
                 Path(item.file_path),
@@ -5132,7 +6565,12 @@ class MainWindow(QWidget):
             ),
             processed_output_path(Path(item.file_path), processed_dir()),
         ]
-        return next((path for path in paths if path.exists()), None)
+        existing_path = next((path for path in paths if path.exists()), None)
+        if existing_path is not None:
+            return existing_path
+        if allow_latest_numbered_fallback:
+            return self._latest_numbered_processed_output_path_for_account_id(item.account_id)
+        return None
 
     def _on_open_processed_folder_clicked(self) -> None:
         path = self._processed_output_dir_for_current_account()
@@ -5144,7 +6582,20 @@ class MainWindow(QWidget):
             self._notify(f"Could not open the processed folder: {exc}", Tone.ERROR)
 
     def _on_open_latest_processed_output_clicked(self) -> None:
-        path = self._processing_last_output_path
+        # Always re-resolve from the currently selected item at click time so a
+        # stale ``_processing_last_output_path`` (left over from another item or
+        # an interim refresh) can't open the wrong file. Query the DB directly
+        # by id so this also works before ``_displayed_items`` is populated.
+        # Fall back to the cached path only when no item is selected.
+        path: Path | None = None
+        item = self._processing_selected_item()
+        if item is None and self._selected_processing_item_id is not None:
+            with get_session() as session:
+                item = session.get(DownloadItem, self._selected_processing_item_id)
+        if item is not None:
+            path = self._existing_processed_output_path_for_item(item)
+        if path is None:
+            path = self._processing_last_output_path
         if path is None or not path.exists():
             self._notify("No processed output is available to open yet.", Tone.WARNING)
             return
@@ -5162,7 +6613,10 @@ class MainWindow(QWidget):
 
         output_path = self._processing_last_output_path
         if (output_path is None or not output_path.exists()) and item.file_path:
-            output_path = self._existing_processed_output_path_for_item(item)
+            output_path = self._existing_processed_output_path_for_item(
+                item,
+                allow_latest_numbered_fallback=True,
+            )
         if output_path is None or not output_path.exists():
             self._notify("Process the video before adding it to the schedule.", Tone.WARNING)
             return
@@ -5171,55 +6625,38 @@ class MainWindow(QWidget):
             return
 
         title = self._processing_title_draft_input.text().strip() or item.title or None
-        description = self._processing_caption_draft_input.toPlainText().strip() or None
+        description = self._caption_for_save(
+            self._processing_caption_draft_input.toPlainText()
+        )
         with get_session() as session:
             account = session.get(Account, item.account_id)
             if account is None:
                 self._notify("The selected account no longer exists.", Tone.WARNING)
                 return
-            existing_job = (
-                session.query(UploadJob)
-                .filter(UploadJob.account_id == account.id)
-                .filter(UploadJob.processed_path == str(output_path))
-                .one_or_none()
-            )
             scheduled_at = self._next_upload_slot(account.upload_schedule_slots)
             status = "scheduled" if scheduled_at is not None else "draft"
             timezone_label = account.upload_timezone or "Asia/Bangkok"
             privacy_status = account.upload_default_privacy or "private"
-            if existing_job is None:
-                session.add(
-                    UploadJob(
-                        account_id=account.id,
-                        download_item_id=item.id,
-                        processed_path=str(output_path),
-                        title=title,
-                        description=description,
-                        scheduled_at=scheduled_at,
-                        timezone=timezone_label,
-                        privacy_status=privacy_status,
-                        made_for_kids=int(account.upload_made_for_kids or 0),
-                        contains_synthetic_media=int(account.upload_contains_synthetic_media or 0),
-                        status=status,
-                    )
-                )
-            else:
-                existing_job.download_item_id = item.id
-                existing_job.title = title
-                existing_job.description = description
-                existing_job.scheduled_at = scheduled_at
-                existing_job.timezone = timezone_label
-                existing_job.privacy_status = privacy_status
-                existing_job.made_for_kids = int(account.upload_made_for_kids or 0)
-                existing_job.contains_synthetic_media = int(
-                    account.upload_contains_synthetic_media or 0
-                )
-                existing_job.status = status
-                existing_job.error_message = None
+            job = UploadJob(
+                account_id=account.id,
+                download_item_id=item.id,
+                processed_path=str(output_path),
+                title=title,
+                description=description,
+                scheduled_at=scheduled_at,
+                timezone=timezone_label,
+                privacy_status=privacy_status,
+                made_for_kids=int(account.upload_made_for_kids or 0),
+                contains_synthetic_media=int(account.upload_contains_synthetic_media or 0),
+                status=status,
+            )
+            session.add(job)
+            session.flush()
+            self._last_created_schedule_job_id = job.id
             session.commit()
 
         self._refresh_schedule_page()
-        self._notify_and_refresh("Added processed video to the upload schedule.", Tone.SUCCESS)
+        self._notify_and_refresh("Added latest processed export to the publish queue.", Tone.SUCCESS)
 
     def _set_current_page(self, page_name: str) -> None:
         if page_name not in MODULE_PAGES:
@@ -5331,45 +6768,25 @@ class MainWindow(QWidget):
         layout = self._scrape_intake_panel.layout()
         margins = layout.contentsMargins()
         spacing = layout.spacing()
-        fixed_widgets = (
-            self._scrape_intake_title,
-            self._scrape_intake_hint,
-            self._scrape_summary_label,
-            self._scrape_progress_label,
-            self._scrape_progress_bar,
-        )
-        fixed_height = sum(
-            widget.sizeHint().height() for widget in fixed_widgets if widget.isVisible()
-        )
-        source_row_height = self._scrape_intake_source_row.sizeHint().height()
-        instagram_row_height = self._instagram_discover_row.sizeHint().height()
-        instagram_log_height = (
-            self._instagram_discover_log.sizeHint().height()
-            if self._instagram_discover_log.isVisible()
-            else 0
-        )
-        visible_block_count = sum(
-            1
-            for height in (
-                fixed_height,
-                source_row_height,
-                instagram_row_height,
-                instagram_log_height,
-            )
-            if height > 0
-        )
-        reserved_height = (
-            margins.top()
-            + margins.bottom()
-            + fixed_height
-            + source_row_height
-            + instagram_row_height
-            + instagram_log_height
-            + (spacing * max(visible_block_count, 0))
-        )
+
+        # Walk every layout item above the tabs, summing real heights plus one
+        # spacing per item (each is separated from the next, and the last from
+        # the tabs, by `spacing`). The previous implementation collapsed the
+        # five "fixed" widgets into a single block, under-reserving spacing
+        # and causing the bottom of the tab content to clip below the viewport.
+        reserved_height = margins.top() + margins.bottom()
+        for index in range(layout.count()):
+            item = layout.itemAt(index)
+            widget = item.widget()
+            if widget is self._scrape_tabs:
+                continue
+            if widget is not None and not widget.isVisible():
+                continue
+            reserved_height += item.sizeHint().height() + spacing
+
         target_height = max(
             420,
-            self._scroll_area.viewport().height() - reserved_height - spacing,
+            self._scroll_area.viewport().height() - reserved_height,
         )
         self._scrape_tabs.setFixedHeight(target_height)
 
@@ -5796,13 +7213,16 @@ class MainWindow(QWidget):
         self._scrape_source_input.setEnabled(scrape_controls_enabled)
         self._scrape_add_source_button.setEnabled(scrape_controls_enabled)
         self._instagram_discover_source_combo.setEnabled(instagram_discover_enabled)
-        self._instagram_discover_min_new_input.setEnabled(instagram_discover_enabled)
+        self._instagram_result_limit_input.setEnabled(instagram_discover_enabled)
         self._instagram_discover_min_likes_input.setEnabled(instagram_discover_enabled)
-        self._instagram_deep_search_checkbox.setEnabled(instagram_discover_enabled)
         self._candidate_sort_combo.setEnabled(workspace_enabled)
         self._candidate_sort_direction_combo.setEnabled(workspace_enabled)
+        instagram_source_selected = self._instagram_discover_source_combo.currentData() is not None
         self._instagram_discover_button.setEnabled(
-            instagram_discover_enabled and self._instagram_discover_source_combo.currentData() is not None
+            instagram_discover_enabled and instagram_source_selected
+        )
+        self._instagram_archive_button.setEnabled(
+            instagram_discover_enabled and instagram_source_selected
         )
         self._source_table.setEnabled(workspace_enabled)
         self._source_filter.setEnabled(workspace_enabled)
@@ -5819,6 +7239,7 @@ class MainWindow(QWidget):
             self._source_toggle_button.setText("Disable" if selected_source.enabled else "Enable")
         self._candidate_table.setEnabled(workspace_enabled)
         self._candidate_state_filter.setEnabled(workspace_enabled)
+        self._candidate_source_filter.setEnabled(workspace_enabled)
         self._candidate_queue_button.setText(self._candidate_queue_button_text(candidate))
         self._candidate_queue_button.setEnabled(can_queue)
         self._candidate_ignore_button.setEnabled(can_ignore)
@@ -6005,6 +7426,7 @@ class MainWindow(QWidget):
         self._schedule_open_output_button.setEnabled(has_selection)
         self._schedule_copy_path_button.setEnabled(has_selection)
         self._schedule_open_folder_button.setEnabled(has_selection)
+        self._schedule_instagram_assist_button.setEnabled(has_selection)
         self._schedule_status_combo.setEnabled(has_selection)
         self._schedule_datetime_edit.setEnabled(has_selection)
         self._schedule_save_time_button.setEnabled(has_selection)
@@ -6031,6 +7453,13 @@ class MainWindow(QWidget):
             except Exception:  # noqa: BLE001
                 pass
             return job
+
+    def _take_preferred_schedule_selection_id(self, fallback_job_id: int | None) -> int | None:
+        if self._last_created_schedule_job_id is None:
+            return fallback_job_id
+        preferred_job_id = self._last_created_schedule_job_id
+        self._last_created_schedule_job_id = None
+        return preferred_job_id
 
     def _schedule_caption_text_for_job(self, job: UploadJob) -> str:
         title = (job.title or "").strip()
@@ -6185,6 +7614,44 @@ class MainWindow(QWidget):
         os.startfile(str(output_path))
         self._notify("Opened reel output.", Tone.SUCCESS)
 
+    def _on_open_instagram_assist_clicked(self) -> None:
+        job_id = self._selected_schedule_job_id()
+        if job_id is None:
+            self._notify("Select a publish job first.", Tone.WARNING)
+            return
+
+        with get_session() as session:
+            job = (
+                session.query(UploadJob)
+                .options(joinedload(UploadJob.account))
+                .filter(UploadJob.id == job_id)
+                .one_or_none()
+            )
+            if job is None:
+                self._notify("The selected publish job no longer exists.", Tone.WARNING)
+                self._refresh_schedule_page()
+                return
+            output_path = Path(job.processed_path)
+            profile_name = (job.account.instagram_profile if job.account else None) or "main"
+            caption_text = self._schedule_caption_text_for_job(job)
+
+        if not output_path.exists():
+            self._notify("Reel output file is missing.", Tone.ERROR)
+            return
+
+        QApplication.clipboard().setText(caption_text)
+        try:
+            os.startfile(str(output_path.parent))
+            launch_instagram_upload_assist(profile_name=profile_name)
+        except Exception as exc:  # noqa: BLE001
+            self._notify(f"Could not open Instagram assisted upload: {exc}", Tone.ERROR)
+            return
+
+        self._notify(
+            "Caption copied. Instagram opened; upload the Reel manually, then mark Posted.",
+            Tone.SUCCESS,
+        )
+
     def _sync_processed_outputs_to_upload_jobs(self) -> None:
         if self._current_account_id is None:
             return
@@ -6236,7 +7703,9 @@ class MainWindow(QWidget):
         if not hasattr(self, "_schedule_table"):
             return
 
-        selected_job_id = self._selected_schedule_job_id()
+        selected_job_id = self._take_preferred_schedule_selection_id(
+            self._selected_schedule_job_id()
+        )
         workspace_enabled = self._current_account_id is not None
         self._schedule_table.setEnabled(workspace_enabled)
         self._schedule_table.blockSignals(True)
@@ -6586,6 +8055,7 @@ class MainWindow(QWidget):
                 item.like_count,
                 item.comment_count,
                 item.duration_seconds,
+                item.created_at,
                 item.title,
                 item.channel_name,
                 item.published_at,
@@ -6613,6 +8083,46 @@ class MainWindow(QWidget):
                 return "Redownload Candidate"
         return "Send To Download"
 
+    @staticmethod
+    def _candidate_source_filter_value(candidate: ScrapeCandidate) -> str:
+        channel_name = (candidate.channel_name or "").strip()
+        if channel_name:
+            return channel_name.casefold()
+        scrape_source_url = (candidate.scrape_source_url or "").strip()
+        parsed = urlparse(scrape_source_url)
+        path_part = parsed.path.strip("/").split("/", 1)[0]
+        return (path_part or scrape_source_url or "(unknown)").casefold()
+
+    @staticmethod
+    def _candidate_source_filter_label(candidate: ScrapeCandidate) -> str:
+        channel_name = (candidate.channel_name or "").strip()
+        if channel_name:
+            return channel_name
+        scrape_source_url = (candidate.scrape_source_url or "").strip()
+        parsed = urlparse(scrape_source_url)
+        path_part = parsed.path.strip("/").split("/", 1)[0]
+        return path_part or "(unknown)"
+
+    def _refresh_candidate_source_filter_options(
+        self,
+        candidates: list[ScrapeCandidate],
+    ) -> None:
+        selected = self._candidate_source_filter.currentData() or "all"
+        source_options: dict[str, str] = {}
+        for candidate in candidates:
+            value = self._candidate_source_filter_value(candidate)
+            if value and value != "(unknown)":
+                source_options.setdefault(value, self._candidate_source_filter_label(candidate))
+
+        self._candidate_source_filter.blockSignals(True)
+        self._candidate_source_filter.clear()
+        self._candidate_source_filter.addItem("Source: All", "all")
+        for value, label in sorted(source_options.items(), key=lambda item: item[1].casefold()):
+            self._candidate_source_filter.addItem(f"Source: {label}", value)
+        selected_index = self._candidate_source_filter.findData(selected)
+        self._candidate_source_filter.setCurrentIndex(selected_index if selected_index >= 0 else 0)
+        self._candidate_source_filter.blockSignals(False)
+
     def _matches_candidate_state_filter(self, candidate: ScrapeCandidate) -> bool:
         min_likes = self._instagram_discover_min_likes_input.value()
         account = self._active_account()
@@ -6625,10 +8135,14 @@ class MainWindow(QWidget):
         ):
             return False
         selected_state = self._candidate_state_filter.currentData()
-        if selected_state in {None, "all"}:
+        if selected_state not in {None, "all"}:
+            normalized_state = "candidate" if candidate.state == "new" else candidate.state
+            if normalized_state != selected_state:
+                return False
+        selected_source = self._candidate_source_filter.currentData()
+        if selected_source in {None, "all"}:
             return True
-        normalized_state = "candidate" if candidate.state == "new" else candidate.state
-        return normalized_state == selected_state
+        return self._candidate_source_filter_value(candidate) == selected_source
 
     @staticmethod
     def _candidate_sort_datetime(value: dt.datetime | None) -> dt.datetime:
@@ -6656,7 +8170,9 @@ class MainWindow(QWidget):
                 published_at,
             )
         if sort_mode == "newest":
+            created_at = self._candidate_sort_datetime(item.created_at)
             return (
+                created_at,
                 published_at,
                 item.like_count or 0,
                 item.comment_count or 0,
@@ -6676,6 +8192,8 @@ class MainWindow(QWidget):
 
     def _on_interaction_idle(self) -> None:
         if self._pending_refresh:
+            if self._processing_has_unsaved_text_edits():
+                return
             self._pending_refresh = False
             self._apply_refresh()
 
@@ -6832,6 +8350,15 @@ class MainWindow(QWidget):
         self._clear_source_selection()
         self._clear_candidate_selection()
         self._apply_refresh(force=True)
+        # Restore this account's saved Processing widget values (template,
+        # caption style, title style, font, size, color, layout, etc.) so
+        # switching between niche accounts doesn't require re-picking
+        # niche-appropriate styles each time. No-op for new accounts with
+        # no saved snapshot yet. Runs AFTER _apply_refresh because
+        # _refresh_processing_page → _set_processing_placeholder_state (the
+        # no-items branch) resets the template to "gaming_meme_black",
+        # which would otherwise overwrite the snapshot we just applied.
+        self._apply_processing_preferences_for_account(self._current_account_id)
 
     def _on_current_account_changed(self) -> None:
         self._set_current_account_from_combo(self._current_account_combo)
@@ -6878,6 +8405,7 @@ class MainWindow(QWidget):
             self._restore_combo_value(self._account_platform_combo, "youtube")
             self._account_niche_input.clear()
             self._account_login_input.clear()
+            self._account_instagram_profile_input.setText("main")
             self._account_credential_input.clear()
             self._account_scrape_sources_input.clear()
             self._account_scrape_max_items_input.setText("20")
@@ -6909,6 +8437,7 @@ class MainWindow(QWidget):
         self._restore_combo_value(self._account_platform_combo, account.platform)
         self._account_niche_input.setText(account.niche_label or "")
         self._account_login_input.setText(account.login_identifier or "")
+        self._account_instagram_profile_input.setText(account.instagram_profile or "main")
         self._account_credential_input.setText(account.credential_blob or "")
         self._account_scrape_sources_input.setText(account.scrape_source_urls or "")
         self._account_scrape_max_items_input.setText(str(account.scrape_max_items or 20))
@@ -6989,9 +8518,10 @@ class MainWindow(QWidget):
                 account.name = name
 
             account.platform = platform
-            account.niche_label = self._account_niche_input.text().strip() or None
+            account.niche_label = self._account_niche_input.toPlainText().strip() or None
             account.login_identifier = self._account_login_input.text().strip() or None
-            account.credential_blob = self._account_credential_input.text().strip() or None
+            account.instagram_profile = self._account_instagram_profile_input.text().strip() or "main"
+            account.credential_blob = self._account_credential_input.toPlainText().strip() or None
             account.scrape_source_urls = "\n".join(scrape_source_urls) or None
             account.scrape_max_items = scrape_max_items
             account.scrape_max_age_days = scrape_max_age_days
@@ -7004,13 +8534,19 @@ class MainWindow(QWidget):
             account.ranking_weight_likes = ranking_weight_likes
             account.ranking_weight_recency = ranking_weight_recency
             account.ranking_weight_keyword_match = ranking_weight_keyword_match
-            account.writing_tone = self._account_writing_tone_input.text().strip() or None
-            account.target_audience = self._account_target_audience_input.text().strip() or None
-            account.hook_style = self._account_hook_style_input.text().strip() or None
-            account.banned_phrases = self._account_banned_phrases_input.text().strip() or None
-            account.title_style_notes = self._account_title_style_notes_input.text().strip() or None
+            account.writing_tone = self._account_writing_tone_input.toPlainText().strip() or None
+            account.target_audience = (
+                self._account_target_audience_input.toPlainText().strip() or None
+            )
+            account.hook_style = self._account_hook_style_input.toPlainText().strip() or None
+            account.banned_phrases = (
+                self._account_banned_phrases_input.toPlainText().strip() or None
+            )
+            account.title_style_notes = (
+                self._account_title_style_notes_input.toPlainText().strip() or None
+            )
             account.caption_style_notes = (
-                self._account_caption_style_notes_input.text().strip() or None
+                self._account_caption_style_notes_input.toPlainText().strip() or None
             )
             account.upload_timezone = "Asia/Jakarta"
             account.upload_default_privacy = "private"
@@ -7090,6 +8626,9 @@ class MainWindow(QWidget):
         self._mark_user_interacting()
 
     def _request_refresh(self) -> None:
+        if self._processing_has_unsaved_text_edits():
+            self._pending_refresh = True
+            return
         if self._interaction_idle_timer.isActive():
             self._pending_refresh = True
             return
@@ -7399,7 +8938,7 @@ class MainWindow(QWidget):
             row = self._source_table.rowCount()
             self._source_table.insertRow(row)
 
-            enabled_combo = QComboBox()
+            enabled_combo = NoScrollComboBox()
             enabled_combo.setObjectName("tableCombo")
             enabled_combo.addItem("Yes", 1)
             enabled_combo.addItem("No", 0)
@@ -7496,13 +9035,20 @@ class MainWindow(QWidget):
         self._run_table.blockSignals(False)
 
     @staticmethod
-    def _published_text(candidate: ScrapeCandidate) -> str:
-        if candidate.published_at is None:
+    def _candidate_date_text(value: dt.datetime | None) -> str:
+        if value is None:
             return "(unknown)"
-        published_at = candidate.published_at
-        if published_at.tzinfo is None:
-            published_at = published_at.replace(tzinfo=dt.timezone.utc)
-        return published_at.astimezone().strftime("%Y-%m-%d")
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=dt.timezone.utc)
+        return value.astimezone().strftime("%Y-%m-%d")
+
+    @classmethod
+    def _published_text(cls, candidate: ScrapeCandidate) -> str:
+        return cls._candidate_date_text(candidate.published_at)
+
+    @classmethod
+    def _candidate_added_text(cls, candidate: ScrapeCandidate) -> str:
+        return cls._candidate_date_text(candidate.created_at)
 
     @staticmethod
     def _candidate_number_text(value: int | None) -> str:
@@ -7523,21 +9069,26 @@ class MainWindow(QWidget):
         account = self._active_account()
         sort_label = self._candidate_sort_combo.currentText().replace("Sort: ", "")
         direction_label = self._candidate_sort_direction_combo.currentText().lower()
+        source_label = ""
+        selected_source = self._candidate_source_filter.currentData()
+        if selected_source not in {None, "all"}:
+            source_text = self._candidate_source_filter.currentText().replace("Source: ", "")
+            source_label = f" from {source_text}"
         if account is None or account.platform != "instagram":
             return (
-                f"Showing {shown_count} of {total_count} candidate(s), "
+                f"Showing {shown_count} of {total_count} candidate(s){source_label}, "
                 f"sorted by {sort_label} ({direction_label})."
             )
 
         min_likes = self._instagram_discover_min_likes_input.value()
         if min_likes <= 0:
             return (
-                f"Showing all {shown_count} candidate(s), "
+                f"Showing all {shown_count} candidate(s){source_label}, "
                 f"sorted by {sort_label} ({direction_label})."
             )
         hidden_count = max(total_count - shown_count, 0)
         return (
-            f"Showing {shown_count} of {total_count} candidate(s) with "
+            f"Showing {shown_count} of {total_count} candidate(s){source_label} with "
             f"{min_likes:,}+ likes, sorted by {sort_label} ({direction_label}). "
             f"Lower Min likes to reveal {hidden_count} hidden candidate(s)."
         )
@@ -7584,6 +9135,7 @@ class MainWindow(QWidget):
         all_candidates = self._load_all_candidates_for_current_account()
         self._sync_candidate_download_states(all_candidates)
         all_candidates = self._load_all_candidates_for_current_account()
+        self._refresh_candidate_source_filter_options(all_candidates)
 
         filtered_candidates = [
             candidate
@@ -7663,6 +9215,8 @@ class MainWindow(QWidget):
                 self._candidate_duration_text(candidate.duration_seconds)
             )
             duration_item.setData(Qt.ItemDataRole.UserRole, candidate.id)
+            added_item = QTableWidgetItem(self._candidate_added_text(candidate))
+            added_item.setData(Qt.ItemDataRole.UserRole, candidate.id)
             published_item = QTableWidgetItem(self._published_text(candidate))
             published_item.setData(Qt.ItemDataRole.UserRole, candidate.id)
             channel_item = QTableWidgetItem(candidate.channel_name or "(unknown)")
@@ -7677,17 +9231,33 @@ class MainWindow(QWidget):
             self._candidate_table.setItem(row, 2, likes_item)
             self._candidate_table.setItem(row, 3, comments_item)
             self._candidate_table.setItem(row, 4, duration_item)
-            self._candidate_table.setItem(row, 5, published_item)
-            self._candidate_table.setItem(row, 6, channel_item)
-            self._candidate_table.setItem(row, 7, title_item)
-            self._candidate_table.setItem(row, 8, match_item)
+            self._candidate_table.setItem(row, 5, added_item)
+            self._candidate_table.setItem(row, 6, published_item)
+            self._candidate_table.setItem(row, 7, channel_item)
+            self._candidate_table.setItem(row, 8, title_item)
+            self._candidate_table.setItem(row, 9, match_item)
 
             if self._selected_candidate_id == candidate.id:
                 self._candidate_table.selectRow(row)
 
         self._candidate_table.resizeRowsToContents()
         self._candidate_table.blockSignals(False)
+        self._scroll_selected_candidate_into_view()
         self._refresh_candidate_action_state()
+
+    def _scroll_selected_candidate_into_view(self) -> None:
+        if self._selected_candidate_id is None:
+            return
+        for row in range(self._candidate_table.rowCount()):
+            item = self._candidate_table.item(row, 0)
+            if item is None:
+                continue
+            if item.data(Qt.ItemDataRole.UserRole) == self._selected_candidate_id:
+                self._candidate_table.scrollToItem(
+                    item,
+                    QAbstractItemView.ScrollHint.PositionAtCenter,
+                )
+                return
 
     def _on_candidate_selection_changed(self) -> None:
         selected_items = self._candidate_table.selectedItems()
@@ -7697,6 +9267,23 @@ class MainWindow(QWidget):
 
         self._selected_candidate_id = selected_items[0].data(Qt.ItemDataRole.UserRole)
         self._refresh_candidate_action_state()
+
+    def _on_candidate_row_double_clicked(self, row: int, _column: int) -> None:
+        """Open the candidate's source URL in the default browser.
+
+        Lets the user quickly preview the original Instagram post before
+        deciding to download it. The URL is read from the in-memory
+        ``_displayed_candidates`` snapshot (kept in sync with the table) so
+        no DB round-trip is needed.
+        """
+        if row < 0 or row >= len(self._displayed_candidates):
+            return
+        candidate = self._displayed_candidates[row]
+        source_url = (candidate.source_url or "").strip()
+        if not source_url:
+            self._notify("This candidate has no source URL to open.", Tone.WARNING)
+            return
+        QDesktopServices.openUrl(QUrl(source_url))
 
     def _on_source_selection_changed(self) -> None:
         selected_items = self._source_table.selectedItems()
@@ -7808,18 +9395,6 @@ class MainWindow(QWidget):
             self._notify_and_refresh(f"Assigned item to {account_name}.", Tone.SUCCESS)
 
     def _on_scrape_clicked(self) -> None:
-        account = self._active_account()
-        if account is not None and account.platform == "instagram":
-            source = next(
-                (
-                    source
-                    for source in self._displayed_sources
-                    if source.enabled and source.source_type == "instagram_profile"
-                ),
-                None,
-            )
-            if source is not None and self._start_instagram_discover_for_source(account, source):
-                return
         job = self._build_scrape_job_for_all_enabled_sources()
         if job is None:
             return
@@ -7846,6 +9421,15 @@ class MainWindow(QWidget):
         if not enabled_sources:
             self._notify("Add at least one enabled YouTube source first.", Tone.WARNING)
             return None
+        if account.platform == "instagram":
+            max_items = min(max(max_items, 1), INSTAGRAM_MAX_RESULT_LIMIT)
+            if not self._confirm_instagram_scrape(
+                mode_label="Find Latest",
+                result_limit=max_items,
+                uses_latest_cursor=True,
+            ):
+                return None
+
         return ScrapeJobConfig(
             account_id=account.id,
             source_ids=[source.id for source in enabled_sources],
@@ -7866,10 +9450,6 @@ class MainWindow(QWidget):
             self._notify("Select a source first.", Tone.WARNING)
             return
 
-        if account.platform == "instagram" and source.source_type == "instagram_profile":
-            self._start_instagram_discover_for_source(account, source)
-            return
-
         (
             _sources,
             keywords,
@@ -7881,6 +9461,15 @@ class MainWindow(QWidget):
             min_like_count,
             weights,
         ) = self._account_scrape_config(account)
+        if account.platform == "instagram":
+            max_items = min(max(max_items, 1), INSTAGRAM_MAX_RESULT_LIMIT)
+            if not self._confirm_instagram_scrape(
+                mode_label="Find Latest",
+                result_limit=max_items,
+                uses_latest_cursor=True,
+            ):
+                return
+
         self._start_scrape_job(
             ScrapeJobConfig(
                 account_id=account.id,
@@ -7899,41 +9488,168 @@ class MainWindow(QWidget):
     def _start_instagram_discover_for_source(self, account: Account, source: Source) -> bool:
         username = self._instagram_profile_username(source.source_url)
         if not username:
-            self._notify("Use Discover + Rank for Instagram hashtag sources.", Tone.WARNING)
+            self._notify("Use an Instagram profile source for Find Latest.", Tone.WARNING)
             return False
 
-        min_new = self._instagram_discover_min_new_input.value()
-        limit = self._instagram_discovery_limit(min_new)
-        scrolls = self._instagram_discovery_scrolls(min_new)
-        deep_search = self._instagram_deep_search_checkbox.isChecked()
-        if deep_search:
-            min_new = max(min_new, 20)
-            limit = max(limit, 120)
-            scrolls = max(scrolls, 50)
+        requested_results = self._instagram_result_limit_input.value()
+        if not self._confirm_instagram_scrape(
+            mode_label="Find Latest",
+            result_limit=requested_results,
+            uses_latest_cursor=True,
+        ):
+            return False
 
         combo_index = self._instagram_discover_source_combo.findData(source.id)
         if combo_index >= 0:
             self._instagram_discover_source_combo.setCurrentIndex(combo_index)
-        self._start_instagram_discover_rank_job(
-            InstagramDiscoverRankJobConfig(
-                username=username,
-                target_account_name=account.name,
-                min_new=min_new,
-                limit=limit,
-                scrolls=scrolls,
-                stall_limit=10 if deep_search or min_new >= 20 else 8,
-                wait_ms=4500 if deep_search or min_new >= 20 else 4000,
+
+        (
+            _sources,
+            keywords,
+            _configured_max_items,
+            max_age_days,
+            discovery_mode,
+            auto_queue_limit,
+            min_view_count,
+            min_like_count,
+            weights,
+        ) = self._account_scrape_config(account)
+        self._append_instagram_discover_log(
+            f"Find Latest for @{username}: requesting up to {requested_results} Apify result(s)."
+        )
+
+        self._start_scrape_job(
+            ScrapeJobConfig(
+                account_id=account.id,
+                source_ids=[source.id],
+                keywords=keywords,
+                max_items=requested_results,
+                max_age_days=max_age_days,
+                discovery_mode=discovery_mode,
+                auto_queue_limit=auto_queue_limit,
+                min_view_count=min_view_count,
+                min_like_count=min_like_count,
+                weights=weights,
+            )
+        )
+        return True
+
+    def _on_instagram_archive_clicked(self) -> None:
+        if self._scrape_in_progress or self._instagram_discover_in_progress:
+            self._notify("A scrape job is already running.", Tone.WARNING)
+            return
+
+        account = self._active_account()
+        if account is None:
+            self._notify("Select your niche account first.", Tone.WARNING)
+            return
+        if account.platform != "instagram":
+            self._notify("Select an Instagram niche account before archive backfill.", Tone.WARNING)
+            return
+
+        source_id = self._instagram_discover_source_combo.currentData()
+        if source_id is None:
+            self._notify("Add and enable an Instagram profile source first.", Tone.WARNING)
+            return
+
+        source = next(
+            (source for source in self._load_sources_for_account(account.id) if source.id == int(source_id)),
+            None,
+        )
+        if source is None:
+            self._notify("The selected source no longer exists.", Tone.WARNING)
+            return
+
+        depth = self._instagram_result_limit_input.value()
+        if not self._confirm_instagram_scrape(
+            mode_label="Search Archive",
+            result_limit=depth,
+            uses_latest_cursor=False,
+        ):
+            return
+        self._start_instagram_archive_backfill(account=account, source=source, depth=depth)
+
+    def _confirm_instagram_scrape(
+        self,
+        *,
+        mode_label: str,
+        result_limit: int,
+        uses_latest_cursor: bool,
+    ) -> bool:
+        estimated_cost = result_limit * 2.70 / 1000
+        cursor_note = (
+            "Find Latest uses the saved last-scraped date when available."
+            if uses_latest_cursor
+            else "Search Archive ignores the last-scraped date and dedupes locally."
+        )
+        response = QMessageBox.question(
+            self,
+            mode_label,
+            (
+                f"{mode_label} will request up to {result_limit} Apify results "
+                f"(about ${estimated_cost:.2f} at Free-plan pricing).\n\n"
+                f"{cursor_note}\n\n"
+                "Existing candidates and downloads are deduped locally. Continue?"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return response == QMessageBox.StandardButton.Yes
+
+    def _start_instagram_archive_backfill(
+        self,
+        *,
+        account: Account,
+        source: Source,
+        depth: int,
+    ) -> bool:
+        username = self._instagram_profile_username(source.source_url)
+        if not username:
+            self._notify("Use an Instagram profile source for archive backfill.", Tone.WARNING)
+            return False
+
+        combo_index = self._instagram_discover_source_combo.findData(source.id)
+        if combo_index >= 0:
+            self._instagram_discover_source_combo.setCurrentIndex(combo_index)
+
+        (
+            _sources,
+            keywords,
+            _configured_max_items,
+            _max_age_days,
+            discovery_mode,
+            auto_queue_limit,
+            _min_view_count,
+            _min_like_count,
+            weights,
+        ) = self._account_scrape_config(account)
+        self._append_instagram_discover_log(
+            f"Search Archive for @{username}: requesting up to {depth} Apify result(s)."
+        )
+        self._start_scrape_job(
+            ScrapeJobConfig(
+                account_id=account.id,
+                source_ids=[source.id],
+                keywords=keywords,
+                max_items=depth,
+                max_age_days=None,
+                discovery_mode=discovery_mode,
+                auto_queue_limit=auto_queue_limit,
+                min_view_count=0,
+                min_like_count=0,
+                weights=weights,
+                archive_backfill=True,
             )
         )
         return True
 
     @staticmethod
     def _instagram_discovery_limit(min_new: int) -> int:
-        return min(max(min_new * 8, min_new, 40), 500)
+        return min(max(min_new, 1), INSTAGRAM_MAX_RESULT_LIMIT)
 
     @staticmethod
     def _instagram_discovery_scrolls(min_new: int) -> int:
-        return min(max(min_new * 3, 30), 80)
+        return 0
 
     @staticmethod
     def _instagram_profile_username(value: str) -> str:
@@ -8181,6 +9897,7 @@ class MainWindow(QWidget):
         min_view_count: int,
         min_like_count: int,
         weights: DiscoveryWeights,
+        archive_backfill: bool = False,
     ) -> tuple[int, int, int, int]:
         with get_session() as session:
             run = ScrapeRun(account_id=account_id, source_id=source.id, status="running")
@@ -8190,10 +9907,17 @@ class MainWindow(QWidget):
 
         try:
             if source.platform == "instagram":
-                scraped = scrape_instagram_source(
+                # Cost-saving: latest scans ask Apify to skip posts older than
+                # (last_scraped_at - 1 day). Archive backfills intentionally
+                # leave since=None so they can mine older source history.
+                since: dt.datetime | None = None
+                if not archive_backfill and source.last_scraped_at is not None:
+                    since = source.last_scraped_at - dt.timedelta(days=1)
+                scraped = scrape_instagram_source_apify(
                     source_url=source.source_url,
                     max_items=max_items,
                     max_age_days=max_age_days,
+                    since=since,
                 )
             else:
                 scraped = scrape_youtube_source(
@@ -8254,7 +9978,6 @@ class MainWindow(QWidget):
                 source_row = session.get(Source, source.id)
                 run_row = session.get(ScrapeRun, run_id)
                 if source_row is not None:
-                    source_row.last_scraped_at = dt.datetime.now(dt.timezone.utc)
                     source_row.last_run_status = "failed"
                     source_row.last_error_summary = str(exc)[:200]
                 if run_row is not None:
@@ -8344,6 +10067,11 @@ class MainWindow(QWidget):
         parsed = urlparse(url.strip())
         parts = [part for part in parsed.path.split("/") if part]
         kind = parts[0].lower() if parts else "p"
+        # Map /reels/ (plural — web) to /reel/ (singular — canonical) so that
+        # the same shortcode pasted in either form normalises to one URL and
+        # the duplicate guard works correctly.
+        if kind == "reels":
+            kind = "reel"
         if kind not in {"p", "reel", "tv"}:
             kind = "p"
         return f"https://www.instagram.com/{kind}/{shortcode}/"
@@ -8396,15 +10124,30 @@ class MainWindow(QWidget):
                 self._notify("This Instagram URL is already in candidates.", Tone.WARNING)
                 return
 
+        candidate = self._manual_instagram_candidate_from_url(
+            account=account,
+            normalized_url=normalized_url,
+            shortcode=shortcode,
+        )
+
+        with get_session() as session:
             candidate_row = ScrapeCandidate(
-                scrape_source_url=normalized_url,
-                source_url=normalized_url,
-                extractor="instagram",
-                video_id=shortcode,
-                title=f"Instagram media {shortcode}",
-                discovery_query="manual",
-                match_reason="Manual Instagram URL",
-                ranking_score=0,
+                scrape_source_url=candidate.scrape_source_url,
+                source_url=candidate.source_url,
+                extractor=candidate.extractor,
+                video_id=candidate.video_id,
+                title=candidate.title,
+                channel_name=candidate.channel_name,
+                published_at=candidate.published_at,
+                description=candidate.description,
+                view_count=candidate.view_count,
+                like_count=candidate.like_count,
+                comment_count=candidate.comment_count,
+                duration_seconds=candidate.duration_seconds,
+                thumbnail_url=candidate.thumbnail_url,
+                discovery_query=candidate.discovery_query,
+                match_reason=candidate.match_reason,
+                ranking_score=candidate.ranking_score,
                 account_id=account.id,
             )
             session.add(candidate_row)
@@ -8416,6 +10159,95 @@ class MainWindow(QWidget):
         self._refresh_candidates(force=True)
         self._scrape_tabs.setCurrentIndex(0)
         self._notify(success_message, Tone.SUCCESS)
+
+    def _manual_instagram_candidate_from_url(
+        self,
+        *,
+        account: Account,
+        normalized_url: str,
+        shortcode: str,
+    ) -> ScrapedVideoCandidate:
+        (
+            _sources,
+            keywords,
+            _max_items,
+            max_age_days,
+            _discovery_mode,
+            _auto_queue_limit,
+            _min_view_count,
+            _min_like_count,
+            weights,
+        ) = self._account_scrape_config(account)
+
+        # 1. DB cache: if this account has already seen this shortcode (as a
+        #    candidate or as a download), reuse the stored metadata. This makes
+        #    re-pasting the same URL free (no Apify call, no Instagram traffic).
+        cached = self._cached_instagram_candidate(account_id=account.id, shortcode=shortcode)
+        if cached is not None:
+            return rank_candidate(
+                cached,
+                keywords=keywords,
+                weights=weights,
+                max_age_days=max_age_days,
+            )
+
+        # 2. Fresh fetch: call Apify (no Instagram account login involved).
+        candidates: list[ScrapedVideoCandidate] = []
+        try:
+            candidates = scrape_instagram_urls_apify(
+                [normalized_url],
+                results_limit=1,
+            )
+        except (ApifyConfigError, ApifyScrapeError):
+            # Apify not configured or the run failed. Fall through to the
+            # stub-candidate path below so the UI still works without metadata.
+            candidates = []
+
+        if candidates:
+            candidate = candidates[0]
+            candidate = ScrapedVideoCandidate(
+                scrape_source_url=normalized_url,
+                source_url=candidate.source_url,
+                extractor=candidate.extractor,
+                video_id=candidate.video_id,
+                title=candidate.title,
+                channel_name=candidate.channel_name,
+                published_at=candidate.published_at,
+                description=candidate.description,
+                view_count=candidate.view_count,
+                like_count=candidate.like_count,
+                comment_count=candidate.comment_count,
+                duration_seconds=candidate.duration_seconds,
+                thumbnail_url=candidate.thumbnail_url,
+                discovery_query="manual",
+                match_reason=candidate.match_reason,
+                ranking_score=candidate.ranking_score,
+            )
+            return rank_candidate(
+                candidate,
+                keywords=keywords,
+                weights=weights,
+                max_age_days=max_age_days,
+            )
+
+        return ScrapedVideoCandidate(
+            scrape_source_url=normalized_url,
+            source_url=normalized_url,
+            extractor="instagram",
+            video_id=shortcode,
+            title=f"Instagram media {shortcode}",
+            channel_name=None,
+            published_at=None,
+            description=None,
+            view_count=None,
+            like_count=None,
+            comment_count=None,
+            duration_seconds=None,
+            thumbnail_url=None,
+            discovery_query="manual",
+            match_reason="Manual Instagram URL",
+            ranking_score=0,
+        )
 
     def _on_remove_source_clicked(self) -> None:
         source = self._current_selected_source()
@@ -8783,6 +10615,51 @@ class MainWindow(QWidget):
         if candidate.extractor == "youtube" and candidate.video_id:
             return f"youtube:{candidate.video_id}"
         return cls._video_key(candidate.source_url) or candidate.source_url
+
+    def _cached_instagram_candidate(
+        self, *, account_id: int, shortcode: str
+    ) -> ScrapedVideoCandidate | None:
+        """Return a previously scraped candidate for this shortcode, if any.
+
+        Used to short-circuit the Apify call when the user re-pastes an
+        Instagram URL we have already fetched metadata for. Apify charges
+        per result, so this saves money on every repeat.
+        """
+        if not shortcode:
+            return None
+
+        with get_session() as session:
+            row = (
+                session.query(ScrapeCandidate)
+                .filter(
+                    ScrapeCandidate.account_id == account_id,
+                    ScrapeCandidate.video_id == shortcode,
+                )
+                .order_by(ScrapeCandidate.updated_at.desc())
+                .first()
+            )
+
+        if row is None:
+            return None
+
+        return ScrapedVideoCandidate(
+            scrape_source_url=row.scrape_source_url,
+            source_url=row.source_url,
+            extractor=row.extractor,
+            video_id=row.video_id,
+            title=row.title,
+            channel_name=row.channel_name,
+            published_at=row.published_at,
+            description=row.description,
+            view_count=row.view_count,
+            like_count=row.like_count,
+            comment_count=row.comment_count,
+            duration_seconds=row.duration_seconds,
+            thumbnail_url=row.thumbnail_url,
+            discovery_query="manual",
+            match_reason=row.match_reason,
+            ranking_score=row.ranking_score,
+        )
 
     def _find_duplicate_for_account(self, url: str, account_id: int) -> DownloadItem | None:
         requested_key = self._video_key(url)

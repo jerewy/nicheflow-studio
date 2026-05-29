@@ -99,6 +99,10 @@ def _ensure_compatibility() -> None:
             connection.execute(
                 text("ALTER TABLE download_items ADD COLUMN source_description VARCHAR(8192)")
             )
+        if "processed_path" not in columns:
+            connection.execute(
+                text("ALTER TABLE download_items ADD COLUMN processed_path VARCHAR(2048)")
+            )
         if "title_draft" not in columns:
             connection.execute(
                 text("ALTER TABLE download_items ADD COLUMN title_draft VARCHAR(1024)")
@@ -203,6 +207,8 @@ def _ensure_compatibility() -> None:
             connection.execute(text("ALTER TABLE accounts ADD COLUMN writing_tone VARCHAR(256)"))
         if "target_audience" not in account_columns:
             connection.execute(text("ALTER TABLE accounts ADD COLUMN target_audience VARCHAR(256)"))
+        if "instagram_profile" not in account_columns:
+            connection.execute(text("ALTER TABLE accounts ADD COLUMN instagram_profile VARCHAR(64)"))
         if "hook_style" not in account_columns:
             connection.execute(text("ALTER TABLE accounts ADD COLUMN hook_style VARCHAR(256)"))
         if "banned_phrases" not in account_columns:
@@ -234,6 +240,10 @@ def _ensure_compatibility() -> None:
                 text(
                     "ALTER TABLE accounts ADD COLUMN upload_contains_synthetic_media INTEGER DEFAULT 0"
                 )
+            )
+        if "processing_preferences" not in account_columns:
+            connection.execute(
+                text("ALTER TABLE accounts ADD COLUMN processing_preferences VARCHAR(4096)")
             )
 
         upload_job_columns = {

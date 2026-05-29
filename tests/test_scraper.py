@@ -12,11 +12,13 @@ from nicheflow_studio.scraper.youtube import (
     validate_youtube_source_url,
 )
 from nicheflow_studio.scraper.instagram import (
+    InstagramRateLimitError,
     infer_instagram_source_type,
     normalize_instagram_source_url,
     scrape_instagram_url,
     scrape_instagram_source,
     scrape_instagram_urls,
+    scrape_instagram_urls_with_stats,
 )
 
 
@@ -317,6 +319,68 @@ def test_scrape_instagram_urls_skips_non_video_posts(monkeypatch) -> None:
     )
 
     assert [candidate.video_id for candidate in candidates] == ["DYdWmVauJRQ", "DYdxGRpO7Am"]
+
+
+def test_scrape_instagram_urls_with_stats_limits_attempts(monkeypatch) -> None:
+    monkeypatch.setattr("nicheflow_studio.scraper.instagram.YoutubeDL", FakeInstagramYoutubeDL)
+    monkeypatch.setattr("nicheflow_studio.scraper.instagram.time.sleep", lambda _: None)
+
+    candidates, stats = scrape_instagram_urls_with_stats(
+        [
+            "https://www.instagram.com/reel/one/",
+            "https://www.instagram.com/reel/two/",
+            "https://www.instagram.com/reel/three/",
+        ],
+        max_items=2,
+    )
+
+    assert [candidate.video_id for candidate in candidates] == ["one", "two"]
+    assert stats.input_urls == 3
+    assert stats.extraction_limit == 2
+    assert stats.attempted == 2
+    assert stats.extracted == 2
+
+
+def test_scrape_instagram_urls_stops_on_rate_limit_with_partial_candidates(monkeypatch) -> None:
+    first_candidate = ScrapedVideoCandidate(
+        scrape_source_url="https://www.instagram.com/reel/first/",
+        source_url="https://www.instagram.com/reel/first/",
+        extractor="instagram",
+        video_id="first",
+        title="First reel",
+        channel_name="meme.ig",
+        published_at=dt.datetime.now(dt.timezone.utc),
+    )
+
+    def fake_scrape_instagram_url(url: str) -> ScrapedVideoCandidate:
+        if url.endswith("/limited/"):
+            from yt_dlp.utils import DownloadError
+
+            raise DownloadError(
+                "ERROR: [Instagram] limited: Requested content is not available, "
+                "rate-limit reached or login required."
+            )
+        return first_candidate
+
+    monkeypatch.setattr(
+        "nicheflow_studio.scraper.instagram.scrape_instagram_url",
+        fake_scrape_instagram_url,
+    )
+    monkeypatch.setattr("nicheflow_studio.scraper.instagram.time.sleep", lambda _: None)
+
+    try:
+        scrape_instagram_urls(
+            [
+                "https://www.instagram.com/reel/first/",
+                "https://www.instagram.com/reel/limited/",
+                "https://www.instagram.com/reel/after/",
+            ]
+        )
+    except InstagramRateLimitError as exc:
+        assert str(exc) == "Instagram rate limit hit. Wait 15-30 min before running again."
+        assert exc.partial_candidates == [first_candidate]
+    else:
+        raise AssertionError("Expected InstagramRateLimitError")
 
 
 def test_scrape_instagram_source_returns_video_candidates(monkeypatch) -> None:

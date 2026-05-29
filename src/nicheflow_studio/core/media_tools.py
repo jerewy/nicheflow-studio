@@ -64,15 +64,39 @@ def subprocess_run_kwargs() -> dict[str, int]:
     }
 
 
+def windows_emoji_font_file() -> Path | None:
+    """Path to Segoe UI Emoji (``seguiemj.ttf``) when available.
+
+    Pillow uses this font with ``embedded_color=True`` to render color emoji
+    glyphs into the overlay title PNG. Returns None on non-Windows or when
+    the file is missing — callers fall back to stripping emoji from the
+    title rather than shipping missing-glyph boxes.
+    """
+    if os.name != "nt":
+        return None
+    windows_dir = Path(os.environ.get("WINDIR", "C:/Windows"))
+    candidate = windows_dir / "Fonts" / "seguiemj.ttf"
+    if candidate.exists():
+        return candidate.resolve()
+    return None
+
+
 def windows_font_file(font_name: str | None = None) -> Path | None:
     if os.name != "nt":
         return None
     windows_dir = Path(os.environ.get("WINDIR", "C:/Windows"))
     font_map = {
+        "arial_black": "ariblk.ttf",
         "segoe_ui": "segoeui.ttf",
         "bahnschrift": "bahnschrift.ttf",
         "arial_bold": "arialbd.ttf",
+        "arial_rounded_bold": "ARLRDBD.TTF",
         "impact": "impact.ttf",
+        "georgia": "georgia.ttf",
+        "georgia_italic": "georgiai.ttf",
+        "georgia_bold": "georgiab.ttf",
+        "times_italic": "timesi.ttf",
+        "comic_italic": "comici.ttf",
         "comic_bold": "comicbd.ttf",
         "lilita_one_style": "comicbd.ttf",
         "grobold_style": "impact.ttf",
@@ -84,11 +108,11 @@ def windows_font_file(font_name: str | None = None) -> Path | None:
         candidates.append(windows_dir / "Fonts" / mapped_name)
     candidates.extend(
         [
+            # Prefer bold chunky fonts for watermark replacement text.
+            windows_dir / "Fonts" / "ariblk.ttf",   # Arial Black — chunky, wide
+            windows_dir / "Fonts" / "arialbd.ttf",  # Arial Bold — fallback
+            windows_dir / "Fonts" / "bahnschrift.ttf",
             windows_dir / "Fonts" / "segoeui.ttf",
-            windows_dir / "Fonts" / "comicbd.ttf",
-            windows_dir / "Fonts" / "impact.ttf",
-            windows_dir / "Fonts" / "arialbd.ttf",
-            windows_dir / "Fonts" / "arial.ttf",
         ]
     )
     for candidate in candidates:

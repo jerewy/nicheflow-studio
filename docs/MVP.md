@@ -18,11 +18,11 @@ This MVP is designed to be runnable and useful quickly, while keeping the codeba
   - manually track posted URL and basic metrics
 - YouTube ingestion via `yt-dlp` as a source pipeline, including YouTube Shorts URLs:
   - paste URL -> download -> record in DB -> show status in UI
-- Instagram source intake via `instaloader`:
+- Instagram source intake via Apify:
   - save Instagram Reel/profile/hashtag references as candidate ideas
-  - download selected Instagram Reel/post URLs through the normal queue
-  - review them alongside other candidates
-  - reuse a saved Instaloader session when one exists under `~/.instagram_scraper/`
+  - fetch public metadata through `apify/instagram-scraper`
+  - review candidates alongside other sources
+  - keep logged-in Instagram scraping out of the normal app flow
 - Processing workflow:
   - black-canvas/no-blur vertical template
   - clean title rendering

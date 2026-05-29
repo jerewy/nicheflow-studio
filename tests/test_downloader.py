@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from nicheflow_studio.downloader.instagram import _download_with_yt_dlp
+import pytest
+
+from nicheflow_studio.downloader.instagram import download_instagram_url, _download_with_yt_dlp
 from nicheflow_studio.downloader.youtube import _yt_dlp_options
 
 
@@ -24,6 +26,13 @@ def test_yt_dlp_options_fall_back_to_progressive_mp4_without_ffmpeg(monkeypatch)
 
     assert options["format"] == "best[ext=mp4]/best"
     assert "merge_output_format" not in options
+
+
+def test_yt_dlp_options_do_not_attach_browser_cookies() -> None:
+    options = _yt_dlp_options(Path.cwd() / "data" / "downloads")
+
+    assert "cookiefile" not in options
+    assert "cookiesfrombrowser" not in options
 
 
 def test_instagram_downloader_uses_yt_dlp_first(monkeypatch, tmp_path: Path) -> None:
@@ -66,3 +75,29 @@ def test_instagram_downloader_uses_yt_dlp_first(monkeypatch, tmp_path: Path) -> 
     assert result.video_id == "DYdxGRpO7Am"
     assert result.title == "Video by meme.ig"
     assert result.file_path.read_bytes() == b"video"
+
+
+def test_instagram_downloader_does_not_fall_back_to_instaloader(
+    monkeypatch, tmp_path: Path
+) -> None:
+    class FailingYoutubeDL:
+        def __init__(self, _options: dict[str, object]) -> None:
+            pass
+
+        def __enter__(self):  # noqa: ANN204
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def extract_info(self, _url: str, *, download: bool) -> dict[str, object]:
+            assert download is True
+            raise RuntimeError("yt-dlp extractor failed")
+
+    monkeypatch.setattr("nicheflow_studio.downloader.instagram.YoutubeDL", FailingYoutubeDL)
+
+    with pytest.raises(RuntimeError, match="yt-dlp extractor failed"):
+        download_instagram_url(
+            url="https://www.instagram.com/reel/DYdxGRpO7Am/",
+            output_dir=tmp_path,
+        )
