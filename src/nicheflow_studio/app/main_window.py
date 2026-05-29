@@ -3487,6 +3487,7 @@ class MainWindow(QWidget):
         self._processing_title_color_input.editingFinished.connect(save)
         self._processing_title_background_combo.currentIndexChanged.connect(save)
         self._processing_title_layout_combo.currentIndexChanged.connect(save)
+        self._processing_alter_audio_checkbox.stateChanged.connect(save)
 
         panel_layout.addStretch(1)
         panel.setLayout(panel_layout)
@@ -4326,6 +4327,7 @@ class MainWindow(QWidget):
             "text_color": self._processing_title_color_input.text().strip(),
             "background": self._processing_title_background_combo.currentData() or "",
             "layout": self._processing_title_layout_combo.currentData() or "",
+            "alter_audio": bool(self._processing_alter_audio_checkbox.isChecked()),
         }
 
     def _save_processing_preferences_for_current_account(self) -> None:
@@ -4387,6 +4389,7 @@ class MainWindow(QWidget):
             self._processing_title_color_input,
             self._processing_title_background_combo,
             self._processing_title_layout_combo,
+            self._processing_alter_audio_checkbox,
         ]
         previous_suppress = self._suppress_processing_prefs_save
         self._suppress_processing_prefs_save = True
@@ -4442,6 +4445,10 @@ class MainWindow(QWidget):
                 index = self._processing_title_layout_combo.findData(layout_value)
                 if index >= 0:
                     self._processing_title_layout_combo.setCurrentIndex(index)
+
+            self._processing_alter_audio_checkbox.setChecked(
+                bool(snapshot.get("alter_audio", False))
+            )
         finally:
             for widget in widgets:
                 widget.blockSignals(False)

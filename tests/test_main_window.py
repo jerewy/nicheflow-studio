@@ -1846,6 +1846,54 @@ def test_processing_preferences_persist_per_account_across_switches(
         window.close()
 
 
+def test_alter_audio_checkbox_round_trips_through_preferences(qt_app) -> None:
+    """The 'Alter audio' toggle is part of the per-account Processing snapshot:
+    it serializes into the saved snapshot and is restored onto the widget by
+    _apply_processing_preferences_for_account. (Account-switch restore order is
+    covered by the template-persistence test; this isolates the checkbox's
+    snapshot/save/apply contract deterministically.)"""
+    import json
+
+    init_db()
+    with get_session() as session:
+        session.add(Account(name="Repost A", platform="instagram"))
+        session.commit()
+        account_id = session.query(Account).filter(Account.name == "Repost A").one().id
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._set_current_page("processing")
+        qt_app.processEvents()
+        window._current_account_combo.setCurrentIndex(1)
+        qt_app.processEvents()
+
+        # 1) The snapshot reflects the checkbox state.
+        window._processing_alter_audio_checkbox.setChecked(True)
+        assert window._processing_preferences_snapshot()["alter_audio"] is True
+
+        # 2) Saving writes it to the account row.
+        window._suppress_processing_prefs_save = False
+        window._save_processing_preferences_for_current_account()
+        with get_session() as session:
+            stored = session.get(Account, account_id).processing_preferences
+        assert json.loads(stored)["alter_audio"] is True
+
+        # 3) Applying restores it onto the widget even after it's flipped off.
+        #    Block signals on the flip so it doesn't re-save over the stored value.
+        window._processing_alter_audio_checkbox.blockSignals(True)
+        window._processing_alter_audio_checkbox.setChecked(False)
+        window._processing_alter_audio_checkbox.blockSignals(False)
+        assert window._apply_processing_preferences_for_account(account_id) is True
+        assert window._processing_alter_audio_checkbox.isChecked() is True
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
 def test_loading_fresh_video_inherits_account_style_without_clobbering(
     qt_app,
 ) -> None:
