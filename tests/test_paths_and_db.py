@@ -335,6 +335,7 @@ def test_init_db_adds_scrape_columns_and_creates_candidates_table() -> None:
     assert "ranking_weight_keyword_match" in account_columns
     assert "writing_tone" in account_columns
     assert "target_audience" in account_columns
+    assert "instagram_profile" in account_columns
     assert "hook_style" in account_columns
     assert "banned_phrases" in account_columns
     assert "title_style_notes" in account_columns

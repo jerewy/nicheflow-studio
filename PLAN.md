@@ -1,8 +1,8 @@
 # NicheFlow Studio Plan
 
-Last updated: 2026-04-28
+Last updated: 2026-05-24
 Status: Active execution plan
-Current milestone: Make the Instagram-first manual publishing MVP coherent on top of the working scrape/download/processing flow.
+Current milestone: Make the Instagram-first manual publishing MVP coherent on top of the working scrape/download/processing flow. Niche account strategy locked in (see §2A).
 
 ## 1. What This Project Should Be Right Now
 
@@ -73,6 +73,113 @@ These are part of the broader vision, but should not drive current implementatio
 - analytics dashboards
 - cloud sync
 - stealth / anti-detection systems
+
+## 2A. Niche Account Strategy
+
+Last updated: 2026-05-24
+Status: Active — drives account setup, content choices, and campaign eligibility decisions.
+
+### Account portfolio (5 Instagram accounts, dual-use)
+
+Each account does double duty: it is both a niche brand account (where we publish)
+AND a scraping profile in the `ProfilePool` (where we read public posts from).
+Same IG account, two roles. Trade-off accepted: fewer accounts to manage,
+slightly higher per-account ban risk.
+
+Throughput math at 5 dual-use accounts: scraping ceiling drops from ~2,500-3,500
+posts/day (separate pools) to ~1,000-1,500 posts/day. Still far more than any
+single niche needs, so net-positive trade-off.
+
+### Confirmed niches (4 of 5)
+
+| # | Niche | Lane (the specific lane within the niche) | Caption style preset | Title style preset |
+|---|---|---|---|---|
+| 1 | Meme | Chronically online late-night burnout humor — 3am cope, doomscrolling, anxiety humor, online-culture meta. NOT generic memes. | `meme_relatable` | `meme_setup_punchline` |
+| 2 | History | Specific lane TBD (ancient civ / war stories / forgotten figures / weird facts — pick ONE) | `narrative` | Auto / Narrative |
+| 3 | Movie | Cinema atmospheric — scene reactions, plot-twist moments, IMDb-style synopsis body. Modelled on @cinema.defined. | `cinema_hook` | `cinema_hook` |
+| 4 | Music | Specific lane TBD (lyric breakdowns / song moments / artist BTS / genre-specific) | TBD | TBD |
+| 5 | — | TBD (on hold — only add when a niche genuinely interests the user) | — | — |
+
+### Core principle: one account = one specific lane
+
+People don't follow accounts for broad categories ("memes"). They follow for a
+predictable vibe consistently delivered. If they can't guess what the next post
+will feel like, they don't hit follow.
+
+Filter rule for every post: "Does this hit harder for someone in MY lane than
+for the general population?" If yes → post. If no → skip even if it's good
+content on its own.
+
+This applies to campaign clips too: when a campaign provides 30 source clips,
+only post the 3-6 that fit the account's lane. Frame every clip with a hook
+in the account's voice via the text overlay.
+
+### Campaign category → niche compatibility
+
+Campaign platform offers categories: irl-streaming, irl-content, gaming,
+sports, music, podcasts, gambling. Gambling explicitly avoided (IG restrictions
++ user preference).
+
+| Niche | Direct campaign category fits | Indirect fits (clip-by-clip) |
+|---|---|---|
+| Meme | None | Podcasts (funny moments), irl-streaming (viral fails), occasional sports |
+| History | None | History-themed podcasts only (Hardcore History, Lex Fridman + historians) |
+| Movie | None | None — organic-growth-only on this platform |
+| Music | Music | — |
+
+Only Music has a direct category. Other niches participate by cherry-picking
+clips from podcast/irl campaigns that match the account's lane. Movie account
+is an organic-growth play (not campaign-eligible on the current platform).
+
+### Account growth gating (must be hit before campaigns)
+
+Most clipper platforms require minimums before letting an account submit:
+- 1,000+ followers
+- 30+ days account age
+- Real engagement history (not zero-like posts)
+- Audience demographics matching campaign requirements (e.g. 50%+ English-speaking
+  countries — language of captions is NOT the same as follower geography;
+  this must be tracked in IG Insights once each account is active)
+
+Implication: all 5 accounts go through a 4-8 week growth phase before any
+campaign monetization is realistic.
+
+### @memeistsdaily — first account, current status
+
+- Lane: chronically online late-night burnout humor
+- Status (2026-05-24): 14 posts, 1 follower — pre-monetization growth phase
+- Bio (committed): `your daily dose of cope 💀 / new clip every 24h / ↓ turn on notifications`
+- Display name suggestion: `daily memes 💀`
+- Profile pic: new neon-green mascot on pure black (high-contrast, thumbnail-readable)
+- Next steps: update bio + display name on IG, post daily in the committed lane
+
+### NicheFlow Account-row config to mirror the strategy
+
+When each niche account gets a row in the `accounts` table, the
+caption/title style fields above feed straight into `smart_drafts.py`. The
+free-text Account fields (`writing_tone`, `target_audience`, `hook_style`,
+`banned_phrases`, `title_style_notes`, `caption_style_notes`) tighten the
+prompt so generated captions stay in lane automatically. These should be
+filled per-account, not left blank.
+
+### Campaign-platform rules to respect (clipper side)
+
+Live constraints from the active payout platform — must be obeyed across
+all 5 accounts:
+
+- No botting / fake engagement (no view pumps, like-for-like pods, comment rings)
+- No low-quality / "blatantly automated" posts — AI-generated captions must not
+  read as AI. Style work in `smart_drafts.py` exists precisely to clear this bar.
+- No repeat posts on the same account
+- Posts must stay public until payment lands
+- Per-post min: 1,000 views. Total min for eligibility: ~25,000 views.
+- Audience-match: campaigns may require 50%+ followers from English-speaking
+  countries. Posting in English does not guarantee this — depends on who
+  IG distributed the early posts to. Bias early posts toward US-timezone
+  signals (US trending audio, US-time-zone posting, engaging with US accounts).
+- Vary hook templates across posts — don't ship 10 reels starting with "When
+  you realize…". Bot-detection looks at template repetition.
+- Add ±15-min jitter to posting time — don't post at 20:00:00 exactly every day.
 
 ## 3. Core User Flow
 
@@ -300,11 +407,28 @@ Start only after Milestones 1-4 are complete.
 Possible future work:
 
 - [ ] smart scraping/discovery for selected accounts
+- [ ] account-fit analyzer for Instagram source accounts
+- [ ] source-to-carousel/post generator for archive-style post accounts
 - [ ] direct manual intake from a single YouTube / Shorts URL such as `https://www.youtube.com/shorts/...`
 - [ ] stronger duplicate/content-fit rules
 - [ ] scheduling
 - [ ] uploaders
 - [ ] analytics
+
+Planned order after the current Reels MVP:
+
+1. Account Fit Analyzer
+   - Compare scraped or manually captured Instagram source accounts against managed account profiles such as `Life Lagged`, `MemeistsDaily`, and future accounts.
+   - Score source-account fit by niche, tone, audience, format, content pillars, engagement quality, and reuse risk.
+   - Extract useful management insights from scraped metadata: common hooks, recurring topics, top formats, posting cadence, and which sources are approved, rejected, or review-only.
+   - Keep the feature focused on learning and source selection; do not auto-repost Instagram media.
+
+2. Source-to-Carousel/Post Generator
+   - Support future post-first accounts such as `Mister Lost Archive`.
+   - Treat Instagram posts as inspiration only: extract the idea, verify the story from external sources, and generate original single-post or carousel drafts.
+   - Auto-search free/open visual sources first: Library of Congress, Wikimedia Commons, Europeana, Pexels, Pixabay, and later Flickr Commons if useful.
+   - Generate AI fallback prompts when safe visuals are weak or unavailable; AI output should be marked internally as a visual recreation and should not be presented as a real historical photo.
+   - Render a dark newspaper/archive-style template for single posts and carousel slides after the user approves the story and visual plan.
 
 ### Milestone 5A: Instagram-First Manual Publish MVP
 
@@ -344,9 +468,40 @@ Definition of done:
 
 ## 7. Immediate Priority Backlog
 
-Last updated: 2026-05-21
+Last updated: 2026-05-24
 
-### Just shipped (code done, tests passing)
+### Just shipped (code done, tests passing) — 2026-05-24
+
+- **`cinema_hook` caption + title style** (in `smart_drafts.py`)
+  - New caption style modeled on @cinema.defined: hook line with ellipsis beat
+    + one emoji (💀/🤯/💔) → 2-3 Wikipedia-style paragraphs opening with
+    `"[Film Title] (Year), directed by [Director], is a [genre] film about [premise]."`
+  - New title style: 10-20 word atmospheric sentence using three templates
+    ("That kind of…", reveal-beat, short stab fragments)
+  - Forces named-entity grounding (no "this guy / that movie" hedging when
+    vision identified the film)
+  - Movie / film / cinema niche profile added to `_niche_profile()` and
+    `_angle_plan()` so prompts write like a cinephile, not a meme account
+  - UI: "Cinema Hook" added to Caption Style dropdown, "Cinema Atmospheric"
+    added to Title Style dropdown in `main_window.py`
+  - Skip lists updated so encyclopedic-explainer bans don't fight the
+    deliberately-encyclopedic synopsis body of this style
+
+- **Rate-limit hardening for Instagram scraping** (in `scraper/instagram.py`
+  and `core/instagram_profile_pool.py`)
+  - Graduated cooldown: 1st 429 → 30min, 2nd → 2h, 3rd+ → 6h (was always 6h).
+    3-5× higher daily scraping throughput across main/alt1/alt2 set.
+  - Adaptive per-request delay: `1.5 ** min(failure_count, 3)` multiplier
+    on profiles with recent 429 history — recovering profiles slow down so
+    they don't crash back into another 429.
+  - Wider base delay band: `(4.0, 8.0)` → `(6.0, 14.0)` for more human cadence.
+  - Stale-session filter: `ProfilePool.available()` now auto-skips profiles
+    whose login is >=14 days old, instead of burning a request to discover
+    they're dead.
+  - 9 new tests in `test_instagram_profile_pool.py` + `test_instagram_scraper_rotation.py`,
+    plus the existing 25 still green.
+
+### Just shipped (code done, tests passing) — earlier
 
 - Prompt rewrite: profile-branched prompt (~50 lines), replaces 130-line mega-prompt
   - `gaming_meme` / `reaction_clip` → meme.ig style, situational POV hooks, 3-paragraph captions
@@ -394,41 +549,43 @@ Observed blockers:
 
 #### Fix A: make vision failures visible and reduce silent writer-only output
 
-- [ ] Add provider diagnostics to `SmartDrafts.generation_meta` when Groq vision fails or is skipped:
+- [x] Add provider diagnostics to `SmartDrafts.generation_meta` when Groq vision fails or is skipped:
   - `vision_attempted`
   - `vision_used`
   - `vision_error`
+  - `vision_retry_attempted`
   - `frame_count`
+  - `low_context`
   - `writer_model`
   - `vision_model`
-- [ ] In `scripts\test_generation.py`, print `vision_error` and `frame_count` whenever provider is `Groq Llama 3.3` but an `input_path` existed.
-- [ ] Add a `--require-vision` flag to `scripts\test_generation.py` for quality validation. When set, fail the item instead of accepting writer-only output if the item has no transcript and source title is generic.
-- [ ] Treat generic source titles as low-context:
-  - `Video by meme.ig`
-  - filenames that only repeat platform/id metadata
+- [x] In `scripts\test_generation.py`, print `vision_error` and `frame_count` whenever the writer ran without vision on a clip that had an `input_path`.
+- [x] Add a `--require-vision` flag to `scripts\test_generation.py` for quality validation. When set, raises `VisionRequiredError` for low-context items (generic title + no transcript) if vision was not used.
+- [x] Treat generic source titles as low-context (`_is_low_context_source_title`):
+  - `Video by meme.ig` / `Reel by <handle>` / `Post by <handle>`
+  - filenames that only repeat platform/id metadata (eg. `Instagram_DYfJT5WOtzJ`, `shorts_abc123`)
   - empty or near-empty titles
-- [ ] For low-context items, prefer one of these before accepting writer-only output:
-  - retry vision once with fewer frames, such as 2 frames instead of 5
-  - use a shorter visual-summary prompt
-  - mark generation as needing visual context instead of returning generic captions
-- [ ] Add tests that simulate a Groq vision failure with generic metadata and assert the script/UI surfaces the failure instead of presenting Local fallback or generic Groq text as good output.
+- [x] For low-context items, retry vision once with `LOW_CONTEXT_RETRY_FRAME_COUNT=2` frames before accepting writer-only output. Smaller prompt has a real chance of clearing Groq's 30K TPM window.
+- [x] Add tests for: low-context detection, generation_meta diagnostic fields, `require_vision` raises on low-context vision failure, `require_vision` passes when vision used, `require_vision` passes when context is high even without vision, low-context retry fires with fewer frames, retry is skipped on high-context items.
 
 #### Fix B: rewrite meme caption style away from textbook definitions
 
-- [ ] Remove or sharply narrow "explainer" language in the `gaming_meme` / `reaction_clip` prompt profile.
-- [ ] Add explicit caption rules for meme.ig-style accounts:
-  - Assume the viewer understands common games and internet culture.
-  - Do not define Minecraft, skins, memes, reaction videos, PvP, streamers, or other common terms.
-  - Start with the relatable situation or feeling.
-  - Keep captions concrete to the clip, not educational.
-  - Never echo audience labels like `Gen Z gamers and meme fans`.
-  - Do not write "This clip is funny because..." unless the source explicitly calls for analysis.
-- [ ] Add negative examples to the prompt:
+- [x] Removed "ground a new viewer (what the thing is)" instruction from the `gaming_meme` / `reaction_clip` profile — that line was the source of the encyclopedia-opener drift. Replaced with "one concrete detail from THIS clip, NOT a definition of the game/show/format."
+- [x] Same narrowing applied to the default `contextual_info` caption_style_line.
+- [x] Added caption-style-aware AVOID bullets via `_anti_explainer_avoid_lines()`:
+  - Ban on encyclopedia openers (`X is a popular Y game where...`)
+  - Ban on explain-the-joke openers (`This clip is funny because...`)
+  - Ban on echoing the account `target_audience` string verbatim (injects the actual string into the ban when present)
+  - Bans skipped automatically for `meme_factual` style (intentionally Wikipedia-tone) so they do not fight the style.
+- [x] Added NEGATIVE/POSITIVE EXAMPLES block via `_negative_caption_examples_block()`:
   - Bad: `Minecraft is a popular sandbox game...`
   - Bad: `Gen Z gamers and meme fans are always on the lookout...`
+  - Bad: `This clip is funny because the trap finally worked...`
   - Good: `That panic when the trap finally works and nobody knows who to blame.`
-- [ ] Add tests around the generated prompt text so these banned caption openings and audience-label leaks stay blocked.
-- [ ] Re-run:
+  - Good: `Bro really thought he had it figured out.`
+  - Good: `POV: you spent two hours building this and it works first try.`
+  - Skipped for `meme_factual` and `narrative` styles (would conflict with intent).
+- [x] Tests added: removed-wording asserts, anti-explainer present/absent per style, target_audience verbatim injection, end-to-end prompt assembly contains bans + examples, meme_factual prompt skips bans.
+- [ ] Re-run on real clips:
   - `.venv\Scripts\python.exe scripts\test_generation.py --account 4 --limit 5 --require-vision`
   - `.venv\Scripts\python.exe scripts\test_generation.py --account 2 --limit 5 --require-vision`
 - [ ] Accept only if most items use vision or clearly explain why vision is unavailable, titles are clip-specific, and captions do not start with textbook definitions.
@@ -439,6 +596,106 @@ Observed blockers:
 - [x] Existing saved processed output for `Instagram_DYfJT5WOtzJ` is not good because it still includes the old source title and stale fallback title text.
 - [x] Fresh direct export with `suggest_title_replacement_crop` removed the old top title, kept the main video and bottom subtitle, rendered a clean new top-band title, and stayed `1080x1920`.
 - [ ] Still needs one app-level Processing run through the PyQt UI to prove the UI path selects the same replacement crop.
+
+### Caption-style enhancements shipped (Fix C bundle)
+
+After Fix A + Fix B landed, three further quality lifts based on real-world
+reference posts (meme.ig and @theanomalists):
+
+- **A: Context / Info zoom-in arc.** Split `contextual_info` from the
+  generic default in `_caption_paragraph_rule` and `_caption_style_title_rules`.
+  Encodes the @theanomalists 3-paragraph template explicitly: P1 hook
+  (1 sentence, 8-16 words) → blank → P2 broader context (named entities,
+  no encyclopedia openers) → blank → P3 THIS moment (specific clip
+  payoff) → blank → 3-5 mixed hashtags.
+- **B: News Brief style added end-to-end.** New `news_brief` caption
+  style modelled on meme.ig post-1 (Emergent Labs / Y Combinator). Short
+  engagement opener line + 2-4 single-fact paragraphs, each ending in
+  1-2 semantic topic emojis (💸 funding, ⚡ tech, 🧠 AI, 📈 growth,
+  🎬 film, 📺 TV, 🔥 hype, 🏈 sports, 🎤 music). 60-120 words, 0-2
+  optional hashtags. Branches added in all per-style helpers; "News
+  Brief" dropdown entry added to the Processing panel; Fix B's anti-
+  explainer bans and negative examples automatically skipped (this
+  style IS factual paragraphs).
+- **C: Name-the-thing rule.** New `_name_the_thing_rules(vision_payload)`
+  helper that fires across all styles when vision extracted
+  `referenced_entity` / `main_subject` / `referenced_concept`. Lists
+  the exact names extracted and forbids generic hedging like 'this
+  guy', 'an actor', 'a famous show'. No-op when vision found nothing.
+
+Verification: smart_drafts 100 passed, processing+main_window 163 passed.
+
+### Title Style decoupling (Path 2)
+
+After Fix A+B+C+enhancements, a new pickable "Title Style" dropdown was
+added to decouple the on-screen title format from the caption style,
+based on real reference posts (IGHT setup-punchline meme hooks).
+
+- New `_title_style_rules(title_style)` helper in `smart_drafts.py`:
+  - Returns `None` for Auto / empty / None — preserves all prior behavior
+    by falling back to `_caption_style_title_rules(caption_style)`.
+  - Defines a new `meme_setup_punchline` style: 4-12 words, `When X:` /
+    `POV: X:` / `Me X:` framing, REQUIRED trailing colon, video footage
+    delivers the punchline. Models the IGHT reference.
+  - Delegates to `_caption_style_title_rules` for the other known styles
+    so any title format can pair with any caption format.
+- Threaded `title_style` parameter through `_smart_draft_prompt`,
+  `_build_groq_payload`, `_build_ollama_payload`,
+  `_generate_groq_smart_drafts`, `_generate_ollama_smart_drafts`, and the
+  entry point `generate_smart_drafts`. All defaults are `None` so calls
+  that don't pass `title_style` behave exactly as before.
+- UI: new "Title Style" dropdown in Processing panel with `Auto (match
+  caption style)` as the default + `Meme Setup → Punchline`,
+  `Relatable Hook`, `Observational Hook`, `News Headline`,
+  `Conversational Hook`, `Descriptive Hook`. The DB column
+  `title_style_preset` already existed and is available for per-item
+  persistence in a follow-up.
+- 11 new tests covering: Auto/empty/None fallback, meme_setup_punchline
+  rule body, delegation for known styles, unknown values fall back,
+  end-to-end prompt assembly with title_style, backward-compat
+  (title_style=None produces same prompt as omitting the parameter), UI
+  dropdown wiring, mixed-style end-to-end (News Brief title + Context/
+  Info caption), generate_smart_drafts threading.
+
+Verification: smart_drafts 119 passed, processing+main_window 163 passed.
+
+### Template B: "Them: / Me:" contrast meme titles
+
+Real-world reference posts use a two-line contrast pattern that the original
+single-line `meme_setup_punchline` rule could not produce reliably. Extended
+the style end-to-end (prompt + renderer):
+
+- `smart_drafts.py`: `_title_style_rules("meme_setup_punchline")` now
+  describes **two templates** with explicit calibration examples:
+  - **Template A** (existing): `When [X]:` / `POV: [X]` / `Me [X]:`,
+    single line, trailing colon.
+  - **Template B** (new): `Them: "[quote]" \n\n Me [situation]:` and
+    related framings (`Everyone:`, `My friends:`, `My therapist:`,
+    `Expectation: / Reality:`). Required literal `\n\n` between the
+    two lines so the renderer reserves the paragraph break. Total
+    6-16 words across both lines. The user's reference example
+    (`Them: "you're so sweet and kind!" \n\n Me when I drive:`) is
+    included verbatim as a calibration anchor.
+- `video.py` renderer changes (paragraph-break support):
+  - `_wrap_overlay_text` now splits on `\n\n` first, wraps each
+    paragraph independently via new `_wrap_single_paragraph` helper,
+    and rejoins with `\n\n`. Single-paragraph behavior is byte-for-byte
+    identical to before.
+  - `_fit_title_band` bumps the upper height cap from 320 to 480 when
+    `line_count >= 3`, so two-paragraph titles aren't truncated below
+    the band. Single/double-line titles still respect the original 320.
+  - `_title_band_filter_complex` and the overlay variant preserve
+    blank-line positions: `wrapped_lines` becomes a list of
+    `(original_index, text)` tuples so y-positions reflect the visual
+    gap, while the FFmpeg filter chain only emits `drawtext` for
+    non-empty lines (chain index stays contiguous).
+- Tests: 1 new prompt-side test (`test_meme_setup_punchline_describes_both_templates`)
+  and 6 new renderer tests covering `\n\n` preservation, per-paragraph
+  wrapping, single-paragraph backward-compat, empty-paragraph collapsing,
+  band-height cap bumping for multi-paragraph, and the FFmpeg filter
+  chain skipping blanks while preserving the gap.
+
+Verification: smart_drafts + processing 164 passed, main_window 125 passed.
 
 ### After generation quality is fixed
 
@@ -455,6 +712,7 @@ Ordered next work:
 - Should cross-account duplicate handling become a warning-only signal later instead of a hard block?
 - Which Windows versions must be supported for MVP?
 - What account fields are truly needed now versus later?
+- Next Instagram profile-pool fix: add an explicit preferred rotation priority of `main`, `alt1`, `alt2`, `alt3`, `alt4`; missing profiles must remain harmless until those accounts exist.
 
 ## 9. Architecture Guardrails
 
@@ -527,6 +785,8 @@ Clean up the Publish Queue so it is manual Instagram-first instead of mixed with
 
 Decided 2026-05-20: keep Python as the single backend and replace only the UI layer, after the Instagram-first MVP ships and is packaged. Do not start UI rewrite work until Milestones 5A/5B are done and a packaged build is validated.
 
+Confirmed 2026-05-24: a future web/multi-device direction remains viable and should be kept open. The current PyQt6 MVP should not be rewritten yet, but new workflow behavior should avoid being trapped in UI code. Prefer plain Python service/module boundaries so a later React frontend can call the same backend logic.
+
 ### Phase A - Finish the MVP on PyQt6
 
 No UI-stack change. Complete the manual Instagram Publish Queue and Instagram manual source intake on the current PyQt6 UI, then package and smoke-test.
@@ -539,4 +799,14 @@ No UI-stack change. Complete the manual Instagram Publish Queue and Instagram ma
 - Steps: bridge spike (one screen) -> define a thin Python API/bridge layer over `core`/`db`/`processing`/`scraper` -> rebuild screens one at a time (Accounts, Scraping, Downloads, Processing, Publish Queue) -> retire PyQt6 and delete `main_window.py`.
 - Rationale: the bridge layer forces UI logic out of the 389 KB `main_window.py`; web styling is the fastest path to a minimalist look.
 
-Rejected: Next.js + Python-over-HTTP (web-server framework features go unused on desktop, heavier packaging) and Electron (second runtime, large bundle).
+Rejected for the immediate desktop-wrapper step: Next.js + Python-over-HTTP (web-server framework features go unused on a local desktop MVP, heavier packaging) and Electron (second runtime, large bundle).
+
+### Phase C - Optional Multi-Device Web App
+
+If the manual publishing workflow proves valuable and phone/tablet access becomes important, evolve from local desktop UI to a real web architecture:
+
+- Frontend: React/TypeScript web UI for review, captions, approvals, Publish Queue, and metrics.
+- Backend: Python API over the same service layer used by the desktop app.
+- Worker: Python/FFmpeg/yt-dlp/Groq processing stays on a PC or server worker, not in the phone browser.
+- Storage: keep SQLite/local files for local-web first; consider Postgres/object storage only when cloud sync or remote access is truly needed.
+- Rule: do not start the web rewrite until the current MVP loop is validated; keep current code migration-friendly by moving business logic out of PyQt widgets when touching it.

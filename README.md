@@ -34,19 +34,15 @@ For smart title/caption generation, copy `.env.example` to `.env`, set `GROQ_API
 .\scripts\check_ai_setup.ps1
 ```
 
-For the stable MVP path, paste an Instagram Reel/post URL into the main URL field and click **Download**. If Instagram blocks a URL in the future, paste it into Source Intake to save it as a manual candidate, then use **Import MP4** after manually downloading the file.
+For the stable MVP path, paste an Instagram Reel/post URL into Source Intake to save it as a manual candidate with Apify metadata, then download or import the MP4 you want to process. The normal Instagram source scrape path also uses Apify via `APIFY_TOKEN`, so the app does not need your Instagram login cookies for scraping.
 
-For Instagram sources that require a logged-in session, create an Instaloader session once and the app will reuse the newest `~\.instagram_scraper\*.session` file:
+Set your Apify token in `.env`:
 
-```powershell
-instaloader --login YOUR_INSTAGRAM_USERNAME --sessionfile "$env:USERPROFILE\.instagram_scraper\YOUR_INSTAGRAM_USERNAME.session"
+```
+APIFY_TOKEN=apify_api_xxxxxxxxxxxxxxxxxxxx
 ```
 
-If Instaloader login is blocked by checkpoint or browser-cookie decryption, use the instagrapi probe to test an alternate Instagram session path:
-
-```powershell
-.\.venv\Scripts\python.exe scripts\instagram_instagrapi_probe.py --username YOUR_INSTAGRAM_USERNAME --target meme.ig --limit 1
-```
+Legacy Instaloader, Instagrapi, and Playwright Instagram scripts remain for explicit debugging only. Do not use them with publisher accounts.
 
 ## Development Loop
 

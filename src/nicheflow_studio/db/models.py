@@ -27,6 +27,7 @@ class Account(Base):
     platform: Mapped[str] = mapped_column(String(32), default="youtube")
     niche_label: Mapped[str | None] = mapped_column(String(128), nullable=True)
     login_identifier: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    instagram_profile: Mapped[str | None] = mapped_column(String(64), nullable=True)
     credential_blob: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     scrape_source_urls: Mapped[str | None] = mapped_column(String(4096), nullable=True)
     scrape_max_items: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -52,6 +53,13 @@ class Account(Base):
     upload_schedule_slots: Mapped[str | None] = mapped_column(String(512), nullable=True)
     upload_made_for_kids: Mapped[int] = mapped_column(Integer, default=0)
     upload_contains_synthetic_media: Mapped[int] = mapped_column(Integer, default=0)
+    # JSON snapshot of the user's last-used Processing settings for this
+    # account (template, caption_style, prompt title_style, visual title
+    # style preset, font_name, font_size, text_color, background, layout).
+    # Auto-saved on widget change and re-applied when the account is
+    # selected, so users don't have to re-pick niche-appropriate styles
+    # every time they switch accounts.
+    processing_preferences: Mapped[str | None] = mapped_column(String(4096), nullable=True)
 
     download_items: Mapped[list["DownloadItem"]] = relationship(back_populates="account")
     upload_jobs: Mapped[list["UploadJob"]] = relationship(back_populates="account")
@@ -74,6 +82,7 @@ class DownloadItem(Base):
     title: Mapped[str | None] = mapped_column(String(512), nullable=True)
     source_description: Mapped[str | None] = mapped_column(String(8192), nullable=True)
     file_path: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    processed_path: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     error_message: Mapped[str | None] = mapped_column(String(512), nullable=True)
     transcript_text: Mapped[str | None] = mapped_column(String(65535), nullable=True)
     title_draft: Mapped[str | None] = mapped_column(String(1024), nullable=True)
