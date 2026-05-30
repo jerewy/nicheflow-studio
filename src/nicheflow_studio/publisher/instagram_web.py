@@ -4,11 +4,41 @@ import argparse
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 from nicheflow_studio.core.instagram_session import DEFAULT_PROFILE_NAME, profile_dir
 
 
 INSTAGRAM_UPLOAD_URL = "https://www.instagram.com/"
+INSTAGRAM_LOGIN_URL = "https://www.instagram.com/accounts/login/"
+
+
+def launch_instagram_login(
+    profile_name: str | None = None,
+    *,
+    wait_seconds: int = 600,
+) -> subprocess.Popen[bytes]:
+    """Open the manual Instagram login flow for a saved profile (re-login helper).
+
+    Reuses scripts/instagram_login_playwright.py so the saved session
+    (storage-state.json) and the login-date manifest are updated the same way
+    a normal login does. Raises FileNotFoundError if the script is missing
+    (e.g. a packaged build without scripts/).
+    """
+    selected_profile = (profile_name or DEFAULT_PROFILE_NAME).strip() or DEFAULT_PROFILE_NAME
+    repo_root = Path(__file__).resolve().parents[3]
+    script = repo_root / "scripts" / "instagram_login_playwright.py"
+    if not script.exists():
+        raise FileNotFoundError(f"login script not found at {script}")
+    command = [
+        sys.executable,
+        str(script),
+        "--profile",
+        selected_profile,
+        "--wait-seconds",
+        str(wait_seconds),
+    ]
+    return subprocess.Popen(command)  # noqa: S603 - fixed command; profile is an argument.
 
 
 def launch_instagram_upload_assist(

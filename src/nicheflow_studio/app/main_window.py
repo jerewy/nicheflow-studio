@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDateTimeEdit,
+    QDialog,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -76,8 +77,18 @@ from nicheflow_studio.processing.video import (
     suggest_title_replacement_crop,
 )
 from nicheflow_studio.processing.watermark import replace_detected_watermark
+from nicheflow_studio.core.account_health import (
+    HealthState,
+    SessionHealth,
+    live_health,
+    local_health,
+)
+from nicheflow_studio.core.instagram_profile_pool import ProfilePool
 from nicheflow_studio.publisher.instagram_publisher import publish_reel
-from nicheflow_studio.publisher.instagram_web import launch_instagram_upload_assist
+from nicheflow_studio.publisher.instagram_web import (
+    launch_instagram_login,
+    launch_instagram_upload_assist,
+)
 from nicheflow_studio.processing.transcription import generate_transcript_draft_in_subprocess
 from nicheflow_studio.processing.smart_drafts import (
     SMART_DRAFT_OPTION_COUNT,
@@ -1403,6 +1414,45 @@ class PublishWorker(QObject):
             self.failed.emit(str(exc))
 
 
+class AccountHealthCheckWorker(QObject):
+    """Run live 'who am I?' checks for many accounts off the UI thread.
+
+    Spaces requests out so a multi-account confirmation does not burst
+    Instagram. Emits one ``result`` per account as it finishes.
+    """
+
+    result = pyqtSignal(dict)
+    completed = pyqtSignal()
+
+    def __init__(self, targets: list[tuple[str, str]]) -> None:
+        super().__init__()
+        self._targets = targets
+
+    def run(self) -> None:
+        import time
+
+        for index, (account_name, profile_name) in enumerate(self._targets):
+            if index > 0:
+                time.sleep(random.uniform(2.0, 4.0))  # gentle spacing between live checks
+            try:
+                health = live_health(profile_name, account_name)
+                payload = {
+                    "profile_name": profile_name,
+                    "state": health.state,
+                    "detail": health.detail,
+                    "username": health.username,
+                }
+            except Exception as exc:  # noqa: BLE001
+                payload = {
+                    "profile_name": profile_name,
+                    "state": HealthState.UNKNOWN,
+                    "detail": f"check failed: {exc}",
+                    "username": None,
+                }
+            self.result.emit(payload)
+        self.completed.emit()
+
+
 class SuggestCropWorker(QObject):
     completed = pyqtSignal(dict)
     failed = pyqtSignal(str)
@@ -1571,6 +1621,10 @@ class MainWindow(QWidget):
         self._publish_batch_queue: list[int] = []
         self._publish_batch_posted = 0
         self._publish_batch_skipped = 0
+        self._account_health_thread: QThread | None = None
+        self._account_health_worker: AccountHealthCheckWorker | None = None
+        self._account_health_in_progress = False
+        self._session_health_dialog: QDialog | None = None
         self._processing_in_progress = False
         self._processing_busy_mode: str | None = None
         self._selected_processing_item_id: int | None = None
@@ -1745,7 +1799,7 @@ class MainWindow(QWidget):
         self._account_platform_combo.addItem("YouTube", "youtube")
         self._account_platform_combo.addItem("Instagram", "instagram")
         self._account_login_input = QLineEdit()
-        self._account_login_input.setPlaceholderText("Handle / profile reference")
+        self._account_login_input.setPlaceholderText("Login email or @username (used for re-login)")
         self._account_instagram_profile_input = QLineEdit()
         self._account_instagram_profile_input.setPlaceholderText("main")
         self._account_scrape_sources_input = QLineEdit()
@@ -1950,8 +2004,12 @@ class MainWindow(QWidget):
         account_layout = QVBoxLayout()
         account_layout.setContentsMargins(16, 14, 16, 14)
         account_layout.setSpacing(10)
+        self._account_health_open_button = QPushButton("Session Health")
+        self._account_health_open_button.setObjectName("downloadToolbarButton")
+        self._account_health_open_button.clicked.connect(self._open_session_health_dialog)
         account_layout.addWidget(account_title)
         account_layout.addWidget(workspace_panel)
+        account_layout.addWidget(self._account_health_open_button)
         account_layout.addWidget(manage_title)
         account_layout.addWidget(manage_hint)
         account_layout.addWidget(self._account_mode_label)
@@ -3647,6 +3705,285 @@ class MainWindow(QWidget):
         page_layout.addWidget(runtime_panel)
         page.setLayout(page_layout)
         return page
+
+    def _open_session_health_dialog(self) -> None:
+        """Open (or focus) the Session Health popup and refresh local status."""
+        if self._session_health_dialog is None:
+            dialog = QDialog(self)
+            dialog.setObjectName("sessionHealthDialog")
+            dialog.setWindowTitle("Session Health")
+            dialog.setMinimumSize(680, 440)
+            dialog_layout = QVBoxLayout()
+            dialog_layout.setContentsMargins(0, 0, 0, 0)
+            dialog_layout.addWidget(self._make_account_health_panel())
+            dialog.setLayout(dialog_layout)
+            self._session_health_dialog = dialog
+        self._refresh_account_health()  # safe local refresh on open
+        self._session_health_dialog.show()
+        self._session_health_dialog.raise_()
+        self._session_health_dialog.activateWindow()
+
+    def _make_account_health_panel(self) -> QFrame:
+        panel = QFrame()
+        panel.setObjectName("panel")
+        layout = QVBoxLayout()
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(12)
+
+        title = QLabel("Session Health")
+        title.setObjectName("sectionTitle")
+        subtitle = QLabel(
+            "Login status per account. Local checks are instant and safe; "
+            "'Check All (live)' confirms each session with Instagram, spaced out."
+        )
+        subtitle.setObjectName("metaValue")
+        subtitle.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+
+        self._account_health_table = TableFocusScrollWidget()
+        self._account_health_table.setObjectName("downloadQueueTable")
+        self._account_health_table.setColumnCount(4)
+        self._account_health_table.setHorizontalHeaderLabels(
+            ["Account", "Profile", "Status", "Detail"]
+        )
+        self._account_health_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
+        self._account_health_table.horizontalHeader().setStretchLastSection(True)
+        self._account_health_table.setMinimumHeight(240)
+        self._account_health_table.itemSelectionChanged.connect(
+            self._on_account_health_selection_changed
+        )
+        layout.addWidget(self._account_health_table)
+
+        actions = QHBoxLayout()
+        actions.setSpacing(10)
+        self._account_health_refresh_button = QPushButton("Refresh")
+        self._account_health_refresh_button.setObjectName("downloadToolbarButton")
+        self._account_health_refresh_button.clicked.connect(self._refresh_account_health)
+        self._account_health_check_all_button = QPushButton("Check All (live)")
+        self._account_health_check_all_button.setObjectName("downloadToolbarButton")
+        self._account_health_check_all_button.clicked.connect(self._on_check_all_health_clicked)
+        self._account_relogin_button = QPushButton("Re-login")
+        self._account_relogin_button.setObjectName("downloadToolbarButton")
+        self._account_relogin_button.setEnabled(False)
+        self._account_relogin_button.clicked.connect(self._on_relogin_selected_account_clicked)
+        self._account_copy_email_button = QPushButton("Copy Email")
+        self._account_copy_email_button.setObjectName("downloadToolbarButton")
+        self._account_copy_email_button.setEnabled(False)
+        self._account_copy_email_button.clicked.connect(self._on_copy_account_email_clicked)
+        actions.addWidget(self._account_health_refresh_button)
+        actions.addWidget(self._account_health_check_all_button)
+        actions.addWidget(self._account_relogin_button)
+        actions.addWidget(self._account_copy_email_button)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+
+        self._account_health_summary = QLabel("")
+        self._account_health_summary.setObjectName("subtleLabel")
+        self._account_health_summary.setWordWrap(True)
+        layout.addWidget(self._account_health_summary)
+
+        panel.setLayout(layout)
+        return panel
+
+    _HEALTH_LABELS = {
+        HealthState.OK: "OK",
+        HealthState.WARN: "Aging",
+        HealthState.STALE: "Re-login",
+        HealthState.NO_SESSION: "No login",
+        HealthState.COOLDOWN: "Cooldown",
+        HealthState.THROTTLED: "Throttled",
+        HealthState.LOGGED_OUT: "Logged out",
+        HealthState.UNKNOWN: "Unknown",
+    }
+
+    @classmethod
+    def _health_state_label(cls, state: str) -> str:
+        return cls._HEALTH_LABELS.get(state, state)
+
+    @staticmethod
+    def _apply_health_status_style(item: QTableWidgetItem, state: str) -> None:
+        if state == HealthState.OK:
+            item.setForeground(QColor("#8ee6b1"))
+            item.setBackground(QColor("#173222"))
+        elif state == HealthState.COOLDOWN:
+            item.setForeground(QColor("#9fc6ff"))
+            item.setBackground(QColor("#162a45"))
+        elif state in {HealthState.WARN, HealthState.UNKNOWN}:
+            item.setForeground(QColor("#f5cd79"))
+            item.setBackground(QColor("#342812"))
+        else:  # STALE, NO_SESSION, THROTTLED, LOGGED_OUT
+            item.setForeground(QColor("#ff9c9c"))
+            item.setBackground(QColor("#35171c"))
+
+    def _selected_health_profile(self) -> tuple[str, str | None] | None:
+        if not hasattr(self, "_account_health_table"):
+            return None
+        items = self._account_health_table.selectedItems()
+        if not items:
+            return None
+        cell = self._account_health_table.item(items[0].row(), 0)
+        if cell is None:
+            return None
+        profile = cell.data(Qt.ItemDataRole.UserRole)
+        if not profile:
+            return None
+        email = cell.data(Qt.ItemDataRole.UserRole + 1)
+        return str(profile), (str(email) if email else None)
+
+    def _on_account_health_selection_changed(self) -> None:
+        if not hasattr(self, "_account_relogin_button"):
+            return
+        selected = self._selected_health_profile()
+        self._account_relogin_button.setEnabled(
+            selected is not None and not self._account_health_in_progress
+        )
+        self._account_copy_email_button.setEnabled(
+            selected is not None and bool(selected[1])
+        )
+
+    def _set_account_health_row(
+        self,
+        account_name: str | None,
+        profile_name: str,
+        email: str | None,
+        health: SessionHealth,
+    ) -> None:
+        table = self._account_health_table
+        row = table.rowCount()
+        table.insertRow(row)
+        values = [
+            account_name or "(unnamed)",
+            profile_name,
+            self._health_state_label(health.state),
+            health.detail,
+        ]
+        for col, value in enumerate(values):
+            cell = QTableWidgetItem(value)
+            cell.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+            if col == 0:
+                cell.setData(Qt.ItemDataRole.UserRole, profile_name)
+                cell.setData(Qt.ItemDataRole.UserRole + 1, email)
+            if col == 2:
+                self._apply_health_status_style(cell, health.state)
+            table.setItem(row, col, cell)
+
+    def _refresh_account_health(self) -> None:
+        if not hasattr(self, "_account_health_table"):
+            return
+        pool = ProfilePool.load()
+        with get_session() as session:
+            rows = [
+                (account.name, (account.instagram_profile or "main"), account.login_identifier)
+                for account in session.query(Account).order_by(Account.name.asc()).all()
+            ]
+        self._account_health_table.blockSignals(True)
+        self._account_health_table.setRowCount(0)
+        for account_name, profile_name, email in rows:
+            health = local_health(profile_name, account_name, pool=pool)
+            self._set_account_health_row(account_name, profile_name, email, health)
+        self._account_health_table.resizeRowsToContents()
+        self._account_health_table.blockSignals(False)
+        if rows:
+            self._account_health_summary.setText(
+                f"{len(rows)} account(s). Local status shown — use 'Check All (live)' "
+                "to confirm sessions with Instagram."
+            )
+        else:
+            self._account_health_summary.setText(
+                "No accounts yet. Create a niche account to track its login."
+            )
+        self._on_account_health_selection_changed()
+
+    def _on_check_all_health_clicked(self) -> None:
+        if self._account_health_in_progress:
+            self._notify("A health check is already running.", Tone.WARNING)
+            return
+        with get_session() as session:
+            targets = [
+                (account.name, (account.instagram_profile or "main"))
+                for account in session.query(Account).order_by(Account.name.asc()).all()
+            ]
+        if not targets:
+            self._notify("No accounts to check.", Tone.INFO)
+            return
+
+        self._account_health_in_progress = True
+        self._account_health_check_all_button.setEnabled(False)
+        self._account_relogin_button.setEnabled(False)
+        self._notify(f"Checking {len(targets)} account(s) live, spaced out...", Tone.INFO)
+
+        thread = QThread(self)
+        worker = AccountHealthCheckWorker(targets)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.result.connect(self._on_account_health_result)
+        worker.completed.connect(self._on_account_health_check_done)
+        worker.completed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._account_health_thread = thread
+        self._account_health_worker = worker
+        thread.start()
+
+    def _on_account_health_result(self, payload: dict) -> None:
+        profile_name = payload.get("profile_name")
+        state = str(payload.get("state"))
+        detail = payload.get("detail") or ""
+        table = self._account_health_table
+        for row in range(table.rowCount()):
+            cell = table.item(row, 0)
+            if cell is not None and cell.data(Qt.ItemDataRole.UserRole) == profile_name:
+                status_item = table.item(row, 2)
+                if status_item is not None:
+                    status_item.setText(self._health_state_label(state))
+                    self._apply_health_status_style(status_item, state)
+                detail_item = table.item(row, 3)
+                if detail_item is not None:
+                    detail_item.setText(detail)
+                break
+
+    def _on_account_health_check_done(self) -> None:
+        self._account_health_in_progress = False
+        self._account_health_thread = None
+        self._account_health_worker = None
+        self._account_health_check_all_button.setEnabled(True)
+        self._on_account_health_selection_changed()
+        self._notify("Live health check complete.", Tone.SUCCESS)
+
+    def _on_relogin_selected_account_clicked(self) -> None:
+        selected = self._selected_health_profile()
+        if selected is None:
+            self._notify("Select an account first.", Tone.WARNING)
+            return
+        profile_name, email = selected
+        if email:
+            QApplication.clipboard().setText(email)
+        try:
+            launch_instagram_login(profile_name)
+        except FileNotFoundError:
+            self._notify(
+                "Login helper not available in this build. Run the login script manually.",
+                Tone.ERROR,
+            )
+            return
+        except Exception as exc:  # noqa: BLE001
+            self._notify(f"Could not open Instagram login: {exc}", Tone.ERROR)
+            return
+        message = "Opened Instagram login. Log in, then click Refresh."
+        if email:
+            message = f"Email copied. {message}"
+        self._notify(message, Tone.SUCCESS)
+
+    def _on_copy_account_email_clicked(self) -> None:
+        selected = self._selected_health_profile()
+        if selected is None or not selected[1]:
+            self._notify("No login email saved for this account.", Tone.WARNING)
+            return
+        QApplication.clipboard().setText(selected[1])
+        self._notify("Copied login email.", Tone.SUCCESS)
 
     def _make_placeholder_page(self, title: str, message: str) -> QWidget:
         title_label = QLabel(title)
