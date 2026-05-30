@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -75,6 +76,7 @@ from nicheflow_studio.processing.video import (
     suggest_title_replacement_crop,
 )
 from nicheflow_studio.processing.watermark import replace_detected_watermark
+from nicheflow_studio.publisher.instagram_publisher import publish_reel
 from nicheflow_studio.publisher.instagram_web import launch_instagram_upload_assist
 from nicheflow_studio.processing.transcription import generate_transcript_draft_in_subprocess
 from nicheflow_studio.processing.smart_drafts import (
@@ -983,6 +985,26 @@ class SmartDraftJobConfig:
     recent_captions: list[str] | None = None
 
 
+# Auto-publish safety limits. Per-account daily cap keeps an accidental
+# mass-post from triggering a ban; the cooldown pauses an account after
+# Instagram shows a checkpoint/challenge so we stop hammering it.
+PUBLISH_DAILY_CAP = 5
+PUBLISH_CHECKPOINT_COOLDOWN = dt.timedelta(hours=3)
+# Randomized gap between posts in a batch run, so a multi-account sweep looks
+# like a person spacing posts out rather than a burst. Applied BETWEEN posts
+# only (single-account cadence stays free).
+PUBLISH_BATCH_GAP_RANGE_SECONDS = (120, 420)  # 2-7 minutes
+
+
+@dataclass(frozen=True)
+class PublishJobConfig:
+    job_id: int
+    profile_name: str
+    video_path: Path
+    caption: str
+    do_share: bool = True
+
+
 @dataclass(frozen=True)
 class DraftRecommendation:
     title_index: int | None
@@ -1353,6 +1375,34 @@ class ProcessWorker(QObject):
             self.failed.emit(str(exc))
 
 
+class PublishWorker(QObject):
+    completed = pyqtSignal(dict)
+    failed = pyqtSignal(str)
+
+    def __init__(self, job: PublishJobConfig) -> None:
+        super().__init__()
+        self._job = job
+
+    def run(self) -> None:
+        try:
+            result = publish_reel(
+                self._job.profile_name,
+                self._job.video_path,
+                self._job.caption,
+                do_share=self._job.do_share,
+            )
+            self.completed.emit(
+                {
+                    "job_id": self._job.job_id,
+                    "status": result.status,
+                    "posted_url": result.posted_url,
+                    "error_message": result.error_message,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
+
+
 class SuggestCropWorker(QObject):
     completed = pyqtSignal(dict)
     failed = pyqtSignal(str)
@@ -1509,6 +1559,18 @@ class MainWindow(QWidget):
         self._draft_worker: TranscriptDraftWorker | None = None
         self._smart_draft_thread: QThread | None = None
         self._smart_draft_worker: SmartDraftWorker | None = None
+        self._publish_thread: QThread | None = None
+        self._publish_worker: PublishWorker | None = None
+        self._publish_in_progress = False
+        # account_id -> UTC datetime the account stays paused until (set after
+        # Instagram shows a checkpoint for that account).
+        self._account_publish_cooldown: dict[int, dt.datetime] = {}
+        # Batch ("Publish Due Now") state. The queue holds job ids; posts run
+        # one at a time with a randomized gap scheduled via QTimer.singleShot.
+        self._publish_batch_active = False
+        self._publish_batch_queue: list[int] = []
+        self._publish_batch_posted = 0
+        self._publish_batch_skipped = 0
         self._processing_in_progress = False
         self._processing_busy_mode: str | None = None
         self._selected_processing_item_id: int | None = None
@@ -3648,6 +3710,21 @@ class MainWindow(QWidget):
         self._schedule_instagram_assist_button.clicked.connect(
             self._on_open_instagram_assist_clicked
         )
+        self._schedule_auto_publish_button = QPushButton("Auto Publish")
+        self._schedule_auto_publish_button.setObjectName("downloadToolbarButton")
+        self._schedule_auto_publish_button.setEnabled(False)
+        self._schedule_auto_publish_button.clicked.connect(
+            self._on_auto_publish_selected_clicked
+        )
+        # Batch runner across all accounts: posts every Ready/due job one at a
+        # time with a randomized gap. Doubles as a Stop button while running.
+        self._schedule_publish_due_button = QPushButton("Publish Due Now")
+        self._schedule_publish_due_button.setObjectName("downloadToolbarButton")
+        self._schedule_publish_due_button.clicked.connect(
+            self._on_publish_due_now_clicked
+        )
+        # Kill-switch: when checked, drive the whole flow but stop before Share.
+        self._schedule_dry_run_checkbox = QCheckBox("Safe mode (stop before posting)")
 
         schedule_action_row = QHBoxLayout()
         schedule_action_row.setSpacing(10)
@@ -3656,6 +3733,9 @@ class MainWindow(QWidget):
         schedule_action_row.addWidget(self._schedule_copy_path_button)
         schedule_action_row.addWidget(self._schedule_open_folder_button)
         schedule_action_row.addWidget(self._schedule_instagram_assist_button)
+        schedule_action_row.addWidget(self._schedule_auto_publish_button)
+        schedule_action_row.addWidget(self._schedule_publish_due_button)
+        schedule_action_row.addWidget(self._schedule_dry_run_checkbox)
         schedule_action_row.addStretch(1)
 
         self._schedule_caption_combo = NoScrollComboBox()
@@ -7450,6 +7530,11 @@ class MainWindow(QWidget):
         self._schedule_copy_path_button.setEnabled(has_selection)
         self._schedule_open_folder_button.setEnabled(has_selection)
         self._schedule_instagram_assist_button.setEnabled(has_selection)
+        self._schedule_auto_publish_button.setEnabled(
+            has_selection
+            and not self._publish_in_progress
+            and not self._publish_batch_active
+        )
         self._schedule_status_combo.setEnabled(has_selection)
         self._schedule_datetime_edit.setEnabled(has_selection)
         self._schedule_save_time_button.setEnabled(has_selection)
@@ -7674,6 +7759,314 @@ class MainWindow(QWidget):
             "Caption copied. Instagram opened; upload the Reel manually, then mark Posted.",
             Tone.SUCCESS,
         )
+
+    def _account_posts_last_24h(self, session, account_id: int) -> int:  # noqa: ANN001
+        since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=24)
+        return (
+            session.query(UploadJob)
+            .filter(
+                UploadJob.account_id == account_id,
+                UploadJob.posted_at.is_not(None),
+                UploadJob.posted_at >= since,
+            )
+            .count()
+        )
+
+    def _account_publish_cooldown_until(self, account_id: int) -> dt.datetime | None:
+        until = self._account_publish_cooldown.get(account_id)
+        if until is None:
+            return None
+        if until <= dt.datetime.now(dt.timezone.utc):
+            self._account_publish_cooldown.pop(account_id, None)
+            return None
+        return until
+
+    def _on_auto_publish_selected_clicked(self) -> None:
+        if self._publish_in_progress:
+            self._notify("A publish is already running.", Tone.WARNING)
+            return
+        job_id = self._selected_schedule_job_id()
+        if job_id is None:
+            self._notify("Select a publish job first.", Tone.WARNING)
+            return
+
+        with get_session() as session:
+            job = (
+                session.query(UploadJob)
+                .options(joinedload(UploadJob.account))
+                .filter(UploadJob.id == job_id)
+                .one_or_none()
+            )
+            if job is None:
+                self._notify("The selected publish job no longer exists.", Tone.WARNING)
+                self._refresh_schedule_page()
+                return
+            # Duplicate guard: never re-post something already posted.
+            if job.posted_at is not None or job.status == "posted":
+                self._notify("This reel is already posted.", Tone.WARNING)
+                return
+            account_id = job.account_id
+            profile_name = (job.account.instagram_profile if job.account else None) or "main"
+            video_path = Path(job.processed_path)
+            caption = self._schedule_caption_text_for_job(job)
+            posts_recent = self._account_posts_last_24h(session, account_id)
+
+        cooldown_until = self._account_publish_cooldown_until(account_id)
+        if cooldown_until is not None:
+            self._notify(
+                f"This account is paused until {cooldown_until.astimezone():%H:%M} "
+                "after a checkpoint.",
+                Tone.WARNING,
+            )
+            return
+        if posts_recent >= PUBLISH_DAILY_CAP:
+            self._notify(
+                f"Daily cap reached for this account ({posts_recent}/{PUBLISH_DAILY_CAP}).",
+                Tone.WARNING,
+            )
+            return
+        if not video_path.exists():
+            self._notify("Reel output file is missing.", Tone.ERROR)
+            return
+
+        do_share = not self._schedule_dry_run_checkbox.isChecked()
+        self._notify(
+            "Safe mode: opening Instagram (will stop before posting)..."
+            if not do_share
+            else "Publishing... an Instagram window will open. Leave it alone.",
+            Tone.INFO,
+        )
+        self._launch_publish_worker(job_id, profile_name, video_path, caption, do_share)
+
+    def _launch_publish_worker(
+        self,
+        job_id: int,
+        profile_name: str,
+        video_path: Path,
+        caption: str,
+        do_share: bool,
+    ) -> None:
+        """Start one publish on a worker thread. Callers MUST gate concurrency."""
+        self._publish_in_progress = True
+        self._schedule_auto_publish_button.setEnabled(False)
+
+        thread = QThread(self)
+        worker = PublishWorker(
+            PublishJobConfig(
+                job_id=job_id,
+                profile_name=profile_name,
+                video_path=video_path,
+                caption=caption,
+                do_share=do_share,
+            )
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(self._on_publish_completed)
+        worker.failed.connect(self._on_publish_failed)
+        worker.completed.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._publish_thread = thread
+        self._publish_worker = worker
+        thread.start()
+
+    # --- Batch ("Publish Due Now") across all accounts -------------------
+
+    def _on_publish_due_now_clicked(self) -> None:
+        if self._publish_batch_active:
+            self._stop_publish_batch(user_cancelled=True)
+            return
+        if self._publish_in_progress:
+            self._notify("A publish is already running.", Tone.WARNING)
+            return
+
+        queue = self._gather_due_publish_job_ids()
+        if not queue:
+            self._notify(
+                "No jobs due. Mark a reel 'Ready' or schedule a past time first.",
+                Tone.INFO,
+            )
+            return
+
+        self._publish_batch_active = True
+        self._publish_batch_queue = queue
+        self._publish_batch_posted = 0
+        self._publish_batch_skipped = 0
+        self._schedule_publish_due_button.setText("Stop Publishing")
+        self._schedule_auto_publish_button.setEnabled(False)
+        self._notify(f"Publishing {len(queue)} due reel(s), spaced out...", Tone.INFO)
+        self._publish_next_in_batch()
+
+    def _gather_due_publish_job_ids(self) -> list[int]:
+        """Job ids approved (Ready) or scheduled-and-due, across all accounts."""
+        now = dt.datetime.now(dt.timezone.utc)
+        due: list[int] = []
+        with get_session() as session:
+            jobs = (
+                session.query(UploadJob)
+                .filter(UploadJob.posted_at.is_(None))
+                .filter(UploadJob.status.in_(["ready", "scheduled"]))
+                .order_by(
+                    UploadJob.scheduled_at.is_(None),
+                    UploadJob.scheduled_at.asc(),
+                    UploadJob.created_at.asc(),
+                )
+                .all()
+            )
+            for job in jobs:
+                scheduled_at = job.scheduled_at
+                if scheduled_at is not None:
+                    if scheduled_at.tzinfo is None:
+                        scheduled_at = scheduled_at.replace(tzinfo=dt.timezone.utc)
+                    if scheduled_at > now:
+                        continue  # not due yet
+                due.append(job.id)
+        return due
+
+    def _prepare_batch_job(self, job_id: int) -> tuple[int, str, Path, str] | None:
+        """Re-validate a queued job against live guards. None = skip it."""
+        with get_session() as session:
+            job = (
+                session.query(UploadJob)
+                .options(joinedload(UploadJob.account))
+                .filter(UploadJob.id == job_id)
+                .one_or_none()
+            )
+            if job is None or job.posted_at is not None or job.status == "posted":
+                return None
+            account_id = job.account_id
+            profile_name = (job.account.instagram_profile if job.account else None) or "main"
+            video_path = Path(job.processed_path)
+            caption = self._schedule_caption_text_for_job(job)
+            posts_recent = self._account_posts_last_24h(session, account_id)
+
+        if self._account_publish_cooldown_until(account_id) is not None:
+            return None
+        if posts_recent >= PUBLISH_DAILY_CAP:
+            return None
+        if not video_path.exists():
+            return None
+        return account_id, profile_name, video_path, caption
+
+    def _publish_next_in_batch(self) -> None:
+        if not self._publish_batch_active:
+            return
+        while self._publish_batch_queue:
+            job_id = self._publish_batch_queue.pop(0)
+            prepared = self._prepare_batch_job(job_id)
+            if prepared is None:
+                self._publish_batch_skipped += 1
+                continue
+            _account_id, profile_name, video_path, caption = prepared
+            do_share = not self._schedule_dry_run_checkbox.isChecked()
+            self._launch_publish_worker(job_id, profile_name, video_path, caption, do_share)
+            return
+        self._finish_publish_batch()
+
+    def _schedule_next_batch_publish(self) -> None:
+        if not self._publish_batch_active:
+            return
+        if not self._publish_batch_queue:
+            self._finish_publish_batch()
+            return
+        gap_seconds = random.randint(*PUBLISH_BATCH_GAP_RANGE_SECONDS)
+        self._notify(
+            f"Next post in ~{round(gap_seconds / 60)} min ({len(self._publish_batch_queue)} left).",
+            Tone.INFO,
+        )
+        QTimer.singleShot(gap_seconds * 1000, self._publish_next_in_batch)
+
+    def _finish_publish_batch(self) -> None:
+        posted = self._publish_batch_posted
+        skipped = self._publish_batch_skipped
+        self._publish_batch_active = False
+        self._publish_batch_queue = []
+        self._schedule_publish_due_button.setText("Publish Due Now")
+        self._notify(
+            f"Batch done: {posted} posted, {skipped} skipped.", Tone.SUCCESS
+        )
+        self._refresh_schedule_page()
+
+    def _stop_publish_batch(self, *, user_cancelled: bool) -> None:
+        self._publish_batch_active = False
+        self._publish_batch_queue = []
+        self._schedule_publish_due_button.setText("Publish Due Now")
+        if user_cancelled:
+            self._notify(
+                "Stopped batch publishing. A post already in progress will finish.",
+                Tone.WARNING,
+            )
+        self._refresh_schedule_page()
+
+    def _on_publish_completed(self, payload: dict) -> None:
+        self._publish_in_progress = False
+        self._publish_thread = None
+        self._publish_worker = None
+        job_id = int(payload.get("job_id"))
+        status = str(payload.get("status"))
+        posted_url = payload.get("posted_url")
+        error_message = payload.get("error_message")
+
+        if status == "posted":
+            with get_session() as session:
+                job = session.get(UploadJob, job_id)
+                if job is not None:
+                    job.status = "posted"
+                    job.posted_at = dt.datetime.now(dt.timezone.utc)
+                    job.posted_url = posted_url
+                    job.error_message = None
+                    session.commit()
+            self._notify("Reel published.", Tone.SUCCESS)
+        elif status == "dry_run":
+            self._notify("Safe mode: reached Share without posting.", Tone.WARNING)
+        elif status == "checkpoint":
+            account_id: int | None = None
+            with get_session() as session:
+                job = session.get(UploadJob, job_id)
+                if job is not None:
+                    account_id = job.account_id
+                    job.status = "failed"
+                    job.error_message = error_message or "checkpoint detected"
+                    session.commit()
+            if account_id is not None:
+                self._account_publish_cooldown[account_id] = (
+                    dt.datetime.now(dt.timezone.utc) + PUBLISH_CHECKPOINT_COOLDOWN
+                )
+            self._notify(
+                "Instagram flagged this account. Paused it and stopped publishing.",
+                Tone.ERROR,
+            )
+        else:  # failed
+            with get_session() as session:
+                job = session.get(UploadJob, job_id)
+                if job is not None:
+                    job.status = "failed"
+                    job.error_message = error_message or "publish failed"
+                    session.commit()
+            self._notify(f"Publish failed: {error_message}", Tone.ERROR)
+
+        self._refresh_schedule_page()
+        self._advance_batch_after(status)
+
+    def _on_publish_failed(self, message: str) -> None:
+        self._publish_in_progress = False
+        self._publish_thread = None
+        self._publish_worker = None
+        self._notify(f"Publish failed: {message}", Tone.ERROR)
+        self._refresh_schedule_page()
+        self._advance_batch_after("failed")
+
+    def _advance_batch_after(self, status: str) -> None:
+        """Continue the batch (if running) with a randomized gap. No-op otherwise."""
+        if not self._publish_batch_active:
+            return
+        if status == "posted":
+            self._publish_batch_posted += 1
+        else:
+            self._publish_batch_skipped += 1
+        self._schedule_next_batch_publish()
 
     def _sync_processed_outputs_to_upload_jobs(self) -> None:
         if self._current_account_id is None:
