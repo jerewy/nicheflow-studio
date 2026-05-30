@@ -1622,6 +1622,7 @@ class MainWindow(QWidget):
         self._publish_batch_queue: list[int] = []
         self._publish_batch_posted = 0
         self._publish_batch_skipped = 0
+        self._last_due_count = 0
         self._account_health_thread: QThread | None = None
         self._account_health_worker: AccountHealthCheckWorker | None = None
         self._account_health_in_progress = False
@@ -2773,6 +2774,13 @@ class MainWindow(QWidget):
         self._refresh_timer.setInterval(8000)
         self._refresh_timer.timeout.connect(self._request_refresh)
         self._refresh_timer.start()
+
+        # Semi-auto scheduler: periodically surface how many reels are due so the
+        # user gets a nudge + one-click batch, without unattended browser pop-ups.
+        self._due_check_timer = QTimer(self)
+        self._due_check_timer.setInterval(60000)
+        self._due_check_timer.timeout.connect(self._update_due_badge)
+        self._due_check_timer.start()
 
         self._set_status("Ready.", Tone.INFO)
         self._set_detail_placeholder()
@@ -8458,6 +8466,47 @@ class MainWindow(QWidget):
         self._refresh_schedule_page()
         self._advance_batch_after("failed")
 
+    @staticmethod
+    def _next_scheduled_hint(jobs: list[UploadJob]) -> str:
+        """Return ' Next: HH:MM (in N min).' for the soonest future scheduled job."""
+        now = dt.datetime.now(dt.timezone.utc)
+        upcoming: list[dt.datetime] = []
+        for job in jobs:
+            scheduled_at = job.scheduled_at
+            if scheduled_at is None or job.posted_at is not None:
+                continue
+            if scheduled_at.tzinfo is None:
+                scheduled_at = scheduled_at.replace(tzinfo=dt.timezone.utc)
+            if scheduled_at > now:
+                upcoming.append(scheduled_at)
+        if not upcoming:
+            return ""
+        soonest = min(upcoming)
+        minutes = int((soonest - now).total_seconds() // 60)
+        relative = f"in {minutes} min" if minutes < 60 else f"in {minutes // 60}h {minutes % 60}m"
+        return f" Next: {soonest.astimezone():%H:%M} ({relative})."
+
+    def _update_due_badge(self) -> None:
+        """Badge the 'Publish Due Now' button with the due count + nudge on rise.
+
+        Semi-auto: we surface what is due and let the user post with one click;
+        we never auto-open a browser. No-op while a batch is already running.
+        """
+        if not hasattr(self, "_schedule_publish_due_button") or self._publish_batch_active:
+            return
+        try:
+            due = len(self._gather_due_publish_job_ids())
+        except Exception:  # noqa: BLE001
+            return
+        self._schedule_publish_due_button.setText(
+            f"Publish Due Now ({due})" if due else "Publish Due Now"
+        )
+        if due > self._last_due_count and due > 0:
+            self._notify(
+                f"{due} reel(s) are due to post — click Publish Due Now.", Tone.INFO
+            )
+        self._last_due_count = due
+
     def _advance_batch_after(self, status: str) -> None:
         """Continue the batch (if running) with a randomized gap. No-op otherwise."""
         if not self._publish_batch_active:
@@ -8589,11 +8638,15 @@ class MainWindow(QWidget):
         if selected_row >= 0:
             self._schedule_table.selectRow(selected_row)
         self._on_schedule_selection_changed()
+        self._update_due_badge()
         if schedule_jobs:
             scheduled_count = sum(1 for job in schedule_jobs if job.scheduled_at is not None)
-            self._schedule_summary_label.setText(
-                f"{len(schedule_jobs)} upload job(s) for this account. {scheduled_count} have a scheduled time."
+            summary = (
+                f"{len(schedule_jobs)} upload job(s) for this account. "
+                f"{scheduled_count} have a scheduled time."
             )
+            next_hint = self._next_scheduled_hint(schedule_jobs)
+            self._schedule_summary_label.setText(summary + next_hint)
         else:
             self._schedule_summary_label.setText(
                 "No publish jobs yet. Finish Preprocess, then use Add to Schedule."

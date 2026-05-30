@@ -171,6 +171,37 @@ def test_publish_due_now_starts_batch_and_can_stop(qt_app, monkeypatch, tmp_path
         window.close()
 
 
+def test_due_badge_shows_count(qt_app, tmp_path: Path) -> None:
+    init_db()
+    account_id, video = _make_account_and_video(tmp_path)
+    with get_session() as session:
+        # Ready jobs (no scheduled time) count as due immediately.
+        session.add_all(
+            [
+                UploadJob(account_id=account_id, processed_path=video, status="ready"),
+                UploadJob(account_id=account_id, processed_path=video, status="ready"),
+            ]
+        )
+        session.commit()
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._current_account_combo.setCurrentIndex(1)
+        window._set_current_page("uploads")
+        qt_app.processEvents()
+
+        window._update_due_badge()
+        assert window._schedule_publish_due_button.text() == "Publish Due Now (2)"
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._due_check_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
 def test_auto_schedule_assigns_jittered_times(qt_app, tmp_path: Path) -> None:
     init_db()
     video = tmp_path / "reel.mp4"
