@@ -171,6 +171,46 @@ def test_publish_due_now_starts_batch_and_can_stop(qt_app, monkeypatch, tmp_path
         window.close()
 
 
+def test_auto_schedule_assigns_jittered_times(qt_app, tmp_path: Path) -> None:
+    init_db()
+    video = tmp_path / "reel.mp4"
+    video.write_bytes(b"processed")
+    with get_session() as session:
+        account = Account(
+            name="RespawnReels",
+            platform="instagram",
+            instagram_profile="main",
+            upload_schedule_slots="09:00, 18:00",
+        )
+        session.add(account)
+        session.flush()
+        for _ in range(3):
+            session.add(UploadJob(account_id=account.id, processed_path=str(video), status="ready"))
+        session.commit()
+        account_id = account.id
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._current_account_combo.setCurrentIndex(1)
+        window._set_current_page("uploads")
+        qt_app.processEvents()
+
+        window._on_auto_schedule_clicked()
+        qt_app.processEvents()
+
+        with get_session() as session:
+            jobs = session.query(UploadJob).filter(UploadJob.account_id == account_id).all()
+            assert all(job.scheduled_at is not None for job in jobs)
+            assert all(job.status == "scheduled" for job in jobs)
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
 def test_auto_publish_respects_daily_cap(qt_app, monkeypatch, tmp_path: Path) -> None:
     init_db()
     account_id, video = _make_account_and_video(tmp_path)

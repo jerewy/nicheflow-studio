@@ -84,6 +84,7 @@ from nicheflow_studio.core.account_health import (
     local_health,
 )
 from nicheflow_studio.core.instagram_profile_pool import ProfilePool
+from nicheflow_studio.core.scheduling import upcoming_slot_times
 from nicheflow_studio.publisher.instagram_publisher import publish_reel
 from nicheflow_studio.publisher.instagram_web import (
     launch_instagram_login,
@@ -4121,6 +4122,13 @@ class MainWindow(QWidget):
         self._schedule_clear_time_button.setObjectName("downloadToolbarButton")
         self._schedule_clear_time_button.setEnabled(False)
         self._schedule_clear_time_button.clicked.connect(self._on_clear_schedule_time_clicked)
+        # Assign jittered slot times to all unscheduled jobs for this account.
+        self._schedule_auto_time_button = QPushButton("Auto-Schedule")
+        self._schedule_auto_time_button.setObjectName("downloadToolbarButton")
+        self._schedule_auto_time_button.setToolTip(
+            "Assign randomized times from this account's schedule slots to unscheduled reels"
+        )
+        self._schedule_auto_time_button.clicked.connect(self._on_auto_schedule_clicked)
         self._schedule_caption_preview = QTextEdit()
         self._schedule_caption_preview.setPlaceholderText(
             "Select a publish job to preview the caption for manual posting."
@@ -4139,6 +4147,7 @@ class MainWindow(QWidget):
         schedule_detail_row.addWidget(self._schedule_datetime_edit)
         schedule_detail_row.addWidget(self._schedule_save_time_button)
         schedule_detail_row.addWidget(self._schedule_clear_time_button)
+        schedule_detail_row.addWidget(self._schedule_auto_time_button)
         schedule_detail_row.addStretch(1)
 
         self._schedule_table = TableFocusScrollWidget()
@@ -8018,6 +8027,49 @@ class MainWindow(QWidget):
 
         self._refresh_schedule_page()
         self._notify("Cleared scheduled time.", Tone.SUCCESS)
+
+    def _on_auto_schedule_clicked(self) -> None:
+        if self._current_account_id is None:
+            self._notify("Select an account workspace first.", Tone.WARNING)
+            return
+        now_local = dt.datetime.now().astimezone()
+        with get_session() as session:
+            account = session.get(Account, self._current_account_id)
+            if account is None:
+                self._notify("Account no longer exists.", Tone.WARNING)
+                return
+            jobs = (
+                session.query(UploadJob)
+                .filter(
+                    UploadJob.account_id == account.id,
+                    UploadJob.posted_at.is_(None),
+                    UploadJob.scheduled_at.is_(None),
+                    UploadJob.status.in_(["draft", "ready"]),
+                )
+                .order_by(UploadJob.created_at.asc())
+                .all()
+            )
+            if not jobs:
+                self._notify("No unscheduled reels to schedule.", Tone.INFO)
+                return
+            times = upcoming_slot_times(account.upload_schedule_slots, len(jobs), after=now_local)
+            if not times:
+                self._notify(
+                    "Set this account's schedule slots first (e.g. 09:00, 18:00).",
+                    Tone.WARNING,
+                )
+                return
+            timezone_label = account.upload_timezone
+            for job, when in zip(jobs, times):
+                job.scheduled_at = when.astimezone(dt.timezone.utc)
+                job.status = "scheduled"
+                if timezone_label:
+                    job.timezone = timezone_label
+                job.error_message = None
+            scheduled_count = min(len(jobs), len(times))
+            session.commit()
+        self._refresh_schedule_page()
+        self._notify(f"Auto-scheduled {scheduled_count} reel(s) with randomized times.", Tone.SUCCESS)
 
     def _on_copy_schedule_caption_clicked(self) -> None:
         job = self._selected_schedule_job()
