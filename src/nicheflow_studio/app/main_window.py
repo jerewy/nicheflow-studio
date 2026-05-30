@@ -1730,6 +1730,17 @@ class MainWindow(QWidget):
         self._sidebar_toggle_button.setIconSize(QSize(20, 20))
         self._sidebar_toggle_button.setFixedSize(38, 38)
         self._sidebar_toggle_button.setProperty("selected", False)
+
+        # Dedicated Session Health entry point (its own sidebar button, so it is
+        # not buried in the account drawer and opens with full dialog space).
+        self._sidebar_health_button = QPushButton()
+        self._sidebar_health_button.setObjectName("sidebarToggle")
+        self._sidebar_health_button.setToolTip("Session Health")
+        self._sidebar_health_button.setText("")
+        self._sidebar_health_button.setIcon(self._sidebar_icon("refresh"))
+        self._sidebar_health_button.setIconSize(QSize(20, 20))
+        self._sidebar_health_button.setFixedSize(38, 38)
+        self._sidebar_health_button.clicked.connect(self._open_session_health_dialog)
         self._module_buttons: dict[str, QPushButton] = {}
         self._sidebar_account_combo = NoScrollComboBox()
         self._sidebar_account_combo.setObjectName("sidebarAccountCombo")
@@ -2004,12 +2015,8 @@ class MainWindow(QWidget):
         account_layout = QVBoxLayout()
         account_layout.setContentsMargins(16, 14, 16, 14)
         account_layout.setSpacing(10)
-        self._account_health_open_button = QPushButton("Session Health")
-        self._account_health_open_button.setObjectName("downloadToolbarButton")
-        self._account_health_open_button.clicked.connect(self._open_session_health_dialog)
         account_layout.addWidget(account_title)
         account_layout.addWidget(workspace_panel)
-        account_layout.addWidget(self._account_health_open_button)
         account_layout.addWidget(manage_title)
         account_layout.addWidget(manage_hint)
         account_layout.addWidget(self._account_mode_label)
@@ -2061,6 +2068,10 @@ class MainWindow(QWidget):
         sidebar_layout.setSpacing(10)
         sidebar_layout.addWidget(
             self._sidebar_toggle_button,
+            alignment=Qt.AlignmentFlag.AlignCenter,
+        )
+        sidebar_layout.addWidget(
+            self._sidebar_health_button,
             alignment=Qt.AlignmentFlag.AlignCenter,
         )
         self._sidebar_account_label.setVisible(False)
@@ -3712,7 +3723,7 @@ class MainWindow(QWidget):
             dialog = QDialog(self)
             dialog.setObjectName("sessionHealthDialog")
             dialog.setWindowTitle("Session Health")
-            dialog.setMinimumSize(680, 440)
+            dialog.setMinimumSize(780, 560)
             dialog_layout = QVBoxLayout()
             dialog_layout.setContentsMargins(0, 0, 0, 0)
             dialog_layout.addWidget(self._make_account_health_panel())

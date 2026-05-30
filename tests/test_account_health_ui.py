@@ -66,6 +66,23 @@ def test_accounts_page_lists_local_session_health(qt_app, monkeypatch, tmp_path:
         _teardown(window)
 
 
+def test_sidebar_health_button_opens_dialog(qt_app, tmp_path: Path) -> None:
+    init_db()
+    _make_accounts()
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        assert window._session_health_dialog is None
+        window._sidebar_health_button.click()
+        qt_app.processEvents()
+        assert window._session_health_dialog is not None
+        assert window._session_health_dialog.isVisible() is True
+        assert window._account_health_table.rowCount() == 2
+    finally:
+        _teardown(window)
+
+
 def test_health_selection_gates_relogin_and_copy_email(qt_app, tmp_path: Path) -> None:
     init_db()
     _make_accounts()
