@@ -2,6 +2,11 @@
 
 Last updated: 2026-04-16
 
+> **Stale notice (2026-05-31):** this status predates the Instagram auto-publish,
+> session-health, and publish-scheduler work, and predates the Apify shared-pool
+> direction. For the current sourcing/pooling plan see `docs/SOURCING_POOLING_PLAN.md`.
+> The "Windows-only YouTube via yt-dlp" framing below is no longer the product target.
+
 ## Current Focus
 
 Finish and harden the first real Processing workflow: better draft generation, more reliable auto-crop, readable title overlays, and faster inspection of processed outputs.

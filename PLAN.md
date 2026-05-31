@@ -4,6 +4,13 @@ Last updated: 2026-05-24
 Status: Active execution plan
 Current milestone: Make the Instagram-first manual publishing MVP coherent on top of the working scrape/download/processing flow. Niche account strategy locked in (see §2A).
 
+> **2026-05-31 direction update:** sourcing has moved to **Apify-sourced shared niche pools**
+> with a **publish-only multi-account network** (10 history + 3 movie), superseding the
+> "5 dual-use accounts" model in §2A and the YouTube-intake framing below. See
+> `docs/SOURCING_POOLING_PLAN.md` for the authoritative sourcing/pooling spec, the accepted
+> platform/rights risks, and the verified Apify pagination limit. Sections below are kept
+> for history but are partially stale where they conflict with that doc.
+
 ## 1. What This Project Should Be Right Now
 
 NicheFlow Studio should ship first as a small, reliable Windows desktop app for a multi-account clipping workflow.

@@ -1,0 +1,244 @@
+# NicheFlow Studio — Sourcing, Pooling & Multi-Account Distribution Build Plan
+
+Last updated: 2026-05-31
+Status: Approved to build (architecture green-lit with the tweaks below)
+Origin: Obsidian `Je Personal Vaults` notes 1 (Multi accounts) and 3 (Scraping pooling), reconciled against the actual codebase.
+
+> This document is the single source of truth for the Apify-sourced, shared-pool,
+> multi-account distribution workstream. It supersedes the conflicting scope
+> statements in older docs (see §1). `PLAN.md` remains the broader roadmap;
+> this file owns the sourcing/pooling slice.
+
+---
+
+## 1. Scope reconciliation (read this first)
+
+Three docs told three different stories. The reconciled truth:
+
+| Source | Said | Reality (2026-05-31) |
+|---|---|---|
+| `CLAUDE.md` (project) | "Windows-only YouTube via `yt-dlp`" | **Stale.** Target is **Instagram**. |
+| `PLAN.md` | 5 dual-use accounts (account = publisher *and* scraper), YouTube intake | Partially stale. Direction is now Apify-sourced shared pools. |
+| `STATUS.md` (2026-04-16) | Processing-hardening focus, YouTube | Stale; Instagram auto-publish + session health shipped after it. |
+| Je plan (notes 1 & 3) | 10 history + 3 movie accounts, Apify-sourced, shared niche pools | **Current direction.** |
+
+**Confirmed direction:** Instagram is the publishing target. **Apify** is the sourcing
+engine (your own IG accounts never scrape — Apify runs on its own infra). YouTube/`yt-dlp`
+stays only as a legacy/secondary intake path, not the center of gravity.
+
+**Key strategy change from `PLAN.md` §2A:** the Je plan abandons the "dual-use account"
+idea (where each publisher account also scrapes). Apify sourcing makes dual-use
+unnecessary and removes the per-account ban risk `PLAN.md` flagged. Accounts become
+**publish-only distribution channels** fed from a shared, niche-separated pool.
+
+---
+
+## 2. Accepted risks (explicit, signed off before building)
+
+These are **business risks the user has accepted**, not bugs to engineer around.
+Written down so they are a conscious decision, not a surprise later.
+
+### 2.1 Platform / originality risk — ACCEPTED
+
+The core loop is: scrape a proven source creator's reels → redistribute the footage
+across 10+ of our own accounts → regenerate titles/captions. This is the
+**content-aggregator pattern Instagram's originality guidelines penalize.** Regenerated
+captions change the *post*, not the *originality of the underlying video*.
+
+- Instagram may throttle reach or remove recommendations for content it judges
+  unoriginal, and repeat/aggregated content can be made ineligible for recommendation.
+- The 14-day reuse cooldown spaces *our own* reuse; it does **not** make borrowed
+  footage original.
+- **Accepted consequence:** some or all of these accounts may be reach-limited or
+  banned. The network is treated as disposable/replaceable, not as durable IP.
+
+### 2.2 Rights / copyright risk — ACCEPTED for MVP
+
+Archival "history" clips and especially **movie scenes** (commercial films) often have
+real owners. The plan defers rights verification.
+
+- **Accepted consequence:** takedown/strike exposure in the interim. Movie accounts
+  are explicitly **secondary / experimental** and must not be the only future
+  monetization inventory (Je note 3 §15.3).
+- Mitigation deferred to "later" per §13.4; not a launch blocker.
+
+### 2.3 Account-footprint risk — NOTED, mitigate cheaply
+
+10+ accounts, similar content, likely shared machine/IP/login tooling. The real
+detection surface is the **network/session footprint**, not video pixels — which is
+why the plan correctly refuses pixel-shuffling (§14). Existing multi-profile login +
+weekly re-login (`core/instagram_profile_pool.py`) is the lever that matters here.
+
+---
+
+## 3. Verified technical finding — Apify pagination
+
+**Question:** can we backfill more than the newest N posts (e.g. posts 1851–3700) from
+one source account?
+
+**Verified answer (2026-05-31, against the live `apify/instagram-scraper` input schema):
+NO.** The actor scrapes **newest → oldest only**. There is **no `offset`, `skip`,
+`startFrom`, or cursor** parameter. `resultsLimit` always counts from the most recent
+post backward; `onlyPostsNewerThan` only *stops early* at a cutoff. (Sources below.)
+
+**Consequences for the runway math:**
+
+1. **First backfill is fine:** set `resultsLimit ≈ 1800` and the actor pages
+   newest→oldest in one run. The existing `scrape_instagram_source_apify(... max_items=1800)`
+   already maps `max_items → resultsLimit`, so no code change is needed for the backfill itself.
+2. **You cannot later reach deeper backlog** on the same account. Once you've pulled the
+   newest ~1800, the *only* ways to grow inventory are:
+   - `onlyPostsNewerThan` to pick up **genuinely new** posts the source publishes later
+     (already wired via the `since=` parameter), or
+   - **add another source account**, or
+   - **single-URL imports** of clips found manually.
+3. **Reliability caveat:** a single `resultsLimit=1800` run against one profile can return
+   *partial* results (IG pagination flakiness on large runs). Budget for **1.5–2× the
+   nominal Apify cost** to cover re-runs, and treat "1800 in one run" as a target, not a
+   guarantee. Verify the actual returned count per run (`ScrapeRun.items_fetched` already
+   records this).
+
+**Decision:** the Je plan's §5.2 "known limitation" is **correct as written**. Do not
+design around deep-backlog pagination. Plan inventory growth around new-posts +
+new-sources + single-URL imports.
+
+Sources:
+- [Instagram Scraper — input schema (Apify)](https://apify.com/apify/instagram-scraper/input-schema)
+- [Instagram Post Scraper (Apify)](https://apify.com/apify/instagram-post-scraper)
+- [onlyPostsNewerThan issue thread (Apify)](https://apify.com/apify/instagram-scraper/issues/problem-on-onlyposts-JNsmloUrVxdN5do0R)
+
+---
+
+## 4. What already exists (do NOT rebuild)
+
+Grounded in `src/nicheflow_studio/`:
+
+| Capability | Where | Notes |
+|---|---|---|
+| Apify bulk-profile scrape | `scraper/instagram_apify.py::scrape_instagram_source_apify` | `resultsLimit` + `onlyPostsNewerThan` already wired |
+| Apify single-URL import | `scraper/instagram_apify.py::scrape_instagram_urls_apify` | 1:1 URL → candidate |
+| Candidate persistence | `db/models.py::ScrapeCandidate` | **account-scoped** (`account_id` required) |
+| Source + run tracking | `db/models.py::Source`, `ScrapeRun` | per-account; `items_fetched/accepted/...` |
+| Download flow | `db/models.py::DownloadItem`, `queue.py` | `account_id` nullable; `video_id` present |
+| Title/caption generation | `processing/smart_drafts.py` | niche-aware (history/movie/meme/cinema profiles) |
+| Manual publish queue | `db/models.py::UploadJob`, `publisher/` | posted metrics on the row |
+| Multi-profile login + health | `core/instagram_profile_pool.py`, `core/account_health.py` | weekly re-login cadence |
+
+**The scraping engine is essentially done.** The gap is the **data model**, not the scrape.
+
+---
+
+## 5. The core architectural gap
+
+Current model is **account-scoped**: every candidate belongs to one account, dedup is
+per-account (`PLAN.md` §"account-scoped duplicate handling"). The Je plan needs the
+**opposite**: account-agnostic **shared niche pools** + a **global media library** with
+**global dedup** and controlled **cross-account reuse**.
+
+Je plan's target shape (note 3 §6, §16):
+
+```
+GLOBAL_MEDIA_LIBRARY   (one physical file per source video, deduped by shortcode/URL)
+   └─ pool_items       (niche membership: history | movie, accepted/evergreen flags)
+         └─ assignments (pool_item → destination account, with reuse_iteration + cooldown)
+               └─ performance_metrics
+```
+
+**Decision (tweak vs Je plan): add the pool layer ALONGSIDE the existing tables, do not
+refactor the account-scoped path away.** Rationale: matches repo guardrail "add
+abstractions only when a second real use case exists," keeps the working YouTube path
+intact, and lets us route only the Apify/Instagram candidates into the pooled model.
+
+### 5.1 New tables (additive migration)
+
+- **`media_assets`** — global, deduped original downloads. Key: `canonical_source_url` +
+  `instagram_shortcode` (+ `platform_media_id` when present). `download_status`.
+  *This is the dedup gate that saves Apify/storage cost.*
+- **`pool_items`** — links a `media_asset` to a niche pool. `niche: Literal["history","movie"]`,
+  `acceptance_status`, `is_evergreen_candidate`. (Partially overlaps `ScrapeCandidate.state`;
+  pool_items is the *accepted, account-agnostic* layer.)
+- **`assignments`** — `pool_item → destination_account`, `scheduled_date`, `reuse_iteration`,
+  `title_text`, `caption_text`, `render_output_path`. (Extends what `UploadJob` does today;
+  may be implemented as new columns on `UploadJob` rather than a new table — see §6 open
+  decision.)
+
+### 5.2 New/changed columns
+
+- **`niche` enum** becomes first-class on candidates, assets, pool_items, and accounts.
+  Today `Account.niche_label` is free text only — keep it for display, add a strict
+  `niche` for the isolation rule.
+- **Niche isolation guard** (Je note 3 §7): reject `pool_item.niche != account.niche` at
+  assignment time. Empty pool never borrows cross-niche.
+- **Global dedup-before-download** (Je note 3 §8): check `media_assets` by
+  shortcode/URL before any `yt-dlp`/download; link instead of re-downloading.
+
+---
+
+## 6. Build phases (mapped to real files)
+
+Ordered for runnable checkpoints. Each phase ends green-tested before the next.
+
+### Phase 0 — Doc + scope reconciliation  ✅ (this document)
+- Write down accepted risks (§2) and the pagination finding (§3). **Done.**
+- Correct stale scope in `CLAUDE.md` / point `PLAN.md` and `STATUS.md` at this file.
+
+### Phase 1 — Niche field + global media library
+- Add strict `niche` to `Account` (+ backfill existing rows from `niche_label`).
+- New `media_assets` table + the dedup-by-shortcode lookup
+  (`find_by_canonical_source_url_or_shortcode`).
+- Wire the Apify candidate → media_asset path so a download registers a global asset.
+- Tests: dedup returns existing asset; second import of same shortcode does not re-download.
+
+### Phase 2 — Niche pools + accepted layer
+- New `pool_items` table; "Accept candidate" promotes a `media_asset` into `HISTORY_ACCEPTED`
+  / `MOVIE_ACCEPTED`.
+- Candidate review UI gains niche tagging + accept-into-pool action (reuse existing
+  candidate review widgets in `app/main_window.py`).
+- Tests: accept creates pool_item with correct niche; cross-niche accept is blocked.
+
+### Phase 3 — Destination accounts + assignment
+- Destination-account records (reuse `Account` with `niche` + a `role`=publish flag).
+- Random first-cycle assignment from pool → accounts (Je note 3 §12), with simple
+  **round-robin-within-shuffle** so per-account volume is even (tweak vs pure random).
+- **Niche isolation guard** enforced here.
+- Tests: assignment never crosses niche; volume is balanced; no clip double-assigned in cycle 1.
+
+### Phase 4 — Draft + render per assignment
+- Generate per-account title/caption via existing `smart_drafts.py` niche profiles.
+- Render account-specific output; track `render_output_path`. Reuse current Processing/export.
+- Feeds the existing manual Publish Queue (`UploadJob`/`publisher/`).
+
+### Phase 5 — Reuse + performance loop
+- `MIN_REUSE_GAP_DAYS = 14` (configurable), `reuse_iteration`, reuse limits
+  (untested 1 / strong 2 / evergreen 3 — Je note 3 §13).
+- Performance metrics already partly on `UploadJob`; surface winners for reuse.
+
+### Phase 6 — Deferred (do not build yet)
+Perceptual visual dedup across different source URLs, AI topic tags, rights-confidence,
+analytics dashboards. (Je note 3 §17 "Not Required Yet".)
+
+---
+
+## 7. Open decisions to confirm before Phase 1 code
+
+1. **Account count / strategy:** adopt Je plan's **10 history + 3 movie**, replacing
+   `PLAN.md` §2A's "5 dual-use" portfolio? (Recommended: yes — Apify sourcing makes
+   dual-use obsolete.)
+2. **`assignments`: new table vs extend `UploadJob`?** `UploadJob` already does most of
+   it. Leaning **extend `UploadJob`** (add `pool_item_id`, `reuse_iteration`) to avoid a
+   parallel structure — confirm.
+3. **Movie network now or later?** History is primary; movie is secondary/experimental.
+   Build history end-to-end first, add movie tables but defer movie accounts?
+4. **Migration style:** repo uses "lightweight compatibility upgrades," not Alembic.
+   Keep that pattern for the new tables? (Recommended: yes, stay consistent.)
+
+---
+
+## 8. First-launch operational runway (with §3 reality baked in)
+
+- 1 source account → one `resultsLimit≈1800` Apify run → ~312 already on hand + new pulls.
+- Download **only accepted** candidates (Je note 3 §10) — keeps Apify/storage cost down.
+- 10 history accounts × ~30 first-cycle posts = ~300 unique assignments before reuse.
+- Inventory growth after backfill = new-posts (`onlyPostsNewerThan`) + new sources +
+  single-URL imports. **Not** deep-backlog pagination (impossible — §3).
+- Budget **1.5–2×** nominal Apify spend for partial-run re-tries.
