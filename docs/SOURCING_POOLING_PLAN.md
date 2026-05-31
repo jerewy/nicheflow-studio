@@ -183,11 +183,19 @@ Ordered for runnable checkpoints. Each phase ends green-tested before the next.
 - Correct stale scope in `CLAUDE.md` / point `PLAN.md` and `STATUS.md` at this file.
 
 ### Phase 1 — Niche field + global media library
-- Add strict `niche` to `Account` (+ backfill existing rows from `niche_label`).
-- New `media_assets` table + the dedup-by-shortcode lookup
-  (`find_by_canonical_source_url_or_shortcode`).
-- Wire the Apify candidate → media_asset path so a download registers a global asset.
-- Tests: dedup returns existing asset; second import of same shortcode does not re-download.
+- ✅ Add strict `niche` to `Account` (+ backfill existing rows from `niche_label`
+  via `core/niche.py::classify_niche`; compat `ALTER` + `_backfill_account_niche`
+  in `db/session.py`). Verified on a copy of the real DB: Past Moments→history,
+  Cinema Files→movie.
+- ✅ New `media_assets` table (`db/models.py::MediaAsset`) + dedup helpers in
+  `db/media_library.py` (`find_media_asset`, `find_or_register_media_asset`,
+  `mark_media_asset_downloaded`, shortcode/URL normalization).
+- ✅ Tests: `tests/test_media_library.py` — dedup returns existing asset; same
+  shortcode from a different URL dedupes; backfill only fills NULLs (never
+  overwrites an explicit niche).
+- ⬜ **Remaining (Step 2):** wire the accepted-candidate → download path through
+  `find_or_register_media_asset` so a real download registers/links a global
+  asset instead of re-downloading (`queue.py` / downloader integration).
 
 ### Phase 2 — Niche pools + accepted layer
 - New `pool_items` table; "Accept candidate" promotes a `media_asset` into `HISTORY_ACCEPTED`

@@ -26,6 +26,11 @@ class Account(Base):
     name: Mapped[str] = mapped_column(String(128))
     platform: Mapped[str] = mapped_column(String(32), default="youtube")
     niche_label: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Strict niche for the shared-pool network: "history" | "movie" (None until
+    # classified). Drives pool isolation so history content never lands on a
+    # movie account and vice versa. Distinct from the free-text niche_label,
+    # which stays for display/prompt context. See docs/SOURCING_POOLING_PLAN.md.
+    niche: Mapped[str | None] = mapped_column(String(16), nullable=True)
     login_identifier: Mapped[str | None] = mapped_column(String(256), nullable=True)
     instagram_profile: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Expected Instagram @handle for this account. When set, the live health
@@ -244,3 +249,33 @@ class ScrapeRun(Base):
     account: Mapped[Account] = relationship(back_populates="scrape_runs")
     source: Mapped[Source] = relationship(back_populates="scrape_runs")
     candidates: Mapped[list[ScrapeCandidate]] = relationship(back_populates="scrape_run")
+
+
+class MediaAsset(Base):
+    """Global Media Library — one row per ORIGINAL downloaded source video,
+    deduplicated across accounts and niches by canonical URL / shortcode.
+
+    This is the dedup gate from docs/SOURCING_POOLING_PLAN.md §5.1/§8: the same
+    source clip (re-imported, reused across accounts) is downloaded ONCE and
+    referenced many times, instead of one physical download per assignment.
+    """
+
+    __tablename__ = "media_assets"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: dt.datetime.now(dt.timezone.utc)
+    )
+
+    platform: Mapped[str] = mapped_column(String(32), default="instagram")
+    # Dedup keys. canonical_source_url is the normalized post/reel URL;
+    # source_shortcode is the Instagram shortcode when known (the stronger key).
+    canonical_source_url: Mapped[str] = mapped_column(String(2048))
+    source_shortcode: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    platform_media_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    original_download_path: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    file_size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # "pending" until the original is on disk, then "downloaded".
+    download_status: Mapped[str] = mapped_column(String(32), default="pending")
+    downloaded_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    checksum: Mapped[str | None] = mapped_column(String(128), nullable=True)
