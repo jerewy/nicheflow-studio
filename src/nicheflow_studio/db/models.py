@@ -313,3 +313,43 @@ class PoolItem(Base):
     is_evergreen_candidate: Mapped[int] = mapped_column(Integer, default=0)
 
     media_asset: Mapped[MediaAsset] = relationship(back_populates="pool_items")
+    assignments: Mapped[list["Assignment"]] = relationship(back_populates="pool_item")
+
+
+class Assignment(Base):
+    """The 'order ticket' — a planned pool_item → account pairing, before the
+    clip is rendered (docs/SOURCING_POOLING_PLAN.md §6, Phase 3, Option A).
+
+    Kept separate from ``UploadJob`` (which needs a rendered file) so the publish
+    queue stays clean: an Assignment is just "this clip is allotted to this
+    account". When Phase 4 renders it, the resulting ``UploadJob`` is linked via
+    ``upload_job_id`` and the status moves on.
+    """
+
+    __tablename__ = "assignments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: dt.datetime.now(dt.timezone.utc)
+    )
+
+    pool_item_id: Mapped[int] = mapped_column(ForeignKey("pool_items.id"))
+    account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"))
+    # Denormalized niche (== pool_item.niche == account.niche). Stored so the
+    # isolation invariant is visible/queryable on the assignment itself.
+    niche: Mapped[str] = mapped_column(String(16), index=True)
+    # "assigned" -> (rendered) -> publish handled by the linked UploadJob.
+    status: Mapped[str] = mapped_column(String(32), default="assigned")
+    scheduled_date: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # 0 for the first-cycle assignment; >0 when a strong clip is reused later
+    # on another same-niche account (Phase 5).
+    reuse_iteration: Mapped[int] = mapped_column(Integer, default=0)
+    # Set once Phase 4 renders this assignment into a publishable UploadJob.
+    upload_job_id: Mapped[int | None] = mapped_column(
+        ForeignKey("upload_jobs.id"), nullable=True
+    )
+
+    pool_item: Mapped[PoolItem] = relationship(back_populates="assignments")
+    account: Mapped[Account] = relationship()
