@@ -4298,6 +4298,18 @@ class MainWindow(QWidget):
         self._schedule_publish_due_button.clicked.connect(
             self._on_publish_due_now_clicked
         )
+        # Multi-account: post every due reel across ALL accounts, one at a time
+        # with the same randomized gap. Sequential (never simultaneous) keeps the
+        # automation footprint low.
+        self._schedule_publish_all_button = QPushButton("Publish All Due")
+        self._schedule_publish_all_button.setObjectName("downloadToolbarButton")
+        self._schedule_publish_all_button.setToolTip(
+            "Post every due reel across ALL accounts, one at a time with a "
+            "2-7 minute gap between posts (sequential, never simultaneous)."
+        )
+        self._schedule_publish_all_button.clicked.connect(
+            self._on_publish_all_due_clicked
+        )
         # Kill-switch: when checked, drive the whole flow but stop before Share.
         self._schedule_dry_run_checkbox = QCheckBox("Safe mode (stop before posting)")
 
@@ -4310,6 +4322,7 @@ class MainWindow(QWidget):
         schedule_action_row.addWidget(self._schedule_instagram_assist_button)
         schedule_action_row.addWidget(self._schedule_auto_publish_button)
         schedule_action_row.addWidget(self._schedule_publish_due_button)
+        schedule_action_row.addWidget(self._schedule_publish_all_button)
         schedule_action_row.addWidget(self._schedule_dry_run_checkbox)
         schedule_action_row.addStretch(1)
 
@@ -8608,16 +8621,91 @@ class MainWindow(QWidget):
         if not self._confirm_publish_target(job_id):
             return
 
-        queue = [job_id]
+        self._begin_publish_batch([job_id], info_message="Publishing selected reel...")
+
+    def _begin_publish_batch(self, job_ids: list[int], *, info_message: str) -> None:
+        """Start the sequential batch runner over ``job_ids``.
+
+        Each job carries its own account/profile, so a queue spanning multiple
+        accounts posts them one at a time with the randomized inter-post gap —
+        never simultaneously. Shared by single-job and all-due publishing.
+        """
         self._publish_batch_active = True
-        self._publish_batch_queue = queue
+        self._publish_batch_queue = list(job_ids)
         self._publish_batch_posted = 0
         self._publish_batch_skipped = 0
         self._batch_skip_reasons = []
         self._schedule_publish_due_button.setText("Stop Publishing")
         self._schedule_auto_publish_button.setEnabled(False)
-        self._notify("Publishing selected reel...", Tone.INFO)
+        self._schedule_publish_all_button.setEnabled(False)
+        self._notify(info_message, Tone.INFO)
         self._publish_next_in_batch()
+
+    def _on_publish_all_due_clicked(self) -> None:
+        """Publish every due reel across all accounts, sequentially."""
+        if self._publish_batch_active:
+            self._notify(
+                "A batch is already running. Use 'Stop Publishing' to cancel.", Tone.WARNING
+            )
+            return
+        if self._publish_in_progress:
+            self._notify("A publish is already running.", Tone.WARNING)
+            return
+
+        job_ids = self._gather_due_publish_job_ids()
+        if not job_ids:
+            self._notify("No due reels to publish across any account.", Tone.WARNING)
+            return
+        if not self._confirm_publish_batch(job_ids):
+            return
+        self._begin_publish_batch(
+            job_ids,
+            info_message=f"Publishing {len(job_ids)} reel(s) across accounts, one at a time...",
+        )
+
+    def _confirm_publish_batch(self, job_ids: list[int]) -> bool:
+        """List every account + file that will be posted, with the gap notice.
+
+        Returns True if the user confirms, False to cancel.
+        """
+        rows: list[tuple[str, str, str]] = []
+        with get_session() as session:
+            for job_id in job_ids:
+                job = (
+                    session.query(UploadJob)
+                    .options(joinedload(UploadJob.account))
+                    .filter(UploadJob.id == job_id)
+                    .one_or_none()
+                )
+                if job is None:
+                    continue
+                account_name = (job.account.name if job.account else None) or "Unknown account"
+                profile = (
+                    self._clean_profile(job.account.instagram_profile if job.account else None)
+                    or "(no profile)"
+                )
+                file_name = Path(job.processed_path).name if job.processed_path else "(unknown file)"
+                rows.append((account_name, profile, file_name))
+        if not rows:
+            self._notify("Due jobs no longer exist.", Tone.WARNING)
+            return False
+
+        lines = "<br>".join(
+            f"&bull; <b>{name}</b> (@{profile}) — {fname}" for name, profile, fname in rows
+        )
+        gap_lo, gap_hi = (g // 60 for g in PUBLISH_BATCH_GAP_RANGE_SECONDS)
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Confirm Publish All Due")
+        msg.setIcon(QMessageBox.Icon.Question)
+        msg.setText(
+            f"<b>Posting {len(rows)} reel(s) across accounts</b>, one at a time "
+            f"with a ~{gap_lo}-{gap_hi} min gap between posts:<br><br>{lines}"
+        )
+        publish_btn = msg.addButton(f"Publish {len(rows)}", QMessageBox.ButtonRole.AcceptRole)
+        msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        msg.setDefaultButton(publish_btn)
+        msg.exec()
+        return msg.clickedButton() is publish_btn
 
     def _confirm_publish_target(self, job_id: int) -> bool:
         """Show a quick confirmation popup with the target account and profile.
@@ -8831,6 +8919,7 @@ class MainWindow(QWidget):
         self._publish_batch_queue = []
         self._batch_skip_reasons = []
         self._schedule_publish_due_button.setText("Publish Due Now")
+        self._schedule_publish_all_button.setEnabled(True)
         message = f"Batch done: {posted} posted, {skipped} skipped."
         if reasons:
             message += " Skipped: " + "; ".join(reasons) + "."
@@ -8843,6 +8932,7 @@ class MainWindow(QWidget):
         self._publish_batch_active = False
         self._publish_batch_queue = []
         self._schedule_publish_due_button.setText("Publish Due Now")
+        self._schedule_publish_all_button.setEnabled(True)
         if user_cancelled:
             self._notify(
                 "Stopped batch publishing. A post already in progress will finish.",

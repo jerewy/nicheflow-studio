@@ -177,6 +177,78 @@ def test_publish_due_now_starts_batch_and_can_stop(qt_app, monkeypatch, tmp_path
         window.close()
 
 
+def test_publish_all_due_batches_across_accounts(qt_app, tmp_path: Path) -> None:
+    """'Publish All Due' queues due reels from MULTIPLE accounts and runs them
+    sequentially: the first launches now, the rest wait in the queue."""
+    init_db()
+    video = tmp_path / "reel.mp4"
+    video.write_bytes(b"processed")
+    with get_session() as session:
+        acc_a = Account(name="History A", platform="instagram", instagram_profile="hista")
+        acc_b = Account(name="History B", platform="instagram", instagram_profile="histb")
+        session.add_all([acc_a, acc_b])
+        session.flush()
+        session.add_all(
+            [
+                UploadJob(account_id=acc_a.id, processed_path=str(video), status="ready"),
+                UploadJob(account_id=acc_b.id, processed_path=str(video), status="ready"),
+            ]
+        )
+        session.commit()
+
+    launched: list = []
+    window = MainWindow()
+    window._launch_publish_worker = lambda *a, **k: launched.append(a)  # type: ignore[method-assign]
+    # Stub the confirmation dialog so the test doesn't block on a QMessageBox.
+    window._confirm_publish_batch = lambda _ids: True  # type: ignore[method-assign]
+    try:
+        window.show()
+        window._set_current_page("uploads")
+        qt_app.processEvents()
+
+        window._on_publish_all_due_clicked()
+        qt_app.processEvents()
+
+        assert window._publish_batch_active is True
+        assert len(launched) == 1  # first account's reel launched immediately
+        assert len(window._publish_batch_queue) == 1  # second account's reel waits for the gap
+        assert window._schedule_publish_due_button.text() == "Stop Publishing"
+        assert window._schedule_publish_all_button.isEnabled() is False
+
+        # The launched job and the queued job belong to different accounts.
+        launched_profile = launched[0][1]
+        assert launched_profile in {"hista", "histb"}
+
+        window._stop_publish_batch(user_cancelled=True)
+        assert window._schedule_publish_all_button.isEnabled() is True
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_publish_all_due_with_nothing_due_is_a_noop(qt_app, tmp_path: Path) -> None:
+    init_db()
+    _make_account_and_video(tmp_path)  # account exists but no due jobs
+    launched: list = []
+    window = MainWindow()
+    window._launch_publish_worker = lambda *a, **k: launched.append(a)  # type: ignore[method-assign]
+    window._confirm_publish_batch = lambda _ids: True  # type: ignore[method-assign]
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._on_publish_all_due_clicked()
+        qt_app.processEvents()
+        assert window._publish_batch_active is False
+        assert launched == []
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
 def test_due_badge_shows_count(qt_app, tmp_path: Path) -> None:
     init_db()
     account_id, video = _make_account_and_video(tmp_path)
