@@ -46,7 +46,8 @@ def test_pooling_page_accept_then_distribute(qt_app, tmp_path: Path) -> None:
         window.show()
         window._set_current_page("pooling")
         qt_app.processEvents()
-        assert window._current_page == "pooling"
+        assert window._current_page == "session_health"
+        assert window._publishing_dashboard_tabs.currentIndex() == 0
 
         window._on_pool_accept_clicked("history")
         qt_app.processEvents()
@@ -87,6 +88,8 @@ def test_pooling_distribute_without_accounts_is_safe(qt_app, tmp_path: Path) -> 
         window.show()
         window._set_current_page("pooling")
         qt_app.processEvents()
+        assert window._current_page == "session_health"
+        assert window._publishing_dashboard_tabs.tabText(0) == "1. Pool & Distribute"
 
         window._on_pool_accept_clicked("movie")
         window._on_pool_distribute_clicked("movie")  # no movie accounts -> no-op, no crash
@@ -94,5 +97,24 @@ def test_pooling_distribute_without_accounts_is_safe(qt_app, tmp_path: Path) -> 
 
         with get_session() as session:
             assert session.query(Assignment).count() == 0
+    finally:
+        _teardown(window)
+
+
+def test_pooling_actions_do_not_overlap_account_table(qt_app, tmp_path: Path) -> None:
+    init_db()
+    _seed(history_accounts=6, clips=8)
+
+    window = MainWindow()
+    try:
+        window.resize(1400, 820)
+        window.show()
+        window._set_current_page("pooling")
+        qt_app.processEvents()
+
+        table_bottom = window._pooling_table.geometry().bottom()
+        actions_top = window._pooling_prep_actions.geometry().top()
+        assert window._pooling_table.maximumHeight() <= 190
+        assert actions_top > table_bottom
     finally:
         _teardown(window)

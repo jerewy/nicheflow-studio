@@ -673,7 +673,8 @@ UPLOAD_PRIVACY_OPTIONS = {
     "unlisted": "Unlisted",
     "public": "Public",
 }
-MODULE_PAGES = ("scraping", "downloads", "processing", "uploads", "session_health", "pooling")
+MODULE_PAGES = ("scraping", "downloads", "processing", "uploads", "session_health")
+GLOBAL_MODULE_PAGES = {"session_health"}
 INSTAGRAM_MAX_RESULT_LIMIT = 1000
 TITLE_STYLE_PRESETS: dict[str, dict[str, object]] = {
     "clean_hook": {
@@ -1787,9 +1788,11 @@ class MainWindow(QWidget):
         self._sidebar_health_button.setObjectName("sidebarToggle")
         self._sidebar_health_button.setToolTip("Publishing Dashboard")
         self._sidebar_health_button.setText("")
-        self._sidebar_health_button.setIcon(self._sidebar_icon("shield"))
+        self._sidebar_health_button.setCheckable(True)
+        self._sidebar_health_button.setIcon(self._sidebar_icon("publishing-dashboard"))
         self._sidebar_health_button.setIconSize(QSize(20, 20))
         self._sidebar_health_button.setFixedSize(38, 38)
+        self._sidebar_health_button.setProperty("selected", False)
         self._sidebar_health_button.clicked.connect(self._open_session_health_dialog)
         self._module_buttons: dict[str, QPushButton] = {}
         self._sidebar_account_combo = NoScrollComboBox()
@@ -2089,7 +2092,6 @@ class MainWindow(QWidget):
             ("downloads", "Download", "play"),
             ("processing", "Preprocess", "refresh"),
             ("uploads", "Publish", "check"),
-            ("pooling", "Pool & Distribute", "refresh"),
         ]
         self._sidebar_nav = QWidget()
         sidebar_nav_layout = QVBoxLayout()
@@ -2111,7 +2113,7 @@ class MainWindow(QWidget):
             self._module_buttons[page_name] = button
             sidebar_nav_layout.addWidget(button)
         self._sidebar_nav.setLayout(sidebar_nav_layout)
-        self._sidebar_nav.setFixedHeight(246)
+        self._sidebar_nav.setFixedHeight(198)
 
         self._sidebar_panel = QFrame()
         self._sidebar_panel.setObjectName("sidebar")
@@ -2762,7 +2764,6 @@ class MainWindow(QWidget):
         self._uploads_page = self._make_schedule_page()
         self._accounts_page = self._make_accounts_page()
         self._session_health_page = self._make_session_health_page()
-        self._pooling_page = self._make_pooling_page()
 
         self._library_gate_panel = QFrame()
         self._library_gate_panel.setObjectName("panel")
@@ -2784,7 +2785,6 @@ class MainWindow(QWidget):
         self._workspace_stack.addWidget(self._processing_page)
         self._workspace_stack.addWidget(self._uploads_page)
         self._workspace_stack.addWidget(self._session_health_page)
-        self._workspace_stack.addWidget(self._pooling_page)
         workspace_content_layout.addWidget(self._workspace_stack)
         self._workspace_content.setLayout(workspace_content_layout)
 
@@ -3789,8 +3789,25 @@ class MainWindow(QWidget):
         page = QWidget()
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-        layout.addWidget(self._make_account_health_panel())
+        layout.setSpacing(12)
+        title = QLabel("Publishing Dashboard")
+        title.setObjectName("sectionTitle")
+        subtitle = QLabel(
+            "Global publishing checks and per-account readiness. Pooling works across "
+            "all accounts; session checks show which profiles can publish now."
+        )
+        subtitle.setObjectName("metaValue")
+        subtitle.setWordWrap(True)
+
+        tabs = QTabWidget()
+        tabs.setObjectName("panel")
+        tabs.addTab(self._make_pooling_panel(), "1. Pool & Distribute")
+        tabs.addTab(self._make_account_health_panel(), "2. Account Readiness")
+        self._publishing_dashboard_tabs = tabs
+
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+        layout.addWidget(tabs, stretch=1)
         page.setLayout(layout)
         return page
 
@@ -3798,22 +3815,13 @@ class MainWindow(QWidget):
 
     _POOLING_NICHES = ("history", "movie")
 
-    def _make_pooling_page(self) -> QWidget:
-        page = QWidget()
-        layout = QVBoxLayout()
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-        layout.addWidget(self._make_pooling_panel())
-        page.setLayout(layout)
-        return page
-
     def _make_pooling_panel(self) -> QFrame:
         self._pooling_niche_labels: dict[str, QLabel] = {}
         panel = QFrame()
         panel.setObjectName("panel")
         layout = QVBoxLayout()
-        layout.setContentsMargins(24, 24, 24, 24)
-        layout.setSpacing(12)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(8)
 
         title = QLabel("Pool & Distribute")
         title.setObjectName("sectionTitle")
@@ -3841,11 +3849,17 @@ class MainWindow(QWidget):
         pool_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         pool_header.setStretchLastSection(True)
         self._pooling_table.verticalHeader().setVisible(False)
-        self._pooling_table.setMinimumHeight(150)
-        self._pooling_table.setMaximumHeight(320)
+        self._pooling_table.setMinimumHeight(130)
+        self._pooling_table.setMaximumHeight(190)
+        self._pooling_table.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
         layout.addWidget(self._pooling_table)
 
+        self._pooling_prep_actions = QWidget()
         prep_row = QHBoxLayout()
+        prep_row.setContentsMargins(0, 4, 0, 0)
         prep_row.setSpacing(10)
         backfill_btn = QPushButton("Register Downloaded Clips")
         backfill_btn.setObjectName("downloadToolbarButton")
@@ -3860,7 +3874,8 @@ class MainWindow(QWidget):
         prep_row.addWidget(backfill_btn)
         prep_row.addWidget(pool_refresh_btn)
         prep_row.addStretch(1)
-        layout.addLayout(prep_row)
+        self._pooling_prep_actions.setLayout(prep_row)
+        layout.addWidget(self._pooling_prep_actions)
 
         for niche in self._POOLING_NICHES:
             layout.addWidget(self._make_pooling_niche_row(niche))
@@ -3877,8 +3892,8 @@ class MainWindow(QWidget):
         frame = QFrame()
         frame.setObjectName("panel")
         row = QHBoxLayout()
-        row.setContentsMargins(12, 10, 12, 10)
-        row.setSpacing(10)
+        row.setContentsMargins(10, 8, 10, 8)
+        row.setSpacing(8)
         label = QLabel("")
         label.setObjectName("metaValue")
         self._pooling_niche_labels[niche] = label
@@ -4044,7 +4059,7 @@ class MainWindow(QWidget):
         )
 
     def _open_session_health_dialog(self) -> None:
-        """Navigate to the Session Health tab and refresh local status."""
+        """Navigate to the Publishing Dashboard and refresh local status."""
         self._set_current_page("session_health")
         self._refresh_account_health()
 
@@ -4055,7 +4070,7 @@ class MainWindow(QWidget):
         layout.setContentsMargins(24, 24, 24, 24)
         layout.setSpacing(12)
 
-        title = QLabel("Publishing Dashboard")
+        title = QLabel("Account Readiness")
         title.setObjectName("sectionTitle")
         subtitle = QLabel(
             "Per-account login and publish readiness. 'Due now' is how many reels "
@@ -4080,16 +4095,16 @@ class MainWindow(QWidget):
             ["Account", "Profile", "Session", "Due now", "Scheduled", "Next post", "Detail"]
         )
         health_header = self._account_health_table.horizontalHeader()
-        health_header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        # Numeric columns (Due now, Scheduled, Next post) only need their content
-        # width; let Account/Profile/Detail absorb the remaining space.
-        for _numeric_col in (3, 4, 5):
+        for _compact_col in (0, 1, 2, 3, 4, 5):
             health_header.setSectionResizeMode(
-                _numeric_col, QHeaderView.ResizeMode.ResizeToContents
+                _compact_col, QHeaderView.ResizeMode.ResizeToContents
             )
+        health_header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
         health_header.setStretchLastSection(True)
         # Hide row numbers + the white corner button, matching every other table.
         self._account_health_table.verticalHeader().setVisible(False)
+        self._account_health_table.setWordWrap(True)
+        self._account_health_table.setTextElideMode(Qt.TextElideMode.ElideNone)
         self._account_health_table.setMinimumHeight(240)
         self._account_health_table.setMaximumHeight(400)
         self._account_health_table.setSizePolicy(
@@ -4235,6 +4250,11 @@ class MainWindow(QWidget):
         for col, value in enumerate(values):
             cell = QTableWidgetItem(value)
             cell.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+            if col == 6:
+                cell.setToolTip(value)
+                cell.setTextAlignment(
+                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+                )
             if col == 0:
                 # Empty profile -> re-login stays disabled (_selected_health_profile
                 # treats falsy as "nothing to act on").
@@ -7674,6 +7694,10 @@ class MainWindow(QWidget):
         self._notify_and_refresh("Added latest processed export to the publish queue.", Tone.SUCCESS)
 
     def _set_current_page(self, page_name: str) -> None:
+        if page_name == "pooling":
+            page_name = "session_health"
+            if hasattr(self, "_publishing_dashboard_tabs"):
+                self._publishing_dashboard_tabs.setCurrentIndex(0)
         if page_name not in MODULE_PAGES:
             return
         self._current_page = page_name
@@ -7687,8 +7711,9 @@ class MainWindow(QWidget):
         self._apply_refresh(force=True, preserve_status=True)
         self._sync_workspace_page_size()
         self._reset_workspace_scroll_to_top()
-        if page_name == "pooling":
+        if page_name == "session_health":
             self._refresh_pooling_page()
+            self._refresh_account_health()
 
     def _reset_workspace_scroll_to_top(self) -> None:
         self._set_workspace_scroll_to_top_now()
@@ -7822,6 +7847,11 @@ class MainWindow(QWidget):
         self._scrape_tabs.setFixedHeight(target_height)
 
     def _sync_sidebar_selection(self) -> None:
+        health_selected = self._current_page == "session_health"
+        self._sidebar_health_button.setChecked(health_selected)
+        self._sidebar_health_button.setProperty("selected", health_selected)
+        self._sidebar_health_button.style().unpolish(self._sidebar_health_button)
+        self._sidebar_health_button.style().polish(self._sidebar_health_button)
         for page_name, button in self._module_buttons.items():
             is_selected = page_name == self._current_page
             button.setChecked(is_selected)
@@ -9532,14 +9562,20 @@ class MainWindow(QWidget):
         )
 
     def _sync_account_panel_visibility(self) -> None:
-        should_show = self._current_account_id is None
-        self._set_account_sidebar_visible(should_show)
-        self._sidebar_toggle_button.setEnabled(self._current_account_id is not None)
+        self._sidebar_toggle_button.setEnabled(True)
+        if self._current_account_id is not None:
+            self._set_account_sidebar_visible(False)
+        elif self._current_page in GLOBAL_MODULE_PAGES:
+            # The Publishing Dashboard / Pool & Distribute work without a selected
+            # account, so don't force the picker open over them — keep whatever
+            # the user had.
+            self._set_account_sidebar_visible(not self._account_panel.isHidden())
+        else:
+            # A per-account page with no account selected: prompt the user to
+            # pick or create one.
+            self._set_account_sidebar_visible(True)
 
     def _toggle_account_sidebar(self) -> None:
-        if self._current_account_id is None:
-            self._set_account_sidebar_visible(True)
-            return
         self._set_account_sidebar_visible(not self._account_panel.isVisible())
 
     def _on_processing_debug_toggled(self, checked: bool) -> None:
@@ -10369,8 +10405,8 @@ class MainWindow(QWidget):
         self._table.setColumnHidden(2, workspace_enabled)
         self._table.setColumnHidden(4, workspace_enabled)
         self._table.setColumnHidden(5, workspace_enabled)
-        show_workspace = workspace_enabled
-        self._library_gate_panel.setVisible(not workspace_enabled)
+        show_workspace = workspace_enabled or self._current_page in GLOBAL_MODULE_PAGES
+        self._library_gate_panel.setVisible(not show_workspace)
         self._workspace_content.setVisible(show_workspace)
         self._sync_account_panel_visibility()
         self._refresh_candidate_action_state()

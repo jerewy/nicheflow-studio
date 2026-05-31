@@ -5180,12 +5180,20 @@ def test_workspace_is_blocked_without_current_account(qt_app) -> None:
         assert window._library_gate_panel.isVisible() is True
         assert window._workspace_content.isVisible() is False
         assert window._account_panel.isVisible() is True
-        assert window._sidebar_toggle_button.isEnabled() is False
+        assert window._sidebar_toggle_button.isEnabled() is True
         assert window._sidebar_toggle_button.isChecked() is True
         assert window._library_gate_label.alignment() == Qt.AlignmentFlag.AlignCenter
         assert (
             window._status_label.text() == "Create and select a niche account to use the library."
         )
+
+        window._toggle_account_sidebar()
+        qt_app.processEvents()
+
+        assert window._account_panel.isVisible() is False
+        assert window._sidebar_toggle_button.isChecked() is False
+        assert window._library_gate_panel.isVisible() is True
+        assert window._workspace_content.isVisible() is False
     finally:
         window._refresh_timer.stop()
         window._toast_timer.stop()
@@ -6101,7 +6109,6 @@ def test_sidebar_selected_state_and_pipeline_width(qt_app) -> None:
             "downloads",
             "processing",
             "uploads",
-            "pooling",
         )
         assert window._module_buttons["scraping"].text() == ""
         assert window._module_buttons["scraping"].toolTip() == "Scrape"
@@ -6111,10 +6118,9 @@ def test_sidebar_selected_state_and_pipeline_width(qt_app) -> None:
         assert window._module_buttons["processing"].toolTip() == "Preprocess"
         assert window._module_buttons["uploads"].text() == ""
         assert window._module_buttons["uploads"].toolTip() == "Publish"
-        assert window._module_buttons["pooling"].toolTip() == "Pool & Distribute"
         assert window._sidebar_panel.width() >= 60
         assert window._sidebar_panel.width() <= 72
-        assert window._sidebar_nav.height() <= 260  # 5 nav buttons
+        assert window._sidebar_nav.height() <= 260
         assert all(button.height() <= 40 for button in window._module_buttons.values())
         assert all(button.width() <= 40 for button in window._module_buttons.values())
         assert window._sidebar_account_combo.isVisible() is False

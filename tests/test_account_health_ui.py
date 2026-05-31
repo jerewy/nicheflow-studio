@@ -3,6 +3,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
+from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import QHeaderView
+
 import nicheflow_studio.app.main_window as mw
 from nicheflow_studio.app.main_window import MainWindow
 from nicheflow_studio.core.account_health import HealthState, SessionHealth
@@ -79,6 +82,58 @@ def test_sidebar_health_button_opens_tab(qt_app, tmp_path: Path) -> None:
         # Session Health is an in-window tab now, not a floating dialog.
         assert window._current_page == "session_health"
         assert window._account_health_table.rowCount() == 2
+    finally:
+        _teardown(window)
+
+
+def test_publishing_dashboard_visible_without_selected_account(qt_app, tmp_path: Path) -> None:
+    init_db()
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        assert window._current_account_id is None
+
+        window._sidebar_health_button.click()
+        qt_app.processEvents()
+
+        assert window._current_page == "session_health"
+        assert window._workspace_content.isVisible() is True
+        assert window._library_gate_panel.isVisible() is False
+        assert window._publishing_dashboard_tabs.tabText(0) == "1. Pool & Distribute"
+        assert window._sidebar_toggle_button.isEnabled() is True
+
+        window._toggle_account_sidebar()
+        qt_app.processEvents()
+
+        assert window._account_panel.isVisible() is False
+        assert window._workspace_content.isVisible() is True
+    finally:
+        _teardown(window)
+
+
+def test_account_readiness_detail_column_is_readable(qt_app, monkeypatch, tmp_path: Path) -> None:
+    init_db()
+    _make_accounts()
+    monkeypatch.setattr(mw, "local_health", _fake_local_health)
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._open_session_health_dialog()
+        qt_app.processEvents()
+
+        table = window._account_health_table
+        header = table.horizontalHeader()
+        assert table.wordWrap() is True
+        assert table.textElideMode() == Qt.TextElideMode.ElideNone
+        assert header.sectionResizeMode(6) == QHeaderView.ResizeMode.Stretch
+        for column in (0, 1, 2, 3, 4, 5):
+            assert header.sectionResizeMode(column) == QHeaderView.ResizeMode.ResizeToContents
+
+        detail_item = table.item(0, 6)
+        assert detail_item is not None
+        assert detail_item.toolTip() == detail_item.text()
     finally:
         _teardown(window)
 
