@@ -1146,6 +1146,89 @@ def test_default_caption_style_title_rules_keep_legacy_behaviour() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Hook drama vs factual-safety tiering (green / yellow / red)
+# ---------------------------------------------------------------------------
+
+
+def test_hook_drama_rules_permit_drama_and_ban_overclaims() -> None:
+    """The framing block must (a) explicitly allow dramatic/emotional hooks
+    and (b) ban the unverifiable RED-tier overclaim phrasings."""
+    joined = "\n".join(smart_drafts._hook_drama_and_fact_safety_rules())
+    # Permission to be dramatic — the fix for flat documentary-label titles.
+    assert "Dramatic" in joined
+    assert "Dramatize the MEANING" in joined
+    # Green / yellow / red tiering is spelled out.
+    assert "GREEN" in joined
+    assert "YELLOW" in joined
+    assert "RED" in joined
+    # Representative banned RED phrasings.
+    assert "never-before-seen" in joined
+    assert "changed history forever" in joined
+    # Identity mislabeling guard.
+    assert "Michael Jordan" in joined
+
+
+def test_smart_draft_prompt_includes_hook_drama_framing_section() -> None:
+    """The drama/factual-safety block is wired into the title section of the
+    assembled prompt, not just available as a standalone helper."""
+    prompt = smart_drafts._smart_draft_prompt(
+        transcript_text="",
+        source_title="Old basketball clip",
+        niche_label="history archive",
+        caption_style="history_lost_archive",
+    )
+    assert "HOOK FRAMING (drama is allowed, overclaiming is not)" in prompt
+    assert "Dramatize the MEANING" in prompt
+    assert "never-before-seen" in prompt
+
+
+def test_clean_option_tiers_normalizes_and_defaults_to_yellow() -> None:
+    """Decorated/cased labels still classify; garbage falls back to the
+    conservative 'yellow'; a non-list returns None so 'unset' is
+    distinguishable from 'all green'."""
+    assert smart_drafts._clean_option_tiers(["green", "RED", "Tier: yellow"]) == [
+        "green",
+        "red",
+        "yellow",
+    ]
+    assert smart_drafts._clean_option_tiers(["green", "banana", ""]) == [
+        "green",
+        "yellow",
+        "yellow",
+    ]
+    assert smart_drafts._clean_option_tiers(None) is None
+    assert smart_drafts._clean_option_tiers("green") is None
+
+
+def test_parse_final_drafts_extracts_option_tiers() -> None:
+    import json
+
+    content = json.dumps(
+        {
+            "final_summary": "An old basketball clip",
+            "title_options": ["At 5'3 he made the NBA", "Defying the odds", "Too short, they said"],
+            "caption_options": ["First caption.", "Second caption.", "Third caption."],
+            "option_notes": ["fact pick", "emotional", "underdog"],
+            "option_tiers": ["yellow", "green", "green"],
+        }
+    )
+    payload = {"choices": [{"message": {"content": content}}]}
+    parsed = smart_drafts._parse_final_drafts(payload, provider_name="Test")
+    assert parsed.option_tiers == ["yellow", "green", "green"]
+
+
+def test_system_and_user_prompts_request_option_tiers() -> None:
+    system_prompt = smart_drafts._smart_draft_system_prompt("contextual_info")
+    assert "option_tiers" in system_prompt
+    user_prompt = smart_drafts._smart_draft_prompt(
+        transcript_text="",
+        source_title="Old clip",
+        niche_label="history archive",
+    )
+    assert "option_tiers" in user_prompt
+
+
+# ---------------------------------------------------------------------------
 # Narrative caption style (theanomalists pattern)
 # ---------------------------------------------------------------------------
 

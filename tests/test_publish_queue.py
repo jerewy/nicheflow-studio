@@ -146,16 +146,22 @@ def test_publish_due_now_starts_batch_and_can_stop(qt_app, monkeypatch, tmp_path
     window = MainWindow()
     # Stub the worker launch so no browser/thread starts; just record the call.
     window._launch_publish_worker = lambda *a, **k: launched.append(a)  # type: ignore[method-assign]
+    # Stub the confirmation dialog so tests don't block on a QMessageBox.
+    window._confirm_publish_target = lambda _job_id: True  # type: ignore[method-assign]
     try:
         window.show()
+        window._current_account_combo.setCurrentIndex(1)
+        window._set_current_page("uploads")
+        qt_app.processEvents()
+        window._schedule_table.selectRow(0)
         qt_app.processEvents()
 
         window._on_publish_due_now_clicked()
         qt_app.processEvents()
 
         assert window._publish_batch_active is True
-        assert len(launched) == 1  # first job launched immediately
-        assert len(window._publish_batch_queue) == 1  # one still queued
+        assert len(launched) == 1  # selected job launched immediately
+        assert len(window._publish_batch_queue) == 0  # only one job queued (selected row)
         assert window._schedule_publish_due_button.text() == "Stop Publishing"
 
         # Clicking again stops the batch.
@@ -164,6 +170,78 @@ def test_publish_due_now_starts_batch_and_can_stop(qt_app, monkeypatch, tmp_path
         assert window._publish_batch_active is False
         assert window._publish_batch_queue == []
         assert window._schedule_publish_due_button.text() == "Publish Due Now"
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_due_badge_shows_count(qt_app, tmp_path: Path) -> None:
+    init_db()
+    account_id, video = _make_account_and_video(tmp_path)
+    with get_session() as session:
+        # Ready jobs (no scheduled time) count as due immediately.
+        session.add_all(
+            [
+                UploadJob(account_id=account_id, processed_path=video, status="ready"),
+                UploadJob(account_id=account_id, processed_path=video, status="ready"),
+            ]
+        )
+        session.commit()
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._current_account_combo.setCurrentIndex(1)
+        window._set_current_page("uploads")
+        qt_app.processEvents()
+
+        window._update_due_badge()
+        # Badge no longer shows a count; button publishes the selected row only.
+        assert window._schedule_publish_due_button.text() == "Publish Due Now"
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._due_check_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_auto_schedule_assigns_jittered_times(qt_app, tmp_path: Path) -> None:
+    init_db()
+    video = tmp_path / "reel.mp4"
+    video.write_bytes(b"processed")
+    with get_session() as session:
+        account = Account(
+            name="RespawnReels",
+            platform="instagram",
+            instagram_profile="main",
+            upload_schedule_slots="09:00, 18:00",
+        )
+        session.add(account)
+        session.flush()
+        for _ in range(3):
+            session.add(UploadJob(account_id=account.id, processed_path=str(video), status="ready"))
+        session.commit()
+        account_id = account.id
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._current_account_combo.setCurrentIndex(1)
+        window._set_current_page("uploads")
+        qt_app.processEvents()
+
+        window._on_auto_schedule_clicked()
+        qt_app.processEvents()
+
+        with get_session() as session:
+            jobs = session.query(UploadJob).filter(UploadJob.account_id == account_id).all()
+            assert all(job.scheduled_at is not None for job in jobs)
+            assert all(job.status == "scheduled" for job in jobs)
     finally:
         window._refresh_timer.stop()
         window._toast_timer.stop()
@@ -208,3 +286,47 @@ def test_auto_publish_respects_daily_cap(qt_app, monkeypatch, tmp_path: Path) ->
         window._toast_timer.stop()
         window._hide_toast()
         window.close()
+
+
+def test_failed_job_shows_reason_inline_and_tooltip(qt_app, tmp_path: Path) -> None:
+    init_db()
+    account_id, video = _make_account_and_video(tmp_path)
+    reason = "not logged in (no sessionid); re-login required"
+    with get_session() as session:
+        session.add(
+            UploadJob(
+                account_id=account_id,
+                processed_path=video,
+                status="failed",
+                error_message=reason,
+            )
+        )
+        session.commit()
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._current_account_combo.setCurrentIndex(1)
+        window._set_current_page("uploads")
+        qt_app.processEvents()
+
+        status_item = window._schedule_table.item(0, 5)
+        # Inline label carries the reason so it's visible without hovering.
+        assert status_item.text() == f"Failed — {reason}"
+        # Full reason is available on hover even when the inline text is elided.
+        assert status_item.toolTip() == reason
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_short_failure_reason_truncates_long_message() -> None:
+    long_msg = "x" * 200
+    short = MainWindow._short_failure_reason(long_msg, limit=60)
+    assert len(short) == 60
+    assert short.endswith("…")
+    assert MainWindow._short_failure_reason(None) == ""
+    assert MainWindow._short_failure_reason("first line\nsecond line") == "first line"

@@ -11,6 +11,7 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import async_playwright
 
 from nicheflow_studio.core.instagram_session import (
@@ -102,11 +103,20 @@ async def login_instagram(
     deadline = time.monotonic() + wait_seconds
 
     async with async_playwright() as playwright:
-        context = await playwright.chromium.launch_persistent_context(
-            str(profile_dir.resolve()),
-            headless=False,
-            viewport={"width": 1280, "height": 900},
-        )
+        launch_kwargs: dict = {
+            "headless": False,
+            "viewport": {"width": 1280, "height": 900},
+            "channel": "chrome",
+        }
+        try:
+            context = await playwright.chromium.launch_persistent_context(
+                str(profile_dir.resolve()), **launch_kwargs
+            )
+        except PlaywrightError:
+            launch_kwargs.pop("channel")
+            context = await playwright.chromium.launch_persistent_context(
+                str(profile_dir.resolve()), **launch_kwargs
+            )
         page = context.pages[0] if context.pages else await context.new_page()
         try:
             if await _has_instagram_session(context):
@@ -172,7 +182,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--wait-seconds",
         type=int,
-        default=600,
+        default=120,
         help="How long to wait for manual login before timing out",
     )
     parser.add_argument(

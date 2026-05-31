@@ -44,6 +44,8 @@ class HealthState:
     THROTTLED = "throttled"  # live check hit Instagram throttling
     LOGGED_OUT = "logged_out"  # live check: cookies exist but Instagram rejected them
     UNKNOWN = "unknown"  # session present but freshness/identity not determinable
+    NOT_CONFIGURED = "not_configured"  # account has no Instagram profile assigned
+    MISMATCH = "mismatch"  # live check: logged in, but as the WRONG account
 
 
 @dataclass(frozen=True)
@@ -67,6 +69,8 @@ class SessionHealth:
             HealthState.NO_SESSION,
             HealthState.THROTTLED,
             HealthState.LOGGED_OUT,
+            HealthState.NOT_CONFIGURED,
+            HealthState.MISMATCH,
         }
 
 
@@ -155,16 +159,25 @@ def _live_identify(profile_name: str) -> tuple[str | None, str | None]:
         return None, f"{type(exc).__name__}: {exc}"
 
 
+def _normalize_handle(value: str | None) -> str:
+    """Canonical form of an Instagram handle for comparison: no '@', lowercase."""
+    return (value or "").strip().lstrip("@").lower()
+
+
 def live_health(
     profile_name: str,
     account_name: str | None = None,
     *,
+    expected_username: str | None = None,
     pool: ProfilePool | None = None,
     now: datetime | None = None,
 ) -> SessionHealth:
     """Authoritative health for one profile via a network 'who am I?' check.
 
-    Starts from :func:`local_health`; if a session exists, confirms it live.
+    Starts from :func:`local_health`; if a session exists, confirms it live. When
+    ``expected_username`` is given, also verifies the logged-in account IS that
+    handle — a mismatch means the profile holds the WRONG account, surfaced as
+    :attr:`HealthState.MISMATCH` so the caller can prompt a re-login.
     """
     moment = now or datetime.now(timezone.utc)
     base = local_health(profile_name, account_name, pool=pool, now=moment)
@@ -173,6 +186,18 @@ def live_health(
 
     username, error = _live_identify(profile_name)
     if username:
+        expected = _normalize_handle(expected_username)
+        if expected and _normalize_handle(username) != expected:
+            return replace(
+                base,
+                state=HealthState.MISMATCH,
+                detail=(
+                    f"Logged in as @{username}, but this account expects "
+                    f"@{expected}. Re-login with the correct account."
+                ),
+                username=username,
+                is_live=True,
+            )
         return replace(
             base,
             state=HealthState.OK,

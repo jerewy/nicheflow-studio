@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 import nicheflow_studio.core.account_health as ah
-from nicheflow_studio.core.account_health import HealthState, local_health
+from nicheflow_studio.core.account_health import HealthState, live_health, local_health
 from nicheflow_studio.core.instagram_profile_pool import Profile, ProfilePool
 
 NOW = datetime(2026, 5, 30, 12, 0, tzinfo=timezone.utc)
@@ -58,3 +58,38 @@ def test_local_health_unknown_without_login_date(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(ah, "_has_sessionid", lambda name: True)
     pool = _pool(tmp_path)  # no last_login
     assert local_health("main", pool=pool, now=NOW).state == HealthState.UNKNOWN
+
+
+def _live_pool(tmp_path) -> ProfilePool:
+    return _pool(tmp_path, last_login=NOW - timedelta(days=1))
+
+
+def test_live_health_flags_wrong_account_as_mismatch(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(ah, "_has_sessionid", lambda name: True)
+    monkeypatch.setattr(ah, "_live_identify", lambda name: ("memeistsdaily", None))
+    health = live_health(
+        "alt1", "Past Moments Daily",
+        expected_username="pastmomentsdaily", pool=_live_pool(tmp_path), now=NOW,
+    )
+    assert health.state == HealthState.MISMATCH
+    assert health.needs_attention is True
+    assert "memeistsdaily" in health.detail and "pastmomentsdaily" in health.detail
+
+
+def test_live_health_matching_handle_is_ok(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(ah, "_has_sessionid", lambda name: True)
+    monkeypatch.setattr(ah, "_live_identify", lambda name: ("memeistsdaily", None))
+    # Expected handle is compared case-insensitively and ignores a leading '@'.
+    health = live_health(
+        "main", "Memeists Daily",
+        expected_username="@MemeistsDaily", pool=_live_pool(tmp_path), now=NOW,
+    )
+    assert health.state == HealthState.OK
+
+
+def test_live_health_without_expected_handle_just_confirms(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(ah, "_has_sessionid", lambda name: True)
+    monkeypatch.setattr(ah, "_live_identify", lambda name: ("whoever", None))
+    health = live_health("main", "Acct", pool=_live_pool(tmp_path), now=NOW)
+    assert health.state == HealthState.OK
+    assert health.username == "whoever"

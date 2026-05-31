@@ -28,6 +28,10 @@ class Account(Base):
     niche_label: Mapped[str | None] = mapped_column(String(128), nullable=True)
     login_identifier: Mapped[str | None] = mapped_column(String(256), nullable=True)
     instagram_profile: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Expected Instagram @handle for this account. When set, the live health
+    # check verifies the logged-in session is actually this account and flags a
+    # mismatch (wrong account in the profile) so the user can re-login.
+    instagram_handle: Mapped[str | None] = mapped_column(String(64), nullable=True)
     credential_blob: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     scrape_source_urls: Mapped[str | None] = mapped_column(String(4096), nullable=True)
     scrape_max_items: Mapped[int | None] = mapped_column(Integer, nullable=True)
