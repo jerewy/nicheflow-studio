@@ -1039,7 +1039,10 @@ def _caption_paragraph_rule(caption_style: str | None) -> str:
             "HARD RULE: the FIRST SENTENCE of the synopsis MUST follow this exact format: "
             "'[Film Title] ([Year]), directed by [Director], is a [genre] [film/movie/series] "
             "about [brief premise].' "
-            "Continue with lead actors, core plot, and themes. "
+            "Continue with ONLY the 2-3 cast members or characters relevant to this "
+            "scene (never an exhaustive cast list — it reads like padding), the core "
+            "plot, and the theme this moment speaks to. End the FINAL paragraph on the "
+            "specific moment shown in this clip, not a broad thesis about the whole film. "
             "Tone is encyclopedic — like an IMDb or Letterboxd synopsis. "
             "Do NOT editorialize, do NOT use 'me when' framing, do NOT comment on quality. "
             f"Hashtags: {_caption_hashtag_target(caption_style)} (optional, e.g. #movietwt #letterboxd)."
@@ -1430,8 +1433,16 @@ def _caption_style_title_rules(caption_style: str | None) -> list[str]:
             "BANNED: 'me when', 'POV:', 'that friend who'. "
             "BANNED: news-headline form ('Director X Does Y'). "
             "BANNED: titles under 8 words. BANNED: emoji. BANNED: hashtags.",
+            "- PLAIN LANGUAGE (the audience is casual viewers, not film students): "
+            "do NOT use film-craft jargon a normal viewer wouldn't say out loud. "
+            "BANNED words include 'score', 'cinematography', 'mise-en-scene', "
+            "'diegetic', 'blocking', 'third act', 'framing device', 'auteur'. "
+            "Use the everyday word instead: 'music' (not 'score'), 'the way it's "
+            "shot' or 'the shots' (not 'cinematography'), 'the ending' (not 'the "
+            "third act'). Atmospheric and poetic is good; insider vocabulary is not.",
             "- The title is on-screen overlay text on a film still. It should feel like "
-            "a film critic wrote it — poetic, specific, and atmospherically grounded.",
+            "a film critic wrote it — poetic, specific, and atmospherically grounded — "
+            "but in words any casual viewer instantly understands.",
         ]
     if style == "contextual_info":
         # Theanomalists titles: descriptive but conversational, not as long
@@ -1743,7 +1754,11 @@ def _caption_style_line(caption_style: str | None) -> str:
             "Example structure: '[Scene prop]... and [what it means]. [EMOJI]'. "
             "Synopsis body: open EVERY caption with "
             "'[Film Title] ([Year]), directed by [Director], is a [genre] film about [premise].' "
-            "Then 2-3 encyclopedic paragraphs on cast, plot, and themes. "
+            "Then 2-3 encyclopedic paragraphs. Name ONLY the 2-3 cast members or "
+            "characters that actually matter to THIS scene — never an exhaustive "
+            "cast roster, which reads like padding. Land the FINAL paragraph on the "
+            "specific moment in this clip (what it shows and why it stays with you), "
+            "not a broad thesis about the whole film. "
             "Tone: IMDb/Letterboxd neutral — no opinion, no hype, no meme framing. "
             "Hashtags: 0-2 film-specific (e.g. #letterboxd #movietwt)."
         )
