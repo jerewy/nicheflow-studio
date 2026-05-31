@@ -279,3 +279,37 @@ class MediaAsset(Base):
     download_status: Mapped[str] = mapped_column(String(32), default="pending")
     downloaded_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     checksum: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    pool_items: Mapped[list["PoolItem"]] = relationship(back_populates="media_asset")
+
+
+class PoolItem(Base):
+    """Accepted-pool membership — links a deduped :class:`MediaAsset` into a
+    niche pool (HISTORY_ACCEPTED / MOVIE_ACCEPTED) that destination accounts in
+    that niche draw from (docs/SOURCING_POOLING_PLAN.md §5.1/§6.3).
+
+    A pool item is the account-agnostic "this clip is approved for the <niche>
+    network" record. Assignments (Phase 3) point an account at a pool item; the
+    niche on the pool item is what the isolation guard checks.
+    """
+
+    __tablename__ = "pool_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: dt.datetime.now(dt.timezone.utc)
+    )
+
+    media_asset_id: Mapped[int] = mapped_column(ForeignKey("media_assets.id"))
+    # Strict pool niche: "history" | "movie". The isolation key.
+    niche: Mapped[str] = mapped_column(String(16), index=True)
+    # "accepted" once approved into the pool. Room for future "retired" etc.
+    acceptance_status: Mapped[str] = mapped_column(String(32), default="accepted")
+    accepted_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    accepted_reason: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    topic_tag: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    rights_confidence: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Strong evergreen clips may later be reused across more same-niche accounts.
+    is_evergreen_candidate: Mapped[int] = mapped_column(Integer, default=0)
+
+    media_asset: Mapped[MediaAsset] = relationship(back_populates="pool_items")

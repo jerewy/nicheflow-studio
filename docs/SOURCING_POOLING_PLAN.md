@@ -198,11 +198,16 @@ Ordered for runnable checkpoints. Each phase ends green-tested before the next.
   asset instead of re-downloading (`queue.py` / downloader integration).
 
 ### Phase 2 — Niche pools + accepted layer
-- New `pool_items` table; "Accept candidate" promotes a `media_asset` into `HISTORY_ACCEPTED`
-  / `MOVIE_ACCEPTED`.
-- Candidate review UI gains niche tagging + accept-into-pool action (reuse existing
-  candidate review widgets in `app/main_window.py`).
-- Tests: accept creates pool_item with correct niche; cross-niche accept is blocked.
+- ✅ New `pool_items` table (`db/models.py::PoolItem`) linking a `MediaAsset`
+  into HISTORY_ACCEPTED / MOVIE_ACCEPTED, with `acceptance_status`,
+  `is_evergreen_candidate`, `topic_tag`, `rights_confidence`.
+- ✅ `db/pools.py`: `accept_into_pool` (idempotent within a niche; **cross-niche
+  accept raises `CrossNicheError`** unless explicitly overridden — the isolation
+  rule), `pool_items_for_niche`, `pool_size`.
+- ✅ Tests: `tests/test_pools.py` (7) — accept creates item, idempotency,
+  cross-niche blocked + override path, invalid niche rejected, niche isolation.
+- ⬜ **Remaining (Step 2):** candidate-review UI gains a niche tag + an
+  "Accept into pool" action (reuse the candidate widgets in `app/main_window.py`).
 
 ### Phase 3 — Destination accounts + assignment
 - Destination-account records (reuse `Account` with `niche` + a `role`=publish flag).
