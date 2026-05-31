@@ -198,14 +198,18 @@ async def _open_composer_and_attach(page: Page, video: Path) -> None:
     if not await _click_first(page, _NEW_POST_SELECTORS):
         raise RuntimeError("could not find the 'New post' / Create button")
     await _human_pause(0.3, 0.8)
-    await _click_first(page, _POST_MENU_SELECTORS, timeout=2500)  # submenu (Post/Reel) if present
+    # The Post/Reel submenu only appears on some IG layouts; modern "Create new
+    # post" goes straight to the file-drop screen. When it's absent this probe
+    # would otherwise burn its whole timeout doing nothing — keep it short so we
+    # don't sit on the composer for seconds. When present, it shows in <1s.
+    await _click_first(page, _POST_MENU_SELECTORS, timeout=1000)
     await _human_pause(0.3, 0.8)
     async with page.expect_file_chooser() as fc_info:
         if not await _click_first(page, _SELECT_FROM_COMPUTER_SELECTORS):
             raise RuntimeError("could not find 'Select from computer'")
     chooser = await fc_info.value
     await chooser.set_files(str(video))
-    await _human_pause(0.8, 1.5)
+    await _human_pause(0.5, 1.0)
     await _dismiss_interstitials(page)  # "Video posts are now shared as reels" -> OK
 
 
