@@ -193,9 +193,13 @@ Ordered for runnable checkpoints. Each phase ends green-tested before the next.
 - ✅ Tests: `tests/test_media_library.py` — dedup returns existing asset; same
   shortcode from a different URL dedupes; backfill only fills NULLs (never
   overwrites an explicit niche).
-- ⬜ **Remaining (Step 2):** wire the accepted-candidate → download path through
-  `find_or_register_media_asset` so a real download registers/links a global
-  asset instead of re-downloading (`queue.py` / downloader integration).
+- ✅ **Step 2:** `queue.py` now registers a `MediaAsset` on every successful
+  Instagram download (`_register_downloaded_media_asset`, idempotent by
+  shortcode/URL; YouTube stays out of the pantry). Re-downloading the same reel
+  reuses the one asset. Tests in `tests/test_queue.py` (3 new). *Note: the
+  pre-download "skip re-download if the original is already on disk" optimization
+  is deferred (title/stale-file edge cases) — registration alone already enables
+  pooling and keeps the pantry deduped.*
 
 ### Phase 2 — Niche pools + accepted layer
 - ✅ New `pool_items` table (`db/models.py::PoolItem`) linking a `MediaAsset`

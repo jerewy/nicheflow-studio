@@ -4,9 +4,14 @@ import logging
 import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 
 from nicheflow_studio.core.paths import downloads_dir
+from nicheflow_studio.db.media_library import (
+    find_or_register_media_asset,
+    mark_media_asset_downloaded,
+)
 from nicheflow_studio.db.models import DownloadItem
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.downloader.instagram import (
@@ -63,6 +68,33 @@ def _download_url(*, url: str):
     if instagram_shortcode_from_url(url) is not None:
         return download_instagram_url(url=url, output_dir=downloads_dir() / "instagram")
     return download_youtube_url(url=url, output_dir=downloads_dir())
+
+
+def _file_size_bytes(path: Path) -> int | None:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return None
+
+
+def _register_downloaded_media_asset(session, *, url: str, result) -> None:
+    """Record a successful Instagram download in the Global Media Library.
+
+    Idempotent by shortcode/URL, so re-downloading the same reel (e.g. for a
+    second account) reuses the one asset instead of creating duplicates. Only
+    Instagram originals enter the pantry — YouTube is a legacy intake path and
+    not part of the shared-pool network.
+    """
+    if instagram_shortcode_from_url(url) is None:
+        return
+    asset, _created = find_or_register_media_asset(
+        session, source_url=url, shortcode=result.video_id, platform="instagram"
+    )
+    mark_media_asset_downloaded(
+        asset,
+        original_download_path=str(result.file_path),
+        file_size_bytes=_file_size_bytes(Path(result.file_path)),
+    )
 
 
 class QueueManager:
@@ -133,6 +165,7 @@ class QueueManager:
                 item.file_path = str(result.file_path)
                 item.error_message = None
                 item.status = "downloaded"
+                _register_downloaded_media_asset(session, url=url, result=result)
                 session.commit()
         except Exception as exc:  # noqa: BLE001
             _logger.exception("download failed for %s", url)
