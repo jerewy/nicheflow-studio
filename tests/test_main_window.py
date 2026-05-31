@@ -6096,7 +6096,13 @@ def test_sidebar_selected_state_and_pipeline_width(qt_app) -> None:
         window._set_current_page("downloads")
         qt_app.processEvents()
 
-        assert tuple(window._module_buttons) == ("scraping", "downloads", "processing", "uploads")
+        assert tuple(window._module_buttons) == (
+            "scraping",
+            "downloads",
+            "processing",
+            "uploads",
+            "pooling",
+        )
         assert window._module_buttons["scraping"].text() == ""
         assert window._module_buttons["scraping"].toolTip() == "Scrape"
         assert window._module_buttons["downloads"].text() == ""
@@ -6105,9 +6111,10 @@ def test_sidebar_selected_state_and_pipeline_width(qt_app) -> None:
         assert window._module_buttons["processing"].toolTip() == "Preprocess"
         assert window._module_buttons["uploads"].text() == ""
         assert window._module_buttons["uploads"].toolTip() == "Publish"
+        assert window._module_buttons["pooling"].toolTip() == "Pool & Distribute"
         assert window._sidebar_panel.width() >= 60
         assert window._sidebar_panel.width() <= 72
-        assert window._sidebar_nav.height() <= 210
+        assert window._sidebar_nav.height() <= 260  # 5 nav buttons
         assert all(button.height() <= 40 for button in window._module_buttons.values())
         assert all(button.width() <= 40 for button in window._module_buttons.values())
         assert window._sidebar_account_combo.isVisible() is False

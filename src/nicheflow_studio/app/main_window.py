@@ -54,14 +54,25 @@ from nicheflow_studio.core.paths import (
     logs_dir,
     processed_dir,
 )
+from nicheflow_studio.db.assignments import (
+    assignment_counts_by_account,
+    distribute_niche,
+)
+from nicheflow_studio.db.media_library import (
+    find_media_asset,
+    find_or_register_media_asset,
+    mark_media_asset_downloaded,
+)
 from nicheflow_studio.db.models import (
     Account,
     DownloadItem,
+    PoolItem,
     ScrapeCandidate,
     ScrapeRun,
     Source,
     UploadJob,
 )
+from nicheflow_studio.db.pools import accept_into_pool, pool_size
 from nicheflow_studio.db.session import get_session, init_db, reset_db_state
 from nicheflow_studio.processing.video import (
     CropSuggestion,
@@ -662,7 +673,7 @@ UPLOAD_PRIVACY_OPTIONS = {
     "unlisted": "Unlisted",
     "public": "Public",
 }
-MODULE_PAGES = ("scraping", "downloads", "processing", "uploads", "session_health")
+MODULE_PAGES = ("scraping", "downloads", "processing", "uploads", "session_health", "pooling")
 INSTAGRAM_MAX_RESULT_LIMIT = 1000
 TITLE_STYLE_PRESETS: dict[str, dict[str, object]] = {
     "clean_hook": {
@@ -2078,6 +2089,7 @@ class MainWindow(QWidget):
             ("downloads", "Download", "play"),
             ("processing", "Preprocess", "refresh"),
             ("uploads", "Publish", "check"),
+            ("pooling", "Pool & Distribute", "refresh"),
         ]
         self._sidebar_nav = QWidget()
         sidebar_nav_layout = QVBoxLayout()
@@ -2099,7 +2111,7 @@ class MainWindow(QWidget):
             self._module_buttons[page_name] = button
             sidebar_nav_layout.addWidget(button)
         self._sidebar_nav.setLayout(sidebar_nav_layout)
-        self._sidebar_nav.setFixedHeight(198)
+        self._sidebar_nav.setFixedHeight(246)
 
         self._sidebar_panel = QFrame()
         self._sidebar_panel.setObjectName("sidebar")
@@ -2750,6 +2762,7 @@ class MainWindow(QWidget):
         self._uploads_page = self._make_schedule_page()
         self._accounts_page = self._make_accounts_page()
         self._session_health_page = self._make_session_health_page()
+        self._pooling_page = self._make_pooling_page()
 
         self._library_gate_panel = QFrame()
         self._library_gate_panel.setObjectName("panel")
@@ -2771,6 +2784,7 @@ class MainWindow(QWidget):
         self._workspace_stack.addWidget(self._processing_page)
         self._workspace_stack.addWidget(self._uploads_page)
         self._workspace_stack.addWidget(self._session_health_page)
+        self._workspace_stack.addWidget(self._pooling_page)
         workspace_content_layout.addWidget(self._workspace_stack)
         self._workspace_content.setLayout(workspace_content_layout)
 
@@ -3779,6 +3793,255 @@ class MainWindow(QWidget):
         layout.addWidget(self._make_account_health_panel())
         page.setLayout(layout)
         return page
+
+    # --- Pool & Distribute page -----------------------------------------
+
+    _POOLING_NICHES = ("history", "movie")
+
+    def _make_pooling_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self._make_pooling_panel())
+        page.setLayout(layout)
+        return page
+
+    def _make_pooling_panel(self) -> QFrame:
+        self._pooling_niche_labels: dict[str, QLabel] = {}
+        panel = QFrame()
+        panel.setObjectName("panel")
+        layout = QVBoxLayout()
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(12)
+
+        title = QLabel("Pool & Distribute")
+        title.setObjectName("sectionTitle")
+        subtitle = QLabel(
+            "Accept downloaded Instagram clips into a niche pool, then distribute "
+            "them across that niche's accounts — one clip per account, evenly, "
+            "with history and movie kept strictly separate."
+        )
+        subtitle.setObjectName("metaValue")
+        subtitle.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+
+        self._pooling_summary_label = QLabel("")
+        self._pooling_summary_label.setObjectName("metaValue")
+        self._pooling_summary_label.setWordWrap(True)
+        layout.addWidget(self._pooling_summary_label)
+
+        self._pooling_table = TableFocusScrollWidget()
+        self._pooling_table.setObjectName("downloadQueueTable")
+        self._pooling_table.setColumnCount(3)
+        self._pooling_table.setHorizontalHeaderLabels(["Account", "Niche", "Assigned clips"])
+        pool_header = self._pooling_table.horizontalHeader()
+        pool_header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        pool_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        pool_header.setStretchLastSection(True)
+        self._pooling_table.verticalHeader().setVisible(False)
+        self._pooling_table.setMinimumHeight(150)
+        self._pooling_table.setMaximumHeight(320)
+        layout.addWidget(self._pooling_table)
+
+        prep_row = QHBoxLayout()
+        prep_row.setSpacing(10)
+        backfill_btn = QPushButton("Register Downloaded Clips")
+        backfill_btn.setObjectName("downloadToolbarButton")
+        backfill_btn.setToolTip(
+            "Register already-downloaded Instagram clips into the media library. "
+            "Run once for clips downloaded before pooling existed."
+        )
+        backfill_btn.clicked.connect(self._on_pool_backfill_clicked)
+        pool_refresh_btn = QPushButton("Refresh")
+        pool_refresh_btn.setObjectName("downloadToolbarButton")
+        pool_refresh_btn.clicked.connect(self._refresh_pooling_page)
+        prep_row.addWidget(backfill_btn)
+        prep_row.addWidget(pool_refresh_btn)
+        prep_row.addStretch(1)
+        layout.addLayout(prep_row)
+
+        for niche in self._POOLING_NICHES:
+            layout.addWidget(self._make_pooling_niche_row(niche))
+
+        self._pooling_status_label = QLabel("")
+        self._pooling_status_label.setObjectName("subtleLabel")
+        self._pooling_status_label.setWordWrap(True)
+        layout.addWidget(self._pooling_status_label)
+        layout.addStretch(1)
+        panel.setLayout(layout)
+        return panel
+
+    def _make_pooling_niche_row(self, niche: str) -> QFrame:
+        frame = QFrame()
+        frame.setObjectName("panel")
+        row = QHBoxLayout()
+        row.setContentsMargins(12, 10, 12, 10)
+        row.setSpacing(10)
+        label = QLabel("")
+        label.setObjectName("metaValue")
+        self._pooling_niche_labels[niche] = label
+        accept_btn = QPushButton(f"Accept downloaded → {niche.title()} pool")
+        accept_btn.setObjectName("downloadToolbarButton")
+        accept_btn.clicked.connect(lambda _=False, n=niche: self._on_pool_accept_clicked(n))
+        distribute_btn = QPushButton(f"Distribute {niche.title()}")
+        distribute_btn.setObjectName("downloadToolbarButton")
+        distribute_btn.clicked.connect(lambda _=False, n=niche: self._on_pool_distribute_clicked(n))
+        row.addWidget(label, stretch=1)
+        row.addWidget(accept_btn)
+        row.addWidget(distribute_btn)
+        frame.setLayout(row)
+        return frame
+
+    def _downloaded_instagram_items(self, session) -> list[DownloadItem]:  # noqa: ANN001
+        items = (
+            session.query(DownloadItem)
+            .filter(DownloadItem.status == "downloaded")
+            .filter(DownloadItem.file_path.isnot(None))
+            .all()
+        )
+        return [i for i in items if instagram_shortcode_from_url(i.source_url) is not None]
+
+    @staticmethod
+    def _register_item_asset(session, item: DownloadItem):  # noqa: ANN001, ANN205
+        """Idempotently register/mark a DownloadItem's original in the pantry."""
+        asset, created = find_or_register_media_asset(
+            session,
+            source_url=item.source_url,
+            shortcode=item.video_id,
+            platform="instagram",
+        )
+        if asset.download_status != "downloaded" and item.file_path:
+            size: int | None = None
+            try:
+                size = Path(item.file_path).stat().st_size
+            except OSError:
+                size = None
+            mark_media_asset_downloaded(
+                asset, original_download_path=item.file_path, file_size_bytes=size
+            )
+        return asset, created
+
+    def _on_pool_backfill_clicked(self) -> None:
+        registered = 0
+        with get_session() as session:
+            for item in self._downloaded_instagram_items(session):
+                _asset, created = self._register_item_asset(session, item)
+                if created:
+                    registered += 1
+            session.commit()
+        self._notify(
+            f"Registered {registered} downloaded clip(s) into the media library.",
+            Tone.SUCCESS,
+        )
+        self._refresh_pooling_page()
+
+    def _on_pool_accept_clicked(self, niche: str) -> None:
+        accepted = 0
+        skipped = 0
+        with get_session() as session:
+            for item in self._downloaded_instagram_items(session):
+                asset, _created = self._register_item_asset(session, item)
+                pools = (
+                    session.query(PoolItem).filter(PoolItem.media_asset_id == asset.id).all()
+                )
+                # Already in this pool, or in a different niche pool -> skip
+                # (cross-niche moves require an explicit override, not a bulk click).
+                if pools:
+                    skipped += 1
+                    continue
+                accept_into_pool(
+                    session, media_asset=asset, niche=niche, accepted_reason="pool page"
+                )
+                accepted += 1
+            size_now = pool_size(session, niche)
+            session.commit()
+        self._notify(
+            f"Accepted {accepted} clip(s) into the {niche} pool "
+            f"({skipped} already pooled). {niche.title()} pool size: {size_now}.",
+            Tone.SUCCESS,
+        )
+        self._refresh_pooling_page()
+
+    def _on_pool_distribute_clicked(self, niche: str) -> None:
+        with get_session() as session:
+            account_count = (
+                session.query(Account).filter(Account.niche == niche).count()
+            )
+            if account_count == 0:
+                self._notify(
+                    f"No {niche} accounts yet. Set an account's niche to '{niche}' "
+                    "in account settings first.",
+                    Tone.WARNING,
+                )
+                return
+            created_count = len(distribute_niche(session, niche))
+            session.commit()
+            counts = assignment_counts_by_account(session, niche)
+            names = {
+                a.id: a.name
+                for a in session.query(Account).filter(Account.niche == niche).all()
+            }
+        if created_count == 0:
+            self._notify(
+                f"Nothing new to distribute for {niche} "
+                "(pool empty, or every clip is already assigned).",
+                Tone.WARNING,
+            )
+            self._refresh_pooling_page()
+            return
+        summary = ", ".join(
+            f"{names.get(account_id, account_id)}: {count}"
+            for account_id, count in sorted(counts.items())
+        )
+        self._notify(
+            f"Distributed {created_count} clip(s) across {niche} accounts.", Tone.SUCCESS
+        )
+        self._pooling_status_label.setText(f"Latest {niche} distribution → {summary}")
+        self._refresh_pooling_page()
+
+    def _refresh_pooling_page(self) -> None:
+        if not hasattr(self, "_pooling_table"):
+            return
+        with get_session() as session:
+            accounts = [
+                (a.id, a.name, a.niche)
+                for a in session.query(Account).order_by(Account.name.asc()).all()
+            ]
+            pool_sizes = {n: pool_size(session, n) for n in self._POOLING_NICHES}
+            counts = {n: assignment_counts_by_account(session, n) for n in self._POOLING_NICHES}
+            dl_items = self._downloaded_instagram_items(session)
+            dl_count = len(dl_items)
+            registered = sum(
+                1
+                for i in dl_items
+                if find_media_asset(session, source_url=i.source_url) is not None
+            )
+
+        self._pooling_table.blockSignals(True)
+        self._pooling_table.setRowCount(0)
+        for account_id, name, niche in accounts:
+            assigned = counts.get(niche or "", {}).get(account_id, 0)
+            row = self._pooling_table.rowCount()
+            self._pooling_table.insertRow(row)
+            for col, value in enumerate([name or "(unnamed)", niche or "—", str(assigned)]):
+                cell = QTableWidgetItem(value)
+                cell.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                if col == 2:
+                    cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self._pooling_table.setItem(row, col, cell)
+        self._pooling_table.resizeRowsToContents()
+        self._pooling_table.blockSignals(False)
+
+        for niche in self._POOLING_NICHES:
+            label = self._pooling_niche_labels.get(niche)
+            if label is not None:
+                label.setText(f"{niche.title()} pool: {pool_sizes[niche]} accepted clip(s)")
+        self._pooling_summary_label.setText(
+            f"{dl_count} downloaded Instagram clip(s), {registered} in the media library.  "
+            f"History pool {pool_sizes['history']} · Movie pool {pool_sizes['movie']}."
+        )
 
     def _open_session_health_dialog(self) -> None:
         """Navigate to the Session Health tab and refresh local status."""
@@ -7424,6 +7687,8 @@ class MainWindow(QWidget):
         self._apply_refresh(force=True, preserve_status=True)
         self._sync_workspace_page_size()
         self._reset_workspace_scroll_to_top()
+        if page_name == "pooling":
+            self._refresh_pooling_page()
 
     def _reset_workspace_scroll_to_top(self) -> None:
         self._set_workspace_scroll_to_top_now()
