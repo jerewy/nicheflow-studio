@@ -84,6 +84,12 @@ from nicheflow_studio.core.account_health import (
     local_health,
 )
 from nicheflow_studio.core.instagram_profile_pool import ProfilePool
+from nicheflow_studio.core.publishing_dashboard import (
+    AccountDashboardRow,
+    PublishJobView,
+    build_dashboard_row,
+    summarize_dashboard,
+)
 from nicheflow_studio.core.scheduling import upcoming_slot_times
 from nicheflow_studio.publisher.instagram_publisher import publish_reel
 from nicheflow_studio.publisher.instagram_web import (
@@ -97,12 +103,11 @@ from nicheflow_studio.processing.smart_drafts import (
     _caption_hashtag_target,
     _caption_paragraph_rule,
     _caption_style_line,
-    _caption_style_title_rules,
     _caption_word_target,
     _groq_limit_profile,
     _profile_style_block,
-    _title_style_rules,
     can_generate_smart_drafts,
+    effective_title_rules,
     generate_smart_drafts,
 )
 from nicheflow_studio.queue import QueueManager
@@ -1769,7 +1774,7 @@ class MainWindow(QWidget):
         # not buried in the account drawer and opens with full dialog space).
         self._sidebar_health_button = QPushButton()
         self._sidebar_health_button.setObjectName("sidebarToggle")
-        self._sidebar_health_button.setToolTip("Session Health")
+        self._sidebar_health_button.setToolTip("Publishing Dashboard")
         self._sidebar_health_button.setText("")
         self._sidebar_health_button.setIcon(self._sidebar_icon("shield"))
         self._sidebar_health_button.setIconSize(QSize(20, 20))
@@ -3787,27 +3792,39 @@ class MainWindow(QWidget):
         layout.setContentsMargins(24, 24, 24, 24)
         layout.setSpacing(12)
 
-        title = QLabel("Session Health")
+        title = QLabel("Publishing Dashboard")
         title.setObjectName("sectionTitle")
         subtitle = QLabel(
-            "Login status per account. Local checks are instant and safe; "
-            "'Check All (live)' confirms each session with Instagram, spaced out."
+            "Per-account login and publish readiness. 'Due now' is how many reels "
+            "could post right now; a red session means due work is blocked until "
+            "re-login. Local checks are instant and safe; 'Check All (live)' "
+            "confirms each session with Instagram, spaced out."
         )
         subtitle.setObjectName("metaValue")
         subtitle.setWordWrap(True)
         layout.addWidget(title)
         layout.addWidget(subtitle)
 
+        self._dashboard_totals_label = QLabel("")
+        self._dashboard_totals_label.setObjectName("metaValue")
+        self._dashboard_totals_label.setWordWrap(True)
+        layout.addWidget(self._dashboard_totals_label)
+
         self._account_health_table = TableFocusScrollWidget()
         self._account_health_table.setObjectName("downloadQueueTable")
-        self._account_health_table.setColumnCount(4)
+        self._account_health_table.setColumnCount(7)
         self._account_health_table.setHorizontalHeaderLabels(
-            ["Account", "Profile", "Status", "Detail"]
+            ["Account", "Profile", "Session", "Due now", "Scheduled", "Next post", "Detail"]
         )
-        self._account_health_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Stretch
-        )
-        self._account_health_table.horizontalHeader().setStretchLastSection(True)
+        health_header = self._account_health_table.horizontalHeader()
+        health_header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        # Numeric columns (Due now, Scheduled, Next post) only need their content
+        # width; let Account/Profile/Detail absorb the remaining space.
+        for _numeric_col in (3, 4, 5):
+            health_header.setSectionResizeMode(
+                _numeric_col, QHeaderView.ResizeMode.ResizeToContents
+            )
+        health_header.setStretchLastSection(True)
         # Hide row numbers + the white corner button, matching every other table.
         self._account_health_table.verticalHeader().setVisible(False)
         self._account_health_table.setMinimumHeight(240)
@@ -3911,25 +3928,45 @@ class MainWindow(QWidget):
             selected is not None and bool(selected[1])
         )
 
+    @staticmethod
+    def _format_next_post(when: dt.datetime | None) -> str:
+        """Local 'HH:MM (in Nh Mm)' for the soonest scheduled post, or '—'."""
+        if when is None:
+            return "—"
+        now = dt.datetime.now(dt.timezone.utc)
+        minutes = int((when - now).total_seconds() // 60)
+        if minutes < 0:
+            relative = "due"
+        elif minutes < 60:
+            relative = f"in {minutes}m"
+        elif minutes < 60 * 24:
+            relative = f"in {minutes // 60}h {minutes % 60}m"
+        else:
+            relative = f"in {minutes // (60 * 24)}d"
+        return f"{when.astimezone():%H:%M} ({relative})"
+
     def _set_account_health_row(
         self,
-        account_name: str | None,
-        profile_name: str | None,
+        dash_row: AccountDashboardRow,
         email: str | None,
-        health: SessionHealth,
         *,
         collision_note: str = "",
     ) -> None:
         table = self._account_health_table
         row = table.rowCount()
         table.insertRow(row)
-        detail = health.detail
+        detail = dash_row.session_detail
+        if dash_row.blocked_reason:
+            detail = f"{dash_row.blocked_reason}. {detail}" if detail else dash_row.blocked_reason
         if collision_note:
             detail = f"{detail}  {collision_note}" if detail else collision_note
         values = [
-            account_name or "(unnamed)",
-            profile_name or "—",  # blank profile shows as unset, never as "main"
-            self._health_state_label(health.state),
+            dash_row.account_name or "(unnamed)",
+            dash_row.profile or "—",  # blank profile shows as unset, never as "main"
+            self._health_state_label(dash_row.session_state),
+            str(dash_row.due_now),
+            str(dash_row.scheduled),
+            self._format_next_post(dash_row.next_post_at),
             detail,
         ]
         for col, value in enumerate(values):
@@ -3938,11 +3975,21 @@ class MainWindow(QWidget):
             if col == 0:
                 # Empty profile -> re-login stays disabled (_selected_health_profile
                 # treats falsy as "nothing to act on").
-                cell.setData(Qt.ItemDataRole.UserRole, profile_name or "")
+                cell.setData(Qt.ItemDataRole.UserRole, dash_row.profile or "")
                 cell.setData(Qt.ItemDataRole.UserRole + 1, email)
-                cell.setData(Qt.ItemDataRole.UserRole + 2, account_name or "")
+                cell.setData(Qt.ItemDataRole.UserRole + 2, dash_row.account_name or "")
             if col == 2:
-                self._apply_health_status_style(cell, health.state)
+                self._apply_health_status_style(cell, dash_row.session_state)
+            if col == 3:
+                cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                # Colour the due-now count by what it MEANS: green = ready to go,
+                # red = work is blocked behind a bad session, plain = nothing due.
+                if dash_row.blocked_reason:
+                    cell.setForeground(QColor("#ff9c9c"))
+                elif dash_row.publishable:
+                    cell.setForeground(QColor("#8ee6b1"))
+            if col in (4, 5):
+                cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             table.setItem(row, col, cell)
 
     @staticmethod
@@ -3986,43 +4033,90 @@ class MainWindow(QWidget):
     def _refresh_account_health(self) -> None:
         if not hasattr(self, "_account_health_table"):
             return
+        now = dt.datetime.now(dt.timezone.utc)
         pool = ProfilePool.load()
         with get_session() as session:
+            accounts = session.query(Account).order_by(Account.name.asc()).all()
             rows = [
-                (account.name, self._clean_profile(account.instagram_profile) or None,
-                 account.login_identifier)
-                for account in session.query(Account).order_by(Account.name.asc()).all()
+                (
+                    account.id,
+                    account.name,
+                    self._clean_profile(account.instagram_profile) or None,
+                    account.login_identifier,
+                    account.upload_schedule_slots,
+                )
+                for account in accounts
             ]
+            # One query for all un-posted jobs, bucketed by account, so the
+            # dashboard scales without an N+1 per-account query.
+            jobs_by_account: dict[int, list[PublishJobView]] = {}
+            for account_id, status, posted_at, scheduled_at in (
+                session.query(
+                    UploadJob.account_id,
+                    UploadJob.status,
+                    UploadJob.posted_at,
+                    UploadJob.scheduled_at,
+                )
+                .filter(UploadJob.posted_at.is_(None))
+                .all()
+            ):
+                jobs_by_account.setdefault(account_id, []).append(
+                    PublishJobView(status=status, posted_at=posted_at, scheduled_at=scheduled_at)
+                )
+
         # Map each non-empty profile to the accounts using it, so a shared session
         # (two accounts on one profile) is flagged instead of silently allowed.
         profile_accounts: dict[str, list[str]] = {}
-        for account_name, profile_name, _ in rows:
+        for _id, account_name, profile_name, _email, _slots in rows:
             if profile_name:
                 profile_accounts.setdefault(profile_name, []).append(account_name or "(unnamed)")
 
         self._account_health_table.blockSignals(True)
         self._account_health_table.setRowCount(0)
-        for account_name, profile_name, email in rows:
+        dash_rows: list[AccountDashboardRow] = []
+        for account_id, account_name, profile_name, email, slots in rows:
             if profile_name is None:
                 health = self._not_configured_health(account_name)
             else:
                 health = local_health(profile_name, account_name, pool=pool)
-            note = self._profile_collision_note(profile_name, account_name, profile_accounts)
-            self._set_account_health_row(
-                account_name, profile_name, email, health, collision_note=note
+            dash_row = build_dashboard_row(
+                account_id=account_id,
+                account_name=account_name or "(unnamed)",
+                profile=profile_name,
+                session_state=health.state,
+                session_label=self._health_state_label(health.state),
+                session_detail=health.detail,
+                jobs=jobs_by_account.get(account_id, []),
+                slots=slots,
+                now=now,
             )
+            dash_rows.append(dash_row)
+            note = self._profile_collision_note(profile_name, account_name, profile_accounts)
+            self._set_account_health_row(dash_row, email, collision_note=note)
         self._account_health_table.resizeRowsToContents()
         self._account_health_table.blockSignals(False)
-        if rows:
+
+        totals = summarize_dashboard(dash_rows)
+        if dash_rows:
+            strip = (
+                f"{totals.account_count} account(s) · "
+                f"{totals.total_due_now} due now · "
+                f"{totals.total_scheduled} scheduled · "
+                f"next post {self._format_next_post(totals.next_post_at)}"
+            )
+            if totals.blocked_accounts:
+                strip += f"  ·  ⚠ {totals.blocked_accounts} account(s) blocked (re-login)"
+            self._dashboard_totals_label.setText(strip)
             shared = sum(1 for names in profile_accounts.values() if len(names) > 1)
             summary = (
-                f"{len(rows)} account(s). Local status shown — use 'Check All (live)' "
-                "to confirm sessions with Instagram."
+                f"{totals.account_count} account(s). Local status shown — use "
+                "'Check All (live)' to confirm sessions with Instagram."
             )
             if shared:
                 summary += f" (!) {shared} profile(s) shared by multiple accounts."
             self._account_health_summary.setText(summary)
         else:
+            self._dashboard_totals_label.setText("")
             self._account_health_summary.setText(
                 "No accounts yet. Create a niche account to track its login."
             )
@@ -4084,7 +4178,7 @@ class MainWindow(QWidget):
                 if status_item is not None:
                     status_item.setText(self._health_state_label(state))
                     self._apply_health_status_style(status_item, state)
-                detail_item = table.item(row, 3)
+                detail_item = table.item(row, 6)  # Detail is the last column
                 if detail_item is not None:
                     detail_item.setText(detail)
                 break
@@ -5319,8 +5413,12 @@ class MainWindow(QWidget):
         title_style = self._processing_title_style()
         prompt_profile = self._processing_prompt_profile()
         profile_block = _profile_style_block(prompt_profile)
-        title_rules = _title_style_rules(title_style) or _caption_style_title_rules(
-            caption_style
+        # Niche-aware so the copied chat prompt matches what live generation
+        # would do — history accounts auto-route to the history title rules.
+        account = self._active_account()
+        niche_label = account.niche_label if account else None
+        title_rules = effective_title_rules(
+            title_style, caption_style, niche_label, prompt_profile
         )
         title_rule_text = "\n".join(title_rules)
 

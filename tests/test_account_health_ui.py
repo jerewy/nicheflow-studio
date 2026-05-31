@@ -138,7 +138,7 @@ def test_live_result_updates_matching_row(qt_app, tmp_path: Path) -> None:
             r for r in range(table.rowCount()) if table.item(r, 0).text() == "RespawnReels"
         )
         assert table.item(respawn_row, 2).text() == "OK"
-        assert table.item(respawn_row, 3).text() == "Confirmed logged in as @respawn"
+        assert table.item(respawn_row, 6).text() == "Confirmed logged in as @respawn"
     finally:
         _teardown(window)
 
@@ -166,7 +166,7 @@ def test_mismatch_result_renders_wrong_account(qt_app, tmp_path: Path) -> None:
             r for r in range(table.rowCount()) if table.item(r, 0).text() == "RespawnReels"
         )
         assert table.item(row, 2).text() == "Wrong account"
-        assert "expects @respawn" in table.item(row, 3).text()
+        assert "expects @respawn" in table.item(row, 6).text()
     finally:
         _teardown(window)
 
@@ -220,7 +220,7 @@ def test_shared_profile_is_flagged_as_collision(qt_app, monkeypatch, tmp_path: P
         a_row = next(
             r for r in range(table.rowCount()) if table.item(r, 0).text() == "Shared A"
         )
-        detail = table.item(a_row, 3).text()
+        detail = table.item(a_row, 6).text()
         assert "shares profile 'main'" in detail
         assert "Shared B" in detail
         assert "shared by multiple accounts" in window._account_health_summary.text()

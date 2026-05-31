@@ -4423,7 +4423,10 @@ def test_processing_copy_chat_prompt_includes_local_file_and_niche_context(
         assert "Style contract copied from NicheFlow smart drafts" in prompt
         assert "Caption word target: 90-150" in prompt
         assert "PAST MOMENTS DAILY" in prompt
-        assert "5-11 words" in prompt
+        # History hooks now use the explanatory 9-16 word rules with a concrete
+        # subject mandate (the Copy Chat Prompt must mirror live generation).
+        assert "9-16 words" in prompt
+        assert "NAMES the concrete visible subject" in prompt
         assert "Do not use generic filler hashtags like #fyp" in prompt
         assert "Generate 3 on-screen title options and 3 caption options" in prompt
         assert "recommend the strongest title/caption pair" in prompt
