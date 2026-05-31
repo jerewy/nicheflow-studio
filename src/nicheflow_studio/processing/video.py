@@ -2294,48 +2294,33 @@ def _fit_title_band(
             max_lines += 1
             wrapped = wrap_func(text, max_chars=max_chars, max_lines=max_lines)
     else:
-        # Initial sizing — preserves existing behavior for short titles. At
-        # canvas_width=1080 this yields font_size up to 60 and max_chars 28,
-        # so 30-char headlines like "When mom explains bath buddies" still
-        # wrap to 2 lines as before with ~75px breathing room on each side.
-        font_size = min(max(requested_font_size, 44), max(44, int(canvas_width * 0.052)), 60)
-        max_chars = max(18, min(28, int(canvas_width / 38)))
-        # Small editorial titles (e.g. Past Moments Black at 46px) look too
-        # narrow and "floating" with the default ~28-char measure — short
-        # headlines collapse into two stubby centered lines. For small fonts
-        # only, widen the line so the block fills more width; at 46px this gives
-        # ~37 chars (a 33-char headline lands on one line) while keeping ~100px+
-        # side margins, safely inside phone safe areas. Larger-font templates
-        # (>48px) keep the original measure so their wider glyphs stay clear of
-        # the edges, and this never fires once the shrink loop lowers the font
-        # (it reads the initial size).
-        if font_size <= 48:
-            max_chars = max(max_chars, int(canvas_width / (font_size * 0.62)))
-        wrapped = _wrap_overlay_text(text, max_chars=max_chars, max_lines=2)
-        # Phase A — PREFER 2 BALANCED LINES. The cinema.defined reference
-        # we're matching wraps long titles into 2 evenly-balanced lines, not
-        # a wide line + a short orphan line. Shrink the font first (so more
-        # chars fit per line) while keeping max_lines=2; only when the text
-        # genuinely can't fit two lines at the smallest readable size do we
-        # let Phase B add a third or fourth line.
-        font_size_floor = 38
+        # Initial sizing for standard/editorial title templates.
+        # Past Moments Black uses a slightly larger title while keeping
+        # the wider, natural line wrapping of the cinema title style.
+        font_size = min(max(requested_font_size, 50), max(50, int(canvas_width * 0.052)), 60)
+
+        # Match the wider text measure used by Cinema Bold Keywords.
+        max_chars = max(30, min(44, int(canvas_width / 30)))
+
+        # Use natural/greedy wrapping instead of balanced wrapping so the
+        # title does not force itself into two equally sized lines.
+        wrap_func = _wrap_overlay_text_greedy
+        wrapped = wrap_func(text, max_chars=max_chars, max_lines=2)
+
+        # Prefer 2 lines; shrink only when the title cannot fit safely.
+        font_size_floor = 42
         while _wrapped_overflows(wrapped, max_chars) and font_size > font_size_floor:
             font_size = max(font_size_floor, font_size - 4)
-            # ~0.65 chars-per-font-size unit tracks the original 28 chars /
-            # font 60 ratio at 1080px, so breathing room stays the same as
-            # the font shrinks.
             max_chars = max(
                 max_chars,
-                int(canvas_width / max(1, int(font_size * 0.65))),
+                min(48, int(canvas_width / max(1, int(font_size * 0.58)))),
             )
-            wrapped = _wrap_overlay_text(text, max_chars=max_chars, max_lines=2)
-        # Phase B — title is too long to fit 2 lines even at the floor font.
-        # Allow 3 then 4 lines. _wrap_overlay_text (balanced) still picks
-        # the most-balanced split at each line count.
+            wrapped = wrap_func(text, max_chars=max_chars, max_lines=2)
+
         max_lines = 2
         while _wrapped_overflows(wrapped, max_chars) and max_lines < 4:
             max_lines += 1
-            wrapped = _wrap_overlay_text(text, max_chars=max_chars, max_lines=max_lines)
+            wrapped = wrap_func(text, max_chars=max_chars, max_lines=max_lines)
     line_count = max(wrapped.count("\n") + 1, 1)
     line_spacing = max(10, int(font_size * 0.24))
     text_height = (line_count * font_size) + (max(line_count - 1, 0) * line_spacing)

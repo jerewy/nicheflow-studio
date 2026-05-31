@@ -16,7 +16,7 @@ INSTAGRAM_LOGIN_URL = "https://www.instagram.com/accounts/login/"
 def launch_instagram_login(
     profile_name: str | None = None,
     *,
-    wait_seconds: int = 600,
+    wait_seconds: int = 120,
 ) -> subprocess.Popen[bytes]:
     """Open the manual Instagram login flow for a saved profile (re-login helper).
 
@@ -77,11 +77,16 @@ def open_visible_instagram_profile(profile_name: str, *, url: str = INSTAGRAM_UP
     user_data_dir.mkdir(parents=True, exist_ok=True)
 
     with sync_playwright() as playwright:
-        context = playwright.chromium.launch_persistent_context(
-            user_data_dir=str(user_data_dir),
-            headless=False,
-            viewport=None,
-        )
+        launch_kwargs: dict = {"headless": False, "viewport": None, "channel": "chrome"}
+        try:
+            context = playwright.chromium.launch_persistent_context(
+                user_data_dir=str(user_data_dir), **launch_kwargs
+            )
+        except PlaywrightError:
+            launch_kwargs.pop("channel")
+            context = playwright.chromium.launch_persistent_context(
+                user_data_dir=str(user_data_dir), **launch_kwargs
+            )
         page = context.pages[0] if context.pages else context.new_page()
         page.goto(url, wait_until="domcontentloaded")
         page.bring_to_front()

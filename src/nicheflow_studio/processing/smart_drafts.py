@@ -58,6 +58,7 @@ class SmartDrafts:
     recommended_caption_index: int | None = None
     recommendation_reason: str | None = None
     option_notes: list[str] | None = None
+    option_tiers: list[str] | None = None
     used_fallback: bool = False
     vision_payload: dict[str, object] | None = None
     generation_meta: dict[str, object] | None = None
@@ -319,6 +320,7 @@ def _generate_ollama_smart_drafts(
         recommended_caption_index=parsed.recommended_caption_index,
         recommendation_reason=parsed.recommendation_reason,
         option_notes=parsed.option_notes,
+        option_tiers=parsed.option_tiers,
         vision_payload=visual_payload,
         generation_meta={
             "writer_model": model,
@@ -338,6 +340,7 @@ def _generate_ollama_smart_drafts(
             "recommended_caption_option_index": parsed.recommended_caption_index,
             "recommendation_reason": parsed.recommendation_reason,
             "option_notes": parsed.option_notes,
+            "option_tiers": parsed.option_tiers,
         },
     )
 
@@ -466,6 +469,7 @@ def _generate_groq_smart_drafts(
         recommended_caption_index=parsed.recommended_caption_index,
         recommendation_reason=parsed.recommendation_reason,
         option_notes=parsed.option_notes,
+        option_tiers=parsed.option_tiers,
         vision_payload=vision_payload,
         generation_meta={
             "writer_model": reasoning_model,
@@ -485,6 +489,7 @@ def _generate_groq_smart_drafts(
             "recommended_caption_option_index": parsed.recommended_caption_index,
             "recommendation_reason": parsed.recommendation_reason,
             "option_notes": parsed.option_notes,
+            "option_tiers": parsed.option_tiers,
             "limit_profile": _groq_limit_profile(),
             **usage_meta,
         },
@@ -690,6 +695,9 @@ def _smart_draft_prompt(
             ),
             *(_title_style_rules(title_style) or _caption_style_title_rules(caption_style)),
             "",
+            "HOOK FRAMING (drama is allowed, overclaiming is not)",
+            *_hook_drama_and_fact_safety_rules(),
+            "",
             "CAPTION",
             f"- Each caption is the Instagram description copy, "
             f"about {_caption_word_target(caption_style)} words. "
@@ -725,6 +733,11 @@ def _smart_draft_prompt(
             f"- option_notes: exactly {SMART_DRAFT_OPTION_COUNT} short strings, one per option, "
             "labeling each option's use case such as clearest hook, most niche-native, "
             "most curiosity-driven, safest factual pick, or best for reach.",
+            f"- option_tiers: exactly {SMART_DRAFT_OPTION_COUNT} strings, one per title in the "
+            "same order, each exactly 'green', 'yellow', or 'red' from the HOOK FRAMING "
+            "tiers above. 'green' = no checkable claim (safe to auto-post); 'yellow' = "
+            "states a concrete fact grounded in the signals; 'red' = an unverifiable "
+            "overclaim (you should not have written it — fix the title instead of tagging it red).",
             "",
             "AVOID",
             (
@@ -748,6 +761,49 @@ def _smart_draft_prompt(
             f"Transcript:\n{transcript_block}",
         ]
     )
+
+
+def _hook_drama_and_fact_safety_rules() -> list[str]:
+    """Permit dramatic/emotional hooks while keeping concrete claims grounded.
+
+    Earlier prompts only said "never invent facts", which the model read as
+    "stay neutral" and produced flat, documentary-label titles ("Archival
+    footage of X in 1992") that underperform on Reels. This block separates
+    the two concerns explicitly: dramatize the MEANING of the moment freely,
+    but treat any concrete factual claim as something that must already be in
+    the signals. It mirrors the green/yellow/red tiering decided for the
+    account voice — see [[nicheflow_ig_profiles]] / [[decisions_nicheflow]].
+
+    Applies across every caption_style: meme styles rarely make factual
+    claims, so the rules are a no-op there, while history/cinema/narrative
+    styles get the calibration that matters most for them.
+    """
+    return [
+        "- Dramatic, emotional, funny, or curiosity-driven hooks are encouraged. "
+        "The title does NOT need to sound like a neutral documentary label such "
+        "as 'Archival footage of X in 1992'. Dramatize the MEANING of the "
+        "moment, not the facts themselves.",
+        "- GREEN (always fine): emotional or interpretive framing of what is "
+        "visibly happening, e.g. 'This scene got awkward fast', 'He made it look "
+        "effortless', 'This moment still feels unreal'. The clip itself is "
+        "enough support; no extra proof needed.",
+        "- YELLOW (allowed only when the signals support it): any concrete claim "
+        "such as a name, age, height, date, place, record, cause, quote, or a "
+        "'first / shortest / biggest' superlative. Use these ONLY when the "
+        "transcript, source caption, niche, or visual evidence actually backs "
+        "them. If a number, record, or identity is not in the signals, do not "
+        "state it as fact.",
+        "- RED (never write): unverifiable rarity, secrecy, or world-changing "
+        "claims. Banned phrasings include 'never-before-seen', 'rare footage "
+        "nobody has seen', 'the last video ever of him', 'they tried to hide "
+        "this', 'this changed history forever', 'the rarest footage on the "
+        "internet', and 'this destroyed her career'. They assert certainty the "
+        "clip cannot back up.",
+        "- Mislabeling identity or inventing causation is RED too: never name "
+        "the wrong person (e.g. calling another player 'Michael Jordan') and "
+        "never invent cause-and-effect ('the routine that made him the greatest "
+        "ever'). Frame the meaning instead of fabricating the fact.",
+    ]
 
 
 def _recent_draft_dedup_prompt(
@@ -1060,13 +1116,15 @@ def _smart_draft_system_prompt(caption_style: str | None) -> str:
     return (
         "You create short-form video hooks and captions. "
         "Return only valid JSON with keys final_summary, title_options, caption_options, "
-        "recommended_pick, option_notes. "
+        "recommended_pick, option_notes, option_tiers. "
         f"title_options must contain exactly {SMART_DRAFT_OPTION_COUNT} strings. "
         f"caption_options must contain exactly {SMART_CAPTION_OPTION_COUNT} strings. "
         f"Each caption_options string must be {word_target} words. "
         "recommended_pick must be an object with 1-based title_option_index, "
         "caption_option_index, and a short account-aware reason. "
         f"option_notes must contain exactly {SMART_DRAFT_OPTION_COUNT} short strings explaining each option's angle. "
+        f"option_tiers must contain exactly {SMART_DRAFT_OPTION_COUNT} strings, one per title_options "
+        "entry, each exactly 'green', 'yellow', or 'red' per the HOOK FRAMING tiers. "
         f"{paragraph_rule}"
     )
 
@@ -2269,6 +2327,33 @@ class _ParsedDraftResponse:
     recommended_caption_index: int | None = None
     recommendation_reason: str | None = None
     option_notes: list[str] | None = None
+    option_tiers: list[str] | None = None
+
+
+# The model occasionally decorates a tier ("green ✅", "Tier: yellow") — match
+# the colour word anywhere in the value rather than demanding an exact string,
+# so a sloppy label still classifies instead of being dropped.
+_OPTION_TIER_VALUES = ("green", "yellow", "red")
+
+
+def _clean_option_tiers(value: object) -> list[str] | None:
+    """Normalize the model's option_tiers into a list of 'green'/'yellow'/'red'.
+
+    Anything unrecognized becomes 'yellow' — the conservative middle tier — so
+    a malformed label is never silently treated as auto-postable 'green'.
+    Returns ``None`` when no list was provided so callers can tell "model said
+    nothing" apart from "model said green".
+    """
+    if not isinstance(value, (list, tuple)):
+        return None
+    tiers: list[str] = []
+    for item in value:
+        lowered = _normalize_whitespace(str(item)).casefold()
+        matched = next((tier for tier in _OPTION_TIER_VALUES if tier in lowered), "yellow")
+        tiers.append(matched)
+        if len(tiers) >= SMART_DRAFT_OPTION_COUNT:
+            break
+    return tiers or None
 
 
 def _parse_final_drafts(response_payload: dict[str, object], *, provider_name: str) -> _ParsedDraftResponse:
@@ -2292,6 +2377,7 @@ def _parse_final_drafts(response_payload: dict[str, object], *, provider_name: s
         recommended_caption_index=recommendation["recommended_caption_index"],
         recommendation_reason=recommendation["recommendation_reason"],
         option_notes=recommendation["option_notes"],
+        option_tiers=recommendation["option_tiers"],
     )
 
 
@@ -2329,11 +2415,15 @@ def _parse_recommendation_fields(parsed: dict[str, object]) -> dict[str, object]
         raw_pick.get("option_notes") or parsed.get("option_notes"),
         preserve_paragraphs=False,
     )[:SMART_DRAFT_OPTION_COUNT]
+    option_tiers = _clean_option_tiers(
+        raw_pick.get("option_tiers") or parsed.get("option_tiers")
+    )
     return {
         "recommended_title_index": title_index if title_index is not None else shared_index,
         "recommended_caption_index": caption_index if caption_index is not None else shared_index,
         "recommendation_reason": reason[:320] or None,
         "option_notes": option_notes or None,
+        "option_tiers": option_tiers,
     }
 
 
@@ -2647,6 +2737,11 @@ def _generate_local_fallback_drafts(
         f"Best fallback pick for {niche_text} because it uses the clearest available subject "
         "without inventing unsupported details."
     )
+    # Fallback drafts are produced without a model grader, so we cannot vouch
+    # for tier accuracy — tag every option 'yellow' (review before posting)
+    # rather than 'green', so the auto-publish gate never ships a degraded
+    # fallback draft unattended.
+    fallback_option_tiers = ["yellow"] * SMART_DRAFT_OPTION_COUNT
     return SmartDrafts(
         summary=summary,
         title_options=title_options,
@@ -2656,6 +2751,7 @@ def _generate_local_fallback_drafts(
         recommended_caption_index=0,
         recommendation_reason=fallback_reason,
         option_notes=fallback_option_notes,
+        option_tiers=fallback_option_tiers,
         used_fallback=True,
         generation_meta={
             "writer_model": None,
@@ -2672,6 +2768,7 @@ def _generate_local_fallback_drafts(
             "recommended_caption_option_index": 0,
             "recommendation_reason": fallback_reason,
             "option_notes": fallback_option_notes,
+            "option_tiers": fallback_option_tiers,
             "errors": errors,
         },
     )

@@ -209,6 +209,8 @@ def _ensure_compatibility() -> None:
             connection.execute(text("ALTER TABLE accounts ADD COLUMN target_audience VARCHAR(256)"))
         if "instagram_profile" not in account_columns:
             connection.execute(text("ALTER TABLE accounts ADD COLUMN instagram_profile VARCHAR(64)"))
+        if "instagram_handle" not in account_columns:
+            connection.execute(text("ALTER TABLE accounts ADD COLUMN instagram_handle VARCHAR(64)"))
         if "hook_style" not in account_columns:
             connection.execute(text("ALTER TABLE accounts ADD COLUMN hook_style VARCHAR(256)"))
         if "banned_phrases" not in account_columns:

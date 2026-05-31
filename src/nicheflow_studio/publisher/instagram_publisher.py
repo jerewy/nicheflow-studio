@@ -197,38 +197,50 @@ async def _open_composer_and_attach(page: Page, video: Path) -> None:
     """Open the Create dialog and hand the video to the file chooser."""
     if not await _click_first(page, _NEW_POST_SELECTORS):
         raise RuntimeError("could not find the 'New post' / Create button")
-    await _human_pause()
+    await _human_pause(0.3, 0.8)
     await _click_first(page, _POST_MENU_SELECTORS, timeout=2500)  # submenu (Post/Reel) if present
-    await _human_pause()
+    await _human_pause(0.3, 0.8)
     async with page.expect_file_chooser() as fc_info:
         if not await _click_first(page, _SELECT_FROM_COMPUTER_SELECTORS):
             raise RuntimeError("could not find 'Select from computer'")
     chooser = await fc_info.value
     await chooser.set_files(str(video))
-    await _human_pause(1.5, 3.0)
+    await _human_pause(0.8, 1.5)
     await _dismiss_interstitials(page)  # "Video posts are now shared as reels" -> OK
 
 
 async def _select_9_16_aspect(page: Page) -> None:
-    """Expand the crop control and choose 9:16. Warns (not fatal) if absent."""
-    if not await _click_first(page, _CROP_BUTTON_SELECTORS, timeout=8000):
+    """Expand the crop control and choose 9:16. Warns (not fatal) if absent.
+
+    Large videos can take 30-60 s to process in Instagram's browser uploader
+    before the crop screen appears — use a generous timeout so we don't give up
+    while the upload is still in progress.
+    """
+    if not await _click_first(page, _CROP_BUTTON_SELECTORS, timeout=45000):
         log.warning("could not find crop control; leaving aspect as-is")
         return
-    await _human_pause(0.5, 1.2)
+    await _human_pause(0.3, 0.7)
     if not await _click_first(page, _ASPECT_9_16_SELECTORS, timeout=5000):
         log.warning("could not find 9:16 option; leaving aspect as-is")
         return
     log.info("set aspect ratio to 9:16")
-    await _human_pause(0.6, 1.4)
+    await _human_pause(0.3, 0.8)
 
 
 async def _advance_through_edit_steps(page: Page) -> None:
-    """Set 9:16 on the crop screen, then click through crop -> filter screens."""
+    """Set 9:16 on the crop screen, then click through crop -> filter screens.
+
+    The first 'Next' click (crop → filter) may need to wait a long time because
+    Instagram processes the video in the browser before the button becomes active.
+    Give it the same generous budget as the crop-control search; the second 'Next'
+    (filter → caption) is just a UI transition and is fast.
+    """
     await _select_9_16_aspect(page)
-    for _ in range(2):  # crop screen, then filter screen
-        if not await _click_first(page, _NEXT_SELECTORS, timeout=15000):
+    timeouts = [60000, 15000]  # crop-screen Next can be slow; filter-screen Next is fast
+    for timeout_ms in timeouts:
+        if not await _click_first(page, _NEXT_SELECTORS, timeout=timeout_ms):
             raise RuntimeError("could not advance with 'Next' during edit steps")
-        await _human_pause(1.0, 2.2)
+        await _human_pause(0.6, 1.4)
 
 
 async def _fill_caption(page: Page, caption: str) -> None:
@@ -319,7 +331,7 @@ async def _publish_reel_async(
                 return PublishResult(
                     "failed", error_message="not logged in (no sessionid); re-login required"
                 )
-            await _human_pause(1.0, 2.0)
+            await _human_pause(0.5, 1.0)
             await _dismiss_interstitials(page)
 
             marker = await _detect_checkpoint(page)
@@ -355,7 +367,7 @@ async def _publish_reel_async(
                 )
 
             posted_url = await _capture_posted_url(page) if capture_url else None
-            await _human_pause(1.0, 2.0)
+            await _human_pause(4.0, 6.0)
             return PublishResult("posted", posted_url=posted_url)
 
         except (RuntimeError, PlaywrightTimeout) as exc:
@@ -376,7 +388,7 @@ def publish_reel(
     *,
     do_share: bool = True,
     channel: str | None = "chrome",
-    upload_timeout_s: float = 180.0,
+    upload_timeout_s: float = 300.0,
     keep_open: bool = False,
     capture_url: bool = True,
 ) -> PublishResult:

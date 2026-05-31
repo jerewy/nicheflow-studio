@@ -66,18 +66,18 @@ def test_accounts_page_lists_local_session_health(qt_app, monkeypatch, tmp_path:
         _teardown(window)
 
 
-def test_sidebar_health_button_opens_dialog(qt_app, tmp_path: Path) -> None:
+def test_sidebar_health_button_opens_tab(qt_app, tmp_path: Path) -> None:
     init_db()
     _make_accounts()
     window = MainWindow()
     try:
         window.show()
         qt_app.processEvents()
-        assert window._session_health_dialog is None
+        assert window._current_page != "session_health"
         window._sidebar_health_button.click()
         qt_app.processEvents()
-        assert window._session_health_dialog is not None
-        assert window._session_health_dialog.isVisible() is True
+        # Session Health is an in-window tab now, not a floating dialog.
+        assert window._current_page == "session_health"
         assert window._account_health_table.rowCount() == 2
     finally:
         _teardown(window)
@@ -123,8 +123,11 @@ def test_live_result_updates_matching_row(qt_app, tmp_path: Path) -> None:
         window._open_session_health_dialog()
         qt_app.processEvents()
 
+        # Live results are matched to rows by account_name (multiple accounts can
+        # share one profile, so profile_name alone is ambiguous).
         window._on_account_health_result(
             {
+                "account_name": "RespawnReels",
                 "profile_name": "main",
                 "state": HealthState.OK,
                 "detail": "Confirmed logged in as @respawn",
@@ -136,5 +139,90 @@ def test_live_result_updates_matching_row(qt_app, tmp_path: Path) -> None:
         )
         assert table.item(respawn_row, 2).text() == "OK"
         assert table.item(respawn_row, 3).text() == "Confirmed logged in as @respawn"
+    finally:
+        _teardown(window)
+
+
+def test_mismatch_result_renders_wrong_account(qt_app, tmp_path: Path) -> None:
+    init_db()
+    _make_accounts()
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._open_session_health_dialog()
+        qt_app.processEvents()
+
+        window._on_account_health_result(
+            {
+                "account_name": "RespawnReels",
+                "profile_name": "main",
+                "state": HealthState.MISMATCH,
+                "detail": "Logged in as @other, but this account expects @respawn.",
+            }
+        )
+        table = window._account_health_table
+        row = next(
+            r for r in range(table.rowCount()) if table.item(r, 0).text() == "RespawnReels"
+        )
+        assert table.item(row, 2).text() == "Wrong account"
+        assert "expects @respawn" in table.item(row, 3).text()
+    finally:
+        _teardown(window)
+
+
+def test_blank_profile_is_unconfigured_not_main(qt_app, monkeypatch, tmp_path: Path) -> None:
+    """An account with no profile must read as 'No profile', never borrow 'main'."""
+    init_db()
+    with get_session() as session:
+        session.add(
+            Account(name="No Profile", platform="instagram", instagram_profile=None)
+        )
+        session.commit()
+    monkeypatch.setattr(mw, "local_health", _fake_local_health)
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._open_session_health_dialog()
+        qt_app.processEvents()
+
+        table = window._account_health_table
+        row = next(
+            r for r in range(table.rowCount()) if table.item(r, 0).text() == "No Profile"
+        )
+        assert table.item(row, 1).text() == "—"  # profile column shows unset, not "main"
+        assert table.item(row, 2).text() == "No profile"
+    finally:
+        _teardown(window)
+
+
+def test_shared_profile_is_flagged_as_collision(qt_app, monkeypatch, tmp_path: Path) -> None:
+    """Two accounts on one profile share a single Instagram login — warn about it."""
+    init_db()
+    with get_session() as session:
+        session.add_all(
+            [
+                Account(name="Shared A", platform="instagram", instagram_profile="main"),
+                Account(name="Shared B", platform="instagram", instagram_profile="main"),
+            ]
+        )
+        session.commit()
+    monkeypatch.setattr(mw, "local_health", _fake_local_health)
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._open_session_health_dialog()
+        qt_app.processEvents()
+
+        table = window._account_health_table
+        a_row = next(
+            r for r in range(table.rowCount()) if table.item(r, 0).text() == "Shared A"
+        )
+        detail = table.item(a_row, 3).text()
+        assert "shares profile 'main'" in detail
+        assert "Shared B" in detail
+        assert "shared by multiple accounts" in window._account_health_summary.text()
     finally:
         _teardown(window)

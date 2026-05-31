@@ -657,7 +657,7 @@ UPLOAD_PRIVACY_OPTIONS = {
     "unlisted": "Unlisted",
     "public": "Public",
 }
-MODULE_PAGES = ("scraping", "downloads", "processing", "uploads")
+MODULE_PAGES = ("scraping", "downloads", "processing", "uploads", "session_health")
 INSTAGRAM_MAX_RESULT_LIMIT = 1000
 TITLE_STYLE_PRESETS: dict[str, dict[str, object]] = {
     "clean_hook": {
@@ -1006,6 +1006,12 @@ PUBLISH_CHECKPOINT_COOLDOWN = dt.timedelta(hours=3)
 # like a person spacing posts out rather than a burst. Applied BETWEEN posts
 # only (single-account cadence stays free).
 PUBLISH_BATCH_GAP_RANGE_SECONDS = (120, 420)  # 2-7 minutes
+# Hook-tier gate for unattended batch publishing. A title whose applied hook
+# tier resolves to one of these is HELD for manual review rather than
+# auto-posted. Green (no checkable claim) and unknown/legacy (no tier data,
+# or a manually edited title) pass through, so this never freezes the existing
+# queue — it only catches AI hooks the model itself flagged as risky.
+PUBLISH_AUTO_HOLD_TIERS = frozenset({"yellow", "red"})
 
 
 @dataclass(frozen=True)
@@ -1018,11 +1024,25 @@ class PublishJobConfig:
 
 
 @dataclass(frozen=True)
+class BatchJobPrep:
+    """Result of re-validating a queued job before a batch publish.
+
+    Either ``payload`` is set (account_id, profile_name, video_path, caption) and
+    the job is ready to publish, or ``skip_reason`` explains why the batch dropped
+    it — so a skip is never silent in the "Publish Due Now" summary.
+    """
+
+    payload: tuple[int, str, Path, str] | None = None
+    skip_reason: str | None = None
+
+
+@dataclass(frozen=True)
 class DraftRecommendation:
     title_index: int | None
     caption_index: int | None
     reason: str | None = None
     option_notes: list[str] | None = None
+    option_tiers: list[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -1425,19 +1445,23 @@ class AccountHealthCheckWorker(QObject):
     result = pyqtSignal(dict)
     completed = pyqtSignal()
 
-    def __init__(self, targets: list[tuple[str, str]]) -> None:
+    def __init__(self, targets: list[tuple[str, str, str | None]]) -> None:
         super().__init__()
+        # Each target: (account_name, profile_name, expected_handle_or_None).
         self._targets = targets
 
     def run(self) -> None:
         import time
 
-        for index, (account_name, profile_name) in enumerate(self._targets):
+        for index, (account_name, profile_name, expected_handle) in enumerate(self._targets):
             if index > 0:
                 time.sleep(random.uniform(2.0, 4.0))  # gentle spacing between live checks
             try:
-                health = live_health(profile_name, account_name)
+                health = live_health(
+                    profile_name, account_name, expected_username=expected_handle
+                )
                 payload = {
+                    "account_name": account_name,
                     "profile_name": profile_name,
                     "state": health.state,
                     "detail": health.detail,
@@ -1445,6 +1469,7 @@ class AccountHealthCheckWorker(QObject):
                 }
             except Exception as exc:  # noqa: BLE001
                 payload = {
+                    "account_name": account_name,
                     "profile_name": profile_name,
                     "state": HealthState.UNKNOWN,
                     "detail": f"check failed: {exc}",
@@ -1542,6 +1567,7 @@ class SmartDraftWorker(QObject):
                     "recommended_caption_index": drafts.recommended_caption_index,
                     "recommendation_reason": drafts.recommendation_reason,
                     "option_notes": drafts.option_notes,
+                    "option_tiers": drafts.option_tiers,
                     "provider_label": drafts.provider_label,
                     "used_fallback": drafts.used_fallback,
                     "vision_payload": drafts.vision_payload,
@@ -1622,11 +1648,17 @@ class MainWindow(QWidget):
         self._publish_batch_queue: list[int] = []
         self._publish_batch_posted = 0
         self._publish_batch_skipped = 0
+        # Deduped human-readable reasons for jobs the batch skipped (cap reached,
+        # cooldown, missing file), surfaced in the final "Batch done" summary.
+        self._batch_skip_reasons: list[str] = []
         self._last_due_count = 0
+        # Last directory used by the "Import MP4" file dialog; persists for the
+        # session so re-opening the dialog doesn't reset to home every time.
+        self._last_import_dir: Path | None = None
         self._account_health_thread: QThread | None = None
         self._account_health_worker: AccountHealthCheckWorker | None = None
         self._account_health_in_progress = False
-        self._session_health_dialog: QDialog | None = None
+        self._session_health_page: QWidget | None = None
         self._processing_in_progress = False
         self._processing_busy_mode: str | None = None
         self._selected_processing_item_id: int | None = None
@@ -1739,7 +1771,7 @@ class MainWindow(QWidget):
         self._sidebar_health_button.setObjectName("sidebarToggle")
         self._sidebar_health_button.setToolTip("Session Health")
         self._sidebar_health_button.setText("")
-        self._sidebar_health_button.setIcon(self._sidebar_icon("refresh"))
+        self._sidebar_health_button.setIcon(self._sidebar_icon("shield"))
         self._sidebar_health_button.setIconSize(QSize(20, 20))
         self._sidebar_health_button.setFixedSize(38, 38)
         self._sidebar_health_button.clicked.connect(self._open_session_health_dialog)
@@ -1814,7 +1846,11 @@ class MainWindow(QWidget):
         self._account_login_input = QLineEdit()
         self._account_login_input.setPlaceholderText("Login email or @username (used for re-login)")
         self._account_instagram_profile_input = QLineEdit()
-        self._account_instagram_profile_input.setPlaceholderText("main")
+        self._account_instagram_profile_input.setPlaceholderText("e.g. main, alt1, cinema")
+        self._account_instagram_handle_input = QLineEdit()
+        self._account_instagram_handle_input.setPlaceholderText(
+            "@handle — verifies the right account is logged in (optional)"
+        )
         self._account_scrape_sources_input = QLineEdit()
         self._account_scrape_sources_input.setPlaceholderText("Managed from Source Intake below")
         self._account_scrape_sources_input.setReadOnly(True)
@@ -1938,20 +1974,22 @@ class MainWindow(QWidget):
         account_form.addWidget(self._account_login_input, 3, 1)
         account_form.addWidget(QLabel("IG Browser Profile"), 4, 0)
         account_form.addWidget(self._account_instagram_profile_input, 4, 1)
-        account_form.addWidget(QLabel("Private Notes"), 5, 0)
-        account_form.addWidget(self._account_credential_input, 5, 1)
-        account_form.addWidget(QLabel("AI Tone"), 6, 0)
-        account_form.addWidget(self._account_writing_tone_input, 6, 1)
-        account_form.addWidget(QLabel("Audience"), 7, 0)
-        account_form.addWidget(self._account_target_audience_input, 7, 1)
-        account_form.addWidget(QLabel("Hook Pattern"), 8, 0)
-        account_form.addWidget(self._account_hook_style_input, 8, 1)
-        account_form.addWidget(QLabel("Avoid Phrases"), 9, 0)
-        account_form.addWidget(self._account_banned_phrases_input, 9, 1)
-        account_form.addWidget(QLabel("Title Rules"), 10, 0)
-        account_form.addWidget(self._account_title_style_notes_input, 10, 1)
-        account_form.addWidget(QLabel("Caption Rules"), 11, 0)
-        account_form.addWidget(self._account_caption_style_notes_input, 11, 1)
+        account_form.addWidget(QLabel("IG Handle (expected)"), 5, 0)
+        account_form.addWidget(self._account_instagram_handle_input, 5, 1)
+        account_form.addWidget(QLabel("Private Notes"), 6, 0)
+        account_form.addWidget(self._account_credential_input, 6, 1)
+        account_form.addWidget(QLabel("AI Tone"), 7, 0)
+        account_form.addWidget(self._account_writing_tone_input, 7, 1)
+        account_form.addWidget(QLabel("Audience"), 8, 0)
+        account_form.addWidget(self._account_target_audience_input, 8, 1)
+        account_form.addWidget(QLabel("Hook Pattern"), 9, 0)
+        account_form.addWidget(self._account_hook_style_input, 9, 1)
+        account_form.addWidget(QLabel("Avoid Phrases"), 10, 0)
+        account_form.addWidget(self._account_banned_phrases_input, 10, 1)
+        account_form.addWidget(QLabel("Title Rules"), 11, 0)
+        account_form.addWidget(self._account_title_style_notes_input, 11, 1)
+        account_form.addWidget(QLabel("Caption Rules"), 12, 0)
+        account_form.addWidget(self._account_caption_style_notes_input, 12, 1)
         self._account_form_panel = QWidget()
         account_form_panel_layout = QVBoxLayout()
         account_form_panel_layout.setContentsMargins(0, 0, 0, 0)
@@ -2706,6 +2744,7 @@ class MainWindow(QWidget):
         self._processing_page = self._make_processing_page()
         self._uploads_page = self._make_schedule_page()
         self._accounts_page = self._make_accounts_page()
+        self._session_health_page = self._make_session_health_page()
 
         self._library_gate_panel = QFrame()
         self._library_gate_panel.setObjectName("panel")
@@ -2726,6 +2765,7 @@ class MainWindow(QWidget):
         self._workspace_stack.addWidget(self._downloads_page)
         self._workspace_stack.addWidget(self._processing_page)
         self._workspace_stack.addWidget(self._uploads_page)
+        self._workspace_stack.addWidget(self._session_health_page)
         workspace_content_layout.addWidget(self._workspace_stack)
         self._workspace_content.setLayout(workspace_content_layout)
 
@@ -3726,22 +3766,19 @@ class MainWindow(QWidget):
         page.setLayout(page_layout)
         return page
 
+    def _make_session_health_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self._make_account_health_panel())
+        page.setLayout(layout)
+        return page
+
     def _open_session_health_dialog(self) -> None:
-        """Open (or focus) the Session Health popup and refresh local status."""
-        if self._session_health_dialog is None:
-            dialog = QDialog(self)
-            dialog.setObjectName("sessionHealthDialog")
-            dialog.setWindowTitle("Session Health")
-            dialog.setMinimumSize(780, 560)
-            dialog_layout = QVBoxLayout()
-            dialog_layout.setContentsMargins(0, 0, 0, 0)
-            dialog_layout.addWidget(self._make_account_health_panel())
-            dialog.setLayout(dialog_layout)
-            self._session_health_dialog = dialog
-        self._refresh_account_health()  # safe local refresh on open
-        self._session_health_dialog.show()
-        self._session_health_dialog.raise_()
-        self._session_health_dialog.activateWindow()
+        """Navigate to the Session Health tab and refresh local status."""
+        self._set_current_page("session_health")
+        self._refresh_account_health()
 
     def _make_account_health_panel(self) -> QFrame:
         panel = QFrame()
@@ -3771,7 +3808,14 @@ class MainWindow(QWidget):
             QHeaderView.ResizeMode.Stretch
         )
         self._account_health_table.horizontalHeader().setStretchLastSection(True)
+        # Hide row numbers + the white corner button, matching every other table.
+        self._account_health_table.verticalHeader().setVisible(False)
         self._account_health_table.setMinimumHeight(240)
+        self._account_health_table.setMaximumHeight(400)
+        self._account_health_table.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred,
+        )
         self._account_health_table.itemSelectionChanged.connect(
             self._on_account_health_selection_changed
         )
@@ -3804,6 +3848,7 @@ class MainWindow(QWidget):
         self._account_health_summary.setObjectName("subtleLabel")
         self._account_health_summary.setWordWrap(True)
         layout.addWidget(self._account_health_summary)
+        layout.addStretch(1)
 
         panel.setLayout(layout)
         return panel
@@ -3817,6 +3862,8 @@ class MainWindow(QWidget):
         HealthState.THROTTLED: "Throttled",
         HealthState.LOGGED_OUT: "Logged out",
         HealthState.UNKNOWN: "Unknown",
+        HealthState.NOT_CONFIGURED: "No profile",
+        HealthState.MISMATCH: "Wrong account",
     }
 
     @classmethod
@@ -3867,28 +3914,74 @@ class MainWindow(QWidget):
     def _set_account_health_row(
         self,
         account_name: str | None,
-        profile_name: str,
+        profile_name: str | None,
         email: str | None,
         health: SessionHealth,
+        *,
+        collision_note: str = "",
     ) -> None:
         table = self._account_health_table
         row = table.rowCount()
         table.insertRow(row)
+        detail = health.detail
+        if collision_note:
+            detail = f"{detail}  {collision_note}" if detail else collision_note
         values = [
             account_name or "(unnamed)",
-            profile_name,
+            profile_name or "—",  # blank profile shows as unset, never as "main"
             self._health_state_label(health.state),
-            health.detail,
+            detail,
         ]
         for col, value in enumerate(values):
             cell = QTableWidgetItem(value)
             cell.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
             if col == 0:
-                cell.setData(Qt.ItemDataRole.UserRole, profile_name)
+                # Empty profile -> re-login stays disabled (_selected_health_profile
+                # treats falsy as "nothing to act on").
+                cell.setData(Qt.ItemDataRole.UserRole, profile_name or "")
                 cell.setData(Qt.ItemDataRole.UserRole + 1, email)
+                cell.setData(Qt.ItemDataRole.UserRole + 2, account_name or "")
             if col == 2:
                 self._apply_health_status_style(cell, health.state)
             table.setItem(row, col, cell)
+
+    @staticmethod
+    def _clean_profile(value: str | None) -> str:
+        """An account's Instagram profile, blank if unset.
+
+        A blank profile must NEVER be treated as ``main``: that silently borrows
+        whatever account ``main`` is logged into and would publish there.
+        """
+        return (value or "").strip()
+
+    @staticmethod
+    def _not_configured_health(account_name: str | None) -> SessionHealth:
+        return SessionHealth(
+            profile_name="",
+            account_name=account_name,
+            state=HealthState.NOT_CONFIGURED,
+            detail="No Instagram profile assigned — set one in account settings, then log in.",
+            checked_at=dt.datetime.now(dt.timezone.utc),
+            is_live=False,
+        )
+
+    @staticmethod
+    def _profile_collision_note(
+        profile_name: str | None,
+        account_name: str | None,
+        profile_accounts: dict[str, list[str]],
+    ) -> str:
+        """Warn when more than one account shares a single profile/session."""
+        if not profile_name:
+            return ""
+        others = [
+            name
+            for name in profile_accounts.get(profile_name, [])
+            if name != (account_name or "(unnamed)")
+        ]
+        if not others:
+            return ""
+        return f"(!) shares profile '{profile_name}' with {', '.join(others)}"
 
     def _refresh_account_health(self) -> None:
         if not hasattr(self, "_account_health_table"):
@@ -3896,21 +3989,39 @@ class MainWindow(QWidget):
         pool = ProfilePool.load()
         with get_session() as session:
             rows = [
-                (account.name, (account.instagram_profile or "main"), account.login_identifier)
+                (account.name, self._clean_profile(account.instagram_profile) or None,
+                 account.login_identifier)
                 for account in session.query(Account).order_by(Account.name.asc()).all()
             ]
+        # Map each non-empty profile to the accounts using it, so a shared session
+        # (two accounts on one profile) is flagged instead of silently allowed.
+        profile_accounts: dict[str, list[str]] = {}
+        for account_name, profile_name, _ in rows:
+            if profile_name:
+                profile_accounts.setdefault(profile_name, []).append(account_name or "(unnamed)")
+
         self._account_health_table.blockSignals(True)
         self._account_health_table.setRowCount(0)
         for account_name, profile_name, email in rows:
-            health = local_health(profile_name, account_name, pool=pool)
-            self._set_account_health_row(account_name, profile_name, email, health)
+            if profile_name is None:
+                health = self._not_configured_health(account_name)
+            else:
+                health = local_health(profile_name, account_name, pool=pool)
+            note = self._profile_collision_note(profile_name, account_name, profile_accounts)
+            self._set_account_health_row(
+                account_name, profile_name, email, health, collision_note=note
+            )
         self._account_health_table.resizeRowsToContents()
         self._account_health_table.blockSignals(False)
         if rows:
-            self._account_health_summary.setText(
+            shared = sum(1 for names in profile_accounts.values() if len(names) > 1)
+            summary = (
                 f"{len(rows)} account(s). Local status shown — use 'Check All (live)' "
                 "to confirm sessions with Instagram."
             )
+            if shared:
+                summary += f" (!) {shared} profile(s) shared by multiple accounts."
+            self._account_health_summary.setText(summary)
         else:
             self._account_health_summary.setText(
                 "No accounts yet. Create a niche account to track its login."
@@ -3922,18 +4033,29 @@ class MainWindow(QWidget):
             self._notify("A health check is already running.", Tone.WARNING)
             return
         with get_session() as session:
-            targets = [
-                (account.name, (account.instagram_profile or "main"))
-                for account in session.query(Account).order_by(Account.name.asc()).all()
-            ]
+            accounts = session.query(Account).order_by(Account.name.asc()).all()
+            targets: list[tuple[str, str, str | None]] = []
+            unconfigured = 0
+            for account in accounts:
+                profile = self._clean_profile(account.instagram_profile)
+                if profile:
+                    expected = (account.instagram_handle or "").strip() or None
+                    targets.append((account.name, profile, expected))
+                else:
+                    unconfigured += 1
         if not targets:
-            self._notify("No accounts to check.", Tone.INFO)
+            self._notify(
+                "No accounts have an Instagram profile set — assign one first.", Tone.INFO
+            )
             return
 
         self._account_health_in_progress = True
         self._account_health_check_all_button.setEnabled(False)
         self._account_relogin_button.setEnabled(False)
-        self._notify(f"Checking {len(targets)} account(s) live, spaced out...", Tone.INFO)
+        message = f"Checking {len(targets)} account(s) live, spaced out..."
+        if unconfigured:
+            message += f" ({unconfigured} skipped — no profile set.)"
+        self._notify(message, Tone.INFO)
 
         thread = QThread(self)
         worker = AccountHealthCheckWorker(targets)
@@ -3949,13 +4071,15 @@ class MainWindow(QWidget):
         thread.start()
 
     def _on_account_health_result(self, payload: dict) -> None:
-        profile_name = payload.get("profile_name")
+        account_name = payload.get("account_name") or ""
         state = str(payload.get("state"))
         detail = payload.get("detail") or ""
         table = self._account_health_table
         for row in range(table.rowCount()):
             cell = table.item(row, 0)
-            if cell is not None and cell.data(Qt.ItemDataRole.UserRole) == profile_name:
+            if cell is None:
+                continue
+            if cell.data(Qt.ItemDataRole.UserRole + 2) == account_name:
                 status_item = table.item(row, 2)
                 if status_item is not None:
                     status_item.setText(self._health_state_label(state))
@@ -4164,8 +4288,17 @@ class MainWindow(QWidget):
         self._schedule_table.setHorizontalHeaderLabels(
             ["Account", "Video", "Title", "Scheduled", "Privacy", "Status", "Output"]
         )
-        self._schedule_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self._schedule_table.horizontalHeader().setStretchLastSection(True)
+        _sch_hdr = self._schedule_table.horizontalHeader()
+        _sch_hdr.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        _sch_hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)  # Title col stretches
+        _sch_hdr.setStretchLastSection(False)
+        self._schedule_table.setColumnWidth(0, 110)   # Account
+        self._schedule_table.setColumnWidth(1, 110)   # Video
+        # col 2 (Title) stretches to fill remaining space
+        self._schedule_table.setColumnWidth(3, 135)   # Scheduled
+        self._schedule_table.setColumnWidth(4, 75)    # Privacy
+        self._schedule_table.setColumnWidth(5, 230)   # Status — wide enough for "Failed — <reason>"
+        self._schedule_table.setColumnWidth(6, 100)   # Output
         self._schedule_table.verticalHeader().setVisible(False)
         self._schedule_table.setAlternatingRowColors(True)
         self._schedule_table.setShowGrid(True)
@@ -5124,6 +5257,7 @@ class MainWindow(QWidget):
             title_options,
             caption_options,
             option_notes=recommendation.option_notes if recommendation else None,
+            option_tiers=recommendation.option_tiers if recommendation else None,
             recommended_index=recommendation.title_index if recommendation else None,
         )
         self._set_processing_eval_state(
@@ -5425,9 +5559,26 @@ class MainWindow(QWidget):
             caption_index=caption_index,
             reason=reason,
             option_notes=option_notes,
+            option_tiers=self._clean_saved_option_tiers(payload.get("option_tiers")),
             title_options=title_options,
             caption_options=caption_options,
         )
+
+    @staticmethod
+    def _clean_saved_option_tiers(value: object) -> list[str] | None:
+        """Keep only valid green/yellow/red tier words from a saved payload.
+
+        Tiers are already normalized at generation time; this just guards
+        against malformed persisted data. Returns None when nothing usable
+        remains so the UI shows no badge rather than a wrong one."""
+        if not isinstance(value, (list, tuple)):
+            return None
+        tiers = [
+            str(item).strip().casefold()
+            for item in value
+            if str(item).strip().casefold() in {"green", "yellow", "red"}
+        ]
+        return tiers[:SMART_DRAFT_OPTION_COUNT] or None
 
     def _smart_recommendation_from_meta(
         self,
@@ -5455,6 +5606,7 @@ class MainWindow(QWidget):
             ),
             reason=str(meta.get("recommendation_reason") or "").strip() or None,
             option_notes=option_notes,
+            option_tiers=self._clean_saved_option_tiers(meta.get("option_tiers")),
             title_options=title_options,
             caption_options=caption_options,
         )
@@ -5468,6 +5620,7 @@ class MainWindow(QWidget):
         option_notes: list[str],
         title_options: list[str],
         caption_options: list[str],
+        option_tiers: list[str] | None = None,
     ) -> DraftRecommendation | None:
         max_options = max(len(title_options), len(caption_options))
         if max_options <= 0:
@@ -5480,14 +5633,24 @@ class MainWindow(QWidget):
             title_index = caption_index if caption_index < len(title_options) else None
         if caption_index is None and title_index is not None:
             caption_index = title_index if title_index < len(caption_options) else None
-        if title_index is None and caption_index is None and not option_notes:
+        if title_index is None and caption_index is None and not option_notes and not option_tiers:
             return None
         return DraftRecommendation(
             title_index=title_index,
             caption_index=caption_index,
             reason=reason,
             option_notes=option_notes[:SMART_DRAFT_OPTION_COUNT] or None,
+            option_tiers=(option_tiers or None),
         )
+
+    # On-screen risk badge for each title's hook tier. 🟢 green = no checkable
+    # claim (auto-post safe), 🟡 yellow = grounded factual claim worth a glance,
+    # 🔴 red = unverifiable overclaim. Mirrors the HOOK FRAMING prompt tiers.
+    _OPTION_TIER_BADGES = {
+        "green": "🟢 Green",
+        "yellow": "🟡 Yellow",
+        "red": "🔴 Red",
+    }
 
     def _set_processing_smart_options(
         self,
@@ -5495,6 +5658,7 @@ class MainWindow(QWidget):
         caption_options: list[str],
         *,
         option_notes: list[str] | None = None,
+        option_tiers: list[str] | None = None,
         recommended_index: int | None = None,
     ) -> None:
         self._processing_smart_option_pairs = []
@@ -5525,6 +5689,14 @@ class MainWindow(QWidget):
                     if option_notes and index < len(option_notes)
                     else ""
                 )
+                tier = (
+                    option_tiers[index]
+                    if option_tiers and index < len(option_tiers)
+                    else None
+                )
+                badge = self._OPTION_TIER_BADGES.get(tier or "", "")
+                if badge:
+                    note_text = f"{badge} · {note_text}" if note_text else badge
                 has_content = bool(title_option or caption_option)
                 if has_content:
                     title_input.setText(title_option or "")
@@ -6432,6 +6604,7 @@ class MainWindow(QWidget):
             title_options,
             caption_options,
             option_notes=recommendation.option_notes if recommendation else None,
+            option_tiers=recommendation.option_tiers if recommendation else None,
             recommended_index=apply_index if title_options or caption_options else None,
         )
 
@@ -7169,6 +7342,19 @@ class MainWindow(QWidget):
             self._scroll_area.verticalScrollBar().setValue(0)
             return
 
+        if self._current_page == "session_health" and self._workspace_content.isVisible():
+            height = max(self._scroll_area.viewport().height(), 1)
+            for widget in (
+                self._session_health_page,
+                self._workspace_stack,
+                self._workspace_content,
+                self._scroll_area.widget(),
+            ):
+                if widget is not None:
+                    widget.setFixedHeight(height)
+            self._scroll_area.verticalScrollBar().setValue(0)
+            return
+
         if self._current_page == "uploads" and self._workspace_content.isVisible():
             height = max(self._scroll_area.viewport().height(), 1)
             for widget in (
@@ -7220,6 +7406,7 @@ class MainWindow(QWidget):
             self._processing_page,
             self._downloads_page,
             self._uploads_page,
+            self._session_health_page,
             self._workspace_stack,
             self._workspace_content,
             self._scroll_area.widget(),
@@ -7986,7 +8173,12 @@ class MainWindow(QWidget):
             if job is None:
                 return
             job.status = status
-            job.posted_at = dt.datetime.now(dt.timezone.utc) if status == "posted" else None
+            # Only the PublishWorker should stamp posted_at (so the daily cap
+            # only counts automation-posted jobs). Manually changing the status
+            # to "posted" via the combo leaves posted_at untouched; changing
+            # away from "posted" clears it so re-queueing works correctly.
+            if status != "posted":
+                job.posted_at = None
             job.error_message = None
             session.commit()
         self._refresh_schedule_page()
@@ -8148,9 +8340,18 @@ class MainWindow(QWidget):
                 self._refresh_schedule_page()
                 return
             output_path = Path(job.processed_path)
-            profile_name = (job.account.instagram_profile if job.account else None) or "main"
+            profile_name = self._clean_profile(
+                job.account.instagram_profile if job.account else None
+            )
             caption_text = self._schedule_caption_text_for_job(job)
 
+        if not profile_name:
+            self._notify(
+                "This account has no Instagram profile set. Assign one in account "
+                "settings, then log in.",
+                Tone.WARNING,
+            )
+            return
         if not output_path.exists():
             self._notify("Reel output file is missing.", Tone.ERROR)
             return
@@ -8214,11 +8415,20 @@ class MainWindow(QWidget):
                 self._notify("This reel is already posted.", Tone.WARNING)
                 return
             account_id = job.account_id
-            profile_name = (job.account.instagram_profile if job.account else None) or "main"
+            profile_name = self._clean_profile(
+                job.account.instagram_profile if job.account else None
+            )
             video_path = Path(job.processed_path)
             caption = self._schedule_caption_text_for_job(job)
             posts_recent = self._account_posts_last_24h(session, account_id)
 
+        if not profile_name:
+            self._notify(
+                "This account has no Instagram profile set. Assign one in account "
+                "settings, then log in before publishing.",
+                Tone.WARNING,
+            )
+            return
         cooldown_until = self._account_publish_cooldown_until(account_id)
         if cooldown_until is not None:
             self._notify(
@@ -8290,22 +8500,61 @@ class MainWindow(QWidget):
             self._notify("A publish is already running.", Tone.WARNING)
             return
 
-        queue = self._gather_due_publish_job_ids()
-        if not queue:
-            self._notify(
-                "No jobs due. Mark a reel 'Ready' or schedule a past time first.",
-                Tone.INFO,
-            )
+        job_id = self._selected_schedule_job_id()
+        if job_id is None:
+            self._notify("Select a reel to publish first.", Tone.WARNING)
             return
 
+        # Show which account + Instagram profile will receive the post so the
+        # user can catch wrong-account mistakes before anything is submitted.
+        if not self._confirm_publish_target(job_id):
+            return
+
+        queue = [job_id]
         self._publish_batch_active = True
         self._publish_batch_queue = queue
         self._publish_batch_posted = 0
         self._publish_batch_skipped = 0
+        self._batch_skip_reasons = []
         self._schedule_publish_due_button.setText("Stop Publishing")
         self._schedule_auto_publish_button.setEnabled(False)
-        self._notify(f"Publishing {len(queue)} due reel(s), spaced out...", Tone.INFO)
+        self._notify("Publishing selected reel...", Tone.INFO)
         self._publish_next_in_batch()
+
+    def _confirm_publish_target(self, job_id: int) -> bool:
+        """Show a quick confirmation popup with the target account and profile.
+
+        Returns True if the user clicks Publish, False if they cancel.
+        """
+        with get_session() as session:
+            job = (
+                session.query(UploadJob)
+                .options(joinedload(UploadJob.account))
+                .filter(UploadJob.id == job_id)
+                .one_or_none()
+            )
+            if job is None:
+                self._notify("Job no longer exists.", Tone.WARNING)
+                return False
+            account_name = (job.account.name if job.account else None) or "Unknown account"
+            raw_profile = job.account.instagram_profile if job.account else None
+            profile = self._clean_profile(raw_profile) or "(no profile set)"
+            file_name = Path(job.processed_path).name if job.processed_path else "(unknown file)"
+
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Confirm Publish")
+        msg.setIcon(QMessageBox.Icon.Question)
+        msg.setText(
+            f"<b>Posting to:</b><br><br>"
+            f"Account: &nbsp;&nbsp;<b>{account_name}</b><br>"
+            f"Instagram: <b>@{profile}</b><br>"
+            f"File: &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>{file_name}</b>"
+        )
+        publish_btn = msg.addButton("Publish", QMessageBox.ButtonRole.AcceptRole)
+        msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        msg.setDefaultButton(publish_btn)
+        msg.exec()
+        return msg.clickedButton() is publish_btn
 
     def _gather_due_publish_job_ids(self) -> list[int]:
         """Job ids approved (Ready) or scheduled-and-due, across all accounts."""
@@ -8333,8 +8582,13 @@ class MainWindow(QWidget):
                 due.append(job.id)
         return due
 
-    def _prepare_batch_job(self, job_id: int) -> tuple[int, str, Path, str] | None:
-        """Re-validate a queued job against live guards. None = skip it."""
+    def _prepare_batch_job(self, job_id: int) -> BatchJobPrep:
+        """Re-validate a queued job against live guards.
+
+        Returns a :class:`BatchJobPrep`: either a ready-to-publish payload, or a
+        ``skip_reason`` so the batch can tell the user WHY a job was dropped
+        instead of silently skipping it.
+        """
         with get_session() as session:
             job = (
                 session.query(UploadJob)
@@ -8342,32 +8596,117 @@ class MainWindow(QWidget):
                 .filter(UploadJob.id == job_id)
                 .one_or_none()
             )
-            if job is None or job.posted_at is not None or job.status == "posted":
-                return None
+            if job is None:
+                return BatchJobPrep(skip_reason="a job that no longer exists")
+            account_name = (job.account.name if job.account else None) or "account"
+            file_name = Path(job.processed_path).name if job.processed_path else ""
+            file_label = f"{account_name} ({file_name})" if file_name else account_name
+            if job.posted_at is not None or job.status == "posted":
+                return BatchJobPrep(skip_reason=f"{file_label}: already posted")
             account_id = job.account_id
-            profile_name = (job.account.instagram_profile if job.account else None) or "main"
+            profile_name = self._clean_profile(
+                job.account.instagram_profile if job.account else None
+            )
+            if not profile_name:
+                return BatchJobPrep(
+                    skip_reason=f"{account_name}: no Instagram profile set — assign one first"
+                )
             video_path = Path(job.processed_path)
             caption = self._schedule_caption_text_for_job(job)
             posts_recent = self._account_posts_last_24h(session, account_id)
+            # Hook-tier gate inputs: resolved from the originating item while the
+            # session is open (the relationship lazy-loads).
+            item = job.download_item
+            applied_title_tier = self._resolve_applied_title_tier(
+                applied_title=job.title,
+                smart_title_options_json=item.smart_title_options if item else None,
+                smart_generation_meta_json=item.smart_generation_meta if item else None,
+            )
 
-        if self._account_publish_cooldown_until(account_id) is not None:
-            return None
+        # Cap and cooldown are account-level, so phrase them per account (no file
+        # name) — that way 5 jobs blocked by the same cap collapse to one reason.
+        cooldown_until = self._account_publish_cooldown_until(account_id)
+        if cooldown_until is not None:
+            return BatchJobPrep(
+                skip_reason=(
+                    f"{account_name}: paused until "
+                    f"{cooldown_until.astimezone():%H:%M} after a checkpoint"
+                )
+            )
         if posts_recent >= PUBLISH_DAILY_CAP:
-            return None
+            return BatchJobPrep(
+                skip_reason=(
+                    f"{account_name}: daily cap reached "
+                    f"({posts_recent}/{PUBLISH_DAILY_CAP} in 24h)"
+                )
+            )
         if not video_path.exists():
+            return BatchJobPrep(skip_reason=f"{file_label}: output file is missing")
+        if applied_title_tier in PUBLISH_AUTO_HOLD_TIERS:
+            return BatchJobPrep(
+                skip_reason=(
+                    f"{file_label}: hook tagged {applied_title_tier} — held for "
+                    "review (auto-publish posts Green hooks only)"
+                )
+            )
+        return BatchJobPrep(payload=(account_id, profile_name, video_path, caption))
+
+    @staticmethod
+    def _resolve_applied_title_tier(
+        *,
+        applied_title: str | None,
+        smart_title_options_json: str | None,
+        smart_generation_meta_json: str | None,
+    ) -> str | None:
+        """Tier ('green'/'yellow'/'red') of the title actually being posted.
+
+        Matches the job's applied title against the saved title options to find
+        its index, then returns that option's tier. Returns ``None`` when the
+        tier is unknown — no tier data (legacy items) or a manually edited
+        title that no longer matches a generated option — so the caller can let
+        those through instead of blocking the existing queue.
+        """
+        if not smart_generation_meta_json:
             return None
-        return account_id, profile_name, video_path, caption
+        try:
+            meta = json.loads(smart_generation_meta_json)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(meta, dict):
+            return None
+        tiers = MainWindow._clean_saved_option_tiers(meta.get("option_tiers"))
+        if not tiers:
+            return None
+        options: list[str] = []
+        if smart_title_options_json:
+            try:
+                raw = json.loads(smart_title_options_json)
+            except (json.JSONDecodeError, TypeError):
+                raw = None
+            if isinstance(raw, list):
+                options = [str(option) for option in raw]
+        applied = (applied_title or "").strip().casefold()
+        if not applied:
+            return None
+        for index, option in enumerate(options):
+            if option.strip().casefold() == applied and index < len(tiers):
+                return tiers[index]
+        # Edited title that matches no generated option: tier is genuinely
+        # unknown — the user already took control, so don't guess.
+        return None
 
     def _publish_next_in_batch(self) -> None:
         if not self._publish_batch_active:
             return
         while self._publish_batch_queue:
             job_id = self._publish_batch_queue.pop(0)
-            prepared = self._prepare_batch_job(job_id)
-            if prepared is None:
+            prep = self._prepare_batch_job(job_id)
+            if prep.payload is None:
                 self._publish_batch_skipped += 1
+                if prep.skip_reason and prep.skip_reason not in self._batch_skip_reasons:
+                    self._batch_skip_reasons.append(prep.skip_reason)
                 continue
-            _account_id, profile_name, video_path, caption = prepared
+            _account_id, profile_name, video_path, caption = prep.payload
             do_share = not self._schedule_dry_run_checkbox.isChecked()
             self._launch_publish_worker(job_id, profile_name, video_path, caption, do_share)
             return
@@ -8389,12 +8728,17 @@ class MainWindow(QWidget):
     def _finish_publish_batch(self) -> None:
         posted = self._publish_batch_posted
         skipped = self._publish_batch_skipped
+        reasons = self._batch_skip_reasons
         self._publish_batch_active = False
         self._publish_batch_queue = []
+        self._batch_skip_reasons = []
         self._schedule_publish_due_button.setText("Publish Due Now")
-        self._notify(
-            f"Batch done: {posted} posted, {skipped} skipped.", Tone.SUCCESS
-        )
+        message = f"Batch done: {posted} posted, {skipped} skipped."
+        if reasons:
+            message += " Skipped: " + "; ".join(reasons) + "."
+        # Nothing posted while something was skipped is a warning, not a success.
+        tone = Tone.WARNING if skipped and not posted else Tone.SUCCESS
+        self._notify(message, tone)
         self._refresh_schedule_page()
 
     def _stop_publish_batch(self, *, user_cancelled: bool) -> None:
@@ -8487,25 +8831,8 @@ class MainWindow(QWidget):
         return f" Next: {soonest.astimezone():%H:%M} ({relative})."
 
     def _update_due_badge(self) -> None:
-        """Badge the 'Publish Due Now' button with the due count + nudge on rise.
-
-        Semi-auto: we surface what is due and let the user post with one click;
-        we never auto-open a browser. No-op while a batch is already running.
-        """
-        if not hasattr(self, "_schedule_publish_due_button") or self._publish_batch_active:
-            return
-        try:
-            due = len(self._gather_due_publish_job_ids())
-        except Exception:  # noqa: BLE001
-            return
-        self._schedule_publish_due_button.setText(
-            f"Publish Due Now ({due})" if due else "Publish Due Now"
-        )
-        if due > self._last_due_count and due > 0:
-            self._notify(
-                f"{due} reel(s) are due to post — click Publish Due Now.", Tone.INFO
-            )
-        self._last_due_count = due
+        """No-op while a batch is running; button label is managed by the batch lifecycle."""
+        pass
 
     def _advance_batch_after(self, status: str) -> None:
         """Continue the batch (if running) with a randomized gap. No-op otherwise."""
@@ -8563,6 +8890,16 @@ class MainWindow(QWidget):
 
             if created:
                 session.commit()
+
+    @staticmethod
+    def _short_failure_reason(error_message: str | None, *, limit: int = 60) -> str:
+        """First line of an error, trimmed to a compact inline hint."""
+        if not error_message:
+            return ""
+        first_line = error_message.strip().splitlines()[0].strip()
+        if len(first_line) <= limit:
+            return first_line
+        return first_line[: limit - 1].rstrip() + "…"
 
     def _refresh_schedule_page(self) -> None:
         if not hasattr(self, "_schedule_table"):
@@ -8627,7 +8964,15 @@ class MainWindow(QWidget):
                 table_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
                 table_item.setData(Qt.ItemDataRole.UserRole, job.id)
                 if column == 5:
+                    # Style off the plain label so "Failed" keeps its color,
+                    # then surface the reason inline + full text on hover so the
+                    # user can see *why* a post failed without digging.
                     self._apply_schedule_status_style(table_item, value)
+                    if (job.status or "").lower() == "failed" and job.error_message:
+                        reason = MainWindow._short_failure_reason(job.error_message)
+                        if reason:
+                            table_item.setText(f"Failed — {reason}")
+                        table_item.setToolTip(job.error_message.strip())
                 self._schedule_table.setItem(row, column, table_item)
 
         self._schedule_table.resizeRowsToContents()
@@ -9274,7 +9619,8 @@ class MainWindow(QWidget):
             self._restore_combo_value(self._account_platform_combo, "youtube")
             self._account_niche_input.clear()
             self._account_login_input.clear()
-            self._account_instagram_profile_input.setText("main")
+            self._account_instagram_profile_input.clear()
+            self._account_instagram_handle_input.clear()
             self._account_credential_input.clear()
             self._account_scrape_sources_input.clear()
             self._account_scrape_max_items_input.setText("20")
@@ -9306,7 +9652,8 @@ class MainWindow(QWidget):
         self._restore_combo_value(self._account_platform_combo, account.platform)
         self._account_niche_input.setText(account.niche_label or "")
         self._account_login_input.setText(account.login_identifier or "")
-        self._account_instagram_profile_input.setText(account.instagram_profile or "main")
+        self._account_instagram_profile_input.setText(account.instagram_profile or "")
+        self._account_instagram_handle_input.setText(account.instagram_handle or "")
         self._account_credential_input.setText(account.credential_blob or "")
         self._account_scrape_sources_input.setText(account.scrape_source_urls or "")
         self._account_scrape_max_items_input.setText(str(account.scrape_max_items or 20))
@@ -9389,7 +9736,12 @@ class MainWindow(QWidget):
             account.platform = platform
             account.niche_label = self._account_niche_input.toPlainText().strip() or None
             account.login_identifier = self._account_login_input.text().strip() or None
-            account.instagram_profile = self._account_instagram_profile_input.text().strip() or "main"
+            # Blank stays blank (None) — never silently default to "main", which
+            # would share whatever account 'main' is logged into.
+            account.instagram_profile = self._account_instagram_profile_input.text().strip() or None
+            account.instagram_handle = (
+                self._account_instagram_handle_input.text().strip().lstrip("@") or None
+            )
             account.credential_blob = self._account_credential_input.toPlainText().strip() or None
             account.scrape_source_urls = "\n".join(scrape_source_urls) or None
             account.scrape_max_items = scrape_max_items
@@ -11616,14 +11968,22 @@ class MainWindow(QWidget):
             self._notify("Create and select a niche account first.", Tone.WARNING)
             return
 
+        # Start in the last-used folder, fall back to ~/Videos, then home.
+        if self._last_import_dir is not None and self._last_import_dir.is_dir():
+            start_dir = self._last_import_dir
+        else:
+            videos = Path.home() / "Videos"
+            start_dir = videos if videos.is_dir() else Path.home()
+
         selected_path, _ = QFileDialog.getOpenFileName(
             self,
             "Import MP4",
-            str(Path.home()),
+            str(start_dir),
             "MP4 files (*.mp4);;All files (*.*)",
         )
         if not selected_path:
             return
+        self._last_import_dir = Path(selected_path).parent
 
         self._import_local_video_path(
             Path(selected_path),
