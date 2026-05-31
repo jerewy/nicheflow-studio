@@ -236,6 +236,16 @@ Ordered for runnable checkpoints. Each phase ends green-tested before the next.
   `pool_items_for_niche(niche)` are passed to the planner; `accept_into_pool`
   already blocks cross-niche pool membership upstream.
 
+### UAT harness — `scripts/pool_admin.py`
+Drives the whole backend loop on real data before the in-app buttons exist:
+`status` · `downloaded` · `backfill` (register MediaAssets for pre-existing IG
+downloads) · `accept --niche <n> [--all|--item-id N]` · `distribute --niche <n>
+[--max-per-account N]`. Verified end-to-end on a copy of the real DB: backfill
+102 → accept into history pool → distribute. Nothing posts to Instagram.
+
+**Remaining in-app UI (follow-up):** Accept-into-pool button in candidate review,
+a Distribute action + assignment view. The CLI covers the workflow meanwhile.
+
 ### Phase 4 — Draft + render per assignment
 - Generate per-account title/caption via existing `smart_drafts.py` niche profiles.
 - Render account-specific output; track `render_output_path`. Reuse current Processing/export.
