@@ -210,11 +210,22 @@ Ordered for runnable checkpoints. Each phase ends green-tested before the next.
   "Accept into pool" action (reuse the candidate widgets in `app/main_window.py`).
 
 ### Phase 3 — Destination accounts + assignment
-- Destination-account records (reuse `Account` with `niche` + a `role`=publish flag).
-- Random first-cycle assignment from pool → accounts (Je note 3 §12), with simple
-  **round-robin-within-shuffle** so per-account volume is even (tweak vs pure random).
-- **Niche isolation guard** enforced here.
-- Tests: assignment never crosses niche; volume is balanced; no clip double-assigned in cycle 1.
+- ✅ Distribution algorithm `core/distribution.py::plan_first_cycle` (pure):
+  each clip → exactly one account, **round-robin-within-shuffle** so per-account
+  volume differs by ≤1, optional `max_per_account` cap, deterministic under a
+  seeded rng. `distribution_counts` for a pre-commit preview.
+- ✅ Tests: `tests/test_distribution.py` (7) — each clip once, balanced volume,
+  ≤1 spread on uneven splits, cap leaves remainder unassigned, determinism.
+- ⬜ **Remaining (persistence — needs a small design call):** a DB helper that
+  gathers `Account.niche == niche` + unassigned `pool_items_for_niche`, runs
+  `plan_first_cycle`, and persists. Persisting means **extending `UploadJob`**
+  (decision) with `pool_item_id` + `reuse_iteration` — but `UploadJob.processed_path`
+  is currently NOT NULL and an assigned clip isn't rendered yet (Phase 4). So the
+  open call is how to represent an *assigned-but-unrendered* job (nullable
+  `processed_path` + `status="assigned"`, vs a separate lightweight row).
+- **Niche isolation** is enforced at the DB-helper boundary (only same-niche
+  accounts + pool items are passed in; `accept_into_pool` already blocks
+  cross-niche pool membership upstream).
 
 ### Phase 4 — Draft + render per assignment
 - Generate per-account title/caption via existing `smart_drafts.py` niche profiles.
