@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from PyQt6.QtCore import Qt
@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import QHeaderView
 import nicheflow_studio.app.main_window as mw
 from nicheflow_studio.app.main_window import MainWindow
 from nicheflow_studio.core.account_health import HealthState, SessionHealth
-from nicheflow_studio.db.models import Account
+from nicheflow_studio.db.models import Account, UploadJob
 from nicheflow_studio.db.session import get_session, init_db
 
 
@@ -76,6 +76,9 @@ def test_sidebar_health_button_opens_tab(qt_app, tmp_path: Path) -> None:
     try:
         window.show()
         qt_app.processEvents()
+        # Navigate away from the dashboard first, then verify the button brings us back.
+        window._set_current_page("downloads")
+        qt_app.processEvents()
         assert window._current_page != "session_health"
         window._sidebar_health_button.click()
         qt_app.processEvents()
@@ -103,10 +106,11 @@ def test_publishing_dashboard_visible_without_selected_account(qt_app, tmp_path:
         assert window._publishing_dashboard_tabs.tabText(0) == "1. Pool & Distribute"
         assert window._sidebar_toggle_button.isEnabled() is True
 
+        # Panel starts hidden; toggling once opens it.
         window._toggle_account_sidebar()
         qt_app.processEvents()
 
-        assert window._account_panel.isVisible() is False
+        assert window._account_panel.isVisible() is True
         assert window._workspace_content.isVisible() is True
     finally:
         _teardown(window)
@@ -134,6 +138,108 @@ def test_account_readiness_detail_column_is_readable(qt_app, monkeypatch, tmp_pa
         detail_item = table.item(0, 6)
         assert detail_item is not None
         assert detail_item.toolTip() == detail_item.text()
+    finally:
+        _teardown(window)
+
+
+def test_publishing_dashboard_lists_global_publish_jobs(qt_app, tmp_path: Path) -> None:
+    init_db()
+    first_video = tmp_path / "first.mp4"
+    second_video = tmp_path / "second.mp4"
+    old_video = tmp_path / "old.mp4"
+    posted_duplicate_video = tmp_path / "posted-duplicate.mp4"
+    first_video.write_bytes(b"first")
+    second_video.write_bytes(b"second")
+    old_video.write_bytes(b"old")
+    posted_duplicate_video.write_bytes(b"posted duplicate")
+    now = datetime.now(timezone.utc)
+    with get_session() as session:
+        first = Account(name="Past Moments Daily", platform="instagram", instagram_profile="past")
+        second = Account(name="Cinema Files Daily", platform="instagram", instagram_profile="cinema")
+        session.add_all([first, second])
+        session.flush()
+        session.add_all(
+            [
+                UploadJob(
+                    account_id=first.id,
+                    processed_path=str(first_video),
+                    title="Draft reel",
+                    status="draft",
+                    created_at=now,
+                ),
+                UploadJob(
+                    account_id=first.id,
+                    processed_path=str(first_video),
+                    title="Duplicate draft reel",
+                    status="draft",
+                    created_at=now - timedelta(minutes=5),
+                ),
+                UploadJob(
+                    account_id=second.id,
+                    processed_path=str(second_video),
+                    title="Ready reel",
+                    status="ready",
+                    created_at=now - timedelta(days=3),
+                ),
+                UploadJob(
+                    account_id=second.id,
+                    processed_path=str(old_video),
+                    title="Old exported backlog",
+                    status="draft",
+                    created_at=now - timedelta(days=3),
+                ),
+                UploadJob(
+                    account_id=second.id,
+                    processed_path=str(posted_duplicate_video),
+                    title="Already posted sibling",
+                    status="posted",
+                    posted_at=now,
+                    created_at=now,
+                ),
+                UploadJob(
+                    account_id=second.id,
+                    processed_path=str(posted_duplicate_video),
+                    title="Duplicate still draft",
+                    status="draft",
+                    created_at=now,
+                ),
+            ]
+        )
+        session.commit()
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._open_session_health_dialog()
+        window._publishing_dashboard_tabs.setCurrentIndex(1)
+        window._refresh_global_publish_queue()
+        qt_app.processEvents()
+
+        assert window._publishing_dashboard_tabs.tabText(1) == "2. Multi-Account Publish"
+        assert window._global_publish_table.rowCount() == 2
+        assert "2 recent exported/due publish item(s)" in window._global_publish_summary_label.text()
+        titles = {
+            window._global_publish_table.item(row, 2).text(): row
+            for row in range(window._global_publish_table.rowCount())
+        }
+        assert "Old exported backlog" not in titles
+        assert "Duplicate draft reel" not in titles
+        assert "Duplicate still draft" not in titles
+        draft_row = titles["Draft reel"]
+        assert window._global_publish_table.item(draft_row, 3).text() == "Exported"
+        window._global_publish_table.selectRow(draft_row)
+        qt_app.processEvents()
+
+        assert window._global_publish_mark_ready_button.isEnabled() is True
+        window._on_global_mark_selected_ready_clicked()
+
+        with get_session() as session:
+            statuses = {
+                job.title: job.status for job in session.query(UploadJob).order_by(UploadJob.title)
+            }
+        assert statuses["Draft reel"] == "ready"
+        assert statuses["Ready reel"] == "ready"
     finally:
         _teardown(window)
 

@@ -1022,7 +1022,7 @@ PUBLISH_CHECKPOINT_COOLDOWN = dt.timedelta(hours=3)
 # Randomized gap between posts in a batch run, so a multi-account sweep looks
 # like a person spacing posts out rather than a burst. Applied BETWEEN posts
 # only (single-account cadence stays free).
-PUBLISH_BATCH_GAP_RANGE_SECONDS = (120, 420)  # 2-7 minutes
+PUBLISH_BATCH_GAP_RANGE_SECONDS = (30, 75)  # 30-75 seconds
 # Hook-tier gate for unattended batch publishing. A title whose applied hook
 # tier resolves to one of these is HELD for manual review rather than
 # auto-posted. Green (no checkable claim) and unknown/legacy (no tier data,
@@ -1665,6 +1665,9 @@ class MainWindow(QWidget):
         self._publish_batch_queue: list[int] = []
         self._publish_batch_posted = 0
         self._publish_batch_skipped = 0
+        self._publish_batch_current_label: str | None = None
+        self._publish_batch_next_label: str | None = None
+        self._publish_batch_next_at: dt.datetime | None = None
         # Deduped human-readable reasons for jobs the batch skipped (cap reached,
         # cooldown, missing file), surfaced in the final "Batch done" summary.
         self._batch_skip_reasons: list[str] = []
@@ -1719,6 +1722,13 @@ class MainWindow(QWidget):
         self._toast_timer = QTimer(self)
         self._toast_timer.setSingleShot(True)
         self._toast_timer.timeout.connect(self._hide_toast)
+
+        self._publish_batch_gap_timer = QTimer(self)
+        self._publish_batch_gap_timer.setSingleShot(True)
+        self._publish_batch_gap_timer.timeout.connect(self._publish_next_in_batch)
+        self._publish_batch_countdown_timer = QTimer(self)
+        self._publish_batch_countdown_timer.setInterval(1000)
+        self._publish_batch_countdown_timer.timeout.connect(self._update_publish_batch_status)
 
         self._interaction_idle_timer = QTimer(self)
         self._interaction_idle_timer.setSingleShot(True)
@@ -2846,7 +2856,8 @@ class MainWindow(QWidget):
         self._refresh_runtime_fields()
         self._refresh_account_controls()
         self._show_account_main()
-        self._set_current_page("downloads")
+        self._set_account_sidebar_visible(False)
+        self._set_current_page("session_health")
         self._apply_refresh(force=True)
 
     @staticmethod
@@ -3647,7 +3658,7 @@ class MainWindow(QWidget):
         self._processing_open_latest_output_button.clicked.connect(
             self._on_open_latest_processed_output_clicked
         )
-        self._processing_add_to_schedule_button = QPushButton("Add to Schedule")
+        self._processing_add_to_schedule_button = QPushButton("Update Publish Item")
         self._processing_add_to_schedule_button.setObjectName("ghostButton")
         self._processing_add_to_schedule_button.clicked.connect(
             self._on_add_processed_to_schedule_clicked
@@ -3802,7 +3813,8 @@ class MainWindow(QWidget):
         tabs = QTabWidget()
         tabs.setObjectName("panel")
         tabs.addTab(self._make_pooling_panel(), "1. Pool & Distribute")
-        tabs.addTab(self._make_account_health_panel(), "2. Account Readiness")
+        tabs.addTab(self._make_global_publish_panel(), "2. Multi-Account Publish")
+        tabs.addTab(self._make_account_health_panel(), "3. Account Readiness")
         self._publishing_dashboard_tabs = tabs
 
         layout.addWidget(title)
@@ -4057,6 +4069,277 @@ class MainWindow(QWidget):
             f"{dl_count} downloaded Instagram clip(s), {registered} in the media library.  "
             f"History pool {pool_sizes['history']} · Movie pool {pool_sizes['movie']}."
         )
+
+    # --- Global multi-account publish queue -----------------------------
+
+    def _make_global_publish_panel(self) -> QFrame:
+        panel = QFrame()
+        panel.setObjectName("panel")
+        layout = QVBoxLayout()
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        title = QLabel("Multi-Account Publish")
+        title.setObjectName("sectionTitle")
+        subtitle = QLabel(
+            "Review recent exported reels across accounts. Older draft backlog stays in each "
+            "account's Publish Queue; mark selected exports Ready when they can publish globally."
+        )
+        subtitle.setObjectName("metaValue")
+        subtitle.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+
+        self._global_publish_summary_label = QLabel("")
+        self._global_publish_summary_label.setObjectName("metaValue")
+        self._global_publish_summary_label.setWordWrap(True)
+        layout.addWidget(self._global_publish_summary_label)
+
+        self._global_publish_table = TableFocusScrollWidget()
+        self._global_publish_table.setObjectName("downloadQueueTable")
+        self._global_publish_table.setColumnCount(7)
+        self._global_publish_table.setHorizontalHeaderLabels(
+            ["Account", "Video", "Title", "Status", "Scheduled", "Profile", "Output"]
+        )
+        global_header = self._global_publish_table.horizontalHeader()
+        global_header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        global_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        global_header.setStretchLastSection(False)
+        self._global_publish_table.verticalHeader().setVisible(False)
+        self._global_publish_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._global_publish_table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
+        self._global_publish_table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self._global_publish_table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._global_publish_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._global_publish_table.setWordWrap(False)
+        self._global_publish_table.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self._global_publish_table.setMinimumHeight(260)
+        self._global_publish_table.itemSelectionChanged.connect(
+            self._on_global_publish_selection_changed
+        )
+        layout.addWidget(self._global_publish_table, stretch=1)
+
+        actions = QHBoxLayout()
+        actions.setSpacing(10)
+        self._global_publish_refresh_button = QPushButton("Refresh")
+        self._global_publish_refresh_button.setObjectName("downloadToolbarButton")
+        self._global_publish_refresh_button.clicked.connect(self._refresh_global_publish_queue)
+        self._global_publish_mark_ready_button = QPushButton("Mark Selected Ready")
+        self._global_publish_mark_ready_button.setObjectName("downloadToolbarButton")
+        self._global_publish_mark_ready_button.setEnabled(False)
+        self._global_publish_mark_ready_button.clicked.connect(
+            self._on_global_mark_selected_ready_clicked
+        )
+        self._global_publish_all_due_button = QPushButton("Publish All Due")
+        self._global_publish_all_due_button.setObjectName("downloadToolbarButton")
+        self._global_publish_all_due_button.setToolTip(
+            "Publish every Ready or due scheduled reel across accounts, one at a time."
+        )
+        self._global_publish_all_due_button.clicked.connect(self._on_publish_all_due_clicked)
+        actions.addWidget(self._global_publish_refresh_button)
+        actions.addWidget(self._global_publish_mark_ready_button)
+        actions.addWidget(self._global_publish_all_due_button)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+
+        self._global_publish_status_label = QLabel("")
+        self._global_publish_status_label.setObjectName("subtleLabel")
+        self._global_publish_status_label.setWordWrap(True)
+        layout.addWidget(self._global_publish_status_label)
+
+        panel.setLayout(layout)
+        return panel
+
+    def _selected_global_publish_job_ids(self) -> list[int]:
+        if not hasattr(self, "_global_publish_table"):
+            return []
+        ids: list[int] = []
+        for item in self._global_publish_table.selectedItems():
+            job_id = item.data(Qt.ItemDataRole.UserRole)
+            if job_id is None:
+                continue
+            value = int(job_id)
+            if value not in ids:
+                ids.append(value)
+        return ids
+
+    def _on_global_publish_selection_changed(self) -> None:
+        if not hasattr(self, "_global_publish_mark_ready_button"):
+            return
+        self._global_publish_mark_ready_button.setEnabled(
+            bool(self._selected_global_publish_job_ids())
+        )
+
+    def _on_global_mark_selected_ready_clicked(self) -> None:
+        job_ids = self._selected_global_publish_job_ids()
+        if not job_ids:
+            self._notify("Select one or more publish jobs first.", Tone.WARNING)
+            return
+        with get_session() as session:
+            jobs = session.query(UploadJob).filter(UploadJob.id.in_(job_ids)).all()
+            updated = 0
+            for job in jobs:
+                if job.posted_at is not None or job.status == "posted":
+                    continue
+                if not Path(job.processed_path).exists():
+                    continue
+                job.status = "ready"
+                job.scheduled_at = None
+                updated += 1
+            session.commit()
+        self._refresh_global_publish_queue()
+        self._refresh_account_health()
+        self._notify(f"Marked {updated} publish job(s) ready.", Tone.SUCCESS)
+
+    def _refresh_global_publish_queue(self) -> None:
+        if not hasattr(self, "_global_publish_table"):
+            return
+        due_ids = set(self._gather_due_publish_job_ids())
+        with get_session() as session:
+            all_jobs = (
+                session.query(UploadJob)
+                .options(joinedload(UploadJob.account), joinedload(UploadJob.download_item))
+                .order_by(
+                    UploadJob.scheduled_at.is_(None),
+                    UploadJob.scheduled_at.asc(),
+                    UploadJob.created_at.desc(),
+                )
+                .all()
+            )
+            posted_path_keys = {
+                self._global_publish_account_path_key(job)
+                for job in all_jobs
+                if job.posted_at is not None or job.status == "posted"
+            }
+            unposted_jobs = [
+                job
+                for job in all_jobs
+                if job.posted_at is None and job.status != "posted"
+            ]
+            jobs = self._visible_global_publish_jobs(unposted_jobs, due_ids, posted_path_keys)
+
+        self._global_publish_table.blockSignals(True)
+        self._global_publish_table.setRowCount(0)
+        exported_count = 0
+        ready_count = 0
+        scheduled_count = 0
+        for job in jobs:
+            row = self._global_publish_table.rowCount()
+            self._global_publish_table.insertRow(row)
+            video_title = (
+                job.download_item.title
+                if job.download_item is not None and job.download_item.title
+                else Path(job.processed_path).stem
+            )
+            status_text = self._global_publish_status_text(job)
+            status_key = (job.status or "").lower()
+            if status_key == "draft":
+                exported_count += 1
+            elif status_key == "ready":
+                ready_count += 1
+            elif status_key == "scheduled":
+                scheduled_count += 1
+            profile = self._clean_profile(job.account.instagram_profile if job.account else None)
+            values = [
+                job.account.name if job.account else "Unassigned",
+                video_title or "(untitled)",
+                job.title or "(not drafted)",
+                status_text,
+                self._upload_scheduled_text(job),
+                profile or "—",
+                Path(job.processed_path).name,
+            ]
+            for column, value in enumerate(values):
+                cell = QTableWidgetItem(value)
+                cell.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                cell.setData(Qt.ItemDataRole.UserRole, job.id)
+                if column == 3:
+                    self._apply_schedule_status_style(cell, value)
+                if column == 6:
+                    cell.setToolTip(job.processed_path)
+                self._global_publish_table.setItem(row, column, cell)
+        self._global_publish_table.resizeRowsToContents()
+        self._global_publish_table.blockSignals(False)
+        self._on_global_publish_selection_changed()
+
+        due_count = len(due_ids)
+        total = len(jobs)
+        self._global_publish_summary_label.setText(
+            f"{total} recent exported/due publish item(s) across accounts. "
+            f"{exported_count} exported, {ready_count} ready, {scheduled_count} scheduled, "
+            f"{due_count} due now."
+        )
+        self._global_publish_status_label.setText(
+            "Shows existing output files from the last 24 hours, plus any Ready or Scheduled jobs. "
+            "Use each account's Publish Queue for older unready backlog."
+        )
+        self._update_publish_batch_status()
+
+    @staticmethod
+    def _as_utc_datetime(value: dt.datetime | None) -> dt.datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=dt.timezone.utc)
+        return value.astimezone(dt.timezone.utc)
+
+    @staticmethod
+    def _global_publish_path_key(job: UploadJob) -> str:
+        try:
+            return str(Path(job.processed_path).resolve()).casefold()
+        except OSError:
+            return str(Path(job.processed_path)).casefold()
+
+    def _global_publish_account_path_key(self, job: UploadJob) -> tuple[int | None, str]:
+        return (job.account_id, self._global_publish_path_key(job))
+
+    def _visible_global_publish_jobs(
+        self,
+        jobs: list[UploadJob],
+        due_ids: set[int],
+        posted_path_keys: set[tuple[int | None, str]] | None = None,
+    ) -> list[UploadJob]:
+        posted_path_keys = posted_path_keys or set()
+        now = dt.datetime.now(dt.timezone.utc)
+        recent_cutoff = now - dt.timedelta(hours=24)
+        candidates: list[UploadJob] = []
+        for job in jobs:
+            processed_path = (job.processed_path or "").strip()
+            if not processed_path or not Path(processed_path).exists():
+                continue
+            if self._global_publish_account_path_key(job) in posted_path_keys:
+                continue
+            status_key = (job.status or "").lower()
+            created_at = self._as_utc_datetime(job.created_at)
+            is_recent = created_at is None or created_at >= recent_cutoff
+            if job.id not in due_ids and status_key not in {"ready", "scheduled"} and not is_recent:
+                continue
+            candidates.append(job)
+
+        def sort_key(job: UploadJob) -> tuple[int, int, dt.datetime]:
+            status_priority = {"ready": 2, "scheduled": 1, "draft": 0}.get(
+                (job.status or "").lower(),
+                0,
+            )
+            created_at = self._as_utc_datetime(job.created_at) or dt.datetime.min.replace(
+                tzinfo=dt.timezone.utc
+            )
+            return (1 if job.id in due_ids else 0, status_priority, created_at)
+
+        candidates.sort(key=sort_key, reverse=True)
+        deduped: list[UploadJob] = []
+        seen_paths: set[str] = set()
+        for job in candidates:
+            path_key = self._global_publish_path_key(job)
+            if path_key in seen_paths:
+                continue
+            seen_paths.add(path_key)
+            deduped.append(job)
+        return deduped
+
+    def _global_publish_status_text(self, job: UploadJob) -> str:
+        status_text = self._upload_status_text(job)
+        return "Exported" if status_text == "Draft" else status_text
 
     def _open_session_health_dialog(self) -> None:
         """Navigate to the Publishing Dashboard and refresh local status."""
@@ -4588,7 +4871,7 @@ class MainWindow(QWidget):
         self._schedule_publish_all_button.setObjectName("downloadToolbarButton")
         self._schedule_publish_all_button.setToolTip(
             "Post every due reel across ALL accounts, one at a time with a "
-            "2-7 minute gap between posts (sequential, never simultaneous)."
+            "30-75 second gap between posts (sequential, never simultaneous)."
         )
         self._schedule_publish_all_button.clicked.connect(
             self._on_publish_all_due_clicked
@@ -6481,7 +6764,7 @@ class MainWindow(QWidget):
         output_path = self._new_processed_output_path_for_item(item)
         if output_path is None:
             output_path = self._processed_output_path_for_item(item)
-        # Resolve the "Open Video" / "Add to Schedule" target strictly per-item.
+        # Resolve the "Open Video" / publish-queue target strictly per-item.
         # Earlier this used the cross-account folder mtime fallback and an
         # ``or self._processing_last_output_path`` carryover, both of which
         # leaked another item's most-recent export into this item's panel and
@@ -7456,6 +7739,7 @@ class MainWindow(QWidget):
         # one we just produced.
         self._save_processed_output_for_selected_item(output_path)
         self._refresh_processing_output_preview()
+        queued = self._upsert_publish_job_for_export(output_path, status="ready")
         if payload.get("watermark_replaced"):
             detected = str(payload.get("watermark_detected_text") or "detected watermark")
             replacement = str(payload.get("watermark_replacement_text") or "account handle")
@@ -7464,7 +7748,15 @@ class MainWindow(QWidget):
             )
         else:
             self._processing_progress_label.setText("Processing complete.")
-        self._notify(f"Processed video saved to {output_path.name}.", Tone.SUCCESS)
+        if queued is not None:
+            self._refresh_schedule_page()
+            self._refresh_global_publish_queue()
+            self._notify(
+                f"Processed video saved to {output_path.name} and marked ready to publish.",
+                Tone.SUCCESS,
+            )
+        else:
+            self._notify(f"Processed video saved to {output_path.name}.", Tone.SUCCESS)
 
     def _save_processed_output_for_selected_item(self, output_path: Path) -> None:
         item_id = self._selected_processing_item_id
@@ -7655,9 +7947,36 @@ class MainWindow(QWidget):
         if output_path is None or not output_path.exists():
             self._notify("Process the video before adding it to the schedule.", Tone.WARNING)
             return
-        if item.account_id is None:
-            self._notify("Assign the video to an account before scheduling it.", Tone.WARNING)
+        result = self._upsert_publish_job_for_export(output_path, status="ready")
+        if result is None:
             return
+        self._refresh_schedule_page()
+        if result:
+            self._notify_and_refresh(
+                "Updated existing publish queue item for this export.",
+                Tone.SUCCESS,
+            )
+        else:
+            self._notify_and_refresh(
+                "Added latest processed export to the publish queue.",
+                Tone.SUCCESS,
+            )
+
+    def _upsert_publish_job_for_export(
+        self,
+        output_path: Path,
+        *,
+        status: str | None,
+    ) -> bool | None:
+        item = self._processing_selected_item()
+        if item is None:
+            return None
+        if item.account_id is None:
+            self._notify(
+                "Assign the video to an account before adding it to the publish queue.",
+                Tone.WARNING,
+            )
+            return None
 
         title = self._processing_title_draft_input.text().strip() or item.title or None
         description = self._caption_for_save(
@@ -7667,15 +7986,61 @@ class MainWindow(QWidget):
             account = session.get(Account, item.account_id)
             if account is None:
                 self._notify("The selected account no longer exists.", Tone.WARNING)
-                return
-            scheduled_at = self._next_upload_slot(account.upload_schedule_slots)
-            status = "scheduled" if scheduled_at is not None else "draft"
+                return None
+            scheduled_at = (
+                None
+                if status is not None
+                else self._next_upload_slot(account.upload_schedule_slots)
+            )
+            job_status = status or ("scheduled" if scheduled_at is not None else "draft")
             timezone_label = account.upload_timezone or "Asia/Bangkok"
             privacy_status = account.upload_default_privacy or "private"
+            output_path_text = str(output_path)
+            existing_posted = (
+                session.query(UploadJob)
+                .filter(UploadJob.account_id == account.id)
+                .filter(UploadJob.processed_path == output_path_text)
+                .filter((UploadJob.posted_at.is_not(None)) | (UploadJob.status == "posted"))
+                .order_by(UploadJob.updated_at.desc(), UploadJob.id.desc())
+                .first()
+            )
+            if existing_posted is not None:
+                self._last_created_schedule_job_id = existing_posted.id
+                self._notify(
+                    "This export is already marked posted in the publish queue.",
+                    Tone.WARNING,
+                )
+                return None
+            existing_job = (
+                session.query(UploadJob)
+                .filter(UploadJob.account_id == account.id)
+                .filter(UploadJob.processed_path == output_path_text)
+                .filter(UploadJob.posted_at.is_(None))
+                .filter(UploadJob.status != "posted")
+                .order_by(UploadJob.updated_at.desc(), UploadJob.id.desc())
+                .first()
+            )
+            if existing_job is not None:
+                existing_job.download_item_id = item.id
+                existing_job.title = title
+                existing_job.description = description
+                existing_job.scheduled_at = scheduled_at
+                existing_job.timezone = timezone_label
+                existing_job.privacy_status = privacy_status
+                existing_job.made_for_kids = int(account.upload_made_for_kids or 0)
+                existing_job.contains_synthetic_media = int(
+                    account.upload_contains_synthetic_media or 0
+                )
+                existing_job.status = job_status
+                existing_job.error_message = None
+                session.flush()
+                self._last_created_schedule_job_id = existing_job.id
+                session.commit()
+                return True
             job = UploadJob(
                 account_id=account.id,
                 download_item_id=item.id,
-                processed_path=str(output_path),
+                processed_path=output_path_text,
                 title=title,
                 description=description,
                 scheduled_at=scheduled_at,
@@ -7683,15 +8048,13 @@ class MainWindow(QWidget):
                 privacy_status=privacy_status,
                 made_for_kids=int(account.upload_made_for_kids or 0),
                 contains_synthetic_media=int(account.upload_contains_synthetic_media or 0),
-                status=status,
+                status=job_status,
             )
             session.add(job)
             session.flush()
             self._last_created_schedule_job_id = job.id
             session.commit()
-
-        self._refresh_schedule_page()
-        self._notify_and_refresh("Added latest processed export to the publish queue.", Tone.SUCCESS)
+            return False
 
     def _set_current_page(self, page_name: str) -> None:
         if page_name == "pooling":
@@ -7713,6 +8076,7 @@ class MainWindow(QWidget):
         self._reset_workspace_scroll_to_top()
         if page_name == "session_health":
             self._refresh_pooling_page()
+            self._refresh_global_publish_queue()
             self._refresh_account_health()
 
     def _reset_workspace_scroll_to_top(self) -> None:
@@ -8929,10 +9293,15 @@ class MainWindow(QWidget):
         self._publish_batch_queue = list(job_ids)
         self._publish_batch_posted = 0
         self._publish_batch_skipped = 0
+        self._publish_batch_current_label = None
+        self._publish_batch_next_label = None
+        self._publish_batch_next_at = None
         self._batch_skip_reasons = []
         self._schedule_publish_due_button.setText("Stop Publishing")
         self._schedule_auto_publish_button.setEnabled(False)
         self._schedule_publish_all_button.setEnabled(False)
+        if hasattr(self, "_global_publish_all_due_button"):
+            self._global_publish_all_due_button.setEnabled(False)
         self._notify(info_message, Tone.INFO)
         self._publish_next_in_batch()
 
@@ -8988,13 +9357,13 @@ class MainWindow(QWidget):
         lines = "<br>".join(
             f"&bull; <b>{name}</b> (@{profile}) — {fname}" for name, profile, fname in rows
         )
-        gap_lo, gap_hi = (g // 60 for g in PUBLISH_BATCH_GAP_RANGE_SECONDS)
+        gap_lo, gap_hi = PUBLISH_BATCH_GAP_RANGE_SECONDS
         msg = QMessageBox(self)
         msg.setWindowTitle("Confirm Publish All Due")
         msg.setIcon(QMessageBox.Icon.Question)
         msg.setText(
             f"<b>Posting {len(rows)} reel(s) across accounts</b>, one at a time "
-            f"with a ~{gap_lo}-{gap_hi} min gap between posts:<br><br>{lines}"
+            f"with a ~{gap_lo}-{gap_hi} sec gap between posts:<br><br>{lines}"
         )
         publish_btn = msg.addButton(f"Publish {len(rows)}", QMessageBox.ButtonRole.AcceptRole)
         msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
@@ -9179,8 +9548,13 @@ class MainWindow(QWidget):
     def _publish_next_in_batch(self) -> None:
         if not self._publish_batch_active:
             return
+        self._publish_batch_gap_timer.stop()
+        self._publish_batch_countdown_timer.stop()
+        self._publish_batch_next_at = None
+        self._publish_batch_next_label = None
         while self._publish_batch_queue:
             job_id = self._publish_batch_queue.pop(0)
+            job_label = self._publish_job_label(job_id)
             prep = self._prepare_batch_job(job_id)
             if prep.payload is None:
                 self._publish_batch_skipped += 1
@@ -9188,10 +9562,62 @@ class MainWindow(QWidget):
                     self._batch_skip_reasons.append(prep.skip_reason)
                 continue
             _account_id, profile_name, video_path, caption = prep.payload
+            self._publish_batch_current_label = job_label
+            self._update_publish_batch_status()
             do_share = not self._schedule_dry_run_checkbox.isChecked()
             self._launch_publish_worker(job_id, profile_name, video_path, caption, do_share)
             return
         self._finish_publish_batch()
+
+    def _publish_job_label(self, job_id: int) -> str:
+        with get_session() as session:
+            job = (
+                session.query(UploadJob)
+                .options(joinedload(UploadJob.account))
+                .filter(UploadJob.id == job_id)
+                .one_or_none()
+            )
+            if job is None:
+                return f"job {job_id}"
+            account_name = (job.account.name if job.account else None) or "Unknown account"
+            file_name = Path(job.processed_path).name if job.processed_path else "unknown file"
+            return f"{account_name} - {file_name}"
+
+    @staticmethod
+    def _format_countdown(seconds: int) -> str:
+        seconds = max(seconds, 0)
+        minutes, remaining_seconds = divmod(seconds, 60)
+        return f"{minutes}:{remaining_seconds:02d}" if minutes else f"{remaining_seconds}s"
+
+    def _update_publish_batch_status(self) -> None:
+        if not self._publish_batch_active:
+            return
+        text = ""
+        if self._publish_in_progress and self._publish_batch_current_label:
+            text = (
+                f"Publishing now: {self._publish_batch_current_label}. "
+                f"{len(self._publish_batch_queue)} waiting after this."
+            )
+        elif self._publish_batch_next_at is not None:
+            remaining = int(
+                max(
+                    0,
+                    (self._publish_batch_next_at - dt.datetime.now(dt.timezone.utc)).total_seconds(),
+                )
+            )
+            text = (
+                f"Cooldown: next post in {self._format_countdown(remaining)}. "
+                f"Next: {self._publish_batch_next_label or 'queued reel'} "
+                f"({len(self._publish_batch_queue)} left)."
+            )
+            if remaining <= 0:
+                self._publish_batch_countdown_timer.stop()
+        else:
+            text = f"Publishing batch active. {len(self._publish_batch_queue)} queued."
+        if hasattr(self, "_global_publish_status_label"):
+            self._global_publish_status_label.setText(text)
+        if hasattr(self, "_schedule_summary_label") and self._current_page == "uploads":
+            self._schedule_summary_label.setText(text)
 
     def _schedule_next_batch_publish(self) -> None:
         if not self._publish_batch_active:
@@ -9200,11 +9626,18 @@ class MainWindow(QWidget):
             self._finish_publish_batch()
             return
         gap_seconds = random.randint(*PUBLISH_BATCH_GAP_RANGE_SECONDS)
+        self._publish_batch_current_label = None
+        self._publish_batch_next_label = self._publish_job_label(self._publish_batch_queue[0])
+        self._publish_batch_next_at = dt.datetime.now(dt.timezone.utc) + dt.timedelta(
+            seconds=gap_seconds
+        )
         self._notify(
-            f"Next post in ~{round(gap_seconds / 60)} min ({len(self._publish_batch_queue)} left).",
+            f"Next post in {self._format_countdown(gap_seconds)} ({len(self._publish_batch_queue)} left).",
             Tone.INFO,
         )
-        QTimer.singleShot(gap_seconds * 1000, self._publish_next_in_batch)
+        self._update_publish_batch_status()
+        self._publish_batch_countdown_timer.start()
+        self._publish_batch_gap_timer.start(gap_seconds * 1000)
 
     def _finish_publish_batch(self) -> None:
         posted = self._publish_batch_posted
@@ -9212,9 +9645,16 @@ class MainWindow(QWidget):
         reasons = self._batch_skip_reasons
         self._publish_batch_active = False
         self._publish_batch_queue = []
+        self._publish_batch_current_label = None
+        self._publish_batch_next_label = None
+        self._publish_batch_next_at = None
+        self._publish_batch_gap_timer.stop()
+        self._publish_batch_countdown_timer.stop()
         self._batch_skip_reasons = []
         self._schedule_publish_due_button.setText("Publish Due Now")
         self._schedule_publish_all_button.setEnabled(True)
+        if hasattr(self, "_global_publish_all_due_button"):
+            self._global_publish_all_due_button.setEnabled(True)
         message = f"Batch done: {posted} posted, {skipped} skipped."
         if reasons:
             message += " Skipped: " + "; ".join(reasons) + "."
@@ -9222,18 +9662,29 @@ class MainWindow(QWidget):
         tone = Tone.WARNING if skipped and not posted else Tone.SUCCESS
         self._notify(message, tone)
         self._refresh_schedule_page()
+        self._refresh_global_publish_queue()
+        self._refresh_account_health()
 
     def _stop_publish_batch(self, *, user_cancelled: bool) -> None:
         self._publish_batch_active = False
         self._publish_batch_queue = []
+        self._publish_batch_current_label = None
+        self._publish_batch_next_label = None
+        self._publish_batch_next_at = None
+        self._publish_batch_gap_timer.stop()
+        self._publish_batch_countdown_timer.stop()
         self._schedule_publish_due_button.setText("Publish Due Now")
         self._schedule_publish_all_button.setEnabled(True)
+        if hasattr(self, "_global_publish_all_due_button"):
+            self._global_publish_all_due_button.setEnabled(True)
         if user_cancelled:
             self._notify(
                 "Stopped batch publishing. A post already in progress will finish.",
                 Tone.WARNING,
             )
         self._refresh_schedule_page()
+        self._refresh_global_publish_queue()
+        self._refresh_account_health()
 
     def _on_publish_completed(self, payload: dict) -> None:
         self._publish_in_progress = False
@@ -9248,10 +9699,25 @@ class MainWindow(QWidget):
             with get_session() as session:
                 job = session.get(UploadJob, job_id)
                 if job is not None:
+                    posted_at = dt.datetime.now(dt.timezone.utc)
                     job.status = "posted"
-                    job.posted_at = dt.datetime.now(dt.timezone.utc)
+                    job.posted_at = posted_at
                     job.posted_url = posted_url
                     job.error_message = None
+                    duplicate_jobs = (
+                        session.query(UploadJob)
+                        .filter(UploadJob.id != job.id)
+                        .filter(UploadJob.account_id == job.account_id)
+                        .filter(UploadJob.processed_path == job.processed_path)
+                        .filter(UploadJob.posted_at.is_(None))
+                        .filter(UploadJob.status != "posted")
+                        .all()
+                    )
+                    for duplicate_job in duplicate_jobs:
+                        duplicate_job.status = "posted"
+                        duplicate_job.posted_at = posted_at
+                        duplicate_job.posted_url = posted_url
+                        duplicate_job.error_message = None
                     session.commit()
             self._notify("Reel published.", Tone.SUCCESS)
         elif status == "dry_run":
@@ -9283,6 +9749,8 @@ class MainWindow(QWidget):
             self._notify(f"Publish failed: {error_message}", Tone.ERROR)
 
         self._refresh_schedule_page()
+        self._refresh_global_publish_queue()
+        self._refresh_account_health()
         self._advance_batch_after(status)
 
     def _on_publish_failed(self, message: str) -> None:
@@ -9291,6 +9759,8 @@ class MainWindow(QWidget):
         self._publish_worker = None
         self._notify(f"Publish failed: {message}", Tone.ERROR)
         self._refresh_schedule_page()
+        self._refresh_global_publish_queue()
+        self._refresh_account_health()
         self._advance_batch_after("failed")
 
     @staticmethod
@@ -9477,7 +9947,7 @@ class MainWindow(QWidget):
             self._schedule_summary_label.setText(summary + next_hint)
         else:
             self._schedule_summary_label.setText(
-                "No publish jobs yet. Finish Preprocess, then use Add to Schedule."
+                "No publish jobs yet. Finish Preprocess to create a ready publish item."
             )
 
     def _apply_schedule_status_style(self, item: QTableWidgetItem, status_text: str) -> None:
@@ -9487,7 +9957,7 @@ class MainWindow(QWidget):
         elif status_text == "Uploading":
             item.setForeground(QColor("#9fc6ff"))
             item.setBackground(QColor("#162a45"))
-        elif status_text == "Draft":
+        elif status_text in {"Draft", "Exported"}:
             item.setForeground(QColor("#f5cd79"))
             item.setBackground(QColor("#342812"))
         elif status_text in {"Missing output", "Failed"}:
