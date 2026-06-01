@@ -38,6 +38,55 @@ def test_publish_worker_maps_result_to_payload(qt_app, monkeypatch) -> None:
     }
 
 
+def test_publish_completion_marks_duplicate_export_rows_posted(qt_app, tmp_path: Path) -> None:
+    init_db()
+    video = tmp_path / "reel.mp4"
+    video.write_bytes(b"processed")
+    with get_session() as session:
+        account = Account(name="Cinema Files Daily", platform="instagram", instagram_profile="cinema")
+        session.add(account)
+        session.flush()
+        primary = UploadJob(account_id=account.id, processed_path=str(video), status="ready")
+        duplicate = UploadJob(account_id=account.id, processed_path=str(video), status="draft")
+        session.add_all([primary, duplicate])
+        session.commit()
+        primary_id = primary.id
+        duplicate_id = duplicate.id
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+
+        window._on_publish_completed(
+            {
+                "job_id": primary_id,
+                "status": "posted",
+                "posted_url": "https://www.instagram.com/reel/current/",
+                "error_message": None,
+            }
+        )
+
+        with get_session() as session:
+            jobs = {
+                job.id: job
+                for job in session.query(UploadJob)
+                .filter(UploadJob.id.in_([primary_id, duplicate_id]))
+                .all()
+            }
+
+        assert jobs[primary_id].status == "posted"
+        assert jobs[duplicate_id].status == "posted"
+        assert jobs[primary_id].posted_at is not None
+        assert jobs[duplicate_id].posted_at is not None
+        assert jobs[duplicate_id].posted_url == "https://www.instagram.com/reel/current/"
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
 def _make_account_and_video(tmp_path: Path) -> tuple[int, str]:
     video = tmp_path / "reel.mp4"
     video.write_bytes(b"processed")
@@ -219,7 +268,22 @@ def test_publish_all_due_batches_across_accounts(qt_app, tmp_path: Path) -> None
         launched_profile = launched[0][1]
         assert launched_profile in {"hista", "histb"}
 
+        window._on_publish_completed(
+            {
+                "job_id": launched[0][0],
+                "status": "posted",
+                "posted_url": "https://www.instagram.com/reel/test/",
+                "error_message": None,
+            }
+        )
+        assert window._publish_batch_gap_timer.isActive() is True
+        assert window._publish_batch_countdown_timer.isActive() is True
+        assert window._publish_batch_next_at is not None
+        assert "Cooldown: next post in" in window._schedule_summary_label.text()
+
         window._stop_publish_batch(user_cancelled=True)
+        assert window._publish_batch_gap_timer.isActive() is False
+        assert window._publish_batch_countdown_timer.isActive() is False
         assert window._schedule_publish_all_button.isEnabled() is True
     finally:
         window._refresh_timer.stop()

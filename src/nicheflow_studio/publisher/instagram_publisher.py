@@ -280,10 +280,27 @@ async def _wait_for_share_confirmation(page: Page, timeout_s: float) -> bool:
 
 
 async def _capture_posted_url(page: Page) -> str | None:
-    """Best-effort grab of the new reel's permalink from the confirmation dialog."""
+    """Best-effort grab of the new reel's permalink from the confirmation dialog.
+
+    Keep this scoped to the success dialog. The Instagram home shell can contain
+    old feed/profile links; grabbing the first page-wide ``/reel/`` or ``/p/``
+    anchor can record the wrong URL for a successful upload.
+    """
+    dialog = None
+    for text in _SHARED_CONFIRMATION_TEXT:
+        try:
+            matches = page.locator('[role="dialog"]').filter(has_text=text)
+            if await matches.count():
+                dialog = matches.first
+                break
+        except PlaywrightError:
+            continue
+    if dialog is None:
+        return None
+
     for selector in ('a[href*="/reel/"]', 'a[href*="/p/"]'):
         try:
-            href = await page.locator(selector).first.get_attribute("href", timeout=2500)
+            href = await dialog.locator(selector).first.get_attribute("href", timeout=2500)
         except PlaywrightError:
             continue
         if href:
