@@ -690,10 +690,10 @@ def _smart_draft_prompt(
             # title_style. The explicit user choice wins.
             *(
                 []
-                if _title_style_rules(title_style) is not None
+                if _has_specific_title_style(title_style, niche_label, prompt_profile)
                 else [f"- {style['title']}"]
             ),
-            *(_title_style_rules(title_style) or _caption_style_title_rules(caption_style)),
+            *effective_title_rules(title_style, caption_style, niche_label, prompt_profile),
             "",
             "HOOK FRAMING (drama is allowed, overclaiming is not)",
             *_hook_drama_and_fact_safety_rules(),
@@ -1039,7 +1039,10 @@ def _caption_paragraph_rule(caption_style: str | None) -> str:
             "HARD RULE: the FIRST SENTENCE of the synopsis MUST follow this exact format: "
             "'[Film Title] ([Year]), directed by [Director], is a [genre] [film/movie/series] "
             "about [brief premise].' "
-            "Continue with lead actors, core plot, and themes. "
+            "Continue with ONLY the 2-3 cast members or characters relevant to this "
+            "scene (never an exhaustive cast list — it reads like padding), the core "
+            "plot, and the theme this moment speaks to. End the FINAL paragraph on the "
+            "specific moment shown in this clip, not a broad thesis about the whole film. "
             "Tone is encyclopedic — like an IMDb or Letterboxd synopsis. "
             "Do NOT editorialize, do NOT use 'me when' framing, do NOT comment on quality. "
             f"Hashtags: {_caption_hashtag_target(caption_style)} (optional, e.g. #movietwt #letterboxd)."
@@ -1126,6 +1129,79 @@ def _smart_draft_system_prompt(caption_style: str | None) -> str:
         f"option_tiers must contain exactly {SMART_DRAFT_OPTION_COUNT} strings, one per title_options "
         "entry, each exactly 'green', 'yellow', or 'red' per the HOOK FRAMING tiers. "
         f"{paragraph_rule}"
+    )
+
+
+# History niche detection — kept in one place so _niche_profile, _angle_plan,
+# and the title-rule auto-routing all agree on what counts as "history".
+_HISTORY_NICHE_KEYWORDS = (
+    "history",
+    "historical",
+    "vintage",
+    "archive",
+    "archival",
+    "old footage",
+    "retro",
+)
+
+
+def _is_history_niche(niche_label: str | None) -> bool:
+    niche = _normalize_whitespace(niche_label or "").lower()
+    return any(keyword in niche for keyword in _HISTORY_NICHE_KEYWORDS)
+
+
+# Prompt profiles that carry their OWN deliberate title voice (e.g. story_reel's
+# emotional memory hook, cinema's atmospheric line). History auto-routing must
+# not override these — it only fills in for the generic/broad profile that the
+# archival-footage history accounts (e.g. Past Moments Daily) actually use.
+_GENERIC_TITLE_PROFILES = frozenset({"", "broad_short_form"})
+
+
+def _history_should_auto_route(niche_label: str | None, prompt_profile: str | None) -> bool:
+    return (
+        _is_history_niche(niche_label)
+        and _normalize_whitespace(prompt_profile or "").lower() in _GENERIC_TITLE_PROFILES
+    )
+
+
+def effective_title_rules(
+    title_style: str | None,
+    caption_style: str | None,
+    niche_label: str | None,
+    prompt_profile: str | None = None,
+) -> list[str]:
+    """Pick the on-screen title rules, niche-aware.
+
+    Priority:
+    1. An explicit title_style the user picked always wins.
+    2. Otherwise, a history-niche account on the generic/broad profile defaults
+       to the history hook rules (explanatory 9-16 word shapes) instead of the
+       generic caption-style fallback — so history hooks land even when no style
+       is chosen. A history account on a profile with its own title voice
+       (e.g. story_reel) keeps that voice.
+    3. Otherwise, fall back to the caption-style-derived title rules.
+
+    Used by BOTH the live generation prompt and the Copy Chat Prompt contract so
+    the two never drift.
+    """
+    explicit = _title_style_rules(title_style)
+    if explicit is not None:
+        return explicit
+    if _history_should_auto_route(niche_label, prompt_profile):
+        return _caption_style_title_rules("history_lost_archive")
+    return _caption_style_title_rules(caption_style)
+
+
+def _has_specific_title_style(
+    title_style: str | None,
+    niche_label: str | None,
+    prompt_profile: str | None = None,
+) -> bool:
+    """True when the title rules are a deliberate style (explicit pick OR the
+    history auto-route), so the prompt_profile's generic title line should be
+    suppressed to avoid two competing title instructions."""
+    return _title_style_rules(title_style) is not None or _history_should_auto_route(
+        niche_label, prompt_profile
     )
 
 
@@ -1242,18 +1318,30 @@ def _caption_style_title_rules(caption_style: str | None) -> list[str]:
         return _meme_campaign_title_rules(style)
     if style == "history_lost_archive":
         return [
-            "- HARD RULE: each title is a short past-moment hook, 5-11 words, "
-            "readable in 1-2 overlay lines. Make it feel like an old clip, "
-            "history moment, strange fact, or surprising backstory is being explained.",
-            "- Good shapes: 'The lost story behind this scene', "
-            "'This clip has a stranger backstory', "
-            "'Nobody expected this moment to matter', "
-            "'This old footage aged strangely', "
-            "'The archive says this was not random'.",
-            "- BANNED: meme framing such as 'me when', 'POV:', 'bro', "
-            "'that one friend', or 'send this to'. BANNED: clickbait such as "
-            "'shocking', 'you won't believe', or vague mystery bait. "
-            "BANNED: emoji and hashtags.",
+            "- HARD RULE: each title NAMES the concrete visible subject (object, "
+            "person, activity, vehicle, place, technology) and pairs it with ONE "
+            "clear surprise, contrast, emotional meaning, or historical context. "
+            "Preferred 9-16 words, acceptable 7-18, must fit two centered overlay "
+            "lines. Explain WHY the footage is worth watching — never just label it.",
+            "- Rotate these shapes across the three options: "
+            "'This [subject] [surprising action] in [era]', "
+            "'People actually [did/used/built] [surprising detail] in [era]', "
+            "'How people [ordinary activity] before [modern change]', "
+            "'What [familiar subject] looked like in [era]', "
+            "'When [ordinary thing] [unexpected condition]', "
+            "'The moment [person] [specific emotional action]'.",
+            "- Good: 'People actually attached camping tents to scooters in the "
+            "1950s'. Weak (BANNED — hides the subject): 'The accessory that "
+            "disappeared', 'The lost story behind this scene', 'Nobody expected "
+            "this to matter', 'This old footage aged strangely'.",
+            "- FACT DISCIPLINE: name an exact year/decade only when provided or "
+            "verified; otherwise use 'decades ago' / 'before modern [X]'. Never "
+            "invent rarity, disappearance, first-ever status, popularity, "
+            "commercial failure, or historical importance.",
+            "- BANNED: vague mystery bait ('the lost story', 'aged strangely', "
+            "'was not random'); clickbait ('you won't believe', 'shocking', "
+            "'changed history forever', 'nobody talks about this'); meme framing "
+            "('me when', 'POV:', 'bro', 'send this to'); emoji and hashtags.",
         ]
     if style == "meme_relatable":
         return [
@@ -1345,8 +1433,16 @@ def _caption_style_title_rules(caption_style: str | None) -> list[str]:
             "BANNED: 'me when', 'POV:', 'that friend who'. "
             "BANNED: news-headline form ('Director X Does Y'). "
             "BANNED: titles under 8 words. BANNED: emoji. BANNED: hashtags.",
+            "- PLAIN LANGUAGE (the audience is casual viewers, not film students): "
+            "do NOT use film-craft jargon a normal viewer wouldn't say out loud. "
+            "BANNED words include 'score', 'cinematography', 'mise-en-scene', "
+            "'diegetic', 'blocking', 'third act', 'framing device', 'auteur'. "
+            "Use the everyday word instead: 'music' (not 'score'), 'the way it's "
+            "shot' or 'the shots' (not 'cinematography'), 'the ending' (not 'the "
+            "third act'). Atmospheric and poetic is good; insider vocabulary is not.",
             "- The title is on-screen overlay text on a film still. It should feel like "
-            "a film critic wrote it — poetic, specific, and atmospherically grounded.",
+            "a film critic wrote it — poetic, specific, and atmospherically grounded — "
+            "but in words any casual viewer instantly understands.",
         ]
     if style == "contextual_info":
         # Theanomalists titles: descriptive but conversational, not as long
@@ -1658,7 +1754,11 @@ def _caption_style_line(caption_style: str | None) -> str:
             "Example structure: '[Scene prop]... and [what it means]. [EMOJI]'. "
             "Synopsis body: open EVERY caption with "
             "'[Film Title] ([Year]), directed by [Director], is a [genre] film about [premise].' "
-            "Then 2-3 encyclopedic paragraphs on cast, plot, and themes. "
+            "Then 2-3 encyclopedic paragraphs. Name ONLY the 2-3 cast members or "
+            "characters that actually matter to THIS scene — never an exhaustive "
+            "cast roster, which reads like padding. Land the FINAL paragraph on the "
+            "specific moment in this clip (what it shows and why it stays with you), "
+            "not a broad thesis about the whole film. "
             "Tone: IMDb/Letterboxd neutral — no opinion, no hype, no meme framing. "
             "Hashtags: 0-2 film-specific (e.g. #letterboxd #movietwt)."
         )
@@ -2948,7 +3048,26 @@ def _niche_profile(niche_label: str | None) -> str:
             "clear payoff, and no generic filler."
         )
 
+    # History must be detected before the podcast/story branch below: the
+    # history niche_label often contains "stories" ("forgotten stories"), which
+    # would otherwise misroute history footage into talking-head guidance.
+    is_history = _is_history_niche(niche_label)
+
     profile_parts: list[str] = []
+    if is_history:
+        profile_parts.append(
+            "Write like a history page that makes ordinary past life feel worth "
+            "watching. NAME the visible subject (object, person, activity, "
+            "vehicle, place, technology) and pair it with the one reason it is "
+            "surprising, nostalgic, emotionally human, or different from today — "
+            "do not merely label what is on screen. The on-screen hook explains "
+            "WHY the footage is worth watching, in plain, instantly readable "
+            "words. Ground every claim in what is visible or verified: never "
+            "invent rarity, disappearance, first-ever status, popularity, or "
+            "historical importance, and use an exact year or decade only when it "
+            "is provided or verified. No meme framing, no clickbait, no emoji or "
+            "hashtags in the on-screen title."
+        )
     if any(keyword in niche for keyword in ("game", "gaming", "minecraft", "roblox", "fortnite")):
         profile_parts.append(
             "Use energetic gameplay language, highlight the moment, mechanic, fail, win, or payoff, "
@@ -2974,7 +3093,9 @@ def _niche_profile(niche_label: str | None) -> str:
         profile_parts.append(
             "Use direct, emotionally clear language with a strong takeaway and avoid empty inspiration cliches."
         )
-    if any(keyword in niche for keyword in ("podcast", "interview", "commentary", "story")):
+    if not is_history and any(
+        keyword in niche for keyword in ("podcast", "interview", "commentary", "story")
+    ):
         profile_parts.append(
             "Emphasize the sharpest idea, reveal, or quote-worthy takeaway rather than generic recap language."
         )
@@ -3001,6 +3122,16 @@ def _niche_profile(niche_label: str | None) -> str:
 
 def _angle_plan(niche_label: str | None) -> str:
     niche = _normalize_whitespace(niche_label or "").lower()
+    if _is_history_niche(niche_label):
+        return (
+            "Option 1 = curiosity / surprising fact: name the visible subject and "
+            "the one detail that makes a viewer think 'wait, that existed?'. "
+            "Option 2 = nostalgia / everyday-life framing: present the footage as "
+            "how people once lived, traveled, worked, shopped, or celebrated. "
+            "Option 3 = modern comparison, emotional human moment, or a "
+            "comment-prompt question — only when the footage or verified context "
+            "supports it."
+        )
     if any(keyword in niche for keyword in ("game", "gaming", "minecraft", "roblox", "fortnite")):
         return (
             "Option 1 = direct gameplay hook. "

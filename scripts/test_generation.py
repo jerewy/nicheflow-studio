@@ -20,6 +20,15 @@ import os
 import pathlib
 import sys
 
+# Generated titles/captions (and this script's box-drawing separators) contain
+# non-cp1252 characters like the em-dash. A default Windows console is cp1252, so
+# printing them raises UnicodeEncodeError and hides the actual output. Force the
+# stream to UTF-8 so the smoke is readable on a stock PowerShell/cmd window.
+for _stream in (sys.stdout, sys.stderr):
+    reconfigure = getattr(_stream, "reconfigure", None)
+    if reconfigure is not None:
+        reconfigure(encoding="utf-8")
+
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "src"))
 os.environ.setdefault("NICHEFLOW_DATA_DIR", "data")
 

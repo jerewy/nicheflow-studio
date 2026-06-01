@@ -1090,11 +1090,126 @@ def test_history_lost_archive_title_rules_are_not_meme_framing() -> None:
     rules = smart_drafts._caption_style_title_rules("history_lost_archive")
     joined = "\n".join(rules)
 
-    assert "5-11 words" in joined
+    # New explanatory-hook range (was 5-11; longer hooks name the subject).
+    assert "9-16 words" in joined
+    # Mystery-bait phrases now appear ONLY as banned/weak examples.
     assert "lost story" in joined.lower()
     assert "This old footage aged strangely" in joined
     assert "BANNED" in joined
     assert "me when" in joined.lower()
+
+
+def test_history_lost_archive_title_rules_mandate_concrete_subject() -> None:
+    rules = smart_drafts._caption_style_title_rules("history_lost_archive")
+    joined = "\n".join(rules)
+
+    # Core upgrade: name the visible subject + one surprise, not vague bait.
+    assert "NAMES the concrete visible subject" in joined
+    assert "never just label it" in joined.lower()
+    # The strong calibration example is present as the "good" anchor.
+    assert "camping tents to scooters" in joined
+    # Vague subject-hiding bait is explicitly banned, not recommended.
+    assert "hides the subject" in joined.lower()
+    # Fact discipline: no invented rarity / disappearance / first-ever.
+    assert "FACT DISCIPLINE" in joined
+    assert "first-ever status" in joined
+
+
+def test_niche_profile_history_names_subject_and_avoids_podcast_misroute() -> None:
+    # The real Past Moments niche_label contains "stories", which used to
+    # misroute history into the podcast/story branch.
+    profile = smart_drafts._niche_profile(
+        "History moments, old clips, strange facts, and forgotten stories"
+    )
+
+    assert "NAME the visible subject" in profile
+    assert "never invent rarity" in profile
+    # Must NOT pick up the talking-head guidance.
+    assert "quote-worthy takeaway" not in profile
+
+
+def test_angle_plan_history_uses_curiosity_nostalgia_comparison() -> None:
+    plan = smart_drafts._angle_plan(
+        "History moments, old clips, strange facts, and forgotten stories"
+    )
+
+    assert "curiosity / surprising fact" in plan
+    assert "nostalgia / everyday-life" in plan
+    assert "modern comparison" in plan
+    # Not the generic fallback sequence.
+    assert "Option 1 = strongest direct hook." not in plan
+
+
+HISTORY_NICHE = "History moments, old clips, strange facts, and forgotten stories"
+
+
+def test_effective_title_rules_auto_routes_history_without_explicit_style() -> None:
+    # No explicit title_style, generic/broad caption_style: a history account
+    # should still get the history hook rules, not the generic fallback.
+    rules = smart_drafts.effective_title_rules(
+        title_style=None, caption_style="broad_short_form", niche_label=HISTORY_NICHE
+    )
+    joined = "\n".join(rules)
+
+    assert "NAMES the concrete visible subject" in joined
+    assert "9-16 words" in joined
+
+
+def test_effective_title_rules_respects_explicit_title_style_for_history() -> None:
+    # An explicit pick always wins, even for a history account.
+    rules = smart_drafts.effective_title_rules(
+        title_style="meme_setup_punchline",
+        caption_style="broad_short_form",
+        niche_label=HISTORY_NICHE,
+    )
+    joined = "\n".join(rules)
+
+    assert "SETUP whose punchline" in joined
+    assert "NAMES the concrete visible subject" not in joined
+
+
+def test_effective_title_rules_non_history_keeps_caption_fallback() -> None:
+    # Non-history account with no explicit title_style falls back to the
+    # caption-style-derived rules (here: meme_relatable), not history.
+    rules = smart_drafts.effective_title_rules(
+        title_style=None,
+        caption_style="meme_relatable",
+        niche_label="Relatable daily cope memes",
+    )
+    joined = "\n".join(rules)
+
+    assert "4-8 words" in joined
+    assert "NAMES the concrete visible subject" not in joined
+
+
+def test_effective_title_rules_history_with_story_profile_keeps_its_voice() -> None:
+    # A history-flavoured niche on a profile that has its OWN title voice
+    # (story_reel) must NOT be hijacked into archival hooks.
+    rules = smart_drafts.effective_title_rules(
+        title_style=None,
+        caption_style=None,
+        niche_label="AI restoration family history",
+        prompt_profile="story_reel",
+    )
+    joined = "\n".join(rules)
+
+    assert "NAMES the concrete visible subject" not in joined
+
+
+def test_history_prompt_auto_applies_history_title_rules_end_to_end() -> None:
+    # The whole prompt for a history account (no explicit title_style) must carry
+    # the history title rules AND suppress the generic profile title line.
+    prompt = smart_drafts._smart_draft_prompt(
+        transcript_text="",
+        source_title="Video by theanomalists",
+        niche_label=HISTORY_NICHE,
+        prompt_profile="broad_short_form",
+        caption_style="broad_short_form",
+        title_style=None,
+    )
+
+    assert "NAMES the concrete visible subject" in prompt
+    assert "camping tents to scooters" in prompt
 
 
 def test_meme_factual_system_prompt_enforces_emoji_plus_wikipedia() -> None:

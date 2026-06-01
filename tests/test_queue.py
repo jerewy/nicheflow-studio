@@ -85,6 +85,60 @@ def test_enqueue_download_routes_instagram_urls(monkeypatch) -> None:
     assert item.video_id == "abc123"
     assert item.file_path == str(output_file)
 
+    # The original is now registered in the Global Media Library (pantry).
+    from nicheflow_studio.db.media_library import find_media_asset
+
+    with get_session() as session:
+        asset = find_media_asset(session, source_url="https://www.instagram.com/reel/abc123/")
+        assert asset is not None
+        assert asset.source_shortcode == "abc123"
+        assert asset.download_status == "downloaded"
+        assert asset.original_download_path == str(output_file)
+
+
+def test_instagram_redownload_reuses_one_media_asset(monkeypatch) -> None:
+    output_file = Path.cwd() / "data" / "downloads" / "instagram" / "dupe.mp4"
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    output_file.touch()
+
+    def fake_download(*, url: str, output_dir: Path):
+        return DownloadResult(
+            extractor="instagram", video_id="dupe1", title="Dupe", file_path=output_file
+        )
+
+    monkeypatch.setattr(QueueManager, "_executor", ImmediateExecutor())
+    monkeypatch.setattr("nicheflow_studio.queue.download_instagram_url", fake_download)
+
+    url = "https://www.instagram.com/reel/dupe1/"
+    QueueManager.enqueue_download(url=url)
+    QueueManager.enqueue_download(url=url)  # same reel again (e.g. second account)
+
+    from nicheflow_studio.db.models import MediaAsset
+
+    with get_session() as session:
+        assert session.query(MediaAsset).count() == 1  # deduped to one pantry row
+
+
+def test_youtube_download_does_not_register_media_asset(monkeypatch) -> None:
+    output_file = Path.cwd() / "data" / "downloads" / "yt.mp4"
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    output_file.touch()
+
+    def fake_download(*, url: str, output_dir: Path) -> DownloadResult:
+        return DownloadResult(
+            extractor="youtube", video_id="yt1", title="YT", file_path=output_file
+        )
+
+    monkeypatch.setattr(QueueManager, "_executor", ImmediateExecutor())
+    monkeypatch.setattr("nicheflow_studio.queue.download_youtube_url", fake_download)
+
+    QueueManager.enqueue_download(url="https://youtube.com/watch?v=yt1")
+
+    from nicheflow_studio.db.models import MediaAsset
+
+    with get_session() as session:
+        assert session.query(MediaAsset).count() == 0  # YouTube stays out of the pantry
+
 
 def test_enqueue_download_persists_failed_status_and_sanitized_error(monkeypatch) -> None:
     def fake_download(*, url: str, output_dir: Path) -> DownloadResult:

@@ -73,6 +73,29 @@ def _migrate_account_sources() -> None:
         session.close()
 
 
+def _backfill_account_niche() -> None:
+    """Set the strict ``niche`` for existing accounts from their niche_label.
+
+    Only fills rows where ``niche`` is still NULL, so a manually-set niche is
+    never overwritten. Accounts that don't classify (e.g. meme) stay NULL.
+    """
+    assert _SESSION_FACTORY is not None
+    from nicheflow_studio.core.niche import classify_niche
+
+    session = _SESSION_FACTORY()
+    try:
+        changed = False
+        for account in session.query(Account).filter(Account.niche.is_(None)).all():
+            inferred = classify_niche(account.niche_label)
+            if inferred is not None:
+                account.niche = inferred
+                changed = True
+        if changed:
+            session.commit()
+    finally:
+        session.close()
+
+
 def _db_path() -> Path:
     return data_dir() / "nicheflow.db"
 
@@ -247,6 +270,8 @@ def _ensure_compatibility() -> None:
             connection.execute(
                 text("ALTER TABLE accounts ADD COLUMN processing_preferences VARCHAR(4096)")
             )
+        if "niche" not in account_columns:
+            connection.execute(text("ALTER TABLE accounts ADD COLUMN niche VARCHAR(16)"))
 
         upload_job_columns = {
             column["name"] for column in inspect(connection).get_columns("upload_jobs")
@@ -325,6 +350,7 @@ def init_db() -> None:
     Base.metadata.create_all(_ENGINE)
     _ensure_compatibility()
     _migrate_account_sources()
+    _backfill_account_niche()
 
 
 def reset_db_state() -> None:

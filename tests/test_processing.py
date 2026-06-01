@@ -1352,8 +1352,9 @@ def test_fit_title_band_prefers_two_balanced_lines_over_three_uneven() -> None:
     # Lines should be close in width — diff under 6 chars matches the
     # cinema.defined reference aesthetic.
     assert max(widths) - min(widths) <= 6
-    # Font must shrink to make the 2-line fit work:
-    assert font_size <= 48
+    # Font shrinks one step (54 -> 50) to clear the overflowing second line;
+    # Past Moments Black keeps the title large rather than shrinking further.
+    assert font_size <= 50
 
 
 def test_fit_title_band_cinematic_soft_uses_greedy_two_line_wrap() -> None:
@@ -1413,9 +1414,11 @@ def test_fit_title_band_autofits_long_cinema_title() -> None:
         canvas_width=1080,
         requested_font_size=54,
     )
-    # Font shrinks below the initial 54px ceiling to make room:
-    assert font_size < 54
-    assert font_size >= 38  # auto-fit floor
+    # Past Moments Black intentionally renders a large title, and this 2-line
+    # wrap already fits at the requested size — so the real regression guard is
+    # the no-clip check below (plus the "tail doesn't survive" assertion), not
+    # forced shrinking. Stay within the auto-fit floor and the requested ceiling.
+    assert 38 <= font_size <= 54
     # No line clips the canvas: every wrapped line must stay within ~92% of
     # the canvas at the chosen font. Approximate char width ≈ font_size * 0.55.
     # The original bug produced a 44-char second line at font 54 that

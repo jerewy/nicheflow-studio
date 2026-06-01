@@ -26,6 +26,11 @@ class Account(Base):
     name: Mapped[str] = mapped_column(String(128))
     platform: Mapped[str] = mapped_column(String(32), default="youtube")
     niche_label: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Strict niche for the shared-pool network: "history" | "movie" (None until
+    # classified). Drives pool isolation so history content never lands on a
+    # movie account and vice versa. Distinct from the free-text niche_label,
+    # which stays for display/prompt context. See docs/SOURCING_POOLING_PLAN.md.
+    niche: Mapped[str | None] = mapped_column(String(16), nullable=True)
     login_identifier: Mapped[str | None] = mapped_column(String(256), nullable=True)
     instagram_profile: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Expected Instagram @handle for this account. When set, the live health
@@ -244,3 +249,107 @@ class ScrapeRun(Base):
     account: Mapped[Account] = relationship(back_populates="scrape_runs")
     source: Mapped[Source] = relationship(back_populates="scrape_runs")
     candidates: Mapped[list[ScrapeCandidate]] = relationship(back_populates="scrape_run")
+
+
+class MediaAsset(Base):
+    """Global Media Library — one row per ORIGINAL downloaded source video,
+    deduplicated across accounts and niches by canonical URL / shortcode.
+
+    This is the dedup gate from docs/SOURCING_POOLING_PLAN.md §5.1/§8: the same
+    source clip (re-imported, reused across accounts) is downloaded ONCE and
+    referenced many times, instead of one physical download per assignment.
+    """
+
+    __tablename__ = "media_assets"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: dt.datetime.now(dt.timezone.utc)
+    )
+
+    platform: Mapped[str] = mapped_column(String(32), default="instagram")
+    # Dedup keys. canonical_source_url is the normalized post/reel URL;
+    # source_shortcode is the Instagram shortcode when known (the stronger key).
+    canonical_source_url: Mapped[str] = mapped_column(String(2048))
+    source_shortcode: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    platform_media_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    original_download_path: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    file_size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # "pending" until the original is on disk, then "downloaded".
+    download_status: Mapped[str] = mapped_column(String(32), default="pending")
+    downloaded_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    checksum: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    pool_items: Mapped[list["PoolItem"]] = relationship(back_populates="media_asset")
+
+
+class PoolItem(Base):
+    """Accepted-pool membership — links a deduped :class:`MediaAsset` into a
+    niche pool (HISTORY_ACCEPTED / MOVIE_ACCEPTED) that destination accounts in
+    that niche draw from (docs/SOURCING_POOLING_PLAN.md §5.1/§6.3).
+
+    A pool item is the account-agnostic "this clip is approved for the <niche>
+    network" record. Assignments (Phase 3) point an account at a pool item; the
+    niche on the pool item is what the isolation guard checks.
+    """
+
+    __tablename__ = "pool_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: dt.datetime.now(dt.timezone.utc)
+    )
+
+    media_asset_id: Mapped[int] = mapped_column(ForeignKey("media_assets.id"))
+    # Strict pool niche: "history" | "movie". The isolation key.
+    niche: Mapped[str] = mapped_column(String(16), index=True)
+    # "accepted" once approved into the pool. Room for future "retired" etc.
+    acceptance_status: Mapped[str] = mapped_column(String(32), default="accepted")
+    accepted_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    accepted_reason: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    topic_tag: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    rights_confidence: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Strong evergreen clips may later be reused across more same-niche accounts.
+    is_evergreen_candidate: Mapped[int] = mapped_column(Integer, default=0)
+
+    media_asset: Mapped[MediaAsset] = relationship(back_populates="pool_items")
+    assignments: Mapped[list["Assignment"]] = relationship(back_populates="pool_item")
+
+
+class Assignment(Base):
+    """The 'order ticket' — a planned pool_item → account pairing, before the
+    clip is rendered (docs/SOURCING_POOLING_PLAN.md §6, Phase 3, Option A).
+
+    Kept separate from ``UploadJob`` (which needs a rendered file) so the publish
+    queue stays clean: an Assignment is just "this clip is allotted to this
+    account". When Phase 4 renders it, the resulting ``UploadJob`` is linked via
+    ``upload_job_id`` and the status moves on.
+    """
+
+    __tablename__ = "assignments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: dt.datetime.now(dt.timezone.utc)
+    )
+
+    pool_item_id: Mapped[int] = mapped_column(ForeignKey("pool_items.id"))
+    account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"))
+    # Denormalized niche (== pool_item.niche == account.niche). Stored so the
+    # isolation invariant is visible/queryable on the assignment itself.
+    niche: Mapped[str] = mapped_column(String(16), index=True)
+    # "assigned" -> (rendered) -> publish handled by the linked UploadJob.
+    status: Mapped[str] = mapped_column(String(32), default="assigned")
+    scheduled_date: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # 0 for the first-cycle assignment; >0 when a strong clip is reused later
+    # on another same-niche account (Phase 5).
+    reuse_iteration: Mapped[int] = mapped_column(Integer, default=0)
+    # Set once Phase 4 renders this assignment into a publishable UploadJob.
+    upload_job_id: Mapped[int | None] = mapped_column(
+        ForeignKey("upload_jobs.id"), nullable=True
+    )
+
+    pool_item: Mapped[PoolItem] = relationship(back_populates="assignments")
+    account: Mapped[Account] = relationship()

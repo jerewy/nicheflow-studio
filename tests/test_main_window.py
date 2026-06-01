@@ -3271,8 +3271,123 @@ def test_processing_page_adds_processed_video_to_upload_schedule(qt_app, tmp_pat
         assert job.description == "Scheduled caption"
         assert job.privacy_status == "unlisted"
         assert job.timezone == "Asia/Bangkok"
-        assert job.status == "scheduled"
-        assert job.scheduled_at is not None
+        assert job.status == "ready"
+        assert job.scheduled_at is None
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_processing_completion_auto_adds_ready_publish_job(qt_app, tmp_path: Path) -> None:
+    init_db()
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"video")
+    output_path = processed_dir() / "clip_cropped.mp4"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(b"processed")
+
+    with get_session() as session:
+        account = Account(
+            name="IG Main",
+            platform="instagram",
+            upload_timezone="Asia/Bangkok",
+            upload_default_privacy="private",
+            upload_schedule_slots="09:00, 18:00",
+        )
+        session.add(account)
+        session.flush()
+        item = DownloadItem(
+            source_url="https://instagram.com/reel/clip",
+            title="Original Clip",
+            status="downloaded",
+            account_id=account.id,
+            file_path=str(video_path),
+        )
+        session.add(item)
+        session.commit()
+        item_id = item.id
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._current_account_combo.setCurrentIndex(1)
+        window._set_current_page("processing")
+        qt_app.processEvents()
+        window._selected_processing_item_id = item_id
+        window._processing_title_draft_input.setText("Ready Hook")
+        window._processing_caption_draft_input.setPlainText("Ready caption")
+        window._processing_in_progress = True
+
+        window._on_processing_completed({"output_path": str(output_path)})
+
+        with get_session() as session:
+            job = session.query(UploadJob).one()
+
+        assert job.download_item_id == item_id
+        assert job.processed_path == str(output_path)
+        assert job.title == "Ready Hook"
+        assert job.description == "Ready caption"
+        assert job.status == "ready"
+        assert job.scheduled_at is None
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_processing_add_to_schedule_updates_existing_export_job(qt_app, tmp_path: Path) -> None:
+    init_db()
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"video")
+    output_path = processed_dir() / "clip_cropped.mp4"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(b"processed")
+
+    with get_session() as session:
+        account = Account(name="IG Main", platform="instagram")
+        session.add(account)
+        session.flush()
+        item = DownloadItem(
+            source_url="https://instagram.com/reel/clip",
+            title="Original Clip",
+            status="downloaded",
+            account_id=account.id,
+            file_path=str(video_path),
+        )
+        session.add(item)
+        session.commit()
+        item_id = item.id
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._current_account_combo.setCurrentIndex(1)
+        window._set_current_page("processing")
+        qt_app.processEvents()
+        window._selected_processing_item_id = item_id
+        window._processing_last_output_path = output_path
+
+        window._processing_title_draft_input.setText("First title")
+        window._processing_caption_draft_input.setPlainText("First caption")
+        window._on_add_processed_to_schedule_clicked()
+        window._selected_processing_item_id = item_id
+        window._processing_last_output_path = output_path
+        window._processing_title_draft_input.setText("Updated title")
+        window._processing_caption_draft_input.setPlainText("Updated caption")
+        window._on_add_processed_to_schedule_clicked()
+
+        with get_session() as session:
+            jobs = session.query(UploadJob).all()
+
+        assert len(jobs) == 1
+        assert jobs[0].processed_path == str(output_path)
+        assert jobs[0].title == "Updated title"
+        assert jobs[0].description == "Updated caption"
     finally:
         window._refresh_timer.stop()
         window._toast_timer.stop()
@@ -4423,7 +4538,10 @@ def test_processing_copy_chat_prompt_includes_local_file_and_niche_context(
         assert "Style contract copied from NicheFlow smart drafts" in prompt
         assert "Caption word target: 90-150" in prompt
         assert "PAST MOMENTS DAILY" in prompt
-        assert "5-11 words" in prompt
+        # History hooks now use the explanatory 9-16 word rules with a concrete
+        # subject mandate (the Copy Chat Prompt must mirror live generation).
+        assert "9-16 words" in prompt
+        assert "NAMES the concrete visible subject" in prompt
         assert "Do not use generic filler hashtags like #fyp" in prompt
         assert "Generate 3 on-screen title options and 3 caption options" in prompt
         assert "recommend the strongest title/caption pair" in prompt
@@ -5171,18 +5289,37 @@ def test_workspace_is_blocked_without_current_account(qt_app) -> None:
         window.show()
         qt_app.processEvents()
 
+        # App starts on the Publishing Dashboard (a global page) — workspace
+        # is visible and account panel is collapsed by default.
         assert window._current_account_combo.currentData() is None
+        assert window._account_panel.isVisible() is False
+        assert window._sidebar_toggle_button.isChecked() is False
+        assert window._workspace_content.isVisible() is True
+        assert window._library_gate_panel.isVisible() is False
+
+        # Navigating to a per-account page without an account triggers the gate.
+        window._set_current_page("downloads")
+        qt_app.processEvents()
+
         assert window._url_input.isEnabled() is False
         assert window._table.isEnabled() is False
         assert window._library_gate_panel.isVisible() is True
         assert window._workspace_content.isVisible() is False
         assert window._account_panel.isVisible() is True
-        assert window._sidebar_toggle_button.isEnabled() is False
+        assert window._sidebar_toggle_button.isEnabled() is True
         assert window._sidebar_toggle_button.isChecked() is True
         assert window._library_gate_label.alignment() == Qt.AlignmentFlag.AlignCenter
         assert (
             window._status_label.text() == "Create and select a niche account to use the library."
         )
+
+        window._toggle_account_sidebar()
+        qt_app.processEvents()
+
+        assert window._account_panel.isVisible() is False
+        assert window._sidebar_toggle_button.isChecked() is False
+        assert window._library_gate_panel.isVisible() is True
+        assert window._workspace_content.isVisible() is False
     finally:
         window._refresh_timer.stop()
         window._toast_timer.stop()
@@ -5854,9 +5991,10 @@ def test_workspace_appears_and_buttons_become_clearer_after_account_selection(qt
         window.show()
         qt_app.processEvents()
 
+        # Account panel is closed at startup; check its internal mode without opening it.
         assert window._account_mode == "main"
         assert window._account_main_new_button.text() == "New Niche Account"
-        assert window._account_main_actions.isVisible() is True
+        assert window._account_main_actions.isHidden() is False
         assert window._account_form_panel.isVisible() is False
         assert window._account_delete_panel.isVisible() is False
         assert window._account_save_button.text() == "Create Niche Account"
@@ -5902,6 +6040,10 @@ def test_edit_picker_copy_is_clearer_and_selection_reset_hides_workspace(qt_app)
 
         assert window._workspace_content.isVisible() is True
 
+        # Navigate to a per-account page, then deselect to verify the gate shows.
+        window._set_current_page("downloads")
+        qt_app.processEvents()
+
         window._current_account_combo.setCurrentIndex(0)
         qt_app.processEvents()
 
@@ -5926,6 +6068,10 @@ def test_account_management_modes_switch_cleanly(qt_app) -> None:
     window = MainWindow()
     try:
         window.show()
+        qt_app.processEvents()
+
+        # Open the account panel so sub-widget visibility checks work.
+        window._set_account_sidebar_visible(True)
         qt_app.processEvents()
 
         window._show_edit_account_form()
@@ -5964,6 +6110,10 @@ def test_account_form_bottom_fields_scroll_above_actions(qt_app) -> None:
     try:
         window.resize(620, 650)
         window.show()
+        qt_app.processEvents()
+
+        # Open the account panel so coordinate mapping is valid.
+        window._set_account_sidebar_visible(True)
         qt_app.processEvents()
 
         window._show_new_account_form()
@@ -6064,7 +6214,7 @@ def test_sidebar_account_manager_replaces_brand_slot(qt_app) -> None:
 
         assert top_widget is window._sidebar_toggle_button
         assert window._sidebar_toggle_button.text() == ""
-        assert window._sidebar_toggle_button.toolTip() == "Hide account manager"
+        assert window._sidebar_toggle_button.toolTip() == "Open account manager"
         assert window._sidebar_toggle_button.objectName() == "sidebarToggle"
         assert window._sidebar_toggle_button.width() <= 40
         assert not hasattr(window, "_sidebar_brand")
@@ -6093,7 +6243,12 @@ def test_sidebar_selected_state_and_pipeline_width(qt_app) -> None:
         window._set_current_page("downloads")
         qt_app.processEvents()
 
-        assert tuple(window._module_buttons) == ("scraping", "downloads", "processing", "uploads")
+        assert tuple(window._module_buttons) == (
+            "scraping",
+            "downloads",
+            "processing",
+            "uploads",
+        )
         assert window._module_buttons["scraping"].text() == ""
         assert window._module_buttons["scraping"].toolTip() == "Scrape"
         assert window._module_buttons["downloads"].text() == ""
@@ -6104,7 +6259,7 @@ def test_sidebar_selected_state_and_pipeline_width(qt_app) -> None:
         assert window._module_buttons["uploads"].toolTip() == "Publish"
         assert window._sidebar_panel.width() >= 60
         assert window._sidebar_panel.width() <= 72
-        assert window._sidebar_nav.height() <= 210
+        assert window._sidebar_nav.height() <= 260
         assert all(button.height() <= 40 for button in window._module_buttons.values())
         assert all(button.width() <= 40 for button in window._module_buttons.values())
         assert window._sidebar_account_combo.isVisible() is False
@@ -6517,7 +6672,7 @@ def test_account_manager_is_global_drawer_not_pipeline_page(qt_app) -> None:
         window._set_current_page("accounts")
         qt_app.processEvents()
 
-        assert window._current_page == "downloads"
+        assert window._current_page == "session_health"
         assert "accounts" not in window._module_buttons
         assert window._account_panel.isVisible() is False
         assert window._sidebar_toggle_button.isEnabled() is True
@@ -6531,7 +6686,7 @@ def test_account_manager_is_global_drawer_not_pipeline_page(qt_app) -> None:
         window._sidebar_toggle_button.click()
         qt_app.processEvents()
 
-        assert window._current_page == "downloads"
+        assert window._current_page == "session_health"
         assert window._account_panel.isVisible() is False
         assert window._sidebar_toggle_button.isEnabled() is True
     finally:
