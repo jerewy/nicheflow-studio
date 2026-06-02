@@ -32,7 +32,9 @@ def test_generate_smart_drafts_parses_structured_response(monkeypatch) -> None:
                 b'\\"option_notes\\":[\\"Fastest hook\\",\\"Best overall\\",\\"Backup angle\\"]}"}}]}'
             )
 
-    monkeypatch.setattr(smart_drafts.urllib.request, "urlopen", lambda request, timeout=90: FakeResponse())
+    monkeypatch.setattr(
+        smart_drafts.urllib.request, "urlopen", lambda request, timeout=90: FakeResponse()
+    )
 
     result = smart_drafts.generate_smart_drafts(
         transcript_text="Here is a funny clip about an elephant at the zoo.",
@@ -128,7 +130,9 @@ def test_generate_smart_drafts_can_use_metadata_without_transcript(monkeypatch) 
                 b'\\"caption_options\\":[\\"This Minecraft hoe setup is weirdly clean\\",\\"No dialogue, just a solid farming moment\\",\\"Minecraft gameplay that explains itself\\"]}"}}]}'
             )
 
-    monkeypatch.setattr(smart_drafts.urllib.request, "urlopen", lambda request, timeout=90: FakeResponse())
+    monkeypatch.setattr(
+        smart_drafts.urllib.request, "urlopen", lambda request, timeout=90: FakeResponse()
+    )
 
     result = smart_drafts.generate_smart_drafts(
         transcript_text="",
@@ -410,7 +414,9 @@ def test_generate_smart_drafts_raises_when_groq_has_non_403_error(monkeypatch) -
     assert result.used_fallback is True
 
 
-def test_generate_smart_drafts_ignores_missing_vision_summary_when_groq_vision_is_forbidden(monkeypatch) -> None:
+def test_generate_smart_drafts_ignores_missing_vision_summary_when_groq_vision_is_forbidden(
+    monkeypatch,
+) -> None:
     monkeypatch.setenv("GROQ_API_KEY", "groq-key")
     monkeypatch.setenv("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
     monkeypatch.setenv("GROQ_MODEL", "llama-3.3-70b-versatile")
@@ -453,7 +459,10 @@ def test_generate_smart_drafts_ignores_missing_vision_summary_when_groq_vision_i
     def fake_urlopen(request, timeout=90):  # noqa: ANN001
         payload = smart_drafts.json.loads(request.data.decode("utf-8"))
         captured_payloads.append(payload)
-        if request.full_url == smart_drafts.GROQ_CHAT_COMPLETIONS_URL and payload["model"] == "meta-llama/llama-4-scout-17b-16e-instruct":
+        if (
+            request.full_url == smart_drafts.GROQ_CHAT_COMPLETIONS_URL
+            and payload["model"] == "meta-llama/llama-4-scout-17b-16e-instruct"
+        ):
             raise fake_http_error(request.full_url, 403, "Forbidden")
         return FakeResponse(
             b'{"choices":[{"message":{"content":"{\\"final_summary\\":\\"A Minecraft farming moment\\",'
@@ -473,7 +482,7 @@ def test_generate_smart_drafts_ignores_missing_vision_summary_when_groq_vision_i
     assert result.summary == "A Minecraft farming moment"
     assert captured_payloads[0]["model"] == "meta-llama/llama-4-scout-17b-16e-instruct"
     assert captured_payloads[1]["model"] == "llama-3.3-70b-versatile"
-    assert "\"scene_summary\": \"(none)\"" in captured_payloads[1]["messages"][1]["content"]
+    assert '"scene_summary": "(none)"' in captured_payloads[1]["messages"][1]["content"]
     assert result.vision_payload is None
 
 
@@ -675,7 +684,9 @@ def test_smart_draft_prompt_uses_visual_first_mode_without_transcript() -> None:
         },
     )
 
-    assert "No-transcript mode: visual evidence and source caption are your primary context." in prompt
+    assert (
+        "No-transcript mode: visual evidence and source caption are your primary context." in prompt
+    )
     assert "Source caption (PRIMARY CONTEXT - no transcript available)" in prompt
     assert "When your cat realizes the mirror enemy is actually itself." in prompt
     assert "Write like a real meme page" in prompt
@@ -857,9 +868,7 @@ def test_parse_final_drafts_preserves_title_paragraph_breaks() -> None:
 
 
 def test_normalize_caption_text_collapses_excess_blank_lines() -> None:
-    normalized = smart_drafts._normalize_caption_text(
-        "Para one.\n\n\n\nPara two.   \n\n#tag"
-    )
+    normalized = smart_drafts._normalize_caption_text("Para one.\n\n\n\nPara two.   \n\n#tag")
 
     assert normalized == "Para one.\n\nPara two.\n\n#tag"
 
@@ -944,7 +953,10 @@ def test_extract_message_content_handles_content_parts() -> None:
                 "message": {
                     "content": [
                         {"type": "output_text", "text": "First line"},
-                        {"type": "output_text", "text": "{\"summary\":\"ok\",\"title_options\":[\"A\",\"B\",\"C\"],\"caption_options\":[\"one\",\"two\",\"three\"]}"},
+                        {
+                            "type": "output_text",
+                            "text": '{"summary":"ok","title_options":["A","B","C"],"caption_options":["one","two","three"]}',
+                        },
                     ]
                 }
             }
@@ -954,7 +966,7 @@ def test_extract_message_content_handles_content_parts() -> None:
     content = smart_drafts._extract_message_content(payload)
 
     assert "First line" in content
-    assert "\"summary\":\"ok\"" in content
+    assert '"summary":"ok"' in content
 
 
 def test_extract_message_content_handles_nested_content_parts() -> None:
@@ -963,9 +975,7 @@ def test_extract_message_content_handles_nested_content_parts() -> None:
             {
                 "message": {
                     "content": [
-                        [
-                            {"type": "output_text", "text": "{\"scene_summary\":\"A Minecraft path\"}"}
-                        ]
+                        [{"type": "output_text", "text": '{"scene_summary":"A Minecraft path"}'}]
                     ]
                 }
             }
@@ -974,7 +984,7 @@ def test_extract_message_content_handles_nested_content_parts() -> None:
 
     content = smart_drafts._extract_message_content(payload)
 
-    assert "\"scene_summary\":\"A Minecraft path\"" in content
+    assert '"scene_summary":"A Minecraft path"' in content
 
 
 def test_generate_smart_drafts_raises_when_provider_output_is_unusable(monkeypatch) -> None:
@@ -992,7 +1002,9 @@ def test_generate_smart_drafts_raises_when_provider_output_is_unusable(monkeypat
         def read(self) -> bytes:
             return b'{"choices":[{"message":{"content":"not valid json at all"}}]}'
 
-    monkeypatch.setattr(smart_drafts.urllib.request, "urlopen", lambda request, timeout=90: FakeResponse())
+    monkeypatch.setattr(
+        smart_drafts.urllib.request, "urlopen", lambda request, timeout=90: FakeResponse()
+    )
 
     result = smart_drafts.generate_smart_drafts(
         transcript_text="A silent Minecraft farming clip with a hoe.",
@@ -1091,7 +1103,7 @@ def test_history_lost_archive_title_rules_are_not_meme_framing() -> None:
     joined = "\n".join(rules)
 
     # New explanatory-hook range (was 5-11; longer hooks name the subject).
-    assert "9-16 words" in joined
+    assert "10-16 words" in joined
     # Mystery-bait phrases now appear ONLY as banned/weak examples.
     assert "lost story" in joined.lower()
     assert "This old footage aged strangely" in joined
@@ -1108,6 +1120,8 @@ def test_history_lost_archive_title_rules_mandate_concrete_subject() -> None:
     assert "never just label it" in joined.lower()
     # The strong calibration example is present as the "good" anchor.
     assert "camping tents to scooters" in joined
+    assert "The ski lift ride where John Denver wrote Annie's Song for his wife" in joined
+    assert "Too flat" in joined
     # Vague subject-hiding bait is explicitly banned, not recommended.
     assert "hides the subject" in joined.lower()
     # Fact discipline: no invented rarity / disappearance / first-ever.
@@ -1152,7 +1166,7 @@ def test_effective_title_rules_auto_routes_history_without_explicit_style() -> N
     joined = "\n".join(rules)
 
     assert "NAMES the concrete visible subject" in joined
-    assert "9-16 words" in joined
+    assert "10-16 words" in joined
 
 
 def test_effective_title_rules_respects_explicit_title_style_for_history() -> None:
@@ -1376,6 +1390,65 @@ def test_narrative_title_rules_force_long_headline_format() -> None:
     assert "no hashtags, no emojis" in joined
 
 
+def test_cinema_hook_title_rules_offer_varied_templates_not_one_dominant() -> None:
+    """The movie atmospheric title rules must offer several equally-weighted
+    templates and force each of the three options onto a different one. The old
+    block crowned one template 'dominant' and seeded 'silence' as an example
+    word, which made every generation collapse into the same shape and word."""
+    rules = smart_drafts._caption_style_title_rules("cinema_hook")
+    joined = "\n".join(rules)
+    # Six named templates, not just A/B/C:
+    for template in (
+        "TEMPLATE A",
+        "TEMPLATE B",
+        "TEMPLATE C",
+        "TEMPLATE D",
+        "TEMPLATE E",
+        "TEMPLATE F",
+    ):
+        assert template in joined
+    # No single template is crowned dominant/default/preferred anymore:
+    assert "dominant" not in joined.lower()
+    # Each of the three options must use a DIFFERENT template:
+    assert "DIFFERENT template" in joined
+    # The 'silence' anchor must be gone from the template EXAMPLES, and only
+    # survive as an explicitly banned crutch word:
+    assert "That kind of silence" not in joined
+    assert "crutch" in joined.lower()
+    assert "'silence'" in joined
+
+
+def test_cinema_bold_keywords_inherits_templates_and_forces_distinct_bold() -> None:
+    """Cinema Bold Keywords must build on the cinema atmospheric rules (so the
+    template variety carries over) and additionally require the bolded word to
+    differ across the three options. The old example seeded '**silence**'."""
+    rules = smart_drafts._title_style_rules("cinema_bold_keywords")
+    assert rules is not None
+    joined = "\n".join(rules)
+    # Inherits the varied templates from cinema_hook:
+    assert "TEMPLATE F" in joined
+    # Bold markup rule is still present (we keep the **word** output):
+    assert "EMPHASIS MARKUP" in joined
+    # Distinct bold word across options is now enforced:
+    assert "DISTINCT EMPHASIS" in joined
+    assert "differ across" in joined
+    # The seeded '**silence**' example must be gone:
+    assert "**silence**" not in joined
+
+
+def test_recent_draft_dedup_discourages_template_and_bold_reuse() -> None:
+    """Anti-repetition must push beyond verbatim de-dup: reusing the same
+    opening template or bolded keyword as a recent title is what made movie
+    hooks feel same-y, so the instruction must call both out."""
+    prompt = smart_drafts._recent_draft_dedup_prompt(
+        recent_titles=["That kind of **silence** that says everything"],
+        recent_captions=None,
+    )
+    lowered = prompt.lower()
+    assert "template" in lowered
+    assert "bolded keyword" in lowered
+
+
 # ---------------------------------------------------------------------------
 # Fix A — vision diagnostics, low-context detection, require_vision, retry
 # ---------------------------------------------------------------------------
@@ -1445,9 +1518,7 @@ def test_low_context_titles_detected_when_no_transcript(title: str) -> None:
 
 def test_low_context_false_with_meaningful_title() -> None:
     assert (
-        smart_drafts._is_low_context_source_title(
-            "Trapping a streamer in my elytra drip trap", ""
-        )
+        smart_drafts._is_low_context_source_title("Trapping a streamer in my elytra drip trap", "")
         is False
     )
 
@@ -1903,9 +1974,7 @@ def test_low_context_retry_skipped_when_context_is_sufficient(monkeypatch) -> No
     monkeypatch.setattr(smart_drafts.urllib.request, "urlopen", fake_urlopen)
 
     result = smart_drafts.generate_smart_drafts(
-        transcript_text=(
-            "We built this trap and waited and waited and it actually worked"
-        ),
+        transcript_text=("We built this trap and waited and waited and it actually worked"),
         source_title="A specific descriptive clip title",
         niche_label="gaming",
         input_path=Path("clip.mp4"),
@@ -2023,11 +2092,7 @@ def test_processing_style_dropdown_is_pruned_to_niche_styles() -> None:
     """Processing should show the small day-to-day Meme/Movie style set,
     while old backend styles remain available for saved rows."""
     main_window_src = (
-        Path(__file__).parent.parent
-        / "src"
-        / "nicheflow_studio"
-        / "app"
-        / "main_window.py"
+        Path(__file__).parent.parent / "src" / "nicheflow_studio" / "app" / "main_window.py"
     ).read_text(encoding="utf-8")
     assert 'addItem("(Meme) Context / info", "contextual_info")' in main_window_src
     assert '"meme_friend_group"' in main_window_src
@@ -2299,11 +2364,7 @@ def test_title_style_ui_dropdown_includes_auto_and_meme_setup_punchline() -> Non
     Meme Setup -> Punchline option. Without these the new style is
     unreachable from the app."""
     main_window_src = (
-        Path(__file__).parent.parent
-        / "src"
-        / "nicheflow_studio"
-        / "app"
-        / "main_window.py"
+        Path(__file__).parent.parent / "src" / "nicheflow_studio" / "app" / "main_window.py"
     ).read_text(encoding="utf-8")
     assert 'addItem("Auto (match caption style)", "")' in main_window_src
     assert "(Meme) Setup" in main_window_src
@@ -2344,7 +2405,9 @@ def test_generate_smart_drafts_threads_title_style_into_request(monkeypatch) -> 
     assert captured_prompts, "writer call must have been made"
     writer_prompt = captured_prompts[-1]
     # meme_setup_punchline rules landed in the actual prompt:
-    assert "trailing colon" in writer_prompt.lower() or "ending with a colon" in writer_prompt.lower()
+    assert (
+        "trailing colon" in writer_prompt.lower() or "ending with a colon" in writer_prompt.lower()
+    )
     assert "CREATIVE REMIX IS REQUIRED" in writer_prompt
 
 

@@ -593,9 +593,7 @@ def _smart_draft_prompt(
     transcript_block = transcript_text if transcript_text else "(no transcript available)"
     niche_profile = _niche_profile(niche_label)
     angle_plan = _angle_plan(niche_label)
-    _is_meme_niche = any(
-        kw in (niche_text).lower() for kw in ("meme", "comedy", "funny")
-    )
+    _is_meme_niche = any(kw in (niche_text).lower() for kw in ("meme", "comedy", "funny"))
     niche_guidance = (
         f"Write like someone who understands the {niche_text} niche."
         if niche_label
@@ -727,8 +725,8 @@ def _smart_draft_prompt(
             f"- Option angle plan: {angle_plan}",
             "- final_summary: one short sentence describing what the clip is about.",
             "- recommended_pick: choose the strongest title/caption pair for this specific "
-            "account and return {\"title_option_index\": 1-3, \"caption_option_index\": 1-3, "
-            "\"reason\": \"one short reason\"}. Prefer the pair most likely to work for the "
+            'account and return {"title_option_index": 1-3, "caption_option_index": 1-3, '
+            '"reason": "one short reason"}. Prefer the pair most likely to work for the '
             "account niche, not the cleverest line in isolation.",
             f"- option_notes: exactly {SMART_DRAFT_OPTION_COUNT} short strings, one per option, "
             "labeling each option's use case such as clearest hook, most niche-native, "
@@ -822,9 +820,14 @@ def _recent_draft_dedup_prompt(
     if title_lines:
         blocks.append("Titles:\n" + "\n".join(f"- {title}" for title in title_lines))
     if caption_lines:
-        blocks.append("Caption openings:\n" + "\n".join(f"- {caption}" for caption in caption_lines))
+        blocks.append(
+            "Caption openings:\n" + "\n".join(f"- {caption}" for caption in caption_lines)
+        )
     blocks.append(
-        "Your new title and caption options must be clearly distinct while still matching the current clip."
+        "Your new title and caption options must be clearly distinct while still "
+        "matching the current clip. Distinct means more than reworded: do not "
+        "reopen with the same sentence template as a title above, and do not "
+        "reuse the same emphasised/bolded keyword that any title above already used."
     )
     return "\n".join(blocks)
 
@@ -1280,13 +1283,17 @@ def _title_style_rules(title_style: str | None) -> list[str] | None:
         return [
             *_caption_style_title_rules("cinema_hook"),
             "- EMPHASIS MARKUP: wrap the 1-3 single most impactful words in each "
-            "title with double asterisks, e.g. '**twist**', '**silence**', "
-            "'**aura**'. These markers are rendered as BOLD on-screen text — they "
+            "title with double asterisks, e.g. '**twist**', '**unravels**', "
+            "'**alone**'. These markers are rendered as BOLD on-screen text — they "
             "are formatting, not part of the wording.",
             "- EMPHASIS RULES: mark only 1-3 words total per title (never more); "
             "mark whole words only (never punctuation, never partial words); "
             "never wrap the entire title; pick the words that carry the emotional "
             "punch (the noun or verb the line hinges on), not filler words.",
+            "- DISTINCT EMPHASIS (HARD RULE): the bolded word(s) MUST differ across "
+            "the three options — never bold the same word in more than one option. "
+            "Do NOT default to bolding 'silence', 'moment', or 'connection'; bold "
+            "the word each specific title actually hinges on.",
         ]
     # For known caption-driven styles, delegate to the existing rules so
     # users can mix freely without us duplicating rule bodies.
@@ -1321,19 +1328,28 @@ def _caption_style_title_rules(caption_style: str | None) -> list[str]:
             "- HARD RULE: each title NAMES the concrete visible subject (object, "
             "person, activity, vehicle, place, technology) and pairs it with ONE "
             "clear surprise, contrast, emotional meaning, or historical context. "
-            "Preferred 9-16 words, acceptable 7-18, must fit two centered overlay "
+            "Preferred 10-16 words, acceptable 8-18, must fit two centered overlay "
             "lines. Explain WHY the footage is worth watching — never just label it.",
+            "- STORY-OPENER RULE: write each title like the first sentence of a "
+            "short historical story, not a compressed label or news headline. "
+            "Prefer natural story shapes such as 'The [place/event] where [person] "
+            "[did the memorable thing]', '[Person] [did the memorable thing] during "
+            "[specific situation]', or 'The [ordinary moment] that became [specific "
+            "legacy]'. Keep the emotional or situational context when it is the "
+            "reason the moment matters.",
             "- Rotate these shapes across the three options: "
             "'This [subject] [surprising action] in [era]', "
             "'People actually [did/used/built] [surprising detail] in [era]', "
             "'How people [ordinary activity] before [modern change]', "
             "'What [familiar subject] looked like in [era]', "
             "'When [ordinary thing] [unexpected condition]', "
-            "'The moment [person] [specific emotional action]'.",
-            "- Good: 'People actually attached camping tents to scooters in the "
-            "1950s'. Weak (BANNED — hides the subject): 'The accessory that "
-            "disappeared', 'The lost story behind this scene', 'Nobody expected "
-            "this to matter', 'This old footage aged strangely'.",
+            "'The [place/event] where [person] [specific emotional action]'.",
+            "- Good: 'The ski lift ride where John Denver wrote Annie's Song for "
+            "his wife'; 'People actually attached camping tents to scooters in the "
+            "1950s'. Too flat: 'John Denver wrote Annie's Song on a ski lift'. "
+            "Weak (BANNED — hides the subject): 'The accessory that disappeared', "
+            "'The lost story behind this scene', 'Nobody expected this to matter', "
+            "'This old footage aged strangely'.",
             "- FACT DISCIPLINE: name an exact year/decade only when provided or "
             "verified; otherwise use 'decades ago' / 'before modern [X]'. Never "
             "invent rarity, disappearance, first-ever status, popularity, "
@@ -1410,29 +1426,46 @@ def _caption_style_title_rules(caption_style: str | None) -> list[str]:
             "- The title is on-screen text: no hashtags.",
         ]
     if style == "cinema_hook":
-        # cinema.defined titles: long atmospheric sentences (10-20 words) about
-        # the FEELING of watching the specific movie moment. The dominant template
-        # is "That kind of [noun] that [emotional consequence]." — encode it explicitly.
+        # cinema.defined titles: atmospheric hooks about the FEELING of watching
+        # the specific movie moment. Earlier this block crowned one template
+        # ("That kind of [noun] that...") as DOMINANT and seeded "silence" as an
+        # example word — so the model collapsed every generation into the same
+        # shape with the same bolded word. We now offer SIX equally-weighted
+        # templates and force each of the three options onto a different one.
         return [
-            "- HARD RULE: each title is a 10-20 word ATMOSPHERIC SENTENCE about "
-            "the EMOTIONAL EXPERIENCE of watching this specific movie moment. "
-            "Use one of these three templates: "
-            "TEMPLATE A (dominant): 'That kind of [noun] that [makes you / where you / "
-            "that forces you to] [emotional consequence].' "
-            "Examples: 'That kind of plot twist that makes you go back and rethink every detail.' "
-            "/ 'That kind of silence that makes the entire room hold its breath.' "
-            "/ 'That kind of ending that stays with you for days after the credits roll.' "
-            "TEMPLATE B (reveal beat): 'The [moment/scene/line] that [reframes / changes / "
-            "breaks] everything — and you never saw it coming.' "
-            "TEMPLATE C (short stab): Two or three punchy fragments. "
-            "Example: 'One line. The whole film reshapes. Nobody was ready.'",
-            "- OPTION DISTRIBUTION: spread across the three templates. Do NOT write "
-            "three variations of Template A. Vary the emotional angle: one about "
-            "the twist/reveal, one about the atmosphere/pacing, one about the emotional weight.",
+            "- HARD RULE: each title is a hook (typically 10-20 words; the "
+            "fragment/question templates may be shorter) about the EMOTIONAL "
+            "EXPERIENCE of watching this specific movie moment. Pick from these "
+            "SIX equally-weighted templates — NONE is default or preferred:",
+            "  TEMPLATE A (atmospheric): 'That kind of [noun] that [emotional "
+            "consequence].' e.g. 'That kind of ending that quietly rearranges how "
+            "you saw the whole story.'",
+            "  TEMPLATE B (reveal beat): 'The [moment/scene/line] that [reframes / "
+            "changes / breaks] everything — and you never saw it coming.'",
+            "  TEMPLATE C (short stab): two or three punchy fragments. e.g. 'One "
+            "line. The whole film reshapes. Nobody was ready.'",
+            "  TEMPLATE D (before/after contrast): contrast the scale or feeling "
+            "before vs after the moment. e.g. 'A whole galaxy of distance, undone "
+            "by one quiet thing finally said out loud.'",
+            "  TEMPLATE E (second person): put the viewer inside the moment with "
+            "'you'. e.g. 'You feel the whole room change the second nobody says a word.'",
+            "  TEMPLATE F (question hook): an emotionally specific question. e.g. "
+            "'How does one look end up carrying the weight of an entire story?'",
+            "- OPTION DISTRIBUTION (HARD RULE): the three options MUST each use a "
+            "DIFFERENT template from the list above — never two options on the "
+            "same template, never two options that open with the same words. Also "
+            "vary the emotional angle: one twist/reveal, one atmosphere/pacing, "
+            "one emotional weight.",
+            "- VARY THE ANCHOR WORD: do not lean on the same emotional anchor "
+            "across options. Rotate clip-grounded nouns (the look, the pause, the "
+            "line, the reveal, the music swell, the final shot). BANNED as a "
+            "crutch: defaulting titles to 'silence', 'moment', or 'connection' — "
+            "use them only if the clip genuinely hinges on that word, and never in "
+            "more than one option.",
             "- BANNED: short observational meme hooks ('bro thought he had it', 'wait for it'). "
             "BANNED: 'me when', 'POV:', 'that friend who'. "
             "BANNED: news-headline form ('Director X Does Y'). "
-            "BANNED: titles under 8 words. BANNED: emoji. BANNED: hashtags.",
+            "BANNED: titles under 6 words. BANNED: emoji. BANNED: hashtags.",
             "- PLAIN LANGUAGE (the audience is casual viewers, not film students): "
             "do NOT use film-craft jargon a normal viewer wouldn't say out loud. "
             "BANNED words include 'score', 'cinematography', 'mise-en-scene', "
@@ -1648,8 +1681,7 @@ def _negative_caption_examples_block(caption_style: str | None) -> list[str]:
         "(academic-framing opener — same Wikipedia drift, different wording)",
         "- 'Gen Z gamers and meme fans are always on the lookout for fresh "
         "content like this...' (audience-label leak)",
-        "- 'This clip is funny because the trap finally worked...' "
-        "(explain-the-joke)",
+        "- 'This clip is funny because the trap finally worked...' " "(explain-the-joke)",
         "",
         "POSITIVE EXAMPLES (write captions that open like these):",
         "- 'That panic when the trap finally works and nobody knows who to blame.'",
@@ -2244,7 +2276,9 @@ def _all_groq_keys(*, preferred_first: str | None = None) -> list[str]:
     return keys
 
 
-def _resolve_provider_order(model: str | None, api_key: str | None) -> list[tuple[str, str, str | None]]:
+def _resolve_provider_order(
+    model: str | None, api_key: str | None
+) -> list[tuple[str, str, str | None]]:
     """Return ordered Groq attempts: primary key first, then GROQ2 and GROQ3 fallbacks.
 
     Ollama is no longer in the chain — the user wants Groq-only with rotating
@@ -2288,7 +2322,9 @@ def _groq_vision_enabled() -> bool:
 
 
 def _groq_max_frames() -> int:
-    raw_value = _normalize_whitespace(os.environ.get("GROQ_MAX_FRAMES") or str(DEFAULT_GROQ_MAX_FRAMES))
+    raw_value = _normalize_whitespace(
+        os.environ.get("GROQ_MAX_FRAMES") or str(DEFAULT_GROQ_MAX_FRAMES)
+    )
     try:
         return max(1, min(MAX_GROQ_FRAMES_CAP, int(raw_value)))
     except ValueError:
@@ -2356,9 +2392,7 @@ def _perform_chat_completion_request(
 
 
 _DEFAULT_BACKOFF_SECONDS = 1.0
-_RETRY_AFTER_HINT_RE = re.compile(
-    r"try again in\s*([0-9]+(?:\.[0-9]+)?)\s*(ms|s)", re.IGNORECASE
-)
+_RETRY_AFTER_HINT_RE = re.compile(r"try again in\s*([0-9]+(?:\.[0-9]+)?)\s*(ms|s)", re.IGNORECASE)
 
 
 def _retry_wait_seconds(exc: urllib.error.HTTPError, body: str, attempt: int) -> float:
@@ -2456,17 +2490,23 @@ def _clean_option_tiers(value: object) -> list[str] | None:
     return tiers or None
 
 
-def _parse_final_drafts(response_payload: dict[str, object], *, provider_name: str) -> _ParsedDraftResponse:
+def _parse_final_drafts(
+    response_payload: dict[str, object], *, provider_name: str
+) -> _ParsedDraftResponse:
     content = _extract_message_content(response_payload)
     parsed = _parse_model_json(content)
     summary = _normalize_whitespace(str(parsed.get("final_summary") or parsed.get("summary") or ""))
-    title_options = _clean_options(
-        parsed.get("title_options"), preserve_paragraphs=True
-    )[:SMART_DRAFT_OPTION_COUNT]
-    caption_options = _clean_options(
-        parsed.get("caption_options"), preserve_paragraphs=True
-    )[:SMART_CAPTION_OPTION_COUNT]
-    if not summary or len(title_options) != SMART_DRAFT_OPTION_COUNT or len(caption_options) != SMART_CAPTION_OPTION_COUNT:
+    title_options = _clean_options(parsed.get("title_options"), preserve_paragraphs=True)[
+        :SMART_DRAFT_OPTION_COUNT
+    ]
+    caption_options = _clean_options(parsed.get("caption_options"), preserve_paragraphs=True)[
+        :SMART_CAPTION_OPTION_COUNT
+    ]
+    if (
+        not summary
+        or len(title_options) != SMART_DRAFT_OPTION_COUNT
+        or len(caption_options) != SMART_CAPTION_OPTION_COUNT
+    ):
         raise RuntimeError(f"{provider_name} did not return usable smart drafts.")
     recommendation = _parse_recommendation_fields(parsed)
     return _ParsedDraftResponse(
@@ -2515,9 +2555,7 @@ def _parse_recommendation_fields(parsed: dict[str, object]) -> dict[str, object]
         raw_pick.get("option_notes") or parsed.get("option_notes"),
         preserve_paragraphs=False,
     )[:SMART_DRAFT_OPTION_COUNT]
-    option_tiers = _clean_option_tiers(
-        raw_pick.get("option_tiers") or parsed.get("option_tiers")
-    )
+    option_tiers = _clean_option_tiers(raw_pick.get("option_tiers") or parsed.get("option_tiers"))
     return {
         "recommended_title_index": title_index if title_index is not None else shared_index,
         "recommended_caption_index": caption_index if caption_index is not None else shared_index,
@@ -2549,20 +2587,34 @@ def _parse_recommendation_index(value: object) -> int | None:
     return None
 
 
-def _parse_vision_payload(response_payload: dict[str, object], *, provider_name: str) -> dict[str, object]:
+def _parse_vision_payload(
+    response_payload: dict[str, object], *, provider_name: str
+) -> dict[str, object]:
     content = _extract_message_content(response_payload)
     parsed = _parse_model_json(content)
     normalized = _empty_vision_payload()
     normalized["scene_summary"] = _normalize_whitespace(str(parsed.get("scene_summary") or ""))
     normalized["layout"] = _normalize_whitespace(str(parsed.get("layout") or ""))
-    normalized["panel_relationship"] = _normalize_whitespace(str(parsed.get("panel_relationship") or ""))
+    normalized["panel_relationship"] = _normalize_whitespace(
+        str(parsed.get("panel_relationship") or "")
+    )
     normalized["on_screen_hook"] = _normalize_whitespace(str(parsed.get("on_screen_hook") or ""))
     normalized["implied_premise"] = _normalize_whitespace(str(parsed.get("implied_premise") or ""))
-    normalized["referenced_entity"] = _normalize_whitespace(str(parsed.get("referenced_entity") or ""))
-    normalized["referenced_concept"] = _normalize_whitespace(str(parsed.get("referenced_concept") or ""))
-    normalized["concept_definition"] = _normalize_whitespace(str(parsed.get("concept_definition") or ""))
-    normalized["meme_caption_premise"] = _normalize_whitespace(str(parsed.get("meme_caption_premise") or ""))
-    normalized["context_explainer_seed"] = _normalize_whitespace(str(parsed.get("context_explainer_seed") or ""))
+    normalized["referenced_entity"] = _normalize_whitespace(
+        str(parsed.get("referenced_entity") or "")
+    )
+    normalized["referenced_concept"] = _normalize_whitespace(
+        str(parsed.get("referenced_concept") or "")
+    )
+    normalized["concept_definition"] = _normalize_whitespace(
+        str(parsed.get("concept_definition") or "")
+    )
+    normalized["meme_caption_premise"] = _normalize_whitespace(
+        str(parsed.get("meme_caption_premise") or "")
+    )
+    normalized["context_explainer_seed"] = _normalize_whitespace(
+        str(parsed.get("context_explainer_seed") or "")
+    )
     normalized["visible_roles"] = _clean_options(parsed.get("visible_roles"))
     normalized["ocr_text"] = _clean_options(parsed.get("ocr_text"))
     normalized["top_text_type"] = _vision_choice(
@@ -2589,7 +2641,9 @@ def _parse_vision_payload(response_payload: dict[str, object], *, provider_name:
     normalized["tone"] = _normalize_whitespace(str(parsed.get("tone") or ""))
     normalized["confidence"] = _normalize_whitespace(str(parsed.get("confidence") or ""))
     normalized["hook_moments"] = _clean_options(parsed.get("hook_moments"))
-    normalized["uncertainty_notes"] = _normalize_whitespace(str(parsed.get("uncertainty_notes") or ""))
+    normalized["uncertainty_notes"] = _normalize_whitespace(
+        str(parsed.get("uncertainty_notes") or "")
+    )
     if not any(
         [
             normalized["scene_summary"],
@@ -2769,7 +2823,9 @@ def _summarize_visual_frames_for_local_generation(
         summary_bits.append(f"Source-title hint: {source_title}.")
     if niche_label:
         summary_bits.append(f"Niche hint: {niche_label}.")
-    summary_bits.append("Stay grounded in the visible moment and avoid inventing unsupported details.")
+    summary_bits.append(
+        "Stay grounded in the visible moment and avoid inventing unsupported details."
+    )
     return " ".join(summary_bits)
 
 
@@ -2789,7 +2845,9 @@ def _fallback_vision_payload(
     payload = _empty_vision_payload()
     payload["scene_summary"] = summary
     payload["confidence"] = "low"
-    payload["uncertainty_notes"] = "Derived from frame availability only; no structured vision model output."
+    payload[
+        "uncertainty_notes"
+    ] = "Derived from frame availability only; no structured vision model output."
     return payload
 
 
@@ -2819,7 +2877,9 @@ def _generate_local_fallback_drafts(
         or source_description_text
     )
     summary = summary_signal or f"A {niche_text} clip built from the current source context."
-    title_options = _fallback_title_options(base_title=base_title, niche_text=niche_text, summary=summary)
+    title_options = _fallback_title_options(
+        base_title=base_title, niche_text=niche_text, summary=summary
+    )
     caption_options = _fallback_caption_options(
         base_title=base_title,
         niche_text=niche_text,
@@ -2928,9 +2988,7 @@ def _fallback_caption_options(
     )
     option_2_parts.append(hashtags)
 
-    option_3_parts = [
-        f"Sometimes the simplest clips are the most rewatchable."
-    ]
+    option_3_parts = [f"Sometimes the simplest clips are the most rewatchable."]
     option_3_parts.append(
         f"If you're into {niche_text}, this one's worth a second look. "
         f"{base_title} delivers exactly what you'd hope for. 🎯"
@@ -2963,9 +3021,25 @@ def _fallback_caption_style_sentence(caption_style: str | None) -> str:
 def _fallback_hashtag_line(*, base_title: str, niche_text: str) -> str:
     source = f"{base_title} {niche_text}".lower()
     tags: list[str] = []
-    if any(keyword in source for keyword in ("family", "grandpa", "grandfather", "grandma", "memory", "childhood", "history", "photo", "restore", "ai")):
+    if any(
+        keyword in source
+        for keyword in (
+            "family",
+            "grandpa",
+            "grandfather",
+            "grandma",
+            "memory",
+            "childhood",
+            "history",
+            "photo",
+            "restore",
+            "ai",
+        )
+    ):
         tags.extend(["#family", "#history", "#childhood", "#memories", "#aitools"])
-    elif any(keyword in source for keyword in ("minecraft", "game", "gaming", "roblox", "fortnite")):
+    elif any(
+        keyword in source for keyword in ("minecraft", "game", "gaming", "roblox", "fortnite")
+    ):
         tags.extend(["#gaming", "#minecraft", "#gameplay", "#reels", "#clips"])
     elif any(keyword in source for keyword in ("animal", "pet", "cat", "dog", "zoo")):
         tags.extend(["#animals", "#pets", "#reels", "#funny", "#clips"])
