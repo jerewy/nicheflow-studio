@@ -23,6 +23,7 @@ from pathlib import Path
 from sqlalchemy.orm import Session
 
 from nicheflow_studio.core.niche import NICHE_HISTORY, NICHE_MOVIE
+from nicheflow_studio.core.text_dedup import normalize_caption
 from nicheflow_studio.db.media_library import find_or_register_media_asset
 from nicheflow_studio.db.models import (
     Account,
@@ -106,7 +107,7 @@ def accept_into_pool(
             f"allow_cross_niche=True to override after manual confirmation."
         )
     if not allow_duplicate and media_asset.content_hash:
-        duplicate = _find_content_duplicate_in_niche(
+        duplicate = find_niche_content_duplicate(
             session, niche=niche, content_hash=media_asset.content_hash, exclude_asset_id=media_asset.id
         )
         if duplicate is not None:
@@ -204,17 +205,18 @@ def reject_candidate(
     return candidate.state
 
 
-def _find_content_duplicate_in_niche(
+def find_niche_content_duplicate(
     session: Session,
     *,
     niche: str,
     content_hash: str,
     exclude_asset_id: int | None = None,
 ) -> int | None:
-    """Asset id of an already-accepted clip in ``niche`` whose footage matches.
+    """Asset id of an ACCEPTED clip in ``niche`` whose footage matches, else None.
 
-    Compares the new fingerprint against the fingerprints of assets already in
-    this niche pool. Returns the matching asset id, or ``None``.
+    The footage-level dedup key: catches the same clip reposted under a different
+    shortcode (which URL dedup misses). Only compares against active (accepted)
+    pool members so already-flagged duplicates don't chain.
     """
     from nicheflow_studio.processing.dedup import fingerprints_match
 
@@ -222,6 +224,7 @@ def _find_content_duplicate_in_niche(
         session.query(MediaAsset)
         .join(PoolItem, PoolItem.media_asset_id == MediaAsset.id)
         .filter(PoolItem.niche == niche)
+        .filter(PoolItem.acceptance_status == POOL_STATUS_ACCEPTED)
         .filter(MediaAsset.content_hash.is_not(None))
         .all()
     )
@@ -231,6 +234,25 @@ def _find_content_duplicate_in_niche(
         if fingerprints_match(content_hash, asset.content_hash):
             return asset.id
     return None
+
+
+def flag_pool_item_duplicate(
+    session: Session, *, media_asset_id: int, niche: str, reason: str
+) -> bool:
+    """Flag the niche's pool item for ``media_asset_id`` as duplicate footage so
+    it drops out of distribution. Returns True if a pool item was flagged."""
+    niche = _validate_niche(niche)
+    item = (
+        session.query(PoolItem)
+        .filter(PoolItem.media_asset_id == media_asset_id, PoolItem.niche == niche)
+        .first()
+    )
+    if item is None:
+        return False
+    item.acceptance_status = "duplicate"
+    item.accepted_reason = reason
+    session.flush()
+    return True
 
 
 def pool_items_for_niche(
@@ -270,6 +292,63 @@ class NichePoolStats:
     rejected: int
 
 
+@dataclass(frozen=True)
+class PoolDedupResult:
+    """Outcome of a caption-based pool dedup pass."""
+
+    groups: int  # number of caption groups that had >1 member
+    flagged: int  # pool items marked 'duplicate' (kept one per group)
+
+
+def _pool_item_caption(session: Session, item: PoolItem) -> str | None:
+    """Best-effort caption for a pool item, via its asset's originating
+    scrape candidate (matched by shortcode). None when unattributed."""
+    asset = item.media_asset
+    shortcode = asset.source_shortcode if asset is not None else None
+    if not shortcode:
+        return None
+    candidate = (
+        session.query(ScrapeCandidate)
+        .filter(ScrapeCandidate.video_id == shortcode)
+        .first()
+    )
+    if candidate is None:
+        return None
+    return candidate.description or candidate.title
+
+
+def dedupe_pool_by_caption(session: Session, niche: str) -> PoolDedupResult:
+    """Flag accepted pool items that share a normalized caption with an earlier
+    item in the niche as ``duplicate`` (keeping the oldest), so they never
+    distribute. A cheap PRE-download cross-source pass — the reliable footage
+    check happens at download. Items with no caption are left untouched. Does
+    not commit; the caller owns the transaction.
+    """
+    niche = _validate_niche(niche)
+    items = (
+        session.query(PoolItem)
+        .filter(PoolItem.niche == niche, PoolItem.acceptance_status == "accepted")
+        .order_by(PoolItem.id.asc())
+        .all()
+    )
+    kept_by_key: dict[str, int] = {}
+    duplicate_keys: set[str] = set()
+    flagged = 0
+    for item in items:
+        key = normalize_caption(_pool_item_caption(session, item))
+        if not key:
+            continue  # unattributed / no caption — can't text-dedup
+        if key in kept_by_key:
+            item.acceptance_status = "duplicate"
+            item.accepted_reason = f"duplicate caption of pool item #{kept_by_key[key]}"
+            duplicate_keys.add(key)
+            flagged += 1
+        else:
+            kept_by_key[key] = item.id
+    session.flush()
+    return PoolDedupResult(groups=len(duplicate_keys), flagged=flagged)
+
+
 def niche_pool_stats(session: Session, niche: str) -> NichePoolStats:
     """Compute the pool summary counts for ``niche`` (see :class:`NichePoolStats`)."""
     niche = _validate_niche(niche)
@@ -278,6 +357,9 @@ def niche_pool_stats(session: Session, niche: str) -> NichePoolStats:
         row[0]
         for row in session.query(Assignment.pool_item_id)
         .filter(Assignment.niche == niche)
+        # "skipped_duplicate" assignments don't hold a real slot (literal here to
+        # avoid a pools<->assignments import cycle).
+        .filter(Assignment.status != "skipped_duplicate")
         .all()
     }
     assigned = len(assigned_item_ids)
@@ -295,6 +377,92 @@ def niche_pool_stats(session: Session, niche: str) -> NichePoolStats:
         unused=max(0, pooled - assigned),
         rejected=rejected,
     )
+
+
+# Pool item lifecycle (PoolItem.acceptance_status):
+#   "accepted"  — active inventory, eligible to distribute
+#   "duplicate" — flagged by caption dedup (Phase A)
+#   "removed"   — manually pruned in review (the manual-check gate)
+# Only "accepted" items are distributed; the others stay for audit/restore.
+POOL_STATUS_ACCEPTED = "accepted"
+POOL_STATUS_REMOVED = "removed"
+
+
+def remove_pool_item(
+    session: Session, *, pool_item_id: int, reason: str = "manual removal"
+) -> bool:
+    """Manually remove a clip from the pool — the post-pool review gate.
+
+    Sets ``acceptance_status='removed'`` so the clip no longer distributes
+    (SOURCING_POOLING_PLAN.md §2 manual review, applied at the pool stage).
+    Existing assignments, if any, are left untouched. Returns ``True`` when the
+    item was found. Does not commit; the caller owns the transaction.
+    """
+    item = session.get(PoolItem, pool_item_id)
+    if item is None:
+        return False
+    item.acceptance_status = POOL_STATUS_REMOVED
+    item.accepted_reason = reason
+    session.flush()
+    return True
+
+
+def restore_pool_item(session: Session, *, pool_item_id: int) -> bool:
+    """Undo a removal/duplicate flag — return the item to the active pool.
+    Returns ``True`` when found. Does not commit."""
+    item = session.get(PoolItem, pool_item_id)
+    if item is None:
+        return False
+    item.acceptance_status = POOL_STATUS_ACCEPTED
+    item.accepted_reason = None
+    session.flush()
+    return True
+
+
+@dataclass(frozen=True)
+class PoolReviewRow:
+    """One pool item for the manual-review list: id, status, label, caption."""
+
+    pool_item_id: int
+    status: str
+    shortcode: str | None
+    caption: str | None
+    distributed_to: tuple[str, ...]
+
+
+def pool_review_rows(
+    session: Session, niche: str, *, include_inactive: bool = False
+) -> list[PoolReviewRow]:
+    """Pool items in a niche for manual review, oldest first. By default only
+    active (accepted) items; ``include_inactive`` also lists removed/duplicate
+    ones so a mistaken removal can be spotted and restored."""
+    niche = _validate_niche(niche)
+    query = session.query(PoolItem).filter(PoolItem.niche == niche)
+    if not include_inactive:
+        query = query.filter(PoolItem.acceptance_status == POOL_STATUS_ACCEPTED)
+    items = query.order_by(PoolItem.id.asc()).all()
+
+    rows: list[PoolReviewRow] = []
+    for item in items:
+        asset = item.media_asset
+        shortcode = asset.source_shortcode if asset is not None else None
+        accounts = [
+            session.get(Account, a.account_id).name
+            if session.get(Account, a.account_id) and session.get(Account, a.account_id).name
+            else f"#{a.account_id}"
+            for a in item.assignments
+        ]
+        caption = _pool_item_caption(session, item)
+        rows.append(
+            PoolReviewRow(
+                pool_item_id=item.id,
+                status=item.acceptance_status,
+                shortcode=shortcode,
+                caption=(caption or "")[:80] or None,
+                distributed_to=tuple(accounts),
+            )
+        )
+    return rows
 
 
 @dataclass(frozen=True)

@@ -4,12 +4,13 @@ import random
 from pathlib import Path
 
 from nicheflow_studio.db.assignments import (
+    assignment_counts_by_account,
     distribute_niche,
     pending_download_assignments,
 )
 from nicheflow_studio.db.media_library import find_media_asset
 from nicheflow_studio.db.models import Account, ScrapeCandidate
-from nicheflow_studio.db.pools import accept_candidate_into_pool
+from nicheflow_studio.db.pools import accept_candidate_into_pool, pool_size
 from nicheflow_studio.db.session import get_session, init_db
 from nicheflow_studio.queue import download_assigned_pending
 
@@ -72,22 +73,25 @@ def test_download_assigned_pending_marks_downloaded_with_fingerprint(tmp_path) -
         path.write_bytes(b"fake video bytes")
         return _FakeResult(str(path))
 
+    # Unique fingerprint per clip so the footage-dedup step doesn't treat them
+    # as duplicates of each other.
     summary = download_assigned_pending(
         niche="history",
         downloader=fake_downloader,
-        fingerprinter=lambda _path: "FAKEHASH",
+        fingerprinter=lambda path: f"FP-{Path(path).stem}",
     )
 
     assert summary.downloaded == 3
     assert summary.reused == 0
     assert summary.failed == 0
+    assert summary.duplicates == 0
     with get_session() as session:
         # Every asset is now downloaded with a path + fingerprint recorded.
         assert pending_download_assignments(session, niche="history") == []
         asset = find_media_asset(session, source_url="https://www.instagram.com/reel/SEED0/")
         assert asset.download_status == "downloaded"
         assert asset.original_download_path is not None
-        assert asset.content_hash == "FAKEHASH"
+        assert asset.content_hash == "FP-SEED0"
 
 
 def test_download_assigned_pending_reuses_existing_file(tmp_path) -> None:
@@ -104,14 +108,16 @@ def test_download_assigned_pending_reuses_existing_file(tmp_path) -> None:
         path.write_bytes(b"v")
         return _FakeResult(str(path))
 
+    fp = lambda path: f"FP-{Path(path).stem}"  # unique per clip -> no false dups
     # First run downloads both.
     first = download_assigned_pending(
-        niche="history", downloader=counting_downloader, fingerprinter=lambda _p: "H"
+        niche="history", downloader=counting_downloader, fingerprinter=fp
     )
     assert first.downloaded == 2
+    assert first.duplicates == 0
     # Second run finds them already on disk and reuses (no new downloads).
     second = download_assigned_pending(
-        niche="history", downloader=counting_downloader, fingerprinter=lambda _p: "H"
+        niche="history", downloader=counting_downloader, fingerprinter=fp
     )
     assert second.downloaded == 0
     assert second.reused == 0  # nothing pending remains, so nothing to reuse
@@ -136,3 +142,37 @@ def test_download_assigned_pending_records_failures(tmp_path) -> None:
     # Assets stay pending so a later run can retry them.
     with get_session() as session:
         assert len(pending_download_assignments(session, niche="history")) == 2
+
+
+def test_download_dedup_replace_flags_duplicate_footage(tmp_path) -> None:
+    """Phase B: when downloaded clips share footage, the first is kept and the
+    rest are flagged duplicate — their pool items leave the pool and their
+    assignments become skipped_duplicate (so the next Distribute refills)."""
+    init_db()
+    with get_session() as session:
+        _seed_assigned_pending(session, 3)
+        session.commit()
+
+    def fake_downloader(url: str) -> _FakeResult:
+        path = tmp_path / f"{url.rstrip('/').rsplit('/', 1)[-1]}.mp4"
+        path.write_bytes(b"x")
+        return _FakeResult(str(path))
+
+    # Identical (valid-format) fingerprint for every clip => clips 2 and 3 are
+    # footage dups of clip 1.
+    same_fp = "a1b2c3d4e5f60718,1122334455667788,99aabbccddeeff00"
+    summary = download_assigned_pending(
+        niche="history",
+        downloader=fake_downloader,
+        fingerprinter=lambda _path: same_fp,
+    )
+
+    assert summary.downloaded == 1
+    assert summary.duplicates == 2
+    assert summary.failed == 0
+    with get_session() as session:
+        # Two pool items flagged duplicate -> distributable pool shrinks to 1.
+        assert pool_size(session, "history") == 1
+        # Skipped assignments don't count, so the account reads as holding 1.
+        counts = assignment_counts_by_account(session, "history")
+        assert sum(counts.values()) == 1

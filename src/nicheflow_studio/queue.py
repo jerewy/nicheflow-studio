@@ -8,13 +8,20 @@ from pathlib import Path
 from typing import Callable
 
 from nicheflow_studio.core.paths import downloads_dir
-from nicheflow_studio.db.assignments import pending_download_assignments
+from nicheflow_studio.db.assignments import (
+    ASSIGNMENT_STATUS_SKIPPED_DUPLICATE,
+    pending_download_assignments,
+)
 from nicheflow_studio.db.media_library import (
     find_media_asset,
     find_or_register_media_asset,
     mark_media_asset_downloaded,
 )
-from nicheflow_studio.db.models import DownloadItem, MediaAsset
+from nicheflow_studio.db.models import Assignment, DownloadItem, MediaAsset
+from nicheflow_studio.db.pools import (
+    find_niche_content_duplicate,
+    flag_pool_item_duplicate,
+)
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.downloader.instagram import (
     download_instagram_url,
@@ -124,6 +131,7 @@ class AssignmentDownloadSummary:
     downloaded: int
     reused: int
     failed: int
+    duplicates: int
     errors: tuple[str, ...]
 
 
@@ -138,10 +146,13 @@ def download_assigned_pending(
 
     Candidate-first means most of the assignment backlog is ``pending``; this
     fetches only assigned-but-pending assets (download-once, reference-many),
-    marks each downloaded, and records a perceptual fingerprint for the later
-    content-dedup step. An asset that already has a real file on disk is reused,
-    not re-downloaded. ``downloader``/``fingerprinter``/``progress`` are
-    injectable so the orchestration is testable without hitting the network.
+    marks each downloaded, and records a perceptual fingerprint. The fingerprint
+    then powers footage dedup (Phase B): if a freshly downloaded clip is the same
+    footage as one already in the niche pool (a re-branded repost), its
+    assignment is marked ``skipped_duplicate`` and its pool item flagged
+    duplicate, so the next Distribute refills the slot. An asset already on disk
+    is reused. ``downloader``/``fingerprinter``/``progress`` are injectable so the
+    orchestration is testable without hitting the network.
     """
     download = downloader or (lambda url: _download_url(url=url))
     fingerprint = fingerprinter or _safe_fingerprint
@@ -149,7 +160,7 @@ def download_assigned_pending(
     with get_session() as session:
         targets = pending_download_assignments(session, niche=niche)
 
-    downloaded = reused = failed = 0
+    downloaded = reused = failed = duplicates = 0
     errors: list[str] = []
     total = len(targets)
     for index, target in enumerate(targets):
@@ -182,6 +193,33 @@ def download_assigned_pending(
                     file_size_bytes=_file_size_bytes(file_path),
                     content_hash=content_hash,
                 )
+                # Phase B: footage dedup against what's already in the niche pool.
+                dup_asset_id = (
+                    find_niche_content_duplicate(
+                        session,
+                        niche=target.niche,
+                        content_hash=content_hash,
+                        exclude_asset_id=asset.id,
+                    )
+                    if content_hash
+                    else None
+                )
+                if dup_asset_id is not None:
+                    flag_pool_item_duplicate(
+                        session,
+                        media_asset_id=asset.id,
+                        niche=target.niche,
+                        reason=f"duplicate footage of asset #{dup_asset_id}",
+                    )
+                    for assignment in (
+                        session.query(Assignment)
+                        .filter(Assignment.id.in_(target.assignment_ids))
+                        .all()
+                    ):
+                        assignment.status = ASSIGNMENT_STATUS_SKIPPED_DUPLICATE
+                    session.commit()
+                    duplicates += 1
+                    continue
                 session.commit()
             downloaded += 1
         except Exception as exc:  # noqa: BLE001
@@ -195,6 +233,7 @@ def download_assigned_pending(
         downloaded=downloaded,
         reused=reused,
         failed=failed,
+        duplicates=duplicates,
         errors=tuple(errors),
     )
 

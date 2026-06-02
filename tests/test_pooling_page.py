@@ -208,7 +208,9 @@ def test_pool_download_assigned_runs_and_reports(qt_app, tmp_path: Path, monkeyp
     monkeypatch.setattr(
         mw,
         "download_assigned_pending",
-        lambda **_kwargs: SimpleNamespace(downloaded=2, reused=0, failed=0, errors=()),
+        lambda **_kwargs: SimpleNamespace(
+            downloaded=2, reused=0, failed=0, duplicates=0, errors=()
+        ),
     )
 
     window = MainWindow()

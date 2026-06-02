@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from nicheflow_studio.core.text_dedup import normalize_caption
 from nicheflow_studio.db.media_library import find_or_register_media_asset
 from nicheflow_studio.db.models import Account, ScrapeCandidate
 from nicheflow_studio.db.pools import (
@@ -10,9 +11,13 @@ from nicheflow_studio.db.pools import (
     DuplicateContentError,
     accept_candidate_into_pool,
     accept_into_pool,
+    dedupe_pool_by_caption,
     pool_items_for_niche,
+    pool_review_rows,
     pool_size,
     reject_candidate,
+    remove_pool_item,
+    restore_pool_item,
 )
 from nicheflow_studio.db.session import get_session, init_db
 
@@ -336,3 +341,133 @@ def test_niche_pool_stats_counts_pooled_assigned_unused_rejected(tmp_path) -> No
         assert stats.rejected == 2
         # Movie niche is empty and isolated.
         assert niche_pool_stats(session, "movie").pooled == 0
+
+
+# ---------------------------------------------------------------------------
+# Pre-download caption dedup (SOURCING_POOLING_PLAN.md §3, dedup-before-download)
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_caption_collapses_emoji_punctuation_and_case() -> None:
+    a = normalize_caption("The JFK assassination, explained 🔥🔥")
+    b = normalize_caption("the   jfk assassination explained!!!")
+    assert a == b == "the jfk assassination explained"
+    assert normalize_caption(None) == ""
+    assert normalize_caption("   ") == ""
+
+
+def _pool_clip_with_caption(session, account, shortcode: str, caption: str) -> None:
+    asset = _asset(session, shortcode)
+    accept_into_pool(session, media_asset=asset, niche="history")
+    session.add(
+        ScrapeCandidate(
+            scrape_source_url="https://www.instagram.com/src/",
+            source_url=f"https://www.instagram.com/reel/{shortcode}/",
+            video_id=shortcode,
+            description=caption,
+            account_id=account.id,
+        )
+    )
+    session.flush()
+
+
+def test_dedupe_pool_by_caption_flags_reposts_keeps_one(tmp_path) -> None:
+    """Two clips with the same caption (a cross-source repost) collapse to one;
+    the duplicate is flagged so it drops out of the distributable pool."""
+    init_db()
+    with get_session() as session:
+        account = Account(name="Hist", platform="instagram", niche="history")
+        session.add(account)
+        session.flush()
+        # AAA and BBB share a caption after normalization; CCC is unique.
+        _pool_clip_with_caption(session, account, "AAA", "The JFK assassination explained 🔥")
+        _pool_clip_with_caption(session, account, "BBB", "the jfk assassination explained!!")
+        _pool_clip_with_caption(session, account, "CCC", "A totally different fact")
+        session.commit()
+
+        assert pool_size(session, "history") == 3
+        result = dedupe_pool_by_caption(session, "history")
+        session.commit()
+
+        assert result.groups == 1
+        assert result.flagged == 1
+        # The flagged duplicate is excluded from the accepted/distributable pool.
+        assert pool_size(session, "history") == 2
+        # Re-running is idempotent (the kept items have no new duplicates).
+        again = dedupe_pool_by_caption(session, "history")
+        assert again.flagged == 0
+
+
+def test_dedupe_pool_leaves_uncaptioned_items_untouched(tmp_path) -> None:
+    init_db()
+    with get_session() as session:
+        # Pool items with no originating candidate -> no caption -> not dedup-able.
+        accept_into_pool(session, media_asset=_asset(session, "NOCAP1"), niche="history")
+        accept_into_pool(session, media_asset=_asset(session, "NOCAP2"), niche="history")
+        session.commit()
+
+        result = dedupe_pool_by_caption(session, "history")
+        session.commit()
+        assert result.flagged == 0
+        assert pool_size(session, "history") == 2
+
+
+# ---------------------------------------------------------------------------
+# Manual pool pruning (the post-pool review gate)
+# ---------------------------------------------------------------------------
+
+
+def test_remove_pool_item_drops_it_from_distributable_pool(tmp_path) -> None:
+    init_db()
+    with get_session() as session:
+        accept_into_pool(session, media_asset=_asset(session, "KEEP1"), niche="history")
+        bad = accept_into_pool(session, media_asset=_asset(session, "BAD1"), niche="history")
+        session.commit()
+        assert pool_size(session, "history") == 2
+
+        assert remove_pool_item(session, pool_item_id=bad.id, reason="ad") is True
+        session.commit()
+
+        # Removed item no longer counts toward the distributable pool.
+        assert pool_size(session, "history") == 1
+        remaining = {p.id for p in pool_items_for_niche(session, "history")}
+        assert bad.id not in remaining
+
+
+def test_restore_pool_item_returns_it_to_the_pool(tmp_path) -> None:
+    init_db()
+    with get_session() as session:
+        item = accept_into_pool(session, media_asset=_asset(session, "OOPS1"), niche="history")
+        session.commit()
+        remove_pool_item(session, pool_item_id=item.id, reason="mistake")
+        session.commit()
+        assert pool_size(session, "history") == 0
+
+        assert restore_pool_item(session, pool_item_id=item.id) is True
+        session.commit()
+        assert pool_size(session, "history") == 1
+
+
+def test_remove_missing_pool_item_returns_false(tmp_path) -> None:
+    init_db()
+    with get_session() as session:
+        assert remove_pool_item(session, pool_item_id=99999) is False
+
+
+def test_pool_review_rows_lists_active_and_optionally_inactive(tmp_path) -> None:
+    init_db()
+    with get_session() as session:
+        a = accept_into_pool(session, media_asset=_asset(session, "RV1"), niche="history")
+        accept_into_pool(session, media_asset=_asset(session, "RV2"), niche="history")
+        session.commit()
+        remove_pool_item(session, pool_item_id=a.id, reason="low quality")
+        session.commit()
+
+        active = pool_review_rows(session, "history")
+        assert len(active) == 1  # only the accepted one
+        assert all(r.status == "accepted" for r in active)
+
+        everything = pool_review_rows(session, "history", include_inactive=True)
+        assert len(everything) == 2
+        statuses = {r.status for r in everything}
+        assert "removed" in statuses and "accepted" in statuses

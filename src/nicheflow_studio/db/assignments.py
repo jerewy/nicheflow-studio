@@ -20,6 +20,10 @@ from nicheflow_studio.db.pools import VALID_NICHES, pool_items_for_niche
 
 import random as _random
 
+# An assignment whose clip turned out to be duplicate footage at download time.
+# Excluded from per-account counts so the next Distribute refills the slot.
+ASSIGNMENT_STATUS_SKIPPED_DUPLICATE = "skipped_duplicate"
+
 
 def _validate_niche(niche: str) -> str:
     value = (niche or "").strip().lower()
@@ -107,11 +111,19 @@ def distribute_niche(
 
 
 def assignment_counts_by_account(session: Session, niche: str) -> dict[int, int]:
-    """How many clips each account in this niche has been assigned."""
+    """How many ACTIVE clips each account in this niche holds.
+
+    Excludes ``skipped_duplicate`` assignments so a clip dropped as duplicate
+    footage at download leaves the account short — and the next Distribute tops
+    it back up with a fresh clip (the dedupe 'replace' step).
+    """
     niche = _validate_niche(niche)
     counts: dict[int, int] = {}
     for (account_id,) in (
-        session.query(Assignment.account_id).filter(Assignment.niche == niche).all()
+        session.query(Assignment.account_id)
+        .filter(Assignment.niche == niche)
+        .filter(Assignment.status != ASSIGNMENT_STATUS_SKIPPED_DUPLICATE)
+        .all()
     ):
         counts[account_id] = counts.get(account_id, 0) + 1
     return counts
@@ -171,31 +183,35 @@ class PendingAssetDownload:
     media_asset_id: int
     source_url: str
     shortcode: str | None
+    niche: str
     assignment_ids: tuple[int, ...]
 
 
 def pending_download_assignments(
     session: Session, niche: str | None = None
 ) -> list[PendingAssetDownload]:
-    """Unique media assets referenced by an assignment whose original is still
-    pending download, oldest assignment first. Optionally scoped to one niche."""
+    """Unique media assets referenced by a (non-skipped) assignment whose
+    original is still pending download, oldest assignment first. Optionally
+    scoped to one niche."""
     query = (
-        session.query(Assignment.id, MediaAsset)
+        session.query(Assignment.id, Assignment.niche, MediaAsset)
         .join(PoolItem, PoolItem.id == Assignment.pool_item_id)
         .join(MediaAsset, MediaAsset.id == PoolItem.media_asset_id)
         .filter(MediaAsset.download_status != "downloaded")
+        .filter(Assignment.status != ASSIGNMENT_STATUS_SKIPPED_DUPLICATE)
     )
     if niche is not None:
         query = query.filter(Assignment.niche == _validate_niche(niche))
 
     ordered_asset_ids: list[int] = []
     by_asset: dict[int, dict] = {}
-    for assignment_id, asset in query.order_by(Assignment.id.asc()).all():
+    for assignment_id, assignment_niche, asset in query.order_by(Assignment.id.asc()).all():
         entry = by_asset.get(asset.id)
         if entry is None:
             by_asset[asset.id] = {
                 "source_url": asset.canonical_source_url,
                 "shortcode": asset.source_shortcode,
+                "niche": assignment_niche,
                 "assignment_ids": [assignment_id],
             }
             ordered_asset_ids.append(asset.id)
@@ -207,6 +223,7 @@ def pending_download_assignments(
             media_asset_id=asset_id,
             source_url=by_asset[asset_id]["source_url"],
             shortcode=by_asset[asset_id]["shortcode"],
+            niche=by_asset[asset_id]["niche"],
             assignment_ids=tuple(by_asset[asset_id]["assignment_ids"]),
         )
         for asset_id in ordered_asset_ids

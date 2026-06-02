@@ -4490,6 +4490,8 @@ class MainWindow(QWidget):
     def _on_pool_download_completed(self, niche: str, summary: object) -> None:
         self._finish_pool_download()
         parts = [f"{summary.downloaded} downloaded"]
+        if getattr(summary, "duplicates", 0):
+            parts.append(f"{summary.duplicates} duplicate footage skipped")
         if summary.reused:
             parts.append(f"{summary.reused} already on disk")
         if summary.failed:
