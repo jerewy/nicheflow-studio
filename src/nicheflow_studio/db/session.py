@@ -337,6 +337,18 @@ def _ensure_compatibility() -> None:
                 text("ALTER TABLE scrape_candidates ADD COLUMN scrape_run_id INTEGER")
             )
 
+        # Content dedup fingerprint (additive). media_assets is created by
+        # create_all on fresh DBs (already has the column); this backfills it on
+        # databases created before content dedup existed.
+        if "media_assets" in inspect(connection).get_table_names():
+            media_asset_columns = {
+                column["name"] for column in inspect(connection).get_columns("media_assets")
+            }
+            if "content_hash" not in media_asset_columns:
+                connection.execute(
+                    text("ALTER TABLE media_assets ADD COLUMN content_hash VARCHAR(1024)")
+                )
+
 
 def init_db() -> None:
     global _ENGINE, _SESSION_FACTORY

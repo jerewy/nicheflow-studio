@@ -115,10 +115,48 @@ def mark_media_asset_downloaded(
     original_download_path: str,
     file_size_bytes: int | None = None,
     checksum: str | None = None,
+    content_hash: str | None = None,
 ) -> None:
-    """Record that the original file is now on disk for this asset."""
+    """Record that the original file is now on disk for this asset.
+
+    ``content_hash`` is the perceptual fingerprint (``processing/dedup.py``); the
+    caller computes it from the downloaded file so this module stays
+    dependency-light. Left ``None`` when fingerprinting is unavailable.
+    """
     asset.original_download_path = original_download_path
     asset.file_size_bytes = file_size_bytes
     asset.checksum = checksum
+    if content_hash is not None:
+        asset.content_hash = content_hash
     asset.download_status = "downloaded"
     asset.downloaded_at = dt.datetime.now(dt.timezone.utc)
+
+
+def find_content_duplicate(
+    session: Session,
+    *,
+    content_hash: str | None,
+    platform: str = "instagram",
+    exclude_asset_id: int | None = None,
+) -> MediaAsset | None:
+    """Return an existing asset whose footage matches ``content_hash``, or None.
+
+    Catches the same clip reposted under a different shortcode — which the
+    URL/shortcode dedup in :func:`find_media_asset` cannot. Scans assets that
+    have a fingerprint and compares perceptually (small N expected for MVP).
+    """
+    if not content_hash:
+        return None
+    # Imported here to keep the db layer importable without the processing stack.
+    from nicheflow_studio.processing.dedup import fingerprints_match
+
+    query = session.query(MediaAsset).filter(
+        MediaAsset.platform == platform,
+        MediaAsset.content_hash.is_not(None),
+    )
+    if exclude_asset_id is not None:
+        query = query.filter(MediaAsset.id != exclude_asset_id)
+    for asset in query.all():
+        if fingerprints_match(content_hash, asset.content_hash):
+            return asset
+    return None

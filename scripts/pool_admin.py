@@ -46,10 +46,14 @@ from nicheflow_studio.db.media_library import (  # noqa: E402
     find_or_register_media_asset,
     mark_media_asset_downloaded,
 )
-from nicheflow_studio.db.models import Account, DownloadItem, PoolItem  # noqa: E402
+from nicheflow_studio.db.models import Account, DownloadItem, MediaAsset, PoolItem  # noqa: E402
 from nicheflow_studio.db.pools import accept_into_pool, pool_size  # noqa: E402
 from nicheflow_studio.db.session import get_session, init_db  # noqa: E402
 from nicheflow_studio.downloader.instagram import instagram_shortcode_from_url  # noqa: E402
+from nicheflow_studio.processing.dedup import (  # noqa: E402
+    compute_video_fingerprint,
+    fingerprints_match,
+)
 
 NICHES = ("history", "movie")
 
@@ -139,6 +143,57 @@ def cmd_backfill(_args) -> None:
               f"{linked} already existed. Pantry now reflects existing downloads.")
 
 
+def cmd_fingerprint(_args) -> None:
+    """Backfill perceptual fingerprints on downloaded assets + report duplicates.
+
+    One-time pass so the existing library (downloaded before content dedup) gets
+    fingerprints, then groups assets whose footage matches — the same clip
+    reposted under different shortcodes.
+    """
+    import pathlib as _pathlib
+
+    with get_session() as session:
+        assets = (
+            session.query(MediaAsset)
+            .filter(MediaAsset.download_status == "downloaded")
+            .all()
+        )
+        computed = 0
+        for asset in assets:
+            if asset.content_hash or not asset.original_download_path:
+                continue
+            if not _pathlib.Path(asset.original_download_path).exists():
+                continue
+            fp = compute_video_fingerprint(_pathlib.Path(asset.original_download_path))
+            if fp:
+                asset.content_hash = fp
+                computed += 1
+        session.commit()
+        print(f"Fingerprinted {computed} asset(s).")
+
+        # Cluster assets by matching footage.
+        fingerprinted = [a for a in assets if a.content_hash]
+        clusters: list[list[MediaAsset]] = []
+        for asset in fingerprinted:
+            placed = False
+            for cluster in clusters:
+                if fingerprints_match(asset.content_hash, cluster[0].content_hash):
+                    cluster.append(asset)
+                    placed = True
+                    break
+            if not placed:
+                clusters.append([asset])
+        dupes = [c for c in clusters if len(c) > 1]
+        print(
+            f"{len(fingerprinted)} fingerprinted asset(s) -> {len(clusters)} unique clip(s), "
+            f"{len(dupes)} duplicate group(s)."
+        )
+        for cluster in dupes:
+            print("  duplicate footage:")
+            for asset in cluster:
+                print(f"    asset#{asset.id} {asset.source_shortcode or asset.canonical_source_url}")
+
+
 def cmd_accept(args) -> None:
     niche = args.niche
     with get_session() as session:
@@ -196,6 +251,7 @@ def main() -> None:
     sub.add_parser("status", help="Show accounts, pool sizes, assignment counts.")
     sub.add_parser("downloaded", help="List downloaded Instagram clips + pool status.")
     sub.add_parser("backfill", help="Register MediaAssets for existing IG downloads.")
+    sub.add_parser("fingerprint", help="Backfill content fingerprints + report duplicate footage.")
 
     p_accept = sub.add_parser("accept", help="Accept downloaded clips into a niche pool.")
     p_accept.add_argument("--niche", required=True, choices=NICHES)
@@ -212,6 +268,7 @@ def main() -> None:
         "status": cmd_status,
         "downloaded": cmd_downloaded,
         "backfill": cmd_backfill,
+        "fingerprint": cmd_fingerprint,
         "accept": cmd_accept,
         "distribute": cmd_distribute,
     }[args.command](args)

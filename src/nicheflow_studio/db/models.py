@@ -279,6 +279,9 @@ class MediaAsset(Base):
     download_status: Mapped[str] = mapped_column(String(32), default="pending")
     downloaded_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     checksum: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Perceptual fingerprint (processing/dedup.py) for CONTENT dedup: catches the
+    # same footage reposted under different shortcodes, which URL dedup misses.
+    content_hash: Mapped[str | None] = mapped_column(String(1024), nullable=True)
 
     pool_items: Mapped[list["PoolItem"]] = relationship(back_populates="media_asset")
 
