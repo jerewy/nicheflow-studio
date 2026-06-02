@@ -79,6 +79,7 @@ from nicheflow_studio.db.assignments import (
     account_assignment_backlog,
     assignment_counts_by_account,
     distribute_niche,
+    pending_download_assignments,
 )
 from nicheflow_studio.db.media_library import (
     find_media_asset,
@@ -166,7 +167,7 @@ from nicheflow_studio.processing.smart_drafts import (
     effective_title_rules,
     generate_smart_drafts,
 )
-from nicheflow_studio.queue import QueueManager
+from nicheflow_studio.queue import QueueManager, download_assigned_pending
 from nicheflow_studio.scraper.youtube import (
     DiscoveryWeights,
     ScrapedVideoCandidate,
@@ -1576,6 +1577,28 @@ class AccountHealthCheckWorker(QObject):
                 }
             self.result.emit(payload)
         self.completed.emit()
+
+
+class DownloadAssignedWorker(QObject):
+    """Download originals for assigned-but-pending clips off the UI thread."""
+
+    progress = pyqtSignal(int, int)
+    completed = pyqtSignal(object)  # AssignmentDownloadSummary
+    failed = pyqtSignal(str)
+
+    def __init__(self, niche: str | None) -> None:
+        super().__init__()
+        self._niche = niche
+
+    def run(self) -> None:
+        try:
+            summary = download_assigned_pending(
+                niche=self._niche, progress=self.progress.emit
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
+            return
+        self.completed.emit(summary)
 
 
 class SuggestCropWorker(QObject):
@@ -4003,6 +4026,7 @@ class MainWindow(QWidget):
 
     def _make_pooling_panel(self) -> QWidget:
         self._pooling_niche_labels: dict[str, QLabel] = {}
+        self._pooling_download_buttons: dict[str, QPushButton] = {}
         panel = QFrame()
         panel.setObjectName("panel")
         layout = QVBoxLayout()
@@ -4220,9 +4244,21 @@ class MainWindow(QWidget):
             "already at target are left untouched, new accounts get filled."
         )
         distribute_btn.clicked.connect(lambda _=False, n=niche: self._on_pool_distribute_clicked(n))
+        download_btn = QPushButton(f"Download Assigned {niche.title()}")
+        download_btn.setObjectName("downloadToolbarButton")
+        download_btn.setToolTip(
+            "Fetch the originals for this niche's assigned clips that aren't on "
+            "disk yet (download-once, reference-many). Safe to re-run; already-"
+            "downloaded clips are skipped."
+        )
+        download_btn.clicked.connect(
+            lambda _=False, n=niche: self._on_pool_download_assigned_clicked(n)
+        )
+        self._pooling_download_buttons[niche] = download_btn
         row.addWidget(label, stretch=1)
         row.addWidget(accept_btn)
         row.addWidget(distribute_btn)
+        row.addWidget(download_btn)
         frame.setLayout(row)
         return frame
 
@@ -4405,6 +4441,70 @@ class MainWindow(QWidget):
         )
         self._pooling_status_label.setText(f"Latest {niche} distribution → {summary}")
         self._refresh_pooling_page()
+
+    def _on_pool_download_assigned_clicked(self, niche: str) -> None:
+        if getattr(self, "_pool_download_in_progress", False):
+            self._notify("A download is already running.", Tone.WARNING)
+            return
+        with get_session() as session:
+            pending = pending_download_assignments(session, niche=niche)
+        if not pending:
+            self._notify(
+                f"No assigned {niche} clips need downloading — all are already on disk.",
+                Tone.INFO,
+            )
+            return
+
+        self._pool_download_in_progress = True
+        for button in self._pooling_download_buttons.values():
+            button.setEnabled(False)
+        self._pooling_status_label.setText(
+            f"Downloading {len(pending)} assigned {niche} clip(s)... 0/{len(pending)}"
+        )
+
+        thread = QThread(self)
+        worker = DownloadAssignedWorker(niche)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_pool_download_progress)
+        worker.completed.connect(
+            lambda summary, n=niche: self._on_pool_download_completed(n, summary)
+        )
+        worker.failed.connect(self._on_pool_download_failed)
+        worker.completed.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._pool_download_thread = thread
+        self._pool_download_worker = worker
+        thread.start()
+
+    def _on_pool_download_progress(self, done: int, total: int) -> None:
+        self._pooling_status_label.setText(f"Downloading assigned clips... {done}/{total}")
+
+    def _finish_pool_download(self) -> None:
+        self._pool_download_in_progress = False
+        for button in self._pooling_download_buttons.values():
+            button.setEnabled(True)
+
+    def _on_pool_download_completed(self, niche: str, summary: object) -> None:
+        self._finish_pool_download()
+        parts = [f"{summary.downloaded} downloaded"]
+        if summary.reused:
+            parts.append(f"{summary.reused} already on disk")
+        if summary.failed:
+            parts.append(f"{summary.failed} failed")
+        tone = Tone.WARNING if summary.failed else Tone.SUCCESS
+        self._notify(f"{niche.title()} assigned downloads: {', '.join(parts)}.", tone)
+        if summary.errors:
+            self._pooling_status_label.setText(
+                f"{niche.title()} download issues → " + " · ".join(summary.errors[:3])
+            )
+        self._refresh_pooling_page()
+
+    def _on_pool_download_failed(self, message: str) -> None:
+        self._finish_pool_download()
+        self._notify(f"Download run failed: {message}", Tone.ERROR)
 
     def _refresh_pooling_page(self) -> None:
         if not hasattr(self, "_pooling_table"):

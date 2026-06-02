@@ -8,12 +8,13 @@ from pathlib import Path
 from typing import Callable
 
 from nicheflow_studio.core.paths import downloads_dir
+from nicheflow_studio.db.assignments import pending_download_assignments
 from nicheflow_studio.db.media_library import (
     find_media_asset,
     find_or_register_media_asset,
     mark_media_asset_downloaded,
 )
-from nicheflow_studio.db.models import DownloadItem
+from nicheflow_studio.db.models import DownloadItem, MediaAsset
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.downloader.instagram import (
     download_instagram_url,
@@ -105,6 +106,96 @@ def _register_downloaded_media_asset(session, *, url: str, result) -> None:
         original_download_path=str(result.file_path),
         file_size_bytes=_file_size_bytes(Path(result.file_path)),
         content_hash=content_hash,
+    )
+
+
+def _safe_fingerprint(path: Path) -> str | None:
+    """Perceptual fingerprint, best-effort (never raises)."""
+    try:
+        from nicheflow_studio.processing.dedup import compute_video_fingerprint
+
+        return compute_video_fingerprint(path)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+@dataclass(frozen=True)
+class AssignmentDownloadSummary:
+    downloaded: int
+    reused: int
+    failed: int
+    errors: tuple[str, ...]
+
+
+def download_assigned_pending(
+    *,
+    niche: str | None = None,
+    downloader: Callable[[str], object] | None = None,
+    fingerprinter: Callable[[Path], str | None] | None = None,
+    progress: Callable[[int, int], None] | None = None,
+) -> AssignmentDownloadSummary:
+    """Download originals for assigned clips that aren't on disk yet.
+
+    Candidate-first means most of the assignment backlog is ``pending``; this
+    fetches only assigned-but-pending assets (download-once, reference-many),
+    marks each downloaded, and records a perceptual fingerprint for the later
+    content-dedup step. An asset that already has a real file on disk is reused,
+    not re-downloaded. ``downloader``/``fingerprinter``/``progress`` are
+    injectable so the orchestration is testable without hitting the network.
+    """
+    download = downloader or (lambda url: _download_url(url=url))
+    fingerprint = fingerprinter or _safe_fingerprint
+
+    with get_session() as session:
+        targets = pending_download_assignments(session, niche=niche)
+
+    downloaded = reused = failed = 0
+    errors: list[str] = []
+    total = len(targets)
+    for index, target in enumerate(targets):
+        if progress is not None:
+            progress(index, total)
+        try:
+            with get_session() as session:
+                asset = session.get(MediaAsset, target.media_asset_id)
+                if asset is None:
+                    continue
+                already_on_disk = (
+                    asset.download_status == "downloaded"
+                    and bool(asset.original_download_path)
+                    and Path(asset.original_download_path).exists()
+                )
+            if already_on_disk:
+                reused += 1
+                continue
+
+            result = download(target.source_url)
+            file_path = Path(str(result.file_path))
+            content_hash = fingerprint(file_path)
+            with get_session() as session:
+                asset = session.get(MediaAsset, target.media_asset_id)
+                if asset is None:
+                    continue
+                mark_media_asset_downloaded(
+                    asset,
+                    original_download_path=str(file_path),
+                    file_size_bytes=_file_size_bytes(file_path),
+                    content_hash=content_hash,
+                )
+                session.commit()
+            downloaded += 1
+        except Exception as exc:  # noqa: BLE001
+            failed += 1
+            errors.append(
+                f"{target.shortcode or target.source_url}: {_sanitize_error_message(exc)}"
+            )
+    if progress is not None:
+        progress(total, total)
+    return AssignmentDownloadSummary(
+        downloaded=downloaded,
+        reused=reused,
+        failed=failed,
+        errors=tuple(errors),
     )
 
 

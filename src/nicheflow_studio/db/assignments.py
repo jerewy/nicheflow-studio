@@ -159,6 +159,60 @@ def _clip_label(asset: MediaAsset | None, pool_item_id: int) -> str:
     return f"item#{pool_item_id}"
 
 
+@dataclass(frozen=True)
+class PendingAssetDownload:
+    """A media asset that has at least one assignment but isn't on disk yet.
+
+    Deduped by asset so a clip shared across accounts is fetched ONCE
+    (download-once, reference-many — SOURCING_POOLING_PLAN.md §8, §11).
+    ``assignment_ids`` are the assignments waiting on this asset.
+    """
+
+    media_asset_id: int
+    source_url: str
+    shortcode: str | None
+    assignment_ids: tuple[int, ...]
+
+
+def pending_download_assignments(
+    session: Session, niche: str | None = None
+) -> list[PendingAssetDownload]:
+    """Unique media assets referenced by an assignment whose original is still
+    pending download, oldest assignment first. Optionally scoped to one niche."""
+    query = (
+        session.query(Assignment.id, MediaAsset)
+        .join(PoolItem, PoolItem.id == Assignment.pool_item_id)
+        .join(MediaAsset, MediaAsset.id == PoolItem.media_asset_id)
+        .filter(MediaAsset.download_status != "downloaded")
+    )
+    if niche is not None:
+        query = query.filter(Assignment.niche == _validate_niche(niche))
+
+    ordered_asset_ids: list[int] = []
+    by_asset: dict[int, dict] = {}
+    for assignment_id, asset in query.order_by(Assignment.id.asc()).all():
+        entry = by_asset.get(asset.id)
+        if entry is None:
+            by_asset[asset.id] = {
+                "source_url": asset.canonical_source_url,
+                "shortcode": asset.source_shortcode,
+                "assignment_ids": [assignment_id],
+            }
+            ordered_asset_ids.append(asset.id)
+        else:
+            entry["assignment_ids"].append(assignment_id)
+
+    return [
+        PendingAssetDownload(
+            media_asset_id=asset_id,
+            source_url=by_asset[asset_id]["source_url"],
+            shortcode=by_asset[asset_id]["shortcode"],
+            assignment_ids=tuple(by_asset[asset_id]["assignment_ids"]),
+        )
+        for asset_id in ordered_asset_ids
+    ]
+
+
 def account_assignment_backlog(
     session: Session, account_id: int
 ) -> list[AccountAssignmentRow]:

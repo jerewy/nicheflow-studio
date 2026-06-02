@@ -2,9 +2,38 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import random
+import time
+from types import SimpleNamespace
+
 from nicheflow_studio.app.main_window import MainWindow
-from nicheflow_studio.db.models import Account, Assignment, DownloadItem, PoolItem
+from nicheflow_studio.db.assignments import distribute_niche
+from nicheflow_studio.db.models import Account, Assignment, DownloadItem, PoolItem, ScrapeCandidate
+from nicheflow_studio.db.pools import accept_candidate_into_pool
 from nicheflow_studio.db.session import get_session, init_db
+
+
+def _seed_pending_assigned(clips: int = 2) -> None:
+    """A history account with `clips` candidate-first pooled + distributed clips
+    (assets stay pending — nothing downloaded)."""
+    with get_session() as session:
+        account = Account(
+            name="Hist 0", platform="instagram", instagram_profile="h0", niche="history"
+        )
+        session.add(account)
+        session.flush()
+        for i in range(clips):
+            candidate = ScrapeCandidate(
+                scrape_source_url="https://www.instagram.com/src/",
+                source_url=f"https://www.instagram.com/reel/PEND{i}/",
+                video_id=f"PEND{i}",
+                account_id=account.id,
+            )
+            session.add(candidate)
+            session.flush()
+            accept_candidate_into_pool(session, candidate=candidate, niche="history")
+        distribute_niche(session, "history", rng=random.Random(1))
+        session.commit()
 
 
 def _seed(history_accounts: int = 2, clips: int = 6) -> None:
@@ -148,6 +177,55 @@ def test_pooling_account_backlog_fills_on_selection(qt_app, tmp_path: Path) -> N
         }
         assert downloads == {"downloaded"}
         assert "3 assigned clip(s)" in window._pooling_backlog_label.text()
+    finally:
+        _teardown(window)
+
+
+def test_pool_download_assigned_no_pending_shows_info(qt_app, tmp_path: Path) -> None:
+    init_db()
+    _seed(history_accounts=1, clips=0)  # an account, but nothing assigned
+
+    window = MainWindow()
+    try:
+        window.show()
+        window._set_current_page("pooling")
+        qt_app.processEvents()
+        window._on_pool_download_assigned_clicked("history")
+        qt_app.processEvents()
+        assert getattr(window, "_pool_download_in_progress", False) is False
+        assert "No assigned history clips" in window._status_label.text()
+    finally:
+        _teardown(window)
+
+
+def test_pool_download_assigned_runs_and_reports(qt_app, tmp_path: Path, monkeypatch) -> None:
+    init_db()
+    _seed_pending_assigned(clips=2)
+
+    # Avoid the network: the worker thread calls main_window.download_assigned_pending.
+    from nicheflow_studio.app import main_window as mw
+
+    monkeypatch.setattr(
+        mw,
+        "download_assigned_pending",
+        lambda **_kwargs: SimpleNamespace(downloaded=2, reused=0, failed=0, errors=()),
+    )
+
+    window = MainWindow()
+    try:
+        window.show()
+        window._set_current_page("pooling")
+        qt_app.processEvents()
+        window._on_pool_download_assigned_clicked("history")
+
+        deadline = time.time() + 5.0
+        while getattr(window, "_pool_download_in_progress", False) and time.time() < deadline:
+            qt_app.processEvents()
+            time.sleep(0.02)
+
+        assert getattr(window, "_pool_download_in_progress", False) is False
+        assert all(b.isEnabled() for b in window._pooling_download_buttons.values())
+        assert "2 downloaded" in window._status_label.text()
     finally:
         _teardown(window)
 
