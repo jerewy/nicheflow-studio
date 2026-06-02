@@ -18,6 +18,7 @@ from nicheflow_studio.app.main_window import (
     SuggestCropJobConfig,
     parse_pasted_smart_draft,
 )
+from nicheflow_studio.core.history_sources import DEFAULT_HISTORY_SOURCE_URLS
 from nicheflow_studio.core.paths import downloads_dir, processed_dir
 from nicheflow_studio.processing.video import CropSettings, PreprocessingOcrDiagnostics, VideoProbe
 from nicheflow_studio.db.models import (
@@ -197,11 +198,10 @@ def _fail_draft_job_immediately(window: MainWindow, job) -> None:  # noqa: ANN00
 def test_instagram_profile_username_accepts_username_handle_and_profile_url() -> None:
     assert MainWindow._instagram_profile_username("meme.ig") == "meme.ig"
     assert MainWindow._instagram_profile_username("@meme.ig") == "meme.ig"
+    assert MainWindow._instagram_profile_username("https://www.instagram.com/meme.ig/") == "meme.ig"
     assert (
-        MainWindow._instagram_profile_username("https://www.instagram.com/meme.ig/")
-        == "meme.ig"
+        MainWindow._instagram_profile_username("https://www.instagram.com/reel/DYdxGRpO7Am/") == ""
     )
-    assert MainWindow._instagram_profile_username("https://www.instagram.com/reel/DYdxGRpO7Am/") == ""
 
 
 def test_processing_loading_badge_tracks_generation_state(qt_app) -> None:
@@ -425,6 +425,79 @@ def test_workspace_can_add_scrape_source_to_selected_account(qt_app) -> None:
         window.close()
 
 
+def test_workspace_can_seed_history_source_pool(qt_app) -> None:
+    init_db()
+
+    with get_session() as session:
+        account = Account(name="Past Moments", platform="instagram", niche="history")
+        session.add(account)
+        session.commit()
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._current_account_combo.setCurrentIndex(1)
+        window._set_current_page("scraping")
+        qt_app.processEvents()
+
+        window._on_add_history_source_pool_clicked()
+        qt_app.processEvents()
+
+        with get_session() as session:
+            saved = session.query(Account).filter(Account.name == "Past Moments").one()
+            sources = session.query(Source).filter(Source.account_id == saved.id).all()
+
+        assert len(sources) == len(DEFAULT_HISTORY_SOURCE_URLS)
+        assert {source.source_url for source in sources} == set(DEFAULT_HISTORY_SOURCE_URLS)
+        assert saved.scrape_source_urls is not None
+        assert "https://www.instagram.com/theanomalists/" in saved.scrape_source_urls
+        assert window._source_table.rowCount() == len(DEFAULT_HISTORY_SOURCE_URLS)
+        assert window._status_label.text() == (
+            f"Added {len(DEFAULT_HISTORY_SOURCE_URLS)} history source(s) "
+            "to the current account."
+        )
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_workspace_history_source_pool_is_idempotent(qt_app) -> None:
+    init_db()
+
+    with get_session() as session:
+        account = Account(name="Past Moments", platform="instagram", niche="history")
+        session.add(account)
+        session.commit()
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._current_account_combo.setCurrentIndex(1)
+        qt_app.processEvents()
+
+        window._on_add_history_source_pool_clicked()
+        window._on_add_history_source_pool_clicked()
+        qt_app.processEvents()
+
+        with get_session() as session:
+            saved = session.query(Account).filter(Account.name == "Past Moments").one()
+            count = session.query(Source).filter(Source.account_id == saved.id).count()
+
+        assert count == len(DEFAULT_HISTORY_SOURCE_URLS)
+        assert window._status_label.text() == (
+            "History source pool is already configured for this account."
+        )
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
 def test_workspace_normalizes_scrape_source_subpage_to_root(qt_app) -> None:
     init_db()
 
@@ -627,8 +700,11 @@ def test_processing_page_can_export_cropped_video(
         assert captured["title_font_size"] == window._processing_title_font_size.value()
         assert captured["title_layout"] == "top_band"
         assert window._processing_progress_label.text() == "Processing complete."
-        assert window._status_label.text() == "Processed video saved to reel_001.mp4."
-        assert window._status_label.text().endswith(".mp4.")
+        assert (
+            window._status_label.text()
+            == "Processed video saved to reel_001.mp4 and added to the publish queue."
+        )
+        assert window._status_label.text().endswith("publish queue.")
         assert window._processing_latest_output_label.text() == "reel_001.mp4"
         assert window._processing_latest_output_label.text().endswith(".mp4")
         assert window._processing_open_latest_output_button.isEnabled() is True
@@ -755,7 +831,9 @@ def test_process_worker_replaces_detected_watermark(monkeypatch, tmp_path: Path)
         class region:
             text = "@comedyslam"
 
-    def fake_replace_detected_watermark(path, *, replacement_text, output_path, sample_count=3):  # noqa: ANN001
+    def fake_replace_detected_watermark(
+        path, *, replacement_text, output_path, sample_count=3
+    ):  # noqa: ANN001
         assert path == output_path.parent / "output.mp4"
         assert replacement_text == "@memeistsdaily"
         output_path.write_bytes(b"watermarked")
@@ -1081,7 +1159,9 @@ def test_black_canvas_replaces_source_title_with_automatic_crop(
         assert captured["crop"] == CropSettings(top=420)
         assert captured["title_layout"] == "top_band"
         assert captured["title_text"] == "Our Meme Title"
-        assert "replacement crop applied automatically" in window._processing_suggestion_label.text()
+        assert (
+            "replacement crop applied automatically" in window._processing_suggestion_label.text()
+        )
     finally:
         window._refresh_timer.stop()
         window._toast_timer.stop()
@@ -1152,7 +1232,9 @@ def test_black_canvas_replaces_source_title_without_vision_payload(
         assert captured["crop"] == CropSettings(top=360)
         assert captured["title_layout"] == "top_band"
         assert captured["title_text"] == "Our Meme Title"
-        assert "replacement crop applied automatically" in window._processing_suggestion_label.text()
+        assert (
+            "replacement crop applied automatically" in window._processing_suggestion_label.text()
+        )
     finally:
         window._refresh_timer.stop()
         window._toast_timer.stop()
@@ -2062,9 +2144,9 @@ def test_processing_style_panel_shows_template_and_hides_manual_title_overrides(
         window._current_account_combo.setCurrentIndex(1)
         window._set_current_page("processing")
         qt_app.processEvents()
-        assert window._processing_style_panel.isVisible(), (
-            "style panel is hidden — Template/Style/Font dropdowns unreachable"
-        )
+        assert (
+            window._processing_style_panel.isVisible()
+        ), "style panel is hidden — Template/Style/Font dropdowns unreachable"
         assert window._processing_template_combo.isVisible()
         assert not window._processing_title_style_combo.isVisible()
         assert not window._processing_title_font_combo.isVisible()
@@ -2456,16 +2538,14 @@ def test_processing_page_can_generate_and_apply_smart_drafts(
         assert window._processing_smart_option_buttons[1].isChecked()
         assert window._processing_title_draft_input.text() == "Zoo Hook"
         assert (
-            window._processing_caption_draft_input.toPlainText()
-            == "Wait for the elephant reveal"
+            window._processing_caption_draft_input.toPlainText() == "Wait for the elephant reveal"
         )
         window._apply_refresh(force=True)
         window._set_current_page("processing")
         qt_app.processEvents()
         assert window._processing_title_draft_input.text() == "Zoo Hook"
         assert (
-            window._processing_caption_draft_input.toPlainText()
-            == "Wait for the elephant reveal"
+            window._processing_caption_draft_input.toPlainText() == "Wait for the elephant reveal"
         )
 
         window._on_processing_smart_option_clicked(0)
@@ -3040,9 +3120,7 @@ def test_ai_top_band_suggestion_does_not_block_replacement_crop(
         # Processing must then run the heuristic crop and adopt its result.
         window._on_process_video_clicked()
         assert captured.get("replacement_called") is True
-        assert window._processing_auto_crop == CropSettings(
-            left=80, top=814, right=88, bottom=600
-        )
+        assert window._processing_auto_crop == CropSettings(left=80, top=814, right=88, bottom=600)
         assert captured["job"].crop != CropSettings()
     finally:
         window._refresh_timer.stop()
@@ -3280,7 +3358,7 @@ def test_processing_page_adds_processed_video_to_upload_schedule(qt_app, tmp_pat
         window.close()
 
 
-def test_processing_completion_auto_adds_ready_publish_job(qt_app, tmp_path: Path) -> None:
+def test_processing_completion_auto_adds_draft_publish_job(qt_app, tmp_path: Path) -> None:
     init_db()
     video_path = tmp_path / "clip.mp4"
     video_path.write_bytes(b"video")
@@ -3330,8 +3408,9 @@ def test_processing_completion_auto_adds_ready_publish_job(qt_app, tmp_path: Pat
         assert job.processed_path == str(output_path)
         assert job.title == "Ready Hook"
         assert job.description == "Ready caption"
-        assert job.status == "ready"
+        assert job.status == "draft"
         assert job.scheduled_at is None
+        assert window._gather_due_publish_job_ids() == []
     finally:
         window._refresh_timer.stop()
         window._toast_timer.stop()
@@ -3952,7 +4031,9 @@ def test_publish_queue_selects_first_job_and_shows_caption_preview(qt_app, tmp_p
 
         assert window._selected_schedule_job_id() is not None
         assert window._schedule_copy_caption_button.isEnabled() is True
-        assert window._schedule_caption_preview.toPlainText() == "That ending was wild #gaming #reels"
+        assert (
+            window._schedule_caption_preview.toPlainText() == "That ending was wild #gaming #reels"
+        )
     finally:
         window._refresh_timer.stop()
         window._toast_timer.stop()
@@ -3967,12 +4048,15 @@ def test_publish_queue_preserves_selection_after_status_change(qt_app, tmp_path:
     first_path.write_bytes(b"processed")
     second_path.write_bytes(b"processed")
 
+    now = dt.datetime.now(dt.timezone.utc).replace(second=0, microsecond=0)
     with get_session() as session:
         account = Account(name="RespawnReels", platform="instagram")
         session.add(account)
         session.flush()
         session.add_all(
             [
+                # "First" is the newer export, so it lands on row 0 and "Second"
+                # on row 1 (newest-export-first ordering).
                 UploadJob(
                     account_id=account.id,
                     processed_path=str(first_path),
@@ -3980,6 +4064,7 @@ def test_publish_queue_preserves_selection_after_status_change(qt_app, tmp_path:
                     description="First caption",
                     privacy_status="public",
                     status="draft",
+                    created_at=now,
                 ),
                 UploadJob(
                     account_id=account.id,
@@ -3988,6 +4073,7 @@ def test_publish_queue_preserves_selection_after_status_change(qt_app, tmp_path:
                     description="Second caption",
                     privacy_status="public",
                     status="draft",
+                    created_at=now - dt.timedelta(hours=1),
                 ),
             ]
         )
@@ -4000,7 +4086,7 @@ def test_publish_queue_preserves_selection_after_status_change(qt_app, tmp_path:
         window._current_account_combo.setCurrentIndex(1)
         window._set_current_page("uploads")
         qt_app.processEvents()
-        window._schedule_table.selectRow(1)
+        window._schedule_table.selectRow(1)  # the older export, "Second"
         selected_id = window._selected_schedule_job_id()
 
         window._schedule_status_combo.setCurrentIndex(
@@ -4017,9 +4103,7 @@ def test_publish_queue_preserves_selection_after_status_change(qt_app, tmp_path:
         window.close()
 
 
-def test_publish_queue_caption_dropdown_can_copy_title_and_caption(
-    qt_app, tmp_path: Path
-) -> None:
+def test_publish_queue_caption_dropdown_can_copy_title_and_caption(qt_app, tmp_path: Path) -> None:
     init_db()
     output_path = tmp_path / "reel.mp4"
     output_path.write_bytes(b"processed")
@@ -4119,16 +4203,15 @@ def test_publish_queue_copy_path_and_status_dropdown(qt_app, tmp_path: Path) -> 
         window.close()
 
 
-def test_publish_queue_sorts_scheduled_jobs_before_unscheduled(
-    qt_app, tmp_path: Path
-) -> None:
+def test_publish_queue_sorts_newest_export_first(qt_app, tmp_path: Path) -> None:
+    """The queue shows the newest export on top (by created_at), regardless of
+    whether older rows carry a scheduled time."""
     init_db()
-    early_path = tmp_path / "early.mp4"
-    later_path = tmp_path / "later.mp4"
-    unscheduled_path = tmp_path / "unscheduled.mp4"
-    early_path.write_bytes(b"processed")
-    later_path.write_bytes(b"processed")
-    unscheduled_path.write_bytes(b"processed")
+    newest_path = tmp_path / "newest.mp4"
+    middle_path = tmp_path / "middle.mp4"
+    oldest_path = tmp_path / "oldest.mp4"
+    for path in (newest_path, middle_path, oldest_path):
+        path.write_bytes(b"processed")
     now = dt.datetime.now(dt.timezone.utc).replace(second=0, microsecond=0)
 
     with get_session() as session:
@@ -4137,28 +4220,31 @@ def test_publish_queue_sorts_scheduled_jobs_before_unscheduled(
         session.flush()
         session.add_all(
             [
+                # Oldest export, but it IS scheduled — must NOT float to the top.
                 UploadJob(
                     account_id=account.id,
-                    processed_path=str(unscheduled_path),
-                    title="No Time",
-                    privacy_status="public",
-                    status="draft",
-                ),
-                UploadJob(
-                    account_id=account.id,
-                    processed_path=str(later_path),
-                    title="Later",
-                    scheduled_at=now + dt.timedelta(days=2),
-                    privacy_status="public",
-                    status="scheduled",
-                ),
-                UploadJob(
-                    account_id=account.id,
-                    processed_path=str(early_path),
-                    title="Early",
+                    processed_path=str(oldest_path),
+                    title="Oldest",
                     scheduled_at=now + dt.timedelta(days=1),
                     privacy_status="public",
                     status="scheduled",
+                    created_at=now - dt.timedelta(hours=2),
+                ),
+                UploadJob(
+                    account_id=account.id,
+                    processed_path=str(middle_path),
+                    title="Middle",
+                    privacy_status="public",
+                    status="draft",
+                    created_at=now - dt.timedelta(hours=1),
+                ),
+                UploadJob(
+                    account_id=account.id,
+                    processed_path=str(newest_path),
+                    title="Newest",
+                    privacy_status="public",
+                    status="draft",
+                    created_at=now,
                 ),
             ]
         )
@@ -4172,10 +4258,10 @@ def test_publish_queue_sorts_scheduled_jobs_before_unscheduled(
         window._set_current_page("uploads")
         qt_app.processEvents()
 
-        assert window._schedule_table.item(0, 2).text() == "Early"
-        assert window._schedule_table.item(1, 2).text() == "Later"
-        assert window._schedule_table.item(2, 2).text() == "No Time"
-        assert window._schedule_table.item(2, 3).text() == "(unscheduled)"
+        assert window._schedule_table.item(0, 2).text() == "Newest"
+        assert window._schedule_table.item(1, 2).text() == "Middle"
+        # The older scheduled export sorts last despite having a scheduled time.
+        assert window._schedule_table.item(2, 2).text() == "Oldest"
     finally:
         window._refresh_timer.stop()
         window._toast_timer.stop()
@@ -4183,9 +4269,7 @@ def test_publish_queue_sorts_scheduled_jobs_before_unscheduled(
         window.close()
 
 
-def test_publish_queue_can_save_and_clear_manual_schedule_time(
-    qt_app, tmp_path: Path
-) -> None:
+def test_publish_queue_can_save_and_clear_manual_schedule_time(qt_app, tmp_path: Path) -> None:
     init_db()
     output_path = tmp_path / "reel.mp4"
     output_path.write_bytes(b"processed")
@@ -4221,7 +4305,12 @@ def test_publish_queue_can_save_and_clear_manual_schedule_time(
         window._schedule_table.selectRow(0)
         qt_app.processEvents()
 
-        window._schedule_datetime_edit.setDateTime(window._datetime_to_qdatetime(selected_time))
+        from PyQt6.QtCore import QDate, QTime
+
+        window._schedule_date_edit.setDate(
+            QDate(selected_time.year, selected_time.month, selected_time.day)
+        )
+        window._schedule_time_edit.setTime(QTime(selected_time.hour, selected_time.minute))
         window._schedule_save_time_button.click()
         qt_app.processEvents()
 
@@ -4236,8 +4325,10 @@ def test_publish_queue_can_save_and_clear_manual_schedule_time(
                 "%Y-%m-%d %H:%M"
             )
 
-        assert window._schedule_table.item(0, 3).text().startswith(
-            selected_time.strftime("%Y-%m-%d %H:%M")
+        assert (
+            window._schedule_table.item(0, 3)
+            .text()
+            .startswith(selected_time.strftime("%Y-%m-%d %H:%M"))
         )
 
         window._schedule_clear_time_button.click()
@@ -4511,13 +4602,9 @@ def test_processing_copy_chat_prompt_includes_local_file_and_niche_context(
         qt_app.processEvents()
 
         window._apply_processing_template("lost_archive_black")
-        caption_index = window._processing_caption_style_combo.findData(
-            "history_lost_archive"
-        )
+        caption_index = window._processing_caption_style_combo.findData("history_lost_archive")
         window._processing_caption_style_combo.setCurrentIndex(caption_index)
-        title_index = window._processing_prompt_title_style_combo.findData(
-            "history_lost_archive"
-        )
+        title_index = window._processing_prompt_title_style_combo.findData("history_lost_archive")
         window._processing_prompt_title_style_combo.setCurrentIndex(title_index)
         window._processing_clip_premise_input.setPlainText(
             "Focus on why the clip feels like a recovered file."
@@ -4538,9 +4625,10 @@ def test_processing_copy_chat_prompt_includes_local_file_and_niche_context(
         assert "Style contract copied from NicheFlow smart drafts" in prompt
         assert "Caption word target: 90-150" in prompt
         assert "PAST MOMENTS DAILY" in prompt
-        # History hooks now use the explanatory 9-16 word rules with a concrete
+        # History hooks now use story-opener 10-16 word rules with a concrete
         # subject mandate (the Copy Chat Prompt must mirror live generation).
-        assert "9-16 words" in prompt
+        assert "10-16 words" in prompt
+        assert "STORY-OPENER RULE" in prompt
         assert "NAMES the concrete visible subject" in prompt
         assert "Do not use generic filler hashtags like #fyp" in prompt
         assert "Generate 3 on-screen title options and 3 caption options" in prompt
@@ -4729,8 +4817,7 @@ def test_processing_generate_drafts_uses_visual_first_for_silent_clips(
         assert len(window._processing_smart_option_buttons) == 3
         assert window._processing_title_draft_input.text() == "Zoo Hook"
         assert (
-            window._processing_caption_draft_input.toPlainText()
-            == "Wait for the elephant reveal"
+            window._processing_caption_draft_input.toPlainText() == "Wait for the elephant reveal"
         )
         assert "smart draft options" in window._processing_draft_status_label.text().lower()
     finally:
@@ -5211,7 +5298,9 @@ def test_activity_progress_bar_tracks_source_level_progress(qt_app) -> None:
         qt_app.processEvents()
         window._current_account_combo.setCurrentIndex(1)
         window._set_current_page("scraping")
-        window._candidate_sort_combo.setCurrentIndex(window._candidate_sort_combo.findData("newest"))
+        window._candidate_sort_combo.setCurrentIndex(
+            window._candidate_sort_combo.findData("newest")
+        )
         qt_app.processEvents()
 
         job = window._build_scrape_job_for_all_enabled_sources()
@@ -6951,7 +7040,9 @@ def test_instagram_account_adds_plural_reels_candidate_and_scrolls_to_it(
         qt_app.processEvents()
         window._current_account_combo.setCurrentIndex(1)
         window._set_current_page("scraping")
-        window._candidate_sort_combo.setCurrentIndex(window._candidate_sort_combo.findData("newest"))
+        window._candidate_sort_combo.setCurrentIndex(
+            window._candidate_sort_combo.findData("newest")
+        )
         qt_app.processEvents()
 
         window._scrape_source_input.setText(f"https://www.instagram.com/reels/{shortcode}/")
@@ -6960,9 +7051,7 @@ def test_instagram_account_adds_plural_reels_candidate_and_scrolls_to_it(
 
         with get_session() as session:
             candidate = (
-                session.query(ScrapeCandidate)
-                .filter(ScrapeCandidate.video_id == shortcode)
-                .one()
+                session.query(ScrapeCandidate).filter(ScrapeCandidate.video_id == shortcode).one()
             )
 
         assert candidate.source_url == f"https://www.instagram.com/reel/{shortcode}/"
@@ -7271,7 +7360,9 @@ def test_instagram_candidate_newest_sort_handles_mixed_timezone_datetimes(qt_app
         qt_app.processEvents()
 
         window._instagram_discover_min_likes_input.setValue(0)
-        window._candidate_sort_combo.setCurrentIndex(window._candidate_sort_combo.findData("newest"))
+        window._candidate_sort_combo.setCurrentIndex(
+            window._candidate_sort_combo.findData("newest")
+        )
         qt_app.processEvents()
 
         assert window._candidate_table.rowCount() == 2
@@ -7527,11 +7618,14 @@ def test_instagram_archive_backfill_skips_latest_since_cursor(qt_app, monkeypatc
 
 
 def test_instagram_discover_account_cache_path_is_account_scoped() -> None:
-    assert InstagramDiscoverRankWorker._account_cache_output_path(
-        account_id=42,
-        account_name="Memeists Daily",
-        username="meme.ig",
-    ) == Path("data") / "discovered" / "accounts" / "42-memeists-daily" / "meme.ig-urls.json"
+    assert (
+        InstagramDiscoverRankWorker._account_cache_output_path(
+            account_id=42,
+            account_name="Memeists Daily",
+            username="meme.ig",
+        )
+        == Path("data") / "discovered" / "accounts" / "42-memeists-daily" / "meme.ig-urls.json"
+    )
 
 
 def test_instagram_discover_worker_caps_metadata_extraction(qt_app, monkeypatch) -> None:
@@ -7985,6 +8079,139 @@ def test_candidate_review_actions_show_clear_hint_and_restore_ignored_candidate(
         assert candidate_row is not None
         assert candidate_row.state == "candidate"
         assert window._status_label.text() == "Returned candidate to review."
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def _seed_instagram_candidate(niche: str | None, shortcode: str) -> int:
+    """Create an Instagram account (with the given pool niche) + one candidate.
+    Returns the candidate id."""
+    with get_session() as session:
+        account = Account(name=f"{niche or 'none'} hub", platform="instagram", niche=niche)
+        session.add(account)
+        session.flush()
+        source = Source(
+            account_id=account.id,
+            platform="instagram",
+            source_type="instagram_profile",
+            label="@src",
+            source_url="https://www.instagram.com/src/",
+            enabled=1,
+            priority=100,
+        )
+        session.add(source)
+        session.flush()
+        candidate = ScrapeCandidate(
+            scrape_source_url=source.source_url,
+            source_url=f"https://www.instagram.com/reel/{shortcode}/",
+            extractor="instagram",
+            video_id=shortcode,
+            title="A reel",
+            source_id=source.id,
+            account_id=account.id,
+        )
+        session.add(candidate)
+        session.commit()
+        return candidate.id
+
+
+def test_candidate_accept_into_pool_creates_pending_pool_item(qt_app) -> None:
+    """Accept → Pool puts the candidate into its account's niche pool without a
+    download: pool item exists, asset is pending, candidate is 'pooled'."""
+    init_db()
+    from nicheflow_studio.db.pools import pool_size
+
+    candidate_id = _seed_instagram_candidate("history", "HISTCAND1")
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._current_account_combo.setCurrentIndex(1)
+        window._set_current_page("scraping")
+        qt_app.processEvents()
+        window._candidate_table.selectRow(0)
+        qt_app.processEvents()
+
+        assert window._candidate_accept_button.isEnabled() is True
+        window._on_candidate_accept_pool_clicked()
+        qt_app.processEvents()
+
+        with get_session() as session:
+            candidate_row = session.get(ScrapeCandidate, candidate_id)
+            assert candidate_row.state == "pooled"
+            assert pool_size(session, "history") == 1
+        assert "Accepted into the history pool." in window._status_label.text()
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_candidate_accept_blocked_when_account_has_no_niche(qt_app) -> None:
+    """Without a pool niche on the account, Accept → Pool refuses and pools
+    nothing (the user is told to set the niche first)."""
+    init_db()
+    from nicheflow_studio.db.pools import pool_size
+
+    candidate_id = _seed_instagram_candidate(None, "NONICHE1")
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._current_account_combo.setCurrentIndex(1)
+        window._set_current_page("scraping")
+        qt_app.processEvents()
+        window._candidate_table.selectRow(0)
+        qt_app.processEvents()
+
+        window._on_candidate_accept_pool_clicked()
+        qt_app.processEvents()
+
+        with get_session() as session:
+            candidate_row = session.get(ScrapeCandidate, candidate_id)
+            assert candidate_row.state != "pooled"
+            assert pool_size(session, "history") == 0
+            assert pool_size(session, "movie") == 0
+        assert "no pool niche" in window._status_label.text().lower()
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_candidate_reject_with_reason_never_pools(qt_app) -> None:
+    """Reject → Ad/Campaign tags the candidate rejected_ad_campaign and creates
+    no pool item."""
+    init_db()
+    from nicheflow_studio.db.pools import pool_size
+
+    candidate_id = _seed_instagram_candidate("history", "ADCAND1")
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._current_account_combo.setCurrentIndex(1)
+        window._set_current_page("scraping")
+        qt_app.processEvents()
+        window._candidate_table.selectRow(0)
+        qt_app.processEvents()
+
+        window._on_candidate_reject_clicked("ad_campaign")
+        qt_app.processEvents()
+
+        with get_session() as session:
+            candidate_row = session.get(ScrapeCandidate, candidate_id)
+            assert candidate_row.state == "rejected_ad_campaign"
+            assert pool_size(session, "history") == 0
+        assert "rejected candidate" in window._status_label.text().lower()
     finally:
         window._refresh_timer.stop()
         window._toast_timer.stop()
