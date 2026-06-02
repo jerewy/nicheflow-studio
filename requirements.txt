@@ -11,6 +11,11 @@ instaloader==4.15
 instagrapi==2.5.15
 playwright==1.56.0
 faster-whisper==1.2.1
+# Face detection for auto-picking reel covers (Haar cascade ships inside the
+# wheel — no extra model file). HEADLESS build on purpose: the GUI build bundles
+# its own Qt, which clashes with PyQt6. Cover picking degrades gracefully to
+# sharpness/exposure scoring if this import is ever unavailable.
+opencv-python-headless==4.13.0.92
 
 # Apify (alternative IG scraping path — no IG accounts required, pay-per-result)
 apify-client==1.8.1

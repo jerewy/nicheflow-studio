@@ -1,6 +1,6 @@
 # NicheFlow Studio — Sourcing, Pooling & Multi-Account Distribution Build Plan
 
-Last updated: 2026-05-31
+Last updated: 2026-06-01
 Status: Approved to build (architecture green-lit with the tweaks below)
 Origin: Obsidian `Je Personal Vaults` notes 1 (Multi accounts) and 3 (Scraping pooling), reconciled against the actual codebase.
 
@@ -20,11 +20,16 @@ Three docs told three different stories. The reconciled truth:
 | `CLAUDE.md` (project) | "Windows-only YouTube via `yt-dlp`" | **Stale.** Target is **Instagram**. |
 | `PLAN.md` | 5 dual-use accounts (account = publisher *and* scraper), YouTube intake | Partially stale. Direction is now Apify-sourced shared pools. |
 | `STATUS.md` (2026-04-16) | Processing-hardening focus, YouTube | Stale; Instagram auto-publish + session health shipped after it. |
-| Je plan (notes 1 & 3) | 10 history + 3 movie accounts, Apify-sourced, shared niche pools | **Current direction.** |
+| Je plan (notes 1 & 3) | 10 history + 3 movie accounts, Apify-sourced, shared niche pools | Partially superseded. Current direction is broad random-past/history accounts first; movie is deferred. |
 
 **Confirmed direction:** Instagram is the publishing target. **Apify** is the sourcing
 engine (your own IG accounts never scrape — Apify runs on its own infra). YouTube/`yt-dlp`
 stays only as a legacy/secondary intake path, not the center of gravity.
+
+**2026-06-01 adjustment:** build the first network as broad random-past/history
+accounts, all fed from the shared `history` pool. Do not split into strict
+sub-niches yet. Movie/cinema stays available in the schema but is not the first
+operational target.
 
 **Key strategy change from `PLAN.md` §2A:** the Je plan abandons the "dual-use account"
 idea (where each publisher account also scrapes). Apify sourcing makes dual-use
@@ -243,8 +248,50 @@ downloads) · `accept --niche <n> [--all|--item-id N]` · `distribute --niche <n
 [--max-per-account N]`. Verified end-to-end on a copy of the real DB: backfill
 102 → accept into history pool → distribute. Nothing posts to Instagram.
 
-**Remaining in-app UI (follow-up):** Accept-into-pool button in candidate review,
-a Distribute action + assignment view. The CLI covers the workflow meanwhile.
+**In-app UI:** the Publishing Dashboard has Pool & Distribute controls for
+backfill, accept downloaded clips into a niche pool, and distribute. Source Intake
+also has an "Add History Pool" preset to seed the current Instagram account with
+starter competitor/reference profiles.
+
+### History source preset
+
+The starter source list (verified 2026-06-01 — see
+`docs/competitor-learning-findings.md`):
+
+- `theanomalists` (237K)
+- `crazyfactscorner` (128K)
+- `thehistologian` (120K)
+- `houseofhistorian` (110K)
+- `factsontheway` (37.4K)
+- `thelegendarist` (smaller; corrected from `thelegendartist`)
+
+Dropped as invalid (empty/nonexistent/mistyped on the 2026-06-01 scrape):
+`thelegendartist` (a personal art account), `themysterist`, `thecinemast`,
+`entertainist`, `thelegendast`. Replace with correct handles if found.
+
+These are source-intake references only. They do not auto-download or auto-post.
+The intended loop remains: scrape candidates, review/filter against the acceptance
+rules below, download useful clips, accept downloaded clips into `history`, then
+distribute.
+
+### History pool acceptance rules (learned 2026-06-01)
+
+Locked from competitor analysis of 180 posts across the 6 verified accounts (full
+write-up: `docs/competitor-learning-findings.md`). Step 2 candidate-review /
+`accept_into_pool` should apply these for the `history` niche:
+
+1. **Recognizable subject required** — known person, movie, event, or IP (the
+   strongest performance signal).
+2. **Supports a 15–22 word story hook** (observed median 20 words — revised up from
+   the earlier 10–16 assumption).
+3. **Clip ≤ ~35s**, ideally ~20–30s.
+4. **Understandable in 1–2 seconds**; must have a payoff (no footage that goes nowhere).
+5. **Plan for a long caption (~150 words)**, not just the on-screen hook.
+6. **Broad pop-history categories**: history, movie/TV, celebrity, sports, music,
+   weird/mystery, old TV, internet history.
+7. **Avoid excessive baked-in text** unless it carries the story.
+
+Revisit after we post and measure our own results (Phase 5 loop).
 
 ### Phase 4 — Draft + render per assignment
 - Generate per-account title/caption via existing `smart_drafts.py` niche profiles.
@@ -263,6 +310,9 @@ analytics dashboards. (Je note 3 §17 "Not Required Yet".)
 ---
 
 ## 7. Open decisions to confirm before Phase 1 code
+
+0. **2026-06-01 strategy update:** build history-style accounts first, all drawing
+   from the shared `history` pool. Movie is deferred.
 
 1. **Account count / strategy:** adopt Je plan's **10 history + 3 movie**, replacing
    `PLAN.md` §2A's "5 dual-use" portfolio? (Recommended: yes — Apify sourcing makes
