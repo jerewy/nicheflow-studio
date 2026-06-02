@@ -119,6 +119,39 @@ def test_pooling_table_shows_target_and_need_and_pool_stats(qt_app, tmp_path: Pa
         _teardown(window)
 
 
+def test_pooling_account_backlog_fills_on_selection(qt_app, tmp_path: Path) -> None:
+    init_db()
+    _seed(history_accounts=2, clips=6)
+
+    window = MainWindow()
+    try:
+        window.show()
+        window._set_current_page("pooling")
+        qt_app.processEvents()
+        window._on_pool_accept_clicked("history")
+        window._on_pool_distribute_clicked("history")
+        qt_app.processEvents()
+
+        # Nothing selected yet -> backlog is empty with the prompt label.
+        assert window._pooling_backlog_table.rowCount() == 0
+        assert "Select an account" in window._pooling_backlog_label.text()
+
+        # Selecting an account row fills its backlog (3 clips each). This seed
+        # uses the download-first accept path, so assets are already downloaded
+        # (the candidate-first 'pending' case is covered in test_assignments).
+        window._pooling_table.selectRow(0)
+        qt_app.processEvents()
+        assert window._pooling_backlog_table.rowCount() == 3
+        downloads = {
+            window._pooling_backlog_table.item(r, 2).text()
+            for r in range(window._pooling_backlog_table.rowCount())
+        }
+        assert downloads == {"downloaded"}
+        assert "3 assigned clip(s)" in window._pooling_backlog_label.text()
+    finally:
+        _teardown(window)
+
+
 def test_pooling_distribute_without_accounts_is_safe(qt_app, tmp_path: Path) -> None:
     init_db()
     # Clips exist but no movie accounts.

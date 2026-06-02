@@ -76,6 +76,7 @@ from nicheflow_studio.core.distribution import (
 )
 from nicheflow_studio.core.ui_prefs import get_ui_pref, set_ui_pref
 from nicheflow_studio.db.assignments import (
+    account_assignment_backlog,
     assignment_counts_by_account,
     distribute_niche,
 )
@@ -4099,7 +4100,35 @@ class MainWindow(QWidget):
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Fixed,
         )
+        self._pooling_table.itemSelectionChanged.connect(self._on_pooling_account_selected)
         layout.addWidget(self._pooling_table)
+
+        # Per-account assignment backlog: select an account row above to see the
+        # clips allotted to it and whether each is downloaded yet (Phase 5).
+        self._pooling_backlog_label = QLabel(
+            "Select an account above to see its assignment backlog."
+        )
+        self._pooling_backlog_label.setObjectName("subtleLabel")
+        self._pooling_backlog_label.setWordWrap(True)
+        layout.addWidget(self._pooling_backlog_label)
+
+        self._pooling_backlog_table = TableFocusScrollWidget()
+        self._pooling_backlog_table.setObjectName("downloadQueueTable")
+        self._pooling_backlog_table.setColumnCount(4)
+        self._pooling_backlog_table.setHorizontalHeaderLabels(
+            ["Clip", "Status", "Download", "Scheduled"]
+        )
+        backlog_header = self._pooling_backlog_table.horizontalHeader()
+        backlog_header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        for numeric_col in (1, 2, 3):
+            backlog_header.setSectionResizeMode(numeric_col, QHeaderView.ResizeMode.ResizeToContents)
+        self._pooling_backlog_table.verticalHeader().setVisible(False)
+        self._pooling_backlog_table.setMinimumHeight(120)
+        self._pooling_backlog_table.setMaximumHeight(240)
+        self._pooling_backlog_table.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        layout.addWidget(self._pooling_backlog_table)
 
         # Pool contents for the selected niche: which clips are in the pool, the
         # source they came from, when they were accepted (newest first), and
@@ -4433,12 +4462,19 @@ class MainWindow(QWidget):
             for col, value in enumerate(values):
                 cell = QTableWidgetItem(value)
                 cell.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                if col == 0:
+                    # Stash the account id so the backlog panel can resolve the
+                    # selected row back to an account.
+                    cell.setData(Qt.ItemDataRole.UserRole, account_id)
                 if col >= 2:
                     cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self._pooling_table.setItem(row, col, cell)
         self._pooling_table.resizeRowsToContents()
         self._pooling_table.blockSignals(False)
         self._fit_pooling_accounts_height()
+        # The rebuild cleared any selection (signals were blocked), so the
+        # backlog panel below would show stale rows — reset it.
+        self._clear_pooling_backlog()
 
         # Source-add only applies to a specific niche.
         self._pooling_add_source_button.setEnabled(selected_niche in self._POOLING_NICHES)
@@ -4478,6 +4514,71 @@ class MainWindow(QWidget):
         height = header_height + visible_rows * row_height + frame
         table.setMinimumHeight(height)
         table.setMaximumHeight(height)
+
+    def _selected_pooling_account_id(self) -> int | None:
+        """Account id stashed on the selected accounts-table row, or None."""
+        items = self._pooling_table.selectedItems()
+        if not items:
+            return None
+        first = self._pooling_table.item(items[0].row(), 0)
+        if first is None:
+            return None
+        value = first.data(Qt.ItemDataRole.UserRole)
+        return int(value) if value is not None else None
+
+    def _clear_pooling_backlog(self) -> None:
+        if not hasattr(self, "_pooling_backlog_table"):
+            return
+        self._pooling_backlog_table.setRowCount(0)
+        self._pooling_backlog_label.setText(
+            "Select an account above to see its assignment backlog."
+        )
+
+    def _on_pooling_account_selected(self) -> None:
+        if not hasattr(self, "_pooling_backlog_table"):
+            return
+        account_id = self._selected_pooling_account_id()
+        if account_id is None:
+            self._clear_pooling_backlog()
+            return
+        with get_session() as session:
+            account = session.get(Account, account_id)
+            name = account.name if account and account.name else f"#{account_id}"
+            rows = account_assignment_backlog(session, account_id)
+
+        self._pooling_backlog_table.blockSignals(True)
+        self._pooling_backlog_table.setRowCount(0)
+        for backlog_row in rows:
+            scheduled = (
+                f"{backlog_row.scheduled_date.astimezone():%Y-%m-%d %H:%M}"
+                if backlog_row.scheduled_date is not None
+                else "—"
+            )
+            values = [
+                backlog_row.clip_label,
+                backlog_row.status,
+                backlog_row.download_status,
+                scheduled,
+            ]
+            row = self._pooling_backlog_table.rowCount()
+            self._pooling_backlog_table.insertRow(row)
+            for col, value in enumerate(values):
+                cell = QTableWidgetItem(value)
+                cell.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                if col >= 1:
+                    cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self._pooling_backlog_table.setItem(row, col, cell)
+        self._pooling_backlog_table.resizeRowsToContents()
+        self._pooling_backlog_table.blockSignals(False)
+
+        if rows:
+            self._pooling_backlog_label.setText(
+                f"{name}: {len(rows)} assigned clip(s) in backlog."
+            )
+        else:
+            self._pooling_backlog_label.setText(
+                f"{name}: no clips assigned yet. Run Distribute to fill its backlog."
+            )
 
     def _refresh_pooling_source_inventory(self, selected_niche: str) -> list[str]:
         table = self._pooling_source_table

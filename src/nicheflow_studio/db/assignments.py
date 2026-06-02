@@ -8,10 +8,14 @@ planner (docs/SOURCING_POOLING_PLAN.md Phase 3).
 """
 from __future__ import annotations
 
+import datetime as dt
+from dataclasses import dataclass
+from pathlib import Path
+
 from sqlalchemy.orm import Session
 
 from nicheflow_studio.core.distribution import plan_first_cycle
-from nicheflow_studio.db.models import Account, Assignment, PoolItem
+from nicheflow_studio.db.models import Account, Assignment, MediaAsset, PoolItem
 from nicheflow_studio.db.pools import VALID_NICHES, pool_items_for_niche
 
 import random as _random
@@ -121,3 +125,65 @@ def assignments_for_account(session: Session, account_id: int) -> list[Assignmen
         .order_by(Assignment.created_at.desc())
         .all()
     )
+
+
+@dataclass(frozen=True)
+class AccountAssignmentRow:
+    """One clip allotted to an account, with the info needed to show its place in
+    the backlog (SOURCING_POOLING_PLAN.md §13 Phase 5).
+
+    ``download_status`` comes from the backing :class:`MediaAsset` — "pending"
+    until the original is fetched (candidate-first means most of the backlog is
+    pending), then "downloaded".
+    """
+
+    assignment_id: int
+    pool_item_id: int
+    clip_label: str
+    niche: str
+    status: str
+    download_status: str
+    scheduled_date: dt.datetime | None
+    reuse_iteration: int
+
+
+def _clip_label(asset: MediaAsset | None, pool_item_id: int) -> str:
+    """Best-effort human label for a clip: shortcode, else file name, else URL."""
+    if asset is not None:
+        if asset.source_shortcode:
+            return asset.source_shortcode
+        if asset.original_download_path:
+            return Path(asset.original_download_path).name
+        if asset.canonical_source_url:
+            return asset.canonical_source_url
+    return f"item#{pool_item_id}"
+
+
+def account_assignment_backlog(
+    session: Session, account_id: int
+) -> list[AccountAssignmentRow]:
+    """The clips assigned to one account, newest first, with clip label and
+    download state — the per-account backlog waiting for download/process."""
+    rows: list[AccountAssignmentRow] = []
+    assignments = (
+        session.query(Assignment)
+        .filter(Assignment.account_id == account_id)
+        .order_by(Assignment.created_at.desc())
+        .all()
+    )
+    for assignment in assignments:
+        pool_item = session.get(PoolItem, assignment.pool_item_id)
+        asset = pool_item.media_asset if pool_item is not None else None
+        rows.append(
+            AccountAssignmentRow(
+                assignment_id=assignment.id,
+                pool_item_id=assignment.pool_item_id,
+                clip_label=_clip_label(asset, assignment.pool_item_id),
+                niche=assignment.niche,
+                status=assignment.status,
+                download_status=asset.download_status if asset is not None else "—",
+                scheduled_date=assignment.scheduled_date,
+                reuse_iteration=assignment.reuse_iteration,
+            )
+        )
+    return rows

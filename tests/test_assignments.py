@@ -3,6 +3,7 @@ from __future__ import annotations
 import random
 
 from nicheflow_studio.db.assignments import (
+    account_assignment_backlog,
     assignment_counts_by_account,
     assignments_for_account,
     distribute_niche,
@@ -132,6 +133,35 @@ def test_assignments_for_account_returns_that_accounts_clips(tmp_path) -> None:
         first_account_assignments = assignments_for_account(session, account_ids[0])
         assert all(a.account_id == account_ids[0] for a in first_account_assignments)
         assert len(first_account_assignments) > 0
+
+
+def test_account_assignment_backlog_reports_labels_and_pending_state(tmp_path) -> None:
+    """The per-account backlog lists assigned clips with a label and their
+    download state — pending until the original is fetched (candidate-first)."""
+    init_db()
+    with get_session() as session:
+        account_ids = _make_accounts(session, "history", 1)
+        _fill_pool(session, "history", 4)  # shortcodes history0..history3
+        session.commit()
+        distribute_niche(session, "history", rng=random.Random(1))
+        session.commit()
+
+        backlog = account_assignment_backlog(session, account_ids[0])
+        assert len(backlog) == 4
+        assert all(row.niche == "history" for row in backlog)
+        assert all(row.status == "assigned" for row in backlog)
+        # Pool was filled candidate-first (no downloads) -> every asset is pending.
+        assert all(row.download_status == "pending" for row in backlog)
+        # Labels come from the Instagram shortcode (history0..history3).
+        assert {row.clip_label for row in backlog} == {f"history{i}" for i in range(4)}
+
+
+def test_account_assignment_backlog_empty_for_account_without_assignments(tmp_path) -> None:
+    init_db()
+    with get_session() as session:
+        account_ids = _make_accounts(session, "history", 1)
+        session.commit()
+        assert account_assignment_backlog(session, account_ids[0]) == []
 
 
 def test_top_up_adds_new_accounts_without_touching_existing(tmp_path) -> None:
