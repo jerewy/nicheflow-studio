@@ -74,8 +74,17 @@ def distribute_niche(
     if not unassigned_ids:
         return []
 
+    # Pass each account's existing backlog so max_per_account is a TOTAL target:
+    # re-running "Distribute" only tops up accounts below target and never piles
+    # a second full batch onto accounts that already reached it. With
+    # max_per_account=None this has no effect (uncapped fill).
+    existing_counts = assignment_counts_by_account(session, niche)
     plan = plan_first_cycle(
-        unassigned_ids, account_ids, rng=rng, max_per_account=max_per_account
+        unassigned_ids,
+        account_ids,
+        rng=rng,
+        max_per_account=max_per_account,
+        existing_counts=existing_counts,
     )
 
     created: list[Assignment] = []

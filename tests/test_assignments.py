@@ -132,3 +132,37 @@ def test_assignments_for_account_returns_that_accounts_clips(tmp_path) -> None:
         first_account_assignments = assignments_for_account(session, account_ids[0])
         assert all(a.account_id == account_ids[0] for a in first_account_assignments)
         assert len(first_account_assignments) > 0
+
+
+def test_top_up_adds_new_accounts_without_touching_existing(tmp_path) -> None:
+    """The plan's headline scenario: distribute to a target, add more accounts
+    later, re-distribute — new accounts fill to target, existing ones unchanged,
+    no clip assigned twice."""
+    init_db()
+    with get_session() as session:
+        _make_accounts(session, "history", 2)
+        _fill_pool(session, "history", 200)  # plenty of inventory
+        session.commit()
+
+        first = distribute_niche(session, "history", rng=random.Random(1), max_per_account=28)
+        session.commit()
+        counts = assignment_counts_by_account(session, "history")
+        assert len(first) == 56  # 2 accounts x 28
+        assert all(v == 28 for v in counts.values())
+
+        # Add 3 more accounts and top up to the same target.
+        new_ids = _make_accounts(session, "history", 3)
+        session.commit()
+        second = distribute_niche(session, "history", rng=random.Random(2), max_per_account=28)
+        session.commit()
+
+        counts = assignment_counts_by_account(session, "history")
+        # Every one of the 5 accounts now sits at exactly the target.
+        assert set(counts.values()) == {28}
+        assert len(counts) == 5
+        # The new accounts got the +28 each; nothing was added to the old two.
+        assert len(second) == 84  # 3 new x 28
+        assert all(counts[acc_id] == 28 for acc_id in new_ids)
+        # No pool item is double-booked across the whole niche.
+        all_pool_ids = [a.pool_item_id for a in session.query(Assignment).all()]
+        assert len(all_pool_ids) == len(set(all_pool_ids))

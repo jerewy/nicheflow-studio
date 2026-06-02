@@ -20,6 +20,31 @@ from collections import Counter
 from dataclasses import dataclass
 
 
+# MVP posting cadence used to size each account's backlog. Distribution fills
+# every account up to `daily posts x planning window`, NOT a magic constant like
+# 100 (docs/SOURCING_POOLING_PLAN.md §4). Kept as module defaults for the first
+# cut; can later move to a per-account field or a global setting.
+DEFAULT_DAILY_POSTS_PER_ACCOUNT = 4
+DEFAULT_PLANNING_WINDOW_DAYS = 7
+
+
+def target_backlog(
+    daily_posts_per_account: int = DEFAULT_DAILY_POSTS_PER_ACCOUNT,
+    planning_window_days: int = DEFAULT_PLANNING_WINDOW_DAYS,
+) -> int:
+    """Per-account backlog target = daily posts × planning window (in days).
+
+    Replaces hardcoded distribution sizes: how many clips an account should hold
+    is driven by how fast it posts and how far ahead we plan. MVP default is
+    4 × 7 = 28. See docs/SOURCING_POOLING_PLAN.md §4.
+    """
+    if daily_posts_per_account < 1:
+        raise ValueError("daily_posts_per_account must be at least 1.")
+    if planning_window_days < 1:
+        raise ValueError("planning_window_days must be at least 1.")
+    return daily_posts_per_account * planning_window_days
+
+
 @dataclass(frozen=True)
 class PlannedAssignment:
     """One planned clip→account pairing (ids only; persistence is separate)."""
@@ -34,6 +59,7 @@ def plan_first_cycle(
     *,
     rng: _random.Random | None = None,
     max_per_account: int | None = None,
+    existing_counts: dict[int, int] | None = None,
 ) -> list[PlannedAssignment]:
     """Assign each pool item to exactly one account, balanced and shuffled.
 
@@ -46,9 +72,18 @@ def plan_first_cycle(
     rng:
         Inject a seeded ``random.Random`` for deterministic tests.
     max_per_account:
-        Optional cap on how many clips one account receives this cycle. Once
+        Optional cap on how many clips one account may hold. When
+        ``existing_counts`` is given this is the TOTAL backlog target per
+        account (existing + new), not a per-run cap — so re-running to "top up"
+        is idempotent: an account already at target receives nothing more. Once
         every account is full, remaining clips are left unassigned (returned
         assignments simply stop) — they wait for the next cycle / more accounts.
+    existing_counts:
+        How many clips each account already holds from earlier cycles
+        (``account_id -> count``). Used to make ``max_per_account`` a running
+        total so "Top Up" levels under-filled accounts without touching the
+        ones already at target. Omit (or pass empty) for a clean first cycle,
+        where every account starts at zero.
 
     Returns
     -------
@@ -66,36 +101,31 @@ def plan_first_cycle(
     rng.shuffle(items)
     rng.shuffle(accounts)
 
-    assignments: list[PlannedAssignment] = []
-    per_account: Counter[int] = Counter()
-    account_count = len(accounts)
+    # Seed each account's running count with the backlog it already holds so
+    # max_per_account behaves as a TOTAL target. With no existing counts every
+    # account starts at zero and this matches a clean first cycle.
+    base = existing_counts or {}
+    per_account: Counter[int] = Counter({acct: int(base.get(acct, 0)) for acct in accounts})
 
-    for index, pool_item_id in enumerate(items):
-        # Round-robin over the shuffled account order for even volume.
-        account_id = accounts[index % account_count]
-        if max_per_account is not None:
-            if per_account[account_id] >= max_per_account:
-                # This slot is full; try to place it on any account with room.
-                account_id = _first_account_with_room(accounts, per_account, max_per_account)
-                if account_id is None:
-                    break  # every account is full — stop, leave the rest unassigned
+    def _has_room(account_id: int) -> bool:
+        return max_per_account is None or per_account[account_id] < max_per_account
+
+    assignments: list[PlannedAssignment] = []
+    for pool_item_id in items:
+        # Fill the emptiest account that still has room first (ties broken by the
+        # shuffled account order). This keeps per-account volume even to within
+        # one across accounts that have capacity — even when some started this
+        # run already full from a previous cycle.
+        eligible = [account_id for account_id in accounts if _has_room(account_id)]
+        if not eligible:
+            break  # every account is at target — leave the rest unassigned
+        account_id = min(eligible, key=lambda acct: per_account[acct])
         assignments.append(
             PlannedAssignment(pool_item_id=pool_item_id, account_id=account_id)
         )
         per_account[account_id] += 1
 
     return assignments
-
-
-def _first_account_with_room(
-    accounts: list[int],
-    per_account: "Counter[int]",
-    max_per_account: int,
-) -> int | None:
-    for account_id in accounts:
-        if per_account[account_id] < max_per_account:
-            return account_id
-    return None
 
 
 def distribution_counts(assignments: list[PlannedAssignment]) -> dict[int, int]:
