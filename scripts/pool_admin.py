@@ -46,8 +46,24 @@ from nicheflow_studio.db.media_library import (  # noqa: E402
     find_or_register_media_asset,
     mark_media_asset_downloaded,
 )
-from nicheflow_studio.db.models import Account, DownloadItem, MediaAsset, PoolItem  # noqa: E402
-from nicheflow_studio.db.pools import accept_into_pool, pool_size  # noqa: E402
+from nicheflow_studio.db.models import (  # noqa: E402
+    Account,
+    DownloadItem,
+    MediaAsset,
+    PoolItem,
+    ScrapeCandidate,
+)
+from nicheflow_studio.db.pools import (  # noqa: E402
+    CrossNicheError,
+    DuplicateContentError,
+    accept_candidate_into_pool,
+    accept_into_pool,
+    dedupe_pool_by_caption,
+    pool_review_rows,
+    pool_size,
+    remove_pool_item,
+    restore_pool_item,
+)
 from nicheflow_studio.db.session import get_session, init_db  # noqa: E402
 from nicheflow_studio.downloader.instagram import instagram_shortcode_from_url  # noqa: E402
 from nicheflow_studio.processing.dedup import (  # noqa: E402
@@ -223,6 +239,117 @@ def cmd_accept(args) -> None:
               f"Pool size now {pool_size(session, niche)}.")
 
 
+def cmd_accept_candidates(args) -> None:
+    """Bulk candidate-first accept: pool raw (un-downloaded) candidates as PENDING.
+
+    No download happens — each becomes a pending MediaAsset + PoolItem, so a whole
+    trusted source can enter the pool for $0. URL/shortcode dedup is automatic.
+    """
+    niche = args.niche
+    with get_session() as session:
+        query = session.query(ScrapeCandidate).filter(
+            ScrapeCandidate.state.in_(["candidate", "new"])
+        )
+        if args.source:
+            query = query.filter(ScrapeCandidate.scrape_source_url.like(f"%{args.source}%"))
+        candidates = query.order_by(ScrapeCandidate.id.asc()).all()
+        if args.limit:
+            candidates = candidates[: args.limit]
+
+        if not candidates:
+            print("No matching un-pooled candidates. Check --source / --niche.")
+            return
+        if args.dry_run:
+            print(f"[dry-run] {len(candidates)} candidate(s) would be pooled into '{niche}'.")
+            return
+
+        accepted = skipped = failed = 0
+        for candidate in candidates:
+            try:
+                accept_candidate_into_pool(
+                    session,
+                    candidate=candidate,
+                    niche=niche,
+                    accepted_reason="pool_admin bulk accept",
+                )
+                accepted += 1
+            except (CrossNicheError, DuplicateContentError):
+                skipped += 1
+            except ValueError:
+                failed += 1
+        session.commit()
+        print(
+            f"Pooled {accepted} pending candidate(s) into '{niche}' "
+            f"({skipped} skipped, {failed} unusable). Pool size now {pool_size(session, niche)}."
+        )
+
+
+def cmd_dedupe(args) -> None:
+    """Pre-download caption dedup: flag pool items that repost the same caption."""
+    niche = args.niche
+    with get_session() as session:
+        before = pool_size(session, niche)
+        if args.dry_run:
+            # Count without persisting by rolling back the flush.
+            result = dedupe_pool_by_caption(session, niche)
+            session.rollback()
+            print(
+                f"[dry-run] {result.flagged} duplicate caption(s) across "
+                f"{result.groups} group(s) would be flagged in '{niche}' "
+                f"(pool {before} -> {before - result.flagged})."
+            )
+            return
+        result = dedupe_pool_by_caption(session, niche)
+        session.commit()
+        print(
+            f"Flagged {result.flagged} duplicate(s) across {result.groups} caption "
+            f"group(s) in '{niche}'. Clean pool size now {pool_size(session, niche)}."
+        )
+
+
+def cmd_pool_list(args) -> None:
+    """List pool items for manual review (id, status, shortcode, caption)."""
+    with get_session() as session:
+        rows = pool_review_rows(session, args.niche, include_inactive=args.all)
+        if not rows:
+            print(f"No pool items in '{args.niche}'.")
+            return
+        print(f"=== {len(rows)} pool item(s) in '{args.niche}' "
+              f"({'all statuses' if args.all else 'accepted only'}) ===")
+        for row in rows:
+            dist = f" -> {', '.join(row.distributed_to)}" if row.distributed_to else ""
+            print(
+                f"  #{row.pool_item_id:<5} {row.status:9} {row.shortcode or '-':14} "
+                f"{(row.caption or '(no caption)')[:60]}{dist}"
+            )
+
+
+def cmd_pool_remove(args) -> None:
+    """Manually remove a pool item (or all in a niche by shortcode) from the pool."""
+    with get_session() as session:
+        if args.item_id is not None:
+            ok = remove_pool_item(session, pool_item_id=args.item_id, reason=args.reason)
+            session.commit()
+            print(f"Removed pool item #{args.item_id}." if ok else f"No pool item #{args.item_id}.")
+            return
+        # Remove by shortcode (within the niche).
+        rows = [r for r in pool_review_rows(session, args.niche) if r.shortcode == args.shortcode]
+        if not rows:
+            print(f"No accepted pool item with shortcode '{args.shortcode}' in '{args.niche}'.")
+            return
+        for row in rows:
+            remove_pool_item(session, pool_item_id=row.pool_item_id, reason=args.reason)
+        session.commit()
+        print(f"Removed {len(rows)} pool item(s) with shortcode '{args.shortcode}'.")
+
+
+def cmd_pool_restore(args) -> None:
+    with get_session() as session:
+        ok = restore_pool_item(session, pool_item_id=args.item_id)
+        session.commit()
+        print(f"Restored pool item #{args.item_id}." if ok else f"No pool item #{args.item_id}.")
+
+
 def cmd_distribute(args) -> None:
     niche = args.niche
     with get_session() as session:
@@ -259,6 +386,35 @@ def main() -> None:
     group.add_argument("--all", action="store_true", help="Accept all unpooled downloaded clips.")
     group.add_argument("--item-id", type=int, help="Accept one DownloadItem by id.")
 
+    p_accept_cand = sub.add_parser(
+        "accept-candidates",
+        help="Bulk-accept raw (un-downloaded) candidates into a niche pool as PENDING.",
+    )
+    p_accept_cand.add_argument("--niche", required=True, choices=NICHES)
+    p_accept_cand.add_argument("--source", help="Only candidates whose scrape source URL contains this.")
+    p_accept_cand.add_argument("--limit", type=int, default=None, help="Cap how many to pool.")
+    p_accept_cand.add_argument("--dry-run", action="store_true", help="Count only; write nothing.")
+
+    p_dedupe = sub.add_parser(
+        "dedupe", help="Flag pool items that repost the same caption (pre-download)."
+    )
+    p_dedupe.add_argument("--niche", required=True, choices=NICHES)
+    p_dedupe.add_argument("--dry-run", action="store_true", help="Count only; write nothing.")
+
+    p_list = sub.add_parser("pool-list", help="List pool items for manual review.")
+    p_list.add_argument("--niche", required=True, choices=NICHES)
+    p_list.add_argument("--all", action="store_true", help="Include removed/duplicate items.")
+
+    p_remove = sub.add_parser("pool-remove", help="Manually remove a clip from the pool.")
+    p_remove.add_argument("--niche", required=True, choices=NICHES)
+    grp = p_remove.add_mutually_exclusive_group(required=True)
+    grp.add_argument("--item-id", type=int, help="Pool item id to remove.")
+    grp.add_argument("--shortcode", help="Remove accepted item(s) with this shortcode.")
+    p_remove.add_argument("--reason", default="manual removal", help="Why it's removed.")
+
+    p_restore = sub.add_parser("pool-restore", help="Restore a removed/duplicate pool item.")
+    p_restore.add_argument("--item-id", type=int, required=True)
+
     p_dist = sub.add_parser("distribute", help="Distribute a niche pool across its accounts.")
     p_dist.add_argument("--niche", required=True, choices=NICHES)
     p_dist.add_argument("--max-per-account", type=int, default=None)
@@ -270,6 +426,11 @@ def main() -> None:
         "backfill": cmd_backfill,
         "fingerprint": cmd_fingerprint,
         "accept": cmd_accept,
+        "accept-candidates": cmd_accept_candidates,
+        "dedupe": cmd_dedupe,
+        "pool-list": cmd_pool_list,
+        "pool-remove": cmd_pool_remove,
+        "pool-restore": cmd_pool_restore,
         "distribute": cmd_distribute,
     }[args.command](args)
 
