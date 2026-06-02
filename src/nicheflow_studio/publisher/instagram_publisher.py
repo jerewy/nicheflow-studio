@@ -80,6 +80,26 @@ _CAPTION_SELECTORS = (
     'textarea[aria-label="Write a caption..."]',
     'div[contenteditable="true"][role="textbox"]',
 )
+_COVER_EDIT_SELECTORS = (
+    'div[role="button"]:has-text("Edit cover")',
+    'button:has-text("Edit cover")',
+    'div[role="button"]:has-text("Cover")',
+    'button:has-text("Cover")',
+)
+_COVER_ADD_FROM_COMPUTER_SELECTORS = (
+    'button:has-text("Add from computer")',
+    'div[role="button"]:has-text("Add from computer")',
+    'button:has-text("Upload from computer")',
+    'div[role="button"]:has-text("Upload from computer")',
+    'button:has-text("Select from computer")',
+    'div[role="button"]:has-text("Select from computer")',
+)
+_COVER_DONE_SELECTORS = (
+    'div[role="button"]:text-is("Done")',
+    'button:text-is("Done")',
+    'div[role="button"]:text-is("Apply")',
+    'button:text-is("Apply")',
+)
 _SHARED_CONFIRMATION_TEXT = (
     "Your reel has been shared",
     "Your post has been shared",
@@ -266,6 +286,33 @@ async def _fill_caption(page: Page, caption: str) -> None:
     raise RuntimeError("could not find the caption field")
 
 
+async def _set_reel_cover(page: Page, cover_image: Path | None) -> bool:
+    """Best-effort upload of a custom Reel cover on the final composer screen."""
+    if cover_image is None:
+        return False
+    if not await _click_first(page, _COVER_EDIT_SELECTORS, timeout=6000):
+        log.warning("could not find Instagram cover editor; leaving auto cover")
+        return False
+    await _human_pause(0.4, 0.9)
+    try:
+        async with page.expect_file_chooser(timeout=7000) as fc_info:
+            if not await _click_first(page, _COVER_ADD_FROM_COMPUTER_SELECTORS, timeout=7000):
+                log.warning("could not find cover upload button; leaving auto cover")
+                return False
+        chooser = await fc_info.value
+        await chooser.set_files(str(cover_image))
+    except (PlaywrightError, PlaywrightTimeout) as exc:
+        log.warning("could not upload Instagram cover image: %s", exc)
+        return False
+    await _human_pause(0.8, 1.5)
+    if not await _click_first(page, _COVER_DONE_SELECTORS, timeout=7000):
+        log.warning("could not confirm Instagram cover image; continuing with selected cover")
+    else:
+        await _human_pause(0.4, 0.9)
+    log.info("set Instagram reel cover to %s", cover_image.name)
+    return True
+
+
 async def _wait_for_share_confirmation(page: Page, timeout_s: float) -> bool:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -320,6 +367,7 @@ async def _publish_reel_async(
     *,
     profile_dir: Path,
     video: Path,
+    cover_image: Path | None,
     caption: str,
     do_share: bool,
     keep_open: bool,
@@ -341,7 +389,9 @@ async def _publish_reel_async(
         except PlaywrightError as exc:
             if not channel:
                 return PublishResult("failed", error_message=f"could not launch browser: {exc}")
-            log.warning("channel '%s' unavailable (%s); falling back to bundled Chromium", channel, exc)
+            log.warning(
+                "channel '%s' unavailable (%s); falling back to bundled Chromium", channel, exc
+            )
             launch_kwargs.pop("channel", None)
             context = await playwright.chromium.launch_persistent_context(**launch_kwargs)
 
@@ -363,6 +413,9 @@ async def _publish_reel_async(
             await _open_composer_and_attach(page, video)
             log.info("advancing through edit steps")
             await _advance_through_edit_steps(page)
+            if cover_image is not None:
+                log.info("setting custom cover %s", cover_image.name)
+                await _set_reel_cover(page, cover_image)
             log.info("filling caption")
             await _fill_caption(page, caption)
             await _human_pause(1.0, 2.0)
@@ -407,6 +460,7 @@ def publish_reel(
     video: str | Path,
     caption: str,
     *,
+    cover_image_path: str | Path | None = None,
     do_share: bool = True,
     channel: str | None = "chrome",
     upload_timeout_s: float = 300.0,
@@ -422,12 +476,16 @@ def publish_reel(
     video_path = Path(video)
     if not video_path.exists():
         return PublishResult("failed", error_message=f"video not found: {video_path}")
+    cover_image = Path(cover_image_path) if cover_image_path else None
+    if cover_image is not None and not cover_image.exists():
+        return PublishResult("failed", error_message=f"cover image not found: {cover_image}")
 
     profile = (profile_name or DEFAULT_PROFILE_NAME).strip() or DEFAULT_PROFILE_NAME
     result = asyncio.run(
         _publish_reel_async(
             profile_dir=session_profile_dir(profile),
             video=video_path,
+            cover_image=cover_image,
             caption=caption or "",
             do_share=do_share,
             keep_open=keep_open,

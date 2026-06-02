@@ -119,6 +119,45 @@ def test_instagram_redownload_reuses_one_media_asset(monkeypatch) -> None:
         assert session.query(MediaAsset).count() == 1  # deduped to one pantry row
 
 
+def test_instagram_download_reuses_existing_downloaded_asset_without_ytdlp(monkeypatch) -> None:
+    from nicheflow_studio.db.media_library import (
+        find_or_register_media_asset,
+        mark_media_asset_downloaded,
+    )
+
+    output_file = Path.cwd() / "data" / "downloads" / "instagram" / "existing.mp4"
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    output_file.write_bytes(b"existing")
+    url = "https://www.instagram.com/reel/existing1/"
+
+    with get_session() as session:
+        asset, _created = find_or_register_media_asset(
+            session, source_url=url, shortcode="existing1", platform="instagram"
+        )
+        mark_media_asset_downloaded(asset, original_download_path=str(output_file))
+        session.commit()
+
+    def fail_download(*, url: str, output_dir: Path) -> DownloadResult:
+        raise AssertionError("yt-dlp should not run when the global asset is already downloaded")
+
+    callback_states: list[str] = []
+    monkeypatch.setattr(QueueManager, "_executor", ImmediateExecutor())
+    monkeypatch.setattr("nicheflow_studio.queue.download_instagram_url", fail_download)
+
+    item_id = QueueManager.enqueue_download(
+        url=url,
+        account_id=123,
+        callback=lambda item: callback_states.append(item.status),
+    )
+
+    with get_session() as session:
+        item = session.get(DownloadItem, item_id)
+        assert item.status == "downloaded"
+        assert item.file_path == str(output_file)
+        assert item.account_id == 123
+    assert callback_states == ["downloaded"]
+
+
 def test_youtube_download_does_not_register_media_asset(monkeypatch) -> None:
     output_file = Path.cwd() / "data" / "downloads" / "yt.mp4"
     output_file.parent.mkdir(parents=True, exist_ok=True)

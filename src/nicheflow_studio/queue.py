@@ -9,6 +9,7 @@ from typing import Callable
 
 from nicheflow_studio.core.paths import downloads_dir
 from nicheflow_studio.db.media_library import (
+    find_media_asset,
     find_or_register_media_asset,
     mark_media_asset_downloaded,
 )
@@ -90,10 +91,20 @@ def _register_downloaded_media_asset(session, *, url: str, result) -> None:
     asset, _created = find_or_register_media_asset(
         session, source_url=url, shortcode=result.video_id, platform="instagram"
     )
+    # Perceptual fingerprint for cross-repost content dedup. Best-effort: a
+    # failure here must never break the download or asset registration.
+    content_hash = None
+    try:
+        from nicheflow_studio.processing.dedup import compute_video_fingerprint
+
+        content_hash = compute_video_fingerprint(Path(result.file_path))
+    except Exception:  # noqa: BLE001
+        content_hash = None
     mark_media_asset_downloaded(
         asset,
         original_download_path=str(result.file_path),
         file_size_bytes=_file_size_bytes(Path(result.file_path)),
+        content_hash=content_hash,
     )
 
 
@@ -108,7 +119,33 @@ class QueueManager:
         account_id: int | None = None,
         source_description: str | None = None,
     ) -> int:
+        shortcode = instagram_shortcode_from_url(url)
         with get_session() as session:
+            if shortcode is not None:
+                asset = find_media_asset(session, source_url=url, shortcode=shortcode)
+                if (
+                    asset is not None
+                    and asset.download_status == "downloaded"
+                    and asset.original_download_path
+                    and Path(asset.original_download_path).exists()
+                ):
+                    item = DownloadItem(
+                        source_url=url,
+                        extractor="instagram",
+                        video_id=asset.source_shortcode or shortcode,
+                        title=Path(asset.original_download_path).stem,
+                        file_path=asset.original_download_path,
+                        status="downloaded",
+                        account_id=account_id,
+                        source_description=source_description,
+                    )
+                    session.add(item)
+                    session.commit()
+                    item_id = item.id
+                    if callback is not None:
+                        callback(item)
+                    return item_id
+
             item = DownloadItem(
                 source_url=url,
                 status="queued",

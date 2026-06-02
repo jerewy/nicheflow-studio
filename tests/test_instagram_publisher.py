@@ -32,6 +32,17 @@ def test_publish_reel_fails_fast_when_video_missing(tmp_path: Path) -> None:
     assert "video not found" in (result.error_message or "")
 
 
+def test_publish_reel_fails_fast_when_cover_missing(tmp_path: Path) -> None:
+    video = tmp_path / "reel.mp4"
+    video.write_bytes(b"video")
+
+    result = publish_reel("main", video, "caption", cover_image_path=tmp_path / "missing.jpg")
+
+    assert result.status == "failed"
+    assert result.ok is False
+    assert "cover image not found" in (result.error_message or "")
+
+
 class _FakeLinkLocator:
     def __init__(self, href: str | None) -> None:
         self._href = href
