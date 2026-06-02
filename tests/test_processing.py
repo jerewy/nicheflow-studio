@@ -651,7 +651,9 @@ def test_suggest_title_replacement_crop_preserves_detected_video_body(
     probe = VideoProbe(width=1080, height=1920, duration_seconds=14.0)
 
     monkeypatch.setattr(video, "detect_content_rectangle", lambda path, probe: None)
-    monkeypatch.setattr(video, "detect_visual_content_crop", lambda path, probe: CropSettings(top=660))
+    monkeypatch.setattr(
+        video, "detect_visual_content_crop", lambda path, probe: CropSettings(top=660)
+    )
     monkeypatch.setattr(
         video,
         "detect_dark_band_crop",
@@ -698,9 +700,7 @@ def test_suggest_title_replacement_crop_rejects_aggressive_top_signal(
     assert result == CropSettings()
 
 
-def test_suggest_title_replacement_crop_uses_content_rectangle(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_suggest_title_replacement_crop_uses_content_rectangle(monkeypatch, tmp_path: Path) -> None:
     input_path = tmp_path / "sample.mp4"
     input_path.write_bytes(b"video")
     probe = VideoProbe(width=1080, height=1920, duration_seconds=14.0)
@@ -734,9 +734,7 @@ def test_largest_coverage_band_rejects_short_runs() -> None:
     assert video._largest_coverage_band(coverage, 0.2, 2) is None
 
 
-def test_detect_content_rectangle_finds_moving_footage(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_detect_content_rectangle_finds_moving_footage(monkeypatch, tmp_path: Path) -> None:
     import numpy as np
 
     input_path = tmp_path / "clip.mp4"
@@ -747,9 +745,7 @@ def test_detect_content_rectangle_finds_moving_footage(
     def fake_load(path, timestamp):  # noqa: ANN001, ARG001
         # Black canvas with a bright, frame-to-frame-changing footage rectangle.
         frame = np.zeros((400, 200, 3), dtype=np.uint8)
-        frame[100:300, 40:160, :] = rng.integers(
-            60, 255, size=(200, 120, 3), dtype=np.uint8
-        )
+        frame[100:300, 40:160, :] = rng.integers(60, 255, size=(200, 120, 3), dtype=np.uint8)
         return frame
 
     monkeypatch.setattr(video, "_load_video_frame_at", fake_load)
@@ -903,7 +899,7 @@ def test_fit_title_overlay_short_title_unchanged_after_autofit() -> None:
 
 def test_normalize_overlay_text_preserves_paragraph_breaks() -> None:
     normalized = video._normalize_overlay_text(
-        '  Friend: can you please stop sending\r\nme reels? \r\n\r\n  Me:  '
+        "  Friend: can you please stop sending\r\nme reels? \r\n\r\n  Me:  "
     )
 
     assert normalized == "Friend: can you please stop sending me reels?\n\nMe:"
@@ -955,10 +951,7 @@ def test_strip_overlay_emojis_cleans_whitespace_when_used_as_fallback() -> None:
     # The fallback path runs only when no emoji font is available. The helper
     # both removes emoji codepoints AND tidies the whitespace they left
     # behind so the trailing-emoji case does not ship a stray space.
-    assert (
-        video._strip_overlay_emojis("leave 😭")
-        == "leave"
-    )
+    assert video._strip_overlay_emojis("leave 😭") == "leave"
     assert video._strip_overlay_emojis("hot 🔥 take") == "hot take"
     assert video._strip_overlay_emojis("clean text") == "clean text"
     # Paragraph break structure is preserved by the fallback.
@@ -1010,8 +1003,7 @@ def test_render_overlay_title_image_produces_rgba_png_with_color_emoji(
         # least one pixel where R ≠ G or G ≠ B, which can only come from
         # the COLR/CPAL palette since the text portion is pure white.
         has_color_pixel = any(
-            a > 0 and (r != g or g != b)
-            for r, g, b, a in image.get_flattened_data()
+            a > 0 and (r != g or g != b) for r, g, b, a in image.get_flattened_data()
         )
         assert has_color_pixel, "Expected at least one color emoji pixel"
 
@@ -1332,9 +1324,12 @@ def test_balanced_wrap_returns_none_when_no_valid_split_fits() -> None:
     words = "A reasonably long sentence that does not fit in twenty chars at all".split()
     assert video._balanced_wrap_lines(words, max_chars=20, max_lines=2) is None
     # Single huge word that exceeds max_chars by itself: also None.
-    assert video._balanced_wrap_lines(
-        ["Pneumonoultramicroscopicsilicovolcanoconiosis"], max_chars=20, max_lines=4
-    ) is None
+    assert (
+        video._balanced_wrap_lines(
+            ["Pneumonoultramicroscopicsilicovolcanoconiosis"], max_chars=20, max_lines=4
+        )
+        is None
+    )
 
 
 def test_fit_title_band_prefers_two_balanced_lines_over_three_uneven() -> None:
@@ -1395,9 +1390,7 @@ def test_wrapped_overflows_detects_collapsed_line() -> None:
     last line. A clean wrap has no overflowing line; the collapsed case does."""
     clean_wrap = "That kind of twist that\nmakes you rewatch"
     assert video._wrapped_overflows(clean_wrap, max_chars=28) is False
-    collapsed_wrap = (
-        "That kind of twist that\nmakes you rewatch every quiet room different"
-    )
+    collapsed_wrap = "That kind of twist that\nmakes you rewatch every quiet room different"
     assert video._wrapped_overflows(collapsed_wrap, max_chars=28) is True
     # Blank lines (paragraph spacer) are ignored:
     with_blank = "Them: hi\n\nMe:"
@@ -1434,6 +1427,34 @@ def test_fit_title_band_autofits_long_cinema_title() -> None:
     assert "makes you rewatch every quiet room different" not in wrapped
     # Band height stays sane (not blown out, not collapsed):
     assert 170 <= band_height <= 520
+
+
+def test_past_moments_black_keeps_title_inside_safe_margins() -> None:
+    """Past Moments Black titles must shrink by rendered pixel width, not chars.
+
+    Regression: this John Denver title was accepted as a two-line wrap by the
+    character-count heuristic, but the first line rendered wider than the
+    1080px canvas and clipped at both phone edges.
+    """
+    font_size, wrapped, _band_height = video._fit_title_band(
+        "The moment John Denver wrote Annie's Song for his wife while riding a ski lift",
+        canvas_width=1080,
+        requested_font_size=54,
+        title_font_name="past_moments_arial_bold",
+    )
+
+    safe_width = video._title_safe_text_width(1080)
+    assert font_size <= 38
+    for line in wrapped.split("\n"):
+        if line.strip():
+            assert (
+                video._title_line_pixel_width(
+                    line,
+                    font_size=font_size,
+                    title_font_name="past_moments_arial_bold",
+                )
+                <= safe_width
+            )
 
 
 def test_fit_title_band_short_title_unchanged_after_autofit() -> None:
@@ -1479,7 +1500,7 @@ def test_title_band_filter_chain_skips_blank_lines_but_preserves_gap() -> None:
     visible lines, so the [title0]/[title1]/[title]/... chain stays
     contiguous and doesn't reference a skipped index."""
     filter_string = video._title_band_filter_complex(
-        'Them: hi\n\nMe:',
+        "Them: hi\n\nMe:",
         crop="crop=1080:1920:0:0",
         crop_width=1080,
         crop_height=1920,
@@ -1501,12 +1522,15 @@ def test_title_band_filter_chain_skips_blank_lines_but_preserves_gap() -> None:
     # spacing (because the blank-line slot adds its own line of vertical
     # offset between them):
     import re as _re
+
     y_values = sorted(int(m.group(1)) for m in _re.finditer(r"y=(\d+)", filter_string))
     assert len(y_values) == 2
     # We pull line_spacing the same way _title_band_filter_complex does so
     # the threshold tracks the production formula exactly.
     font_size, _, _ = video._fit_title_band(
-        'Them: hi\n\nMe:', canvas_width=1080, requested_font_size=54,
+        "Them: hi\n\nMe:",
+        canvas_width=1080,
+        requested_font_size=54,
     )
     single_step = font_size + max(10, int(font_size * 0.24))
     gap = y_values[1] - y_values[0]
@@ -1554,6 +1578,43 @@ def test_title_band_insets_cinema_viral_bold_content_width() -> None:
     )
 
     # 56px explicit margin each side: cinema_w=968, left == right guaranteed
+    assert "scale=968:" in filter_string
+    assert ":56:0:color=black[content]" in filter_string
+
+
+def test_title_band_insets_past_moments_content_width() -> None:
+    filter_string = video._title_band_filter_complex(
+        "The moment John Denver wrote Annie's Song\nfor his wife while riding a ski lift",
+        crop="crop=964:418:58:828",
+        crop_width=964,
+        crop_height=418,
+        font_path=Path("dummy.ttf"),
+        requested_font_size=46,
+        title_font_name="past_moments_arial_bold",
+        title_color="white",
+        title_text_dir=Path("."),
+        duration_seconds=2.0,
+    )
+
+    assert "scale=968:" in filter_string
+    assert ":56:0:color=black[content]" in filter_string
+
+
+def test_title_band_insets_legacy_past_moments_arial_bold_content_width() -> None:
+    """Saved Past Moments preferences may still use plain arial_bold + 46px."""
+    filter_string = video._title_band_filter_complex(
+        "The moment John Denver wrote Annie's Song\nfor his wife while riding a ski lift",
+        crop="crop=964:418:58:828",
+        crop_width=964,
+        crop_height=418,
+        font_path=Path("dummy.ttf"),
+        requested_font_size=46,
+        title_font_name="arial_bold",
+        title_color="white",
+        title_text_dir=Path("."),
+        duration_seconds=2.0,
+    )
+
     assert "scale=968:" in filter_string
     assert ":56:0:color=black[content]" in filter_string
 

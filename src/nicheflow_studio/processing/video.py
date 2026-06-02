@@ -287,9 +287,7 @@ def suggest_title_replacement_crop(
 
     visual_crop = detect_visual_content_crop(resolved_input, video_probe)
     visual_top = (
-        visual_crop.top
-        if visual_crop is not None and 0 < visual_crop.top <= max_top_crop
-        else 0
+        visual_crop.top if visual_crop is not None and 0 < visual_crop.top <= max_top_crop else 0
     )
 
     dark_band_crop = detect_dark_band_crop(resolved_input, video_probe)
@@ -549,9 +547,7 @@ def detect_content_rectangle(input_path: Path, probe: VideoProbe) -> CropSetting
         row_sharp_cov < CONTENT_RECT_BLURRED_BG_SHARP_MAX
     )
     blurred_bg_count = int(blurred_bg_signature.sum())
-    is_blurred_bg = blurred_bg_count >= max(
-        30, int(min_h * CONTENT_RECT_BLURRED_BG_MIN_ROW_RATIO)
-    )
+    is_blurred_bg = blurred_bg_count >= max(30, int(min_h * CONTENT_RECT_BLURRED_BG_MIN_ROW_RATIO))
 
     if is_blurred_bg:
         # Vertical extent: rows that have BOTH sharp edges and at least a
@@ -574,9 +570,9 @@ def detect_content_rectangle(input_path: Path, probe: VideoProbe) -> CropSetting
         # characters on the edges may be stationary, but they still belong to
         # the sharp rectangle.
         col_sharp_in_band = sharp_pixel[row_band[0] : row_band[1] + 1].mean(axis=0)
-        col_combined = (
-            col_sharp_in_band >= CONTENT_RECT_BLURRED_BG_COL_SHARP_MIN
-        ).astype(np.float32)
+        col_combined = (col_sharp_in_band >= CONTENT_RECT_BLURRED_BG_COL_SHARP_MIN).astype(
+            np.float32
+        )
         col_band = _largest_coverage_band(
             col_combined,
             0.5,
@@ -601,9 +597,8 @@ def detect_content_rectangle(input_path: Path, probe: VideoProbe) -> CropSetting
         # still holds.
         row_brightness_mean = brightness.mean(axis=1)
         row_motion_mean = temporal.mean(axis=1)
-        is_overlay_bar_row = (
-            (row_brightness_mean > CONTENT_RECT_OVERLAY_BAR_BRIGHTNESS_MIN)
-            & (row_motion_mean < CONTENT_RECT_OVERLAY_BAR_MOTION_MAX)
+        is_overlay_bar_row = (row_brightness_mean > CONTENT_RECT_OVERLAY_BAR_BRIGHTNESS_MIN) & (
+            row_motion_mean < CONTENT_RECT_OVERLAY_BAR_MOTION_MAX
         )
         motion_signal = (
             (row_coverage >= CONTENT_RECT_COVERAGE_THRESHOLD) & ~is_overlay_bar_row
@@ -684,10 +679,7 @@ def detect_content_rectangle(input_path: Path, probe: VideoProbe) -> CropSetting
     last_text_y = top_band_index - 1
     text_row_count = 0
     for scan_y in range(top_band_index, min(scan_end + 1, min_h)):
-        if (
-            static_text[scan_y].mean() >= CONTENT_RECT_TEXT_ROW_RATIO
-            and row_overlay_mask[scan_y]
-        ):
+        if static_text[scan_y].mean() >= CONTENT_RECT_TEXT_ROW_RATIO and row_overlay_mask[scan_y]:
             last_text_y = scan_y
             text_row_count += 1
     if text_row_count >= CONTENT_RECT_TEXT_MIN_ROWS and last_text_y >= top_band_index:
@@ -1250,9 +1242,7 @@ def random_audio_alter_params(rng: random.Random | None = None) -> AudioAlterPar
     )
 
 
-def build_audio_filter(
-    params: AudioAlterParams, *, sample_rate: int = _AUDIO_SAMPLE_RATE
-) -> str:
+def build_audio_filter(params: AudioAlterParams, *, sample_rate: int = _AUDIO_SAMPLE_RATE) -> str:
     """Build an ffmpeg audio filtergraph for the given alteration.
 
     Pitch is shifted via ``asetrate`` (which also changes speed); the sample
@@ -1346,9 +1336,7 @@ def export_cropped_video(
     # stays as an explicit opt-in. For every other layout, or when no markers
     # exist, strip them so they never paint literal asterisks onto a clip.
     title_has_markers = "**" in (title_text or "")
-    keep_bold_markers = title_layout == "top_band" and (
-        enable_bold_keywords or title_has_markers
-    )
+    keep_bold_markers = title_layout == "top_band" and (enable_bold_keywords or title_has_markers)
     raw_title = title_text or ""
     if not keep_bold_markers:
         raw_title = _strip_bold_markers(raw_title)
@@ -1362,9 +1350,7 @@ def export_cropped_video(
         # frame size mid-stream; without this the absolute crop offsets become
         # invalid on a filter reinit and ffmpeg aborts.
         normalize_scale = f"scale={probe.width}:{probe.height}"
-        crop_filter = (
-            f"{normalize_scale},crop={crop_width}:{crop_height}:{crop.left}:{crop.top}"
-        )
+        crop_filter = f"{normalize_scale},crop={crop_width}:{crop_height}:{crop.left}:{crop.top}"
         filter_parts = [crop_filter]
         complex_filter: str | None = None
         emoji_font_path = windows_emoji_font_file()
@@ -1476,12 +1462,12 @@ def export_cropped_video(
 # `overlay` filter; when it isn't, we fall back to stripping the emoji.
 _EMOJI_RUN_PATTERN = re.compile(
     "["
-    "\U0001F300-\U0001FAFF"   # pictographs (😭, 💀, 🤔, 🔥, 🥹, 🤯, 💔, ...)
-    "\U00002600-\U000027BF"   # misc symbols + dingbats (☀, ✨, ❤, ✅)
-    "\U0001F1E6-\U0001F1FF"   # regional-indicator flags
-    "\U0000FE0E-\U0000FE0F"   # variation selectors (text/emoji presentation)
-    "\U0000200D"              # zero-width joiner (emoji sequences)
-    "\U000020E3"              # combining enclosing keycap
+    "\U0001F300-\U0001FAFF"  # pictographs (😭, 💀, 🤔, 🔥, 🥹, 🤯, 💔, ...)
+    "\U00002600-\U000027BF"  # misc symbols + dingbats (☀, ✨, ❤, ✅)
+    "\U0001F1E6-\U0001F1FF"  # regional-indicator flags
+    "\U0000FE0E-\U0000FE0F"  # variation selectors (text/emoji presentation)
+    "\U0000200D"  # zero-width joiner (emoji sequences)
+    "\U000020E3"  # combining enclosing keycap
     "]+"
 )
 
@@ -1605,9 +1591,7 @@ def _bold_masks_for_wrapped(
     return masks
 
 
-def _split_styled_runs(
-    line: str, bold_mask: list[bool] | None
-) -> list[tuple[str, bool, bool]]:
+def _split_styled_runs(line: str, bold_mask: list[bool] | None) -> list[tuple[str, bool, bool]]:
     """Split a line into ``(segment, is_emoji, is_bold)`` runs.
 
     Generalises ``_split_emoji_runs`` so the PIL title renderer can also pick a
@@ -1703,9 +1687,7 @@ def _render_overlay_title_image(
     # ``y`` as body text would push it below the shared baseline. Nudge bold
     # runs up by the ascent difference so every run sits on one baseline.
     base_ascent = text_font.getmetrics()[0]
-    bold_baseline_dy = (
-        base_ascent - bold_font.getmetrics()[0] if bold_font is not None else 0
-    )
+    bold_baseline_dy = base_ascent - bold_font.getmetrics()[0] if bold_font is not None else 0
 
     def _font_for(is_emoji: bool, is_bold: bool):  # noqa: ANN202 - PIL font type
         if is_emoji:
@@ -1734,9 +1716,7 @@ def _render_overlay_title_image(
             widths.append(int(round(font.getlength(segment_text))))
         total_width = sum(widths)
         x = (canvas_width - total_width) // 2 if align == "center" else int(align)
-        for (segment_text, segment_is_emoji, segment_is_bold), segment_width in zip(
-            runs, widths
-        ):
+        for (segment_text, segment_is_emoji, segment_is_bold), segment_width in zip(runs, widths):
             font = _font_for(segment_is_emoji, segment_is_bold)
             if segment_is_emoji:
                 # embedded_color uses the font's COLR/CPAL palette and ignores
@@ -1823,15 +1803,11 @@ def _title_overlay_filter_parts(
     # their paragraph gap; see the matching comment in _title_band_filter_complex.
     raw_lines = title_text_wrapped.split("\n")
     visible_lines: list[tuple[int, str]] = [
-        (index, line.strip())
-        for index, line in enumerate(raw_lines)
-        if line.strip()
+        (index, line.strip()) for index, line in enumerate(raw_lines) if line.strip()
     ]
     line_count = max(len(raw_lines), 1)
     line_spacing = max(8, int(title_font_size * 0.22))
-    text_block_height = (line_count * title_font_size) + (
-        max(line_count - 1, 0) * line_spacing
-    )
+    text_block_height = (line_count * title_font_size) + (max(line_count - 1, 0) * line_spacing)
     start_y = max(32, int((title_box_height - text_block_height) / 2))
     outline_width = _title_outline_width(title_font_name)
     filter_parts: list[str] = []
@@ -1842,9 +1818,7 @@ def _title_overlay_filter_parts(
         filter_parts.append(f"drawbox=x=0:y=0:w=iw:h={title_box_height}:color=white@0.35:t=fill")
     escaped_font = _escape_ffmpeg_path(font_path)
     for chain_index, (original_index, line_text) in enumerate(visible_lines):
-        text_option = _drawtext_textfile_option(
-            line_text, title_text_dir, f"overlay-{chain_index}"
-        )
+        text_option = _drawtext_textfile_option(line_text, title_text_dir, f"overlay-{chain_index}")
         y_value = start_y + (original_index * (title_font_size + line_spacing))
         filter_parts.append(
             "drawtext="
@@ -1888,21 +1862,15 @@ def _title_overlay_filter_complex(
     raw_lines = title_text_wrapped.split("\n")
     line_count = max(len(raw_lines), 1)
     line_spacing = max(8, int(title_font_size * 0.22))
-    text_block_height = (line_count * title_font_size) + (
-        max(line_count - 1, 0) * line_spacing
-    )
+    text_block_height = (line_count * title_font_size) + (max(line_count - 1, 0) * line_spacing)
     start_y = max(32, int((title_box_height - text_block_height) / 2))
     outline_width = _title_outline_width(title_font_name)
 
     content_steps = [f"[0:v]{crop}"]
     if title_background == "dark":
-        content_steps.append(
-            f"drawbox=x=0:y=0:w=iw:h={title_box_height}:color=black@0.55:t=fill"
-        )
+        content_steps.append(f"drawbox=x=0:y=0:w=iw:h={title_box_height}:color=black@0.55:t=fill")
     elif title_background == "light":
-        content_steps.append(
-            f"drawbox=x=0:y=0:w=iw:h={title_box_height}:color=white@0.35:t=fill"
-        )
+        content_steps.append(f"drawbox=x=0:y=0:w=iw:h={title_box_height}:color=white@0.35:t=fill")
     content_chain = ",".join(content_steps) + "[content]"
 
     png_path = title_text_dir / "title-overlay.png"
@@ -1967,9 +1935,7 @@ def _title_band_filter_complex(
     # bold sibling font; it requires both the emoji font (PIL path prerequisite)
     # and a mapped bold face, otherwise it degrades silently to plain text.
     bold_font_path = _bold_font_file(title_font_name) if enable_bold else None
-    use_bold = (
-        enable_bold and bold_font_path is not None and emoji_font_path is not None
-    )
+    use_bold = enable_bold and bold_font_path is not None and emoji_font_path is not None
     if enable_bold:
         visible_text, bold_flags = _parse_bold_markup(text)
     else:
@@ -2002,15 +1968,11 @@ def _title_band_filter_complex(
     # ``visible_lines`` list (with original index) drives drawtext chaining.
     raw_lines = wrapped_text.split("\n")
     visible_lines: list[tuple[int, str]] = [
-        (index, line.strip())
-        for index, line in enumerate(raw_lines)
-        if line.strip()
+        (index, line.strip()) for index, line in enumerate(raw_lines) if line.strip()
     ]
     line_count = max(len(raw_lines), 1)
     line_spacing = max(10, int(font_size * 0.24))
-    text_block_height = (line_count * font_size) + (
-        max(line_count - 1, 0) * line_spacing
-    )
+    text_block_height = (line_count * font_size) + (max(line_count - 1, 0) * line_spacing)
     bottom_gap = (
         max(76, int(font_size * 1.25))
         if _is_cinema_title_font(title_font_name)
@@ -2028,34 +1990,35 @@ def _title_band_filter_complex(
     # title+footage block pushes horizontal meme clips too low by half the title
     # band height.
     content_max_width = (
-        _cinema_inset_content_width(canvas_width)
-        if _is_cinema_title_font(title_font_name)
+        _safe_inset_content_width(canvas_width)
+        if _uses_safe_inset_content(title_font_name, requested_font_size=requested_font_size)
         else canvas_width
     )
-    if _is_cinema_title_font(title_font_name):
+    if _uses_safe_inset_content(title_font_name, requested_font_size=requested_font_size):
         # Scale to fill width, center-crop any excess height.
         # Wide sources (≥16:9) letterbox top/bottom as normal.
         # Narrow sources (9:16 Instagram reel with embedded movie) fill the
-        # full panel width — the side pillarboxing disappears.
-        cinema_w = content_max_width
-        cinema_scale = cinema_w / max(1, crop_width)
-        raw_h = int(crop_height * cinema_scale)
-        content_x = _cinema_inset_margin_px(canvas_width)
+        # inset panel width — the side pillarboxing disappears without crossing
+        # mobile safe-area edges.
+        safe_w = content_max_width
+        safe_scale = safe_w / max(1, crop_width)
+        raw_h = int(crop_height * safe_scale)
+        content_x = _safe_inset_margin_px(canvas_width)
         if raw_h > video_height:
             crop_top = (raw_h - video_height) // 2
             crop_top -= crop_top % 2
             content_height = video_height
             content_chain = (
                 f"[0:v]{crop},"
-                f"scale={cinema_w}:-2,setsar=1,format=yuv420p,"
-                f"crop={cinema_w}:{content_height}:0:{crop_top},"
+                f"scale={safe_w}:-2,setsar=1,format=yuv420p,"
+                f"crop={safe_w}:{content_height}:0:{crop_top},"
                 f"pad={canvas_width}:{content_height}:{content_x}:0:color=black[content]"
             )
         else:
             content_height = raw_h - raw_h % 2
             content_chain = (
                 f"[0:v]{crop},"
-                f"scale={cinema_w}:{content_height},setsar=1,format=yuv420p,"
+                f"scale={safe_w}:{content_height},setsar=1,format=yuv420p,"
                 f"pad={canvas_width}:{content_height}:{content_x}:0:color=black[content]"
             )
     else:
@@ -2081,9 +2044,7 @@ def _title_band_filter_complex(
         # get color emoji or mixed font weights into the output — ffmpeg's
         # ``drawtext`` loads one font file per node with no fallback.
         png_path = title_text_dir / "title-band.png"
-        align_value: str | int = (
-            max(72, content_x + 48) if dialogue_title else "center"
-        )
+        align_value: str | int = max(72, content_x + 48) if dialogue_title else "center"
         _render_overlay_title_image(
             lines=raw_lines,
             canvas_width=canvas_width,
@@ -2122,11 +2083,7 @@ def _title_band_filter_complex(
             ]
         )
 
-    text_x = (
-        str(max(72, content_x + 48))
-        if dialogue_title
-        else "(w-text_w)/2"
-    )
+    text_x = str(max(72, content_x + 48)) if dialogue_title else "(w-text_w)/2"
     filter_parts = [content_chain, titlebase]
     for chain_index, (original_index, line_text) in enumerate(visible_lines):
         text_option = _drawtext_textfile_option(
@@ -2138,9 +2095,7 @@ def _title_band_filter_complex(
         # contiguous and don't reference a skipped index.
         y_value = start_y + (original_index * (font_size + line_spacing))
         input_label = "titlebase" if chain_index == 0 else f"title{chain_index - 1}"
-        output_label = (
-            "title" if chain_index == len(visible_lines) - 1 else f"title{chain_index}"
-        )
+        output_label = "title" if chain_index == len(visible_lines) - 1 else f"title{chain_index}"
         filter_parts.append(
             f"[{input_label}]drawtext="
             f"fontfile='{escaped_font}':"
@@ -2282,7 +2237,15 @@ def _fit_title_band(
         # quotes (~80-90 chars) wrap to a tidy 2-line block instead of an
         # orphaned third line.
         font_size_floor = 38
-        while _wrapped_overflows(wrapped, max_chars) and font_size > font_size_floor:
+        while (
+            _wrapped_overflows(wrapped, max_chars)
+            or _wrapped_exceeds_safe_width(
+                wrapped,
+                font_size=font_size,
+                title_font_name=title_font_name,
+                canvas_width=canvas_width,
+            )
+        ) and font_size > font_size_floor:
             font_size = max(font_size_floor, font_size - 4)
             max_chars = max(
                 max_chars,
@@ -2308,8 +2271,16 @@ def _fit_title_band(
         wrapped = wrap_func(text, max_chars=max_chars, max_lines=2)
 
         # Prefer 2 lines; shrink only when the title cannot fit safely.
-        font_size_floor = 42
-        while _wrapped_overflows(wrapped, max_chars) and font_size > font_size_floor:
+        font_size_floor = 38
+        while (
+            _wrapped_overflows(wrapped, max_chars)
+            or _wrapped_exceeds_safe_width(
+                wrapped,
+                font_size=font_size,
+                title_font_name=title_font_name,
+                canvas_width=canvas_width,
+            )
+        ) and font_size > font_size_floor:
             font_size = max(font_size_floor, font_size - 4)
             max_chars = max(
                 max_chars,
@@ -2351,24 +2322,77 @@ def _is_cinema_title_font(title_font_name: str | None) -> bool:
     return title_font_name in {"comic_italic", "arial_rounded_bold", "georgia"}
 
 
-def _uses_cinema_inset_content(title_font_name: str | None) -> bool:
-    return title_font_name == "arial_rounded_bold"
+def _uses_safe_inset_content(
+    title_font_name: str | None, *, requested_font_size: int | None = None
+) -> bool:
+    if title_font_name in {
+        "comic_italic",
+        "arial_rounded_bold",
+        "georgia",
+        "past_moments_arial_bold",
+    }:
+        return True
+    # Backward compatibility for accounts that saved Past Moments Black before
+    # it got its own internal font key. Other Arial Bold templates use 56-64px.
+    return title_font_name == "arial_bold" and (requested_font_size or 0) <= 46
 
 
 _CINEMA_SIDE_MARGIN_PX = 56  # exact pixels on EACH side — left == right by construction
 # Bumped from 32 to 56 (~5% of a 1080 canvas) so the footage sits a little
 # further from the frame edges and stops getting clipped on smaller phone
 # screens with rounded corners / safe-area insets.
+_TITLE_SAFE_SIDE_MARGIN_PX = 72
 
 
-def _cinema_inset_content_width(canvas_width: int) -> int:
+def _safe_inset_content_width(canvas_width: int) -> int:
     width = canvas_width - _CINEMA_SIDE_MARGIN_PX * 2
     return width - (width % 2)  # keep even for H.264
 
 
-def _cinema_inset_margin_px(canvas_width: int) -> int:
+def _safe_inset_margin_px(canvas_width: int) -> int:
     """Return the exact left=right side margin so the caller never re-derives it."""
-    return (canvas_width - _cinema_inset_content_width(canvas_width)) // 2
+    return (canvas_width - _safe_inset_content_width(canvas_width)) // 2
+
+
+def _title_safe_text_width(canvas_width: int) -> int:
+    return max(1, canvas_width - (_TITLE_SAFE_SIDE_MARGIN_PX * 2))
+
+
+def _wrapped_exceeds_safe_width(
+    wrapped: str,
+    *,
+    font_size: int,
+    title_font_name: str | None,
+    canvas_width: int,
+) -> bool:
+    """True when any rendered title line would cross the left/right safe area."""
+    if title_font_name is None:
+        return False
+    safe_width = _title_safe_text_width(canvas_width)
+    for line in wrapped.split("\n"):
+        if not line.strip():
+            continue
+        if (
+            _title_line_pixel_width(line, font_size=font_size, title_font_name=title_font_name)
+            > safe_width
+        ):
+            return True
+    return False
+
+
+def _title_line_pixel_width(line: str, *, font_size: int, title_font_name: str | None) -> int:
+    try:
+        from PIL import ImageFont
+
+        font_path = windows_font_file(title_font_name)
+        if font_path is not None:
+            font = ImageFont.truetype(str(font_path), font_size)
+            bbox = font.getbbox(line)
+            return max(0, int(bbox[2] - bbox[0]))
+    except Exception:  # noqa: BLE001 - keep renderer usable without Pillow/font metrics
+        pass
+    factor = 0.62 if title_font_name in {"arial_bold", "arial_rounded_bold", "impact"} else 0.58
+    return int(len(line) * font_size * factor)
 
 
 def _wrapped_overflows(wrapped: str, max_chars: int) -> bool:
@@ -2451,9 +2475,7 @@ def _wrap_overlay_text_greedy(text: str, *, max_chars: int, max_lines: int) -> s
     )
 
 
-def _balanced_wrap_lines(
-    words: list[str], *, max_chars: int, max_lines: int
-) -> list[str] | None:
+def _balanced_wrap_lines(words: list[str], *, max_chars: int, max_lines: int) -> list[str] | None:
     """Wrap ``words`` into 1..``max_lines`` lines each <= ``max_chars`` chars,
     minimizing the maximum line width so output looks visually balanced
     instead of left-packed.

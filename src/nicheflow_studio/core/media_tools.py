@@ -90,6 +90,7 @@ def windows_font_file(font_name: str | None = None) -> Path | None:
         "segoe_ui": "segoeui.ttf",
         "bahnschrift": "bahnschrift.ttf",
         "arial_bold": "arialbd.ttf",
+        "past_moments_arial_bold": "arialbd.ttf",
         "arial_rounded_bold": "ARLRDBD.TTF",
         "impact": "impact.ttf",
         "georgia": "georgia.ttf",
@@ -109,7 +110,7 @@ def windows_font_file(font_name: str | None = None) -> Path | None:
     candidates.extend(
         [
             # Prefer bold chunky fonts for watermark replacement text.
-            windows_dir / "Fonts" / "ariblk.ttf",   # Arial Black — chunky, wide
+            windows_dir / "Fonts" / "ariblk.ttf",  # Arial Black — chunky, wide
             windows_dir / "Fonts" / "arialbd.ttf",  # Arial Bold — fallback
             windows_dir / "Fonts" / "bahnschrift.ttf",
             windows_dir / "Fonts" / "segoeui.ttf",
