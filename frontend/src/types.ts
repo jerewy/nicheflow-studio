@@ -76,6 +76,13 @@ export type JobStatus = "pending" | "running" | "succeeded" | "failed";
 export interface JobSnapshot {
   id: string;
   status: JobStatus;
+  progress: number;
+  message: string;
   result: unknown;
   error: string | null;
+}
+
+export interface ExportResult {
+  item_id: number;
+  processed_path: string;
 }

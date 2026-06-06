@@ -13,6 +13,7 @@ real need appears.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import threading
 import uuid
@@ -28,10 +29,20 @@ SUCCEEDED = "succeeded"
 FAILED = "failed"
 
 
+def _accepts_progress(func: Callable[..., Any]) -> bool:
+    """True if ``func`` declares a ``progress`` parameter (so we can inject one)."""
+    try:
+        return "progress" in inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 @dataclass
 class Job:
     id: str
     status: str = PENDING
+    progress: float = 0.0
+    message: str = ""
     result: Any = None
     error: str | None = None
 
@@ -40,6 +51,8 @@ class Job:
         return {
             "id": self.id,
             "status": self.status,
+            "progress": self.progress,
+            "message": self.message,
             "result": self.result,
             "error": self.error,
         }
@@ -59,16 +72,30 @@ class JobManager:
         The callable's return value becomes the job ``result`` (it should be
         JSON-serializable so the bridge can return it). Any exception is captured
         as the job ``error`` with status ``failed`` — it never propagates.
+
+        If ``func`` declares a ``progress`` parameter, a ``report(fraction,
+        message="")`` callback is injected so long jobs can update their status
+        as they run. Callables without that parameter are called unchanged.
         """
         job = Job(id=uuid.uuid4().hex)
         with self._lock:
             self._jobs[job.id] = job
 
+        def report(fraction: float, message: str = "") -> None:
+            with self._lock:
+                job.progress = max(0.0, min(1.0, float(fraction)))
+                if message:
+                    job.message = message
+
+        call_kwargs = dict(kwargs)
+        if _accepts_progress(func):
+            call_kwargs["progress"] = report
+
         def _run() -> None:
             with self._lock:
                 job.status = RUNNING
             try:
-                result = func(*args, **kwargs)
+                result = func(*args, **call_kwargs)
             except Exception as exc:  # noqa: BLE001 - boundary: record, don't crash the thread
                 logger.exception("Background job %s failed", job.id)
                 with self._lock:

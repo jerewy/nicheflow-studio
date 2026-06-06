@@ -22,7 +22,8 @@ from __future__ import annotations
 import logging
 
 from nicheflow_studio.core.ui_prefs import set_ui_pref
-from nicheflow_studio.services import draft_generation, draft_revisions as svc
+from nicheflow_studio.services import draft_generation, draft_revisions as svc, export as export_svc
+from nicheflow_studio.services.errors import ServiceError
 from nicheflow_studio.services.jobs import JobManager
 
 logger = logging.getLogger(__name__)
@@ -47,7 +48,7 @@ def _guard(func):
     def wrapper(*args, **kwargs) -> dict:
         try:
             return _ok(func(*args, **kwargs))
-        except svc.DraftRevisionError as exc:
+        except ServiceError as exc:
             return _fail(str(exc))
         except Exception:  # noqa: BLE001 - bridge boundary must not propagate
             logger.exception("Unexpected error in bridge call %s", getattr(func, "__name__", "?"))
@@ -151,6 +152,14 @@ class ProcessingBridge:
             return dto.to_dict()
 
         job_id = self._jobs.start(_run)
+        return {"job_id": job_id}
+
+    @_guard
+    def start_export(self, item_id: int) -> dict:
+        """Start background Reel export; return a job id to poll via
+        :meth:`get_job`. The job reports progress and its result is
+        ``{item_id, processed_path}``."""
+        job_id = self._jobs.start(export_svc.export_item, item_id)
         return {"job_id": job_id}
 
     @_guard

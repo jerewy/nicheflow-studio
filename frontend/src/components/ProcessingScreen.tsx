@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { bridge } from "@/lib/bridge";
-import type { DraftRevision, ProcessingContext } from "@/types";
+import type { DraftRevision, ExportResult, ProcessingContext } from "@/types";
 
 const POLL_INTERVAL_MS = 4000;
 const JOB_POLL_INTERVAL_MS = 1000;
@@ -14,16 +14,20 @@ const JOB_TIMEOUT_MS = 180000;
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Poll a background job until it finishes; resolve with its result or throw the
-// job's error message.
-async function waitForJob(jobId: string): Promise<unknown> {
+// job's error message. Reports progress on each poll.
+async function waitForJob(
+  jobId: string,
+  onProgress?: (progress: number, message: string) => void,
+): Promise<unknown> {
   const deadline = Date.now() + JOB_TIMEOUT_MS;
   for (;;) {
     const snapshot = await bridge.getJob(jobId);
+    onProgress?.(snapshot.progress, snapshot.message);
     if (snapshot.status === "succeeded") return snapshot.result;
     if (snapshot.status === "failed") {
-      throw new Error(snapshot.error ?? "Generation failed.");
+      throw new Error(snapshot.error ?? "The job failed.");
     }
-    if (Date.now() > deadline) throw new Error("Generation timed out.");
+    if (Date.now() > deadline) throw new Error("The job timed out.");
     await sleep(JOB_POLL_INTERVAL_MS);
   }
 }
@@ -56,6 +60,11 @@ export function ProcessingScreen() {
   const [busy, setBusy] = useState(false);
   const [generating, setGenerating] = useState(false);
   const [canGenerate, setCanGenerate] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [exportProgress, setExportProgress] = useState<{ value: number; message: string } | null>(
+    null,
+  );
+  const [exportedPath, setExportedPath] = useState<string | null>(null);
 
   // The revision currently loaded into the editor, and the user's edits on top.
   const [loadedRevision, setLoadedRevision] = useState<DraftRevision | null>(null);
@@ -159,6 +168,29 @@ export function ProcessingScreen() {
       setActionError(err instanceof Error ? err.message : String(err));
     } finally {
       setGenerating(false);
+    }
+  };
+
+  const exportReel = async () => {
+    if (itemId === null) return;
+    setExporting(true);
+    setActionError(null);
+    setExportedPath(null);
+    setExportProgress({ value: 0, message: "Starting…" });
+    try {
+      const { job_id } = await bridge.startExport(itemId);
+      const result = (await waitForJob(job_id, (value, message) =>
+        setExportProgress({ value, message }),
+      )) as ExportResult;
+      setExportedPath(result.processed_path);
+      // Refetch so the item's processed_path is reflected.
+      const ctx = await bridge.getContext(itemId);
+      setContext(ctx);
+    } catch (err: unknown) {
+      setActionError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setExporting(false);
+      setExportProgress(null);
     }
   };
 
@@ -310,7 +342,7 @@ export function ProcessingScreen() {
       )}
 
       {loadedRevision && (
-        <footer className="flex items-center gap-2">
+        <footer className="flex flex-wrap items-center gap-2">
           <Button onClick={saveEdits} disabled={!dirty || busy}>
             Save edits as new revision
           </Button>
@@ -323,7 +355,33 @@ export function ProcessingScreen() {
               Discard edits
             </Button>
           )}
+          <div className="grow" />
+          <Button variant="secondary" onClick={exportReel} disabled={exporting || dirty}>
+            {exporting ? "Exporting…" : "Export Reel"}
+          </Button>
         </footer>
+      )}
+
+      {exportProgress && (
+        <div className="space-y-1">
+          <div className="h-2 w-full overflow-hidden rounded-full bg-secondary">
+            <div
+              className="h-full bg-primary transition-[width] duration-300"
+              style={{ width: `${Math.round(exportProgress.value * 100)}%` }}
+            />
+          </div>
+          <p className="text-xs text-muted-foreground">{exportProgress.message}</p>
+        </div>
+      )}
+
+      {exportedPath && !exporting && (
+        <p className="text-sm text-emerald-600">Exported: {exportedPath}</p>
+      )}
+
+      {dirty && (
+        <p className="text-xs text-muted-foreground">
+          Save or discard your edits before exporting.
+        </p>
       )}
     </div>
   );

@@ -184,6 +184,43 @@ def test_bridge_get_unknown_job_returns_error() -> None:
     assert result["ok"] is False
 
 
+def test_bridge_start_export_runs_job(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    from nicheflow_studio.processing import video
+
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake")
+    item_id = _make_item(file_path=str(source))
+    bridge = ProcessingBridge()
+
+    monkeypatch.setattr(video, "probe_video", lambda _p: object())
+    monkeypatch.setattr(
+        video, "suggest_title_replacement_crop", lambda _p, _probe: video.CropSettings()
+    )
+    monkeypatch.setattr(video, "export_cropped_video", lambda **kw: kw["output_path"])
+
+    started = bridge.start_export(item_id)
+    assert started["ok"] is True
+    bridge._jobs.join(started["data"]["job_id"])
+    job = bridge.get_job(started["data"]["job_id"])
+
+    assert job["data"]["status"] == "succeeded"
+    assert job["data"]["progress"] == 1.0
+    assert job["data"]["result"]["processed_path"]
+
+
+def test_bridge_export_failure_surfaces_message() -> None:
+    # No file_path -> ExportError -> handled job failure with a real message.
+    item_id = _make_item(file_path=None)
+    bridge = ProcessingBridge()
+
+    started = bridge.start_export(item_id)
+    bridge._jobs.join(started["data"]["job_id"])
+    job = bridge.get_job(started["data"]["job_id"])
+
+    assert job["data"]["status"] == "failed"
+    assert "video file" in job["data"]["error"].lower()
+
+
 # --------------------------------------------------------------------------- #
 # launcher entry resolution
 # --------------------------------------------------------------------------- #

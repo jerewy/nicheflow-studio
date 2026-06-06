@@ -41,6 +41,7 @@ interface PywebviewApi {
     itemId: number,
     payload: Record<string, unknown>,
   ): Promise<Envelope<{ job_id: string }>>;
+  start_export(itemId: number): Promise<Envelope<{ job_id: string }>>;
   get_job(jobId: string): Promise<Envelope<JobSnapshot>>;
 }
 
@@ -119,6 +120,11 @@ export const bridge = {
   ): Promise<{ job_id: string }> {
     if (!hasBridge()) return mock.startGeneration();
     return unwrap(window.pywebview!.api.start_generation(itemId, payload));
+  },
+
+  startExport(itemId: number): Promise<{ job_id: string }> {
+    if (!hasBridge()) return mock.startExport();
+    return unwrap(window.pywebview!.api.start_export(itemId));
   },
 
   getJob(jobId: string): Promise<JobSnapshot> {
@@ -213,7 +219,17 @@ const mock = {
   async startGeneration(): Promise<{ job_id: string }> {
     return { job_id: "mock-job" };
   },
+  async startExport(): Promise<{ job_id: string }> {
+    return { job_id: "mock-export" };
+  },
   async getJob(): Promise<JobSnapshot> {
-    return { id: "mock-job", status: "succeeded", result: mockRevision, error: null };
+    return {
+      id: "mock-job",
+      status: "succeeded",
+      progress: 1,
+      message: "Done",
+      result: mockRevision,
+      error: null,
+    };
   },
 };

@@ -40,3 +40,27 @@ def test_kwargs_are_passed_through() -> None:
     job_id = manager.start(lambda *, a, b: a * b, a=4, b=5)
     snapshot = manager.join(job_id)
     assert snapshot["result"] == 20
+
+
+def test_job_injects_progress_callback_when_declared() -> None:
+    manager = JobManager()
+
+    def work(progress) -> str:
+        progress(0.5, "halfway")
+        return "ok"
+
+    job_id = manager.start(work)
+    snapshot = manager.join(job_id)
+
+    assert snapshot["status"] == SUCCEEDED
+    assert snapshot["result"] == "ok"
+    assert snapshot["progress"] == 0.5
+    assert snapshot["message"] == "halfway"
+
+
+def test_job_without_progress_param_runs_unchanged() -> None:
+    manager = JobManager()
+    job_id = manager.start(lambda: 7)
+    snapshot = manager.join(job_id)
+    assert snapshot["result"] == 7
+    assert snapshot["progress"] == 0.0

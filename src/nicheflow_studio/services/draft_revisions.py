@@ -29,6 +29,7 @@ from sqlalchemy import select
 from nicheflow_studio.core.ui_prefs import get_ui_pref
 from nicheflow_studio.db.models import Account, DownloadItem, DraftRevision
 from nicheflow_studio.db.session import get_session
+from nicheflow_studio.services.errors import ServiceError
 
 # UI pref the desktop/React app may set to tell the CLI which item the user is
 # actively editing. Absent until the UI writes it; ``current`` falls back to the
@@ -40,7 +41,7 @@ ACTIVE_PROCESSING_ITEM_PREF_KEY = "active_processing_item_id"
 _CONTEXT_TRANSCRIPT_CHARS = 4000
 
 
-class DraftRevisionError(Exception):
+class DraftRevisionError(ServiceError):
     """Raised for invalid draft-revision operations (bad item, bad option, etc.).
 
     Callers (CLI, bridge) translate this into a user-facing message; it should
