@@ -70,25 +70,32 @@ Keep the backend stack. Replace only the UI layer incrementally.
 - Long-running AI, scrape, download, FFmpeg, file, and Playwright work runs as UI-independent background jobs
 - Bridge calls return quickly with structured data or job IDs
 - Poll job progress first; add pushed events only if polling proves insufficient
+- SQLite stores versioned draft revisions and remains the source of truth for draft handoff
+- Codex and React use the same draft-revision service; Codex writes through one repository CLI
+- React polls/refetches new revisions without restart and protects unsaved local edits
 - Keep PyQt paths until replacement parity is packaged and validated
 
 See `docs/UI_MIGRATION_PLAN.md` for the authoritative migration contract.
 
 ## Next Actions
 
-1. Create the minimal pywebview shell and Vite/React/TypeScript frontend.
-2. Define the smallest UI-independent background-job contract.
-3. Extract the minimum Processing application services currently embedded in `main_window.py`.
-4. Implement the React Processing workspace with direct structured draft generation/revision.
-5. Connect saved selection, export progress, scheduling, and publish actions.
-6. Build and smoke-test the packaged Windows Processing slice.
-7. Only then choose the next screen to migrate.
+1. Add the versioned draft-revision SQLite model and shared Python service.
+2. Add `scripts/nicheflow_drafts.py` so Codex can read active context and save/revise/apply structured options.
+3. Prove a Codex-written revision can be read without restarting the current app.
+4. Create the minimal pywebview shell and Vite/React/TypeScript frontend.
+5. Poll/refetch the latest draft revision in React with dirty-edit protection.
+6. Define the smallest UI-independent background-job contract.
+7. Extract the minimum Processing application services currently embedded in `main_window.py`.
+8. Connect direct generation/revision, saved selection, export progress, scheduling, and publish actions.
+9. Build and smoke-test the packaged Windows Processing slice.
+10. Only then choose the next screen to migrate.
 
 ## Known Risks And Constraints
 
 - `src/nicheflow_studio/app/main_window.py` remains a large mixed UI/workflow module; extraction must stay scoped to the active slice.
 - React improves layout, state handling, and maintainability but does not make FFmpeg, AI, Playwright, database, or file operations faster by itself.
 - Background work must not block pywebview bridge calls or hold SQLite transactions while waiting on external operations.
+- Automatic draft refetch must not silently overwrite unsaved local edits.
 - The packaged pywebview/React asset path and bridge behavior must be validated early.
 - The current git worktree contains substantial ongoing changes; migration work must preserve them.
 - Platform, originality, rights, and account-footprint risks documented in `docs/SOURCING_POOLING_PLAN.md` remain accepted/current.

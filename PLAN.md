@@ -11,6 +11,12 @@ Current milestone: Start the incremental pywebview/React UI migration with a pac
 > distribution exist. Keep Python/SQLite/FFmpeg/Playwright and migrate only the UI,
 > one workflow at a time. See `docs/UI_MIGRATION_PLAN.md`.
 
+> **2026-06-06 draft handoff update:** SQLite is the source of truth for versioned
+> generated draft revisions. Codex writes structured options through one repository
+> CLI backed by a shared Python service; the React Processing UI polls/refetches the
+> latest revision and updates without clipboard paste or app restart. Unsaved local
+> edits must never be silently overwritten. See `docs/UI_MIGRATION_PLAN.md`.
+
 > **2026-05-31 direction update:** sourcing has moved to **Apify-sourced shared niche pools**
 > with a **publish-only multi-account network** (10 history + 3 movie), superseding the
 > "5 dual-use accounts" model in §2A and the YouTube-intake framing below. See
@@ -797,9 +803,11 @@ Ordered next work:
 Build the Processing-first vertical slice from `docs/UI_MIGRATION_PLAN.md`:
 
 1. create the pywebview + React shell
-2. extract the minimum plain-Python services and UI-independent background-job contract needed by Processing
-3. support direct structured draft generation/revision, selection, export progress, scheduling, and publishing
-4. package and smoke-test the replacement slice before migrating another screen
+2. add the versioned SQLite draft-revision model, shared service, and Codex-facing CLI
+3. prove Codex can save drafts and the open React UI can refetch them without restart
+4. extract the minimum plain-Python services and UI-independent background-job contract needed by Processing
+5. support direct structured draft generation/revision, selection, export progress, scheduling, and publishing
+6. package and smoke-test the replacement slice before migrating another screen
 
 ## 14. UI Upgrade Plan (Active)
 
@@ -810,6 +818,8 @@ The migration is not a full rewrite. Existing SQLite, processing, scraping, pool
 Long-running AI, scrape, download, FFmpeg, file, and Playwright work must run through UI-independent background jobs that expose structured status/progress. Bridge calls start work and return quickly; polling is the initial progress mechanism.
 
 The first vertical slice is Processing. Keep Copy Chat Prompt and Paste Draft as temporary fallbacks, but the target workflow generates and revises structured draft options directly inside NicheFlow, then exports and schedules/publishes from the same saved state.
+
+SQLite is the handoff between Codex, the Processing service, and the React UI. Generated options are stored as versioned draft revisions; the selected final title/caption remains on the existing Processing item for export/publish compatibility. A single repository CLI lets Codex read active context and save/revise/apply structured options through the shared service. The React UI polls/refetches revisions and updates without restart, while dirty-edit protection prevents automatic replacement of unsaved user changes.
 
 Packaging is a checkpoint inside the migration, not a gate before it. The old PyQt workflow remains available until the new Processing slice passes a packaged Windows smoke test.
 
