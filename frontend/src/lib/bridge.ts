@@ -11,6 +11,7 @@
 import type {
   ApplyResult,
   DraftRevision,
+  JobSnapshot,
   ProcessingContext,
 } from "@/types";
 
@@ -35,6 +36,12 @@ interface PywebviewApi {
     revisionId?: number | null,
   ): Promise<Envelope<ApplyResult>>;
   set_active_item(itemId: number): Promise<Envelope<unknown>>;
+  can_generate(): Promise<Envelope<{ can_generate: boolean }>>;
+  start_generation(
+    itemId: number,
+    payload: Record<string, unknown>,
+  ): Promise<Envelope<{ job_id: string }>>;
+  get_job(jobId: string): Promise<Envelope<JobSnapshot>>;
 }
 
 declare global {
@@ -99,6 +106,24 @@ export const bridge = {
   setActiveItem(itemId: number): Promise<unknown> {
     if (!hasBridge()) return Promise.resolve(null);
     return unwrap(window.pywebview!.api.set_active_item(itemId));
+  },
+
+  canGenerate(): Promise<boolean> {
+    if (!hasBridge()) return Promise.resolve(true);
+    return unwrap(window.pywebview!.api.can_generate()).then((d) => d.can_generate);
+  },
+
+  startGeneration(
+    itemId: number,
+    payload: Record<string, unknown> = {},
+  ): Promise<{ job_id: string }> {
+    if (!hasBridge()) return mock.startGeneration();
+    return unwrap(window.pywebview!.api.start_generation(itemId, payload));
+  },
+
+  getJob(jobId: string): Promise<JobSnapshot> {
+    if (!hasBridge()) return mock.getJob();
+    return unwrap(window.pywebview!.api.get_job(jobId));
   },
 };
 
@@ -184,5 +209,11 @@ const mock = {
       title_draft: mockRevision.title_options[optionNumber - 1] ?? "",
       caption_draft: mockRevision.caption_options[optionNumber - 1] ?? "",
     };
+  },
+  async startGeneration(): Promise<{ job_id: string }> {
+    return { job_id: "mock-job" };
+  },
+  async getJob(): Promise<JobSnapshot> {
+    return { id: "mock-job", status: "succeeded", result: mockRevision, error: null };
   },
 };

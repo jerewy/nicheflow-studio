@@ -8,10 +8,11 @@ from nicheflow_studio.app import webview_app
 from nicheflow_studio.app.processing_bridge import ProcessingBridge
 from nicheflow_studio.db.models import Account, DownloadItem
 from nicheflow_studio.db.session import get_session
+from nicheflow_studio.processing import smart_drafts
 from nicheflow_studio.services import draft_revisions as svc
 
 
-def _make_item(*, file_path: str | None = "C:/clips/x.mp4") -> int:
+def _make_item(*, file_path: str | None = "C:/clips/x.mp4", transcript: str | None = None) -> int:
     with get_session() as session:
         account = Account(name="Acc", platform="instagram", niche_label="movie")
         session.add(account)
@@ -20,6 +21,7 @@ def _make_item(*, file_path: str | None = "C:/clips/x.mp4") -> int:
             source_url="https://instagram.com/reel/abc",
             title="Source",
             file_path=file_path,
+            transcript_text=transcript,
             status="completed",
             account_id=account.id,
         )
@@ -122,6 +124,64 @@ def test_bridge_set_active_item_updates_pref() -> None:
     assert result["data"]["active_processing_item_id"] == older
     assert svc.resolve_active_item_id() == older
     assert newer != older  # sanity: two distinct items exist
+
+
+# --------------------------------------------------------------------------- #
+# background generation job
+# --------------------------------------------------------------------------- #
+
+
+def test_bridge_start_generation_runs_job_and_saves_revision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    item_id = _make_item(transcript="A transcript with enough grounding to generate.")
+    bridge = ProcessingBridge()
+
+    monkeypatch.setattr(
+        smart_drafts,
+        "generate_smart_drafts",
+        lambda **_: smart_drafts.SmartDrafts(
+            summary="s",
+            title_options=["t1", "t2", "t3"],
+            caption_options=["c1", "c2", "c3"],
+            provider_label="Groq (test)",
+        ),
+    )
+
+    started = bridge.start_generation(item_id, {"caption_style": "contextual_info"})
+    assert started["ok"] is True
+    job_id = started["data"]["job_id"]
+
+    # Wait for the daemon thread, then read the terminal status via the bridge.
+    bridge._jobs.join(job_id)
+    job = bridge.get_job(job_id)
+    assert job["ok"] is True
+    assert job["data"]["status"] == "succeeded"
+    assert job["data"]["result"]["title_options"] == ["t1", "t2", "t3"]
+
+    # The saved revision is now the latest for the item.
+    latest = bridge.get_latest_revision(item_id)
+    assert latest["data"]["title_options"] == ["t1", "t2", "t3"]
+
+
+def test_bridge_generation_job_reports_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    # No transcript -> generate_revision_for_item raises -> job fails (handled).
+    item_id = _make_item(transcript=None)
+    bridge = ProcessingBridge()
+
+    started = bridge.start_generation(item_id, {})
+    job_id = started["data"]["job_id"]
+    bridge._jobs.join(job_id)
+
+    job = bridge.get_job(job_id)
+    assert job["data"]["status"] == "failed"
+    assert "transcript" in job["data"]["error"].lower()
+
+
+def test_bridge_get_unknown_job_returns_error() -> None:
+    bridge = ProcessingBridge()
+    result = bridge.get_job("nope")
+    assert result["ok"] is False
 
 
 # --------------------------------------------------------------------------- #

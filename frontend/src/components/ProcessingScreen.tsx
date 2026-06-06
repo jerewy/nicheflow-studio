@@ -8,6 +8,25 @@ import { bridge } from "@/lib/bridge";
 import type { DraftRevision, ProcessingContext } from "@/types";
 
 const POLL_INTERVAL_MS = 4000;
+const JOB_POLL_INTERVAL_MS = 1000;
+const JOB_TIMEOUT_MS = 180000;
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Poll a background job until it finishes; resolve with its result or throw the
+// job's error message.
+async function waitForJob(jobId: string): Promise<unknown> {
+  const deadline = Date.now() + JOB_TIMEOUT_MS;
+  for (;;) {
+    const snapshot = await bridge.getJob(jobId);
+    if (snapshot.status === "succeeded") return snapshot.result;
+    if (snapshot.status === "failed") {
+      throw new Error(snapshot.error ?? "Generation failed.");
+    }
+    if (Date.now() > deadline) throw new Error("Generation timed out.");
+    await sleep(JOB_POLL_INTERVAL_MS);
+  }
+}
 
 interface EditableOptions {
   titles: string[];
@@ -35,6 +54,8 @@ export function ProcessingScreen() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [generating, setGenerating] = useState(false);
+  const [canGenerate, setCanGenerate] = useState(false);
 
   // The revision currently loaded into the editor, and the user's edits on top.
   const [loadedRevision, setLoadedRevision] = useState<DraftRevision | null>(null);
@@ -81,6 +102,11 @@ export function ProcessingScreen() {
     };
   }, [loadRevisionIntoEditor]);
 
+  // Whether a draft provider is configured (enables the Generate button).
+  useEffect(() => {
+    bridge.canGenerate().then(setCanGenerate).catch(() => setCanGenerate(false));
+  }, []);
+
   // Poll for newer revisions (Codex writes, or another window's edits).
   useEffect(() => {
     if (itemId === null) return;
@@ -115,6 +141,26 @@ export function ProcessingScreen() {
       captions[index] = value;
       return { ...prev, captions };
     });
+
+  const generate = async () => {
+    if (itemId === null) return;
+    setGenerating(true);
+    setActionError(null);
+    try {
+      const { job_id } = await bridge.startGeneration(itemId, {});
+      const revision = (await waitForJob(job_id)) as DraftRevision;
+      // Respect dirty-edit protection: don't clobber unsaved edits.
+      if (dirtyRef.current) {
+        setPendingRevision(revision);
+      } else {
+        loadRevisionIntoEditor(revision);
+      }
+    } catch (err: unknown) {
+      setActionError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setGenerating(false);
+    }
+  };
 
   const apply = async (optionNumber: number) => {
     if (itemId === null) return;
@@ -174,19 +220,33 @@ export function ProcessingScreen() {
 
   return (
     <div className="mx-auto max-w-5xl space-y-4 p-6">
-      <header className="space-y-1">
-        <div className="flex items-center gap-2">
-          <h1 className="text-2xl font-semibold tracking-tight">Processing</h1>
-          {!bridge.available() && <Badge variant="outline">browser preview</Badge>}
-          {loadedRevision && (
-            <Badge variant="secondary">revision {loadedRevision.revision_number}</Badge>
-          )}
-          {dirty && <Badge variant="destructive">unsaved edits</Badge>}
+      <header className="flex items-start justify-between gap-4">
+        <div className="space-y-1">
+          <div className="flex items-center gap-2">
+            <h1 className="text-2xl font-semibold tracking-tight">Processing</h1>
+            {!bridge.available() && <Badge variant="outline">browser preview</Badge>}
+            {loadedRevision && (
+              <Badge variant="secondary">revision {loadedRevision.revision_number}</Badge>
+            )}
+            {dirty && <Badge variant="destructive">unsaved edits</Badge>}
+          </div>
+          <p className="text-sm text-muted-foreground">
+            {item.title ?? item.source_url}
+            {account?.niche_label ? ` — ${account.niche_label}` : ""}
+          </p>
         </div>
-        <p className="text-sm text-muted-foreground">
-          {item.title ?? item.source_url}
-          {account?.niche_label ? ` — ${account.niche_label}` : ""}
-        </p>
+        <div className="flex flex-col items-end gap-1">
+          <Button
+            onClick={generate}
+            disabled={generating || busy || !canGenerate}
+            title={canGenerate ? undefined : "No draft provider configured (set GROQ_API_KEY)"}
+          >
+            {generating ? "Generating…" : "Generate options"}
+          </Button>
+          {!canGenerate && (
+            <span className="text-xs text-muted-foreground">no provider configured</span>
+          )}
+        </div>
       </header>
 
       {pendingRevision && (

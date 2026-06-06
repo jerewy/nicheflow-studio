@@ -22,7 +22,8 @@ from __future__ import annotations
 import logging
 
 from nicheflow_studio.core.ui_prefs import set_ui_pref
-from nicheflow_studio.services import draft_revisions as svc
+from nicheflow_studio.services import draft_generation, draft_revisions as svc
+from nicheflow_studio.services.jobs import JobManager
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,10 @@ def _guard(func):
 
 class ProcessingBridge:
     """Methods exposed to the React Processing screen via pywebview."""
+
+    def __init__(self) -> None:
+        # One job manager per window; tracks background generation/export work.
+        self._jobs = JobManager()
 
     @_guard
     def get_context(self, item_id: int | None = None) -> dict:
@@ -121,3 +126,37 @@ class ProcessingBridge:
         command follows the UI selection."""
         set_ui_pref(svc.ACTIVE_PROCESSING_ITEM_PREF_KEY, int(item_id))
         return {"active_processing_item_id": int(item_id)}
+
+    @_guard
+    def can_generate(self) -> dict:
+        """Whether a draft provider (Groq/Ollama) is configured, so the UI can
+        enable/disable the Generate action."""
+        return {"can_generate": draft_generation.can_generate()}
+
+    @_guard
+    def start_generation(self, item_id: int, payload: dict | None = None) -> dict:
+        """Start background draft generation; return a job id to poll via
+        :meth:`get_job`. The job result is the saved revision as a dict."""
+        payload = payload or {}
+
+        def _run() -> dict:
+            dto = draft_generation.generate_revision_for_item(
+                item_id,
+                caption_style=payload.get("caption_style"),
+                title_style=payload.get("title_style"),
+                prompt_profile=payload.get("prompt_profile"),
+                clip_premise=payload.get("clip_premise"),
+                source=payload.get("source") or "ui",
+            )
+            return dto.to_dict()
+
+        job_id = self._jobs.start(_run)
+        return {"job_id": job_id}
+
+    @_guard
+    def get_job(self, job_id: str) -> dict:
+        """Status snapshot for a background job started via the bridge."""
+        snapshot = self._jobs.get(job_id)
+        if snapshot is None:
+            raise svc.DraftRevisionError(f"Unknown job id {job_id}.")
+        return snapshot

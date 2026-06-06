@@ -70,3 +70,12 @@ export interface ApplyResult {
   title_draft: string;
   caption_draft: string;
 }
+
+export type JobStatus = "pending" | "running" | "succeeded" | "failed";
+
+export interface JobSnapshot {
+  id: string;
+  status: JobStatus;
+  result: unknown;
+  error: string | null;
+}
