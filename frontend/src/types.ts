@@ -86,3 +86,30 @@ export interface ExportResult {
   item_id: number;
   processed_path: string;
 }
+
+export interface ItemSummary {
+  id: number;
+  title: string | null;
+  source_url: string;
+  account_id: number | null;
+  status: string;
+  has_processed: boolean;
+  has_draft: boolean;
+}
+
+export interface PublishJob {
+  id: number;
+  status: string;
+  title: string | null;
+  scheduled_at: string | null;
+  posted_at: string | null;
+  posted_url: string | null;
+  processed_path: string | null;
+}
+
+export interface QueueResult {
+  job_id: number;
+  status: string;
+  scheduled_at: string | null;
+  created: boolean;
+}

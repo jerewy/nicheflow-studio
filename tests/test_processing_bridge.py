@@ -222,6 +222,42 @@ def test_bridge_export_failure_surfaces_message() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# items + publish queue
+# --------------------------------------------------------------------------- #
+
+
+def test_bridge_list_items_and_queue_for_publish() -> None:
+    item_id = _make_item()
+    bridge = ProcessingBridge()
+    # Mark the item as exported so it can be queued.
+    with get_session() as session:
+        session.get(DownloadItem, item_id).processed_path = "C:/processed/out.mp4"
+        session.commit()
+
+    listed = bridge.list_items()
+    assert listed["ok"] is True
+    assert any(it["id"] == item_id for it in listed["data"])
+
+    queued = bridge.queue_for_publish(item_id)
+    assert queued["ok"] is True
+    assert queued["data"]["status"] == "draft"
+
+    jobs = bridge.list_publish_jobs(item_id)
+    assert jobs["ok"] is True
+    assert len(jobs["data"]) == 1
+
+
+def test_bridge_queue_without_export_returns_error() -> None:
+    item_id = _make_item()  # no processed_path
+    bridge = ProcessingBridge()
+
+    result = bridge.queue_for_publish(item_id)
+
+    assert result["ok"] is False
+    assert "export" in result["error"].lower()
+
+
+# --------------------------------------------------------------------------- #
 # launcher entry resolution
 # --------------------------------------------------------------------------- #
 

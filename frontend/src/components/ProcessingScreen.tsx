@@ -5,7 +5,13 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { bridge } from "@/lib/bridge";
-import type { DraftRevision, ExportResult, ProcessingContext } from "@/types";
+import type {
+  DraftRevision,
+  ExportResult,
+  ItemSummary,
+  ProcessingContext,
+  PublishJob,
+} from "@/types";
 
 const POLL_INTERVAL_MS = 4000;
 const JOB_POLL_INTERVAL_MS = 1000;
@@ -65,6 +71,10 @@ export function ProcessingScreen() {
     null,
   );
   const [exportedPath, setExportedPath] = useState<string | null>(null);
+  const [items, setItems] = useState<ItemSummary[]>([]);
+  const [publishJobs, setPublishJobs] = useState<PublishJob[]>([]);
+  const [scheduleAt, setScheduleAt] = useState("");
+  const [publishMessage, setPublishMessage] = useState<string | null>(null);
 
   // The revision currently loaded into the editor, and the user's edits on top.
   const [loadedRevision, setLoadedRevision] = useState<DraftRevision | null>(null);
@@ -90,18 +100,40 @@ export function ProcessingScreen() {
     setPendingRevision(null);
   }, []);
 
-  // Initial context load.
+  const refreshPublishJobs = useCallback((id: number) => {
+    bridge
+      .listPublishJobs(id)
+      .then(setPublishJobs)
+      .catch(() => setPublishJobs([]));
+  }, []);
+
+  const applyContext = useCallback(
+    (ctx: ProcessingContext) => {
+      setContext(ctx);
+      loadRevisionIntoEditor(ctx.latest_revision);
+      setExportedPath(null);
+      setPublishMessage(null);
+      refreshPublishJobs(ctx.item.id);
+      // Tell the backend which item is active so the Codex CLI `current`
+      // command follows this window's selection. Best-effort.
+      void bridge.setActiveItem(ctx.item.id).catch(() => undefined);
+    },
+    [loadRevisionIntoEditor, refreshPublishJobs],
+  );
+
+  // Initial load: item list + the current item's context.
   useEffect(() => {
     let cancelled = false;
     bridge
+      .listItems()
+      .then((list) => {
+        if (!cancelled) setItems(list);
+      })
+      .catch(() => undefined);
+    bridge
       .getContext()
       .then((ctx) => {
-        if (cancelled) return;
-        setContext(ctx);
-        loadRevisionIntoEditor(ctx.latest_revision);
-        // Tell the backend which item is active so the Codex CLI `current`
-        // command follows this window's selection. Best-effort.
-        void bridge.setActiveItem(ctx.item.id).catch(() => undefined);
+        if (!cancelled) applyContext(ctx);
       })
       .catch((err: unknown) =>
         setLoadError(err instanceof Error ? err.message : String(err)),
@@ -109,7 +141,36 @@ export function ProcessingScreen() {
     return () => {
       cancelled = true;
     };
-  }, [loadRevisionIntoEditor]);
+  }, [applyContext]);
+
+  const switchItem = async (id: number) => {
+    if (id === itemId) return;
+    setActionError(null);
+    try {
+      const ctx = await bridge.getContext(id);
+      applyContext(ctx);
+    } catch (err: unknown) {
+      setActionError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const queueForPublish = async (scheduled: string | null) => {
+    if (itemId === null) return;
+    setBusy(true);
+    setActionError(null);
+    setPublishMessage(null);
+    try {
+      const result = await bridge.queueForPublish(itemId, scheduled);
+      setPublishMessage(
+        `${result.created ? "Added to" : "Updated in"} publish queue as ${result.status}.`,
+      );
+      refreshPublishJobs(itemId);
+    } catch (err: unknown) {
+      setActionError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
 
   // Whether a draft provider is configured (enables the Generate button).
   useEffect(() => {
@@ -183,9 +244,11 @@ export function ProcessingScreen() {
         setExportProgress({ value, message }),
       )) as ExportResult;
       setExportedPath(result.processed_path);
-      // Refetch so the item's processed_path is reflected.
+      // Refetch so the item's processed_path is reflected, and refresh queue/list.
       const ctx = await bridge.getContext(itemId);
       setContext(ctx);
+      refreshPublishJobs(itemId);
+      bridge.listItems().then(setItems).catch(() => undefined);
     } catch (err: unknown) {
       setActionError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -263,9 +326,22 @@ export function ProcessingScreen() {
             {dirty && <Badge variant="destructive">unsaved edits</Badge>}
           </div>
           <p className="text-sm text-muted-foreground">
-            {item.title ?? item.source_url}
-            {account?.niche_label ? ` — ${account.niche_label}` : ""}
+            {account?.niche_label ? `${account.niche_label}` : "no account"}
           </p>
+          {items.length > 0 && (
+            <select
+              className="mt-1 h-9 w-full max-w-md rounded-md border border-input bg-transparent px-2 text-sm"
+              value={item.id}
+              onChange={(e) => switchItem(Number(e.target.value))}
+            >
+              {items.map((it) => (
+                <option key={it.id} value={it.id}>
+                  #{it.id} — {it.title ?? it.source_url}
+                  {it.has_processed ? " ✓exported" : it.has_draft ? " ·draft" : ""}
+                </option>
+              ))}
+            </select>
+          )}
         </div>
         <div className="flex flex-col items-end gap-1">
           <Button
@@ -383,6 +459,58 @@ export function ProcessingScreen() {
           Save or discard your edits before exporting.
         </p>
       )}
+
+      <Card>
+        <CardHeader className="flex-row items-center justify-between space-y-0">
+          <CardTitle className="text-base">Publish</CardTitle>
+          {!item.processed_path && (
+            <span className="text-xs text-muted-foreground">export the reel first</span>
+          )}
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              variant="secondary"
+              disabled={!item.processed_path || busy}
+              onClick={() => queueForPublish(null)}
+            >
+              Add to Publish Queue
+            </Button>
+            <input
+              type="datetime-local"
+              className="h-9 rounded-md border border-input bg-transparent px-2 text-sm"
+              value={scheduleAt}
+              onChange={(e) => setScheduleAt(e.target.value)}
+            />
+            <Button
+              disabled={!item.processed_path || !scheduleAt || busy}
+              onClick={() => queueForPublish(scheduleAt)}
+            >
+              Schedule
+            </Button>
+          </div>
+          {publishMessage && <p className="text-sm text-emerald-600">{publishMessage}</p>}
+          {publishJobs.length > 0 ? (
+            <ul className="space-y-1 text-sm">
+              {publishJobs.map((job) => (
+                <li key={job.id} className="flex items-center gap-2">
+                  <Badge variant={job.posted_at ? "default" : "secondary"}>{job.status}</Badge>
+                  <span className="text-muted-foreground">
+                    {job.title ?? "(untitled)"}
+                    {job.scheduled_at ? ` — scheduled ${job.scheduled_at}` : ""}
+                    {job.posted_at ? ` — posted ${job.posted_at}` : ""}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="text-xs text-muted-foreground">
+              No publish-queue entries for this item yet. Posting to Instagram still happens
+              from the desktop app's Publish Queue.
+            </p>
+          )}
+        </CardContent>
+      </Card>
     </div>
   );
 }

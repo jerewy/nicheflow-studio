@@ -22,7 +22,12 @@ from __future__ import annotations
 import logging
 
 from nicheflow_studio.core.ui_prefs import set_ui_pref
-from nicheflow_studio.services import draft_generation, draft_revisions as svc, export as export_svc
+from nicheflow_studio.services import (
+    draft_generation,
+    draft_revisions as svc,
+    export as export_svc,
+    publishing,
+)
 from nicheflow_studio.services.errors import ServiceError
 from nicheflow_studio.services.jobs import JobManager
 
@@ -63,6 +68,11 @@ class ProcessingBridge:
     def __init__(self) -> None:
         # One job manager per window; tracks background generation/export work.
         self._jobs = JobManager()
+
+    @_guard
+    def list_items(self) -> list[dict]:
+        """Recent downloaded items the user can select to process."""
+        return publishing.list_items()
 
     @_guard
     def get_context(self, item_id: int | None = None) -> dict:
@@ -169,3 +179,14 @@ class ProcessingBridge:
         if snapshot is None:
             raise svc.DraftRevisionError(f"Unknown job id {job_id}.")
         return snapshot
+
+    @_guard
+    def list_publish_jobs(self, item_id: int) -> list[dict]:
+        """Publish-queue rows linked to an item."""
+        return publishing.list_publish_jobs(item_id)
+
+    @_guard
+    def queue_for_publish(self, item_id: int, scheduled_at: str | None = None) -> dict:
+        """Add/update the item's exported reel in the publish queue (draft, or
+        scheduled when ``scheduled_at`` is given)."""
+        return publishing.queue_for_publish(item_id, scheduled_at=scheduled_at)

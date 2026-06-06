@@ -11,13 +11,17 @@
 import type {
   ApplyResult,
   DraftRevision,
+  ItemSummary,
   JobSnapshot,
   ProcessingContext,
+  PublishJob,
+  QueueResult,
 } from "@/types";
 
 type Envelope<T> = { ok: true; data: T } | { ok: false; error: string };
 
 interface PywebviewApi {
+  list_items(): Promise<Envelope<ItemSummary[]>>;
   get_context(itemId?: number | null): Promise<Envelope<ProcessingContext>>;
   get_latest_revision(itemId: number): Promise<Envelope<DraftRevision | null>>;
   list_revisions(itemId: number): Promise<Envelope<DraftRevision[]>>;
@@ -43,6 +47,11 @@ interface PywebviewApi {
   ): Promise<Envelope<{ job_id: string }>>;
   start_export(itemId: number): Promise<Envelope<{ job_id: string }>>;
   get_job(jobId: string): Promise<Envelope<JobSnapshot>>;
+  list_publish_jobs(itemId: number): Promise<Envelope<PublishJob[]>>;
+  queue_for_publish(
+    itemId: number,
+    scheduledAt?: string | null,
+  ): Promise<Envelope<QueueResult>>;
 }
 
 declare global {
@@ -66,9 +75,24 @@ async function unwrap<T>(promise: Promise<Envelope<T>>): Promise<T> {
 export const bridge = {
   available: hasBridge,
 
+  listItems(): Promise<ItemSummary[]> {
+    if (!hasBridge()) return mock.listItems();
+    return unwrap(window.pywebview!.api.list_items());
+  },
+
   getContext(itemId?: number | null): Promise<ProcessingContext> {
     if (!hasBridge()) return mock.getContext();
     return unwrap(window.pywebview!.api.get_context(itemId ?? null));
+  },
+
+  listPublishJobs(itemId: number): Promise<PublishJob[]> {
+    if (!hasBridge()) return mock.listPublishJobs();
+    return unwrap(window.pywebview!.api.list_publish_jobs(itemId));
+  },
+
+  queueForPublish(itemId: number, scheduledAt?: string | null): Promise<QueueResult> {
+    if (!hasBridge()) return mock.queueForPublish();
+    return unwrap(window.pywebview!.api.queue_for_publish(itemId, scheduledAt ?? null));
   },
 
   getLatestRevision(itemId: number): Promise<DraftRevision | null> {
@@ -221,6 +245,25 @@ const mock = {
   },
   async startExport(): Promise<{ job_id: string }> {
     return { job_id: "mock-export" };
+  },
+  async listItems() {
+    return [
+      {
+        id: 1,
+        title: "Mock clip (browser dev)",
+        source_url: "https://instagram.com/reel/mock",
+        account_id: 1,
+        status: "completed",
+        has_processed: false,
+        has_draft: true,
+      },
+    ];
+  },
+  async listPublishJobs() {
+    return [];
+  },
+  async queueForPublish() {
+    return { job_id: 1, status: "draft", scheduled_at: null, created: true };
   },
   async getJob(): Promise<JobSnapshot> {
     return {
