@@ -800,14 +800,15 @@ Ordered next work:
 
 ## 13. Recommended Next Step
 
-Build the Processing-first vertical slice from `docs/UI_MIGRATION_PLAN.md`:
+Build the Processing-first vertical slice from `docs/UI_MIGRATION_PLAN.md` (order matches `STATUS.md` and `docs/UI_MIGRATION_PLAN.md`: build the database handoff first so Codex-to-SQLite value lands before the React screen exists):
 
-1. create the pywebview + React shell
-2. add the versioned SQLite draft-revision model, shared service, and Codex-facing CLI
-3. prove Codex can save drafts and the open React UI can refetch them without restart
-4. extract the minimum plain-Python services and UI-independent background-job contract needed by Processing
-5. support direct structured draft generation/revision, selection, export progress, scheduling, and publishing
-6. package and smoke-test the replacement slice before migrating another screen
+1. add the versioned SQLite draft-revision model, shared service, and Codex-facing CLI
+2. prove Codex can save drafts into SQLite and the running app can read them without restart
+3. create the pywebview + React shell
+4. poll/refetch the latest draft revision in React with dirty-edit protection
+5. extract the minimum plain-Python services and UI-independent background-job contract needed by Processing
+6. support direct structured draft generation/revision, selection, export progress, scheduling, and publishing
+7. package and smoke-test the replacement slice before migrating another screen
 
 ## 14. UI Upgrade Plan (Active)
 

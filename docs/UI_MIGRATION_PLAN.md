@@ -38,7 +38,7 @@ Rationale:
 - The React component ecosystem (shadcn/ui, Tailwind, Radix, TanStack, etc.) is identical across pywebview, Tauri, and Electron — it lives in the frontend, not the shell. So "fast dev / good UI library" gives no reason to switch.
 - On Windows, pywebview and Tauri both render through WebView2 (the same Chromium-based engine). pywebview is not slower at drawing UI, and it starts faster than Electron, which bundles its own Chromium.
 - The real performance bottleneck is the Python backend (FFmpeg, Playwright, Apify, AI), which no shell choice speeds up. Perceived speed comes from the background-job + polling architecture and frontend caching/optimistic UI, not from the shell.
-- pywebview is the only option with an in-process Python bridge. Tauri and Electron would force a separate Python process reached over local HTTP (a sidecar/subprocess to manage), adding latency and lifecycle complexity for a solo developer.
+- pywebview is the only option with an in-process Python bridge. Tauri and Electron would require a separately managed Python process reached through an IPC mechanism (local HTTP, stdio, or another channel) — adding cross-process latency and process lifecycle management (startup, crash handling, shutdown) for a solo developer.
 - Bundle size: pywebview and Tauri are tiny; Electron ships 120MB+.
 
 Net: pywebview maximizes both stated goals (rich React ecosystem + small/simple ship) with the simplest backend integration. Fallback if a concrete WebView2 wall appears during the Processing slice is Tauri (keeps the small bundle), decided with evidence — not Electron.
