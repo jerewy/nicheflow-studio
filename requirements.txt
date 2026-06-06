@@ -1,6 +1,11 @@
 # UI Framework
 PyQt6==6.6.1
 PyQt6-Qt6==6.6.1
+# Webview shell for the incremental React UI migration (docs/UI_MIGRATION_PLAN.md).
+# Hosts the Vite/React Processing screen in an OS WebView2 window and exposes the
+# Python draft-revision service through an in-process bridge. Runs alongside the
+# existing PyQt app until the migrated slice is validated.
+pywebview==5.3.2
 
 # Database
 SQLAlchemy==2.0.25
