@@ -4,7 +4,7 @@ import { OptionCard } from "@/components/OptionCard";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { bridge } from "@/lib/bridge";
+import { bridge, whenBridgeReady } from "@/lib/bridge";
 import type {
   DraftRevision,
   ExportResult,
@@ -75,6 +75,7 @@ export function ProcessingScreen() {
   const [publishJobs, setPublishJobs] = useState<PublishJob[]>([]);
   const [scheduleAt, setScheduleAt] = useState("");
   const [publishMessage, setPublishMessage] = useState<string | null>(null);
+  const [isDesktop, setIsDesktop] = useState(false);
 
   // The revision currently loaded into the editor, and the user's edits on top.
   const [loadedRevision, setLoadedRevision] = useState<DraftRevision | null>(null);
@@ -121,23 +122,32 @@ export function ProcessingScreen() {
     [loadRevisionIntoEditor, refreshPublishJobs],
   );
 
-  // Initial load: item list + the current item's context.
+  // Wait for the pywebview bridge to be injected before the first load, so a
+  // real desktop window doesn't briefly fall back to the browser mock.
   useEffect(() => {
     let cancelled = false;
-    bridge
-      .listItems()
-      .then((list) => {
-        if (!cancelled) setItems(list);
-      })
-      .catch(() => undefined);
-    bridge
-      .getContext()
-      .then((ctx) => {
-        if (!cancelled) applyContext(ctx);
-      })
-      .catch((err: unknown) =>
-        setLoadError(err instanceof Error ? err.message : String(err)),
-      );
+    whenBridgeReady().then((ready) => {
+      if (cancelled) return;
+      setIsDesktop(ready);
+      bridge
+        .canGenerate()
+        .then(setCanGenerate)
+        .catch(() => setCanGenerate(false));
+      bridge
+        .listItems()
+        .then((list) => {
+          if (!cancelled) setItems(list);
+        })
+        .catch(() => undefined);
+      bridge
+        .getContext()
+        .then((ctx) => {
+          if (!cancelled) applyContext(ctx);
+        })
+        .catch((err: unknown) =>
+          setLoadError(err instanceof Error ? err.message : String(err)),
+        );
+    });
     return () => {
       cancelled = true;
     };
@@ -171,11 +181,6 @@ export function ProcessingScreen() {
       setBusy(false);
     }
   };
-
-  // Whether a draft provider is configured (enables the Generate button).
-  useEffect(() => {
-    bridge.canGenerate().then(setCanGenerate).catch(() => setCanGenerate(false));
-  }, []);
 
   // Poll for newer revisions (Codex writes, or another window's edits).
   useEffect(() => {
@@ -319,7 +324,7 @@ export function ProcessingScreen() {
         <div className="space-y-1">
           <div className="flex items-center gap-2">
             <h1 className="text-2xl font-semibold tracking-tight">Processing</h1>
-            {!bridge.available() && <Badge variant="outline">browser preview</Badge>}
+            {!isDesktop && <Badge variant="outline">browser preview</Badge>}
             {loadedRevision && (
               <Badge variant="secondary">revision {loadedRevision.revision_number}</Badge>
             )}

@@ -64,6 +64,44 @@ function hasBridge(): boolean {
   return typeof window !== "undefined" && window.pywebview?.api !== undefined;
 }
 
+let readyPromise: Promise<boolean> | null = null;
+
+/**
+ * Resolve once the pywebview Python API is injected (it arrives asynchronously
+ * and fires a `pywebviewready` event after the page loads). Resolves `true` when
+ * the bridge is present, or `false` after `timeoutMs` — i.e. plain-browser dev,
+ * where the in-memory mock is used instead. Cached so every caller shares one wait.
+ */
+export function whenBridgeReady(timeoutMs = 4000): Promise<boolean> {
+  if (readyPromise) return readyPromise;
+  readyPromise = new Promise<boolean>((resolve) => {
+    if (hasBridge()) {
+      resolve(true);
+      return;
+    }
+    let settled = false;
+    const finish = (value: boolean) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    // pywebview fires this once the API binding is ready.
+    window.addEventListener("pywebviewready", () => finish(true), { once: true });
+    // Fallback poll in case the event fired before this listener attached.
+    const start = Date.now();
+    const timer = window.setInterval(() => {
+      if (hasBridge()) {
+        window.clearInterval(timer);
+        finish(true);
+      } else if (Date.now() - start > timeoutMs) {
+        window.clearInterval(timer);
+        finish(false);
+      }
+    }, 50);
+  });
+  return readyPromise;
+}
+
 async function unwrap<T>(promise: Promise<Envelope<T>>): Promise<T> {
   const result = await promise;
   if (!result.ok) {
