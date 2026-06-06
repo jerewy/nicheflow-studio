@@ -106,7 +106,9 @@ class DownloadItem(Base):
     smart_provider_label: Mapped[str | None] = mapped_column(String(256), nullable=True)
     smart_generation_meta: Mapped[str | None] = mapped_column(String(4096), nullable=True)
     smart_vision_payload: Mapped[str | None] = mapped_column(String(8192), nullable=True)
-    smart_generated_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    smart_generated_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     review_state: Mapped[str] = mapped_column(String(32), default="new")
     account_id: Mapped[int | None] = mapped_column(ForeignKey("accounts.id"), nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="queued")
@@ -219,7 +221,9 @@ class Source(Base):
     source_url: Mapped[str] = mapped_column(String(2048))
     enabled: Mapped[int] = mapped_column(Integer, default=1)
     priority: Mapped[int] = mapped_column(Integer, default=100)
-    last_scraped_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_scraped_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     last_seen_external_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     last_run_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
     last_error_summary: Mapped[str | None] = mapped_column(String(512), nullable=True)
@@ -277,7 +281,9 @@ class MediaAsset(Base):
     file_size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # "pending" until the original is on disk, then "downloaded".
     download_status: Mapped[str] = mapped_column(String(32), default="pending")
-    downloaded_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    downloaded_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     checksum: Mapped[str | None] = mapped_column(String(128), nullable=True)
     # Perceptual fingerprint (processing/dedup.py) for CONTENT dedup: catches the
     # same footage reposted under different shortcodes, which URL dedup misses.
@@ -350,9 +356,64 @@ class Assignment(Base):
     # on another same-niche account (Phase 5).
     reuse_iteration: Mapped[int] = mapped_column(Integer, default=0)
     # Set once Phase 4 renders this assignment into a publishable UploadJob.
-    upload_job_id: Mapped[int | None] = mapped_column(
-        ForeignKey("upload_jobs.id"), nullable=True
-    )
+    upload_job_id: Mapped[int | None] = mapped_column(ForeignKey("upload_jobs.id"), nullable=True)
 
     pool_item: Mapped[PoolItem] = relationship(back_populates="assignments")
     account: Mapped[Account] = relationship()
+
+
+class DraftRevision(Base):
+    """A versioned snapshot of generated Processing draft options for one
+    :class:`DownloadItem` (docs/UI_MIGRATION_PLAN.md "Database-Backed Codex
+    Draft Handoff").
+
+    Codex and the React/pywebview UI both read and write these through
+    ``nicheflow_studio.services.draft_revisions`` — the CLI is only an adapter;
+    rules live in the service. Each saved set of options inserts a new row with
+    an incremented ``revision_number``, so history is preserved and recoverable.
+    Applying a revision copies the chosen option onto the item's ``title_draft``
+    / ``caption_draft`` (and mirrors the ``smart_*`` fields) so the existing
+    export/publish path stays compatible.
+
+    This is a new table, so ``Base.metadata.create_all`` creates it on both
+    fresh and existing databases; no manual column migration is required.
+    """
+
+    __tablename__ = "draft_revisions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: dt.datetime.now(dt.timezone.utc)
+    )
+
+    download_item_id: Mapped[int] = mapped_column(ForeignKey("download_items.id"), index=True)
+    # Per-item monotonic version (1, 2, 3, ...). Assigned by the service, not the DB.
+    revision_number: Mapped[int] = mapped_column(Integer, default=1)
+    # Who produced this revision: "codex" | "groq" | "ollama" | "paste" | "manual".
+    source: Mapped[str] = mapped_column(String(32), default="codex")
+
+    summary: Mapped[str | None] = mapped_column(String(4096), nullable=True)
+    # JSON arrays of strings (mirrors the DownloadItem.smart_* serialization).
+    title_options: Mapped[str | None] = mapped_column(String(8192), nullable=True)
+    caption_options: Mapped[str | None] = mapped_column(String(16384), nullable=True)
+    option_notes: Mapped[str | None] = mapped_column(String(8192), nullable=True)
+    option_tiers: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+
+    # 1-based option numbers, matching the "Title Option N" product convention.
+    recommended_title_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    recommended_caption_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    recommendation_reason: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+
+    title_style_preset: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    caption_style_preset: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    provider_label: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    generation_meta: Mapped[str | None] = mapped_column(String(4096), nullable=True)
+    vision_payload: Mapped[str | None] = mapped_column(String(8192), nullable=True)
+
+    # Set when an option from this revision is applied to the item's final draft.
+    applied_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    applied_title_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    applied_caption_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    download_item: Mapped["DownloadItem"] = relationship()
