@@ -126,7 +126,7 @@ Grounded in `src/nicheflow_studio/`:
 | Source + run tracking | `db/models.py::Source`, `ScrapeRun` | per-account; `items_fetched/accepted/...` |
 | Download flow | `db/models.py::DownloadItem`, `queue.py` | `account_id` nullable; `video_id` present |
 | Title/caption generation | `processing/smart_drafts.py` | niche-aware (history/movie/meme/cinema profiles) |
-| Manual publish queue | `db/models.py::UploadJob`, `publisher/` | posted metrics on the row |
+| Publish queue + automated publisher | `db/models.py::UploadJob`, `publisher/` | scheduling, publish state, posted metrics |
 | Multi-profile login + health | `core/instagram_profile_pool.py`, `core/account_health.py` | weekly re-login cadence |
 
 **The scraping engine is essentially done.** The gap is the **data model**, not the scrape.
@@ -296,7 +296,7 @@ Revisit after we post and measure our own results (Phase 5 loop).
 ### Phase 4 — Draft + render per assignment
 - Generate per-account title/caption via existing `smart_drafts.py` niche profiles.
 - Render account-specific output; track `render_output_path`. Reuse current Processing/export.
-- Feeds the existing manual Publish Queue (`UploadJob`/`publisher/`).
+- Feeds the existing Publish Queue and automated publisher (`UploadJob`/`publisher/`).
 
 ### Phase 5 — Reuse + performance loop
 - `MIN_REUSE_GAP_DAYS = 14` (configurable), `reuse_iteration`, reuse limits

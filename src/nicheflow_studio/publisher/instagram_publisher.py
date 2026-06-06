@@ -381,6 +381,19 @@ async def _publish_reel_async(
             "user_data_dir": str(profile_dir.resolve()),
             "headless": False,
             "viewport": {"width": 1280, "height": 900},
+            # Stay non-headless (a real Chrome window is far less bot-like than
+            # headless) but: (1) start minimized so it doesn't steal focus, and
+            # (2) strip the obvious automation fingerprints Instagram can read —
+            # the "--enable-automation" switch (the "controlled by automated test
+            # software" banner) and the AutomationControlled blink flag that sets
+            # navigator.webdriver=true. NOTE: this only lowers the *technical*
+            # fingerprint; account safety still depends mostly on human-like
+            # pacing and not over-posting (handled by the publish scheduler/jitter).
+            "args": [
+                "--start-minimized",
+                "--disable-blink-features=AutomationControlled",
+            ],
+            "ignore_default_args": ["--enable-automation"],
         }
         if channel:  # real Chrome looks less like automation than bundled Chromium
             launch_kwargs["channel"] = channel
@@ -396,6 +409,23 @@ async def _publish_reel_async(
             context = await playwright.chromium.launch_persistent_context(**launch_kwargs)
 
         page = context.pages[0] if context.pages else await context.new_page()
+        # Force-minimize through the DevTools protocol. A persistent Chrome profile
+        # restores its saved window state and IGNORES --start-minimized, so the flag
+        # alone doesn't keep the publish window out of the way — this does. Automation
+        # (file upload, clicks) is CDP-driven and works fine while minimized. Cosmetic
+        # only: never fail a publish if minimizing doesn't take.
+        try:
+            cdp_session = await context.new_cdp_session(page)
+            window_info = await cdp_session.send("Browser.getWindowForTarget")
+            await cdp_session.send(
+                "Browser.setWindowBounds",
+                {
+                    "windowId": window_info["windowId"],
+                    "bounds": {"windowState": "minimized"},
+                },
+            )
+        except Exception:  # noqa: BLE001 - minimizing is cosmetic
+            log.debug("could not minimize publish window", exc_info=True)
         try:
             await page.goto(INSTAGRAM_URL, wait_until="domcontentloaded", timeout=60000)
             if not await _has_session(context):

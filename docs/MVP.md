@@ -1,44 +1,48 @@
-# NicheFlow Studio - MVP Scope (Windows-first)
+# NicheFlow Studio - Current Operational Scope (Windows-first)
 
-This MVP is designed to be runnable and useful quickly, while keeping the codebase structured for later growth.
+Last updated: 2026-06-06
 
-## In Scope (MVP)
+This document describes the product loop that already exists and must remain working while the UI is migrated incrementally.
 
-- Windows-only desktop app (PyQt6)
-- Local runtime directory: `data/` (ignored by git)
+## In Scope
+
+- Windows-first desktop application
+- Current UI: PyQt6
+- Target UI: pywebview + Vite/React/TypeScript/Tailwind/shadcn, migrated one workflow at a time
+- Existing Python backend remains in place
+- Local runtime data under `data/`:
   - SQLite DB: `data/nicheflow.db`
-  - Downloads: `data/downloads/`
-  - Processed Reels: `data/processed/`
-  - Logs: `data/logs/`
-- Instagram-first publishing workflow:
-  - prepare Instagram-ready vertical Reels
-  - copy captions
-  - open the exported Reel
-  - mark posts as posted
-  - manually track posted URL and basic metrics
-- YouTube ingestion via `yt-dlp` as a source pipeline, including YouTube Shorts URLs:
-  - paste URL -> download -> record in DB -> show status in UI
-- Instagram source intake via Apify:
-  - save Instagram Reel/profile/hashtag references as candidate ideas
-  - fetch public metadata through `apify/instagram-scraper`
-  - review candidates alongside other sources
-  - keep logged-in Instagram scraping out of the normal app flow
-- Processing workflow:
-  - black-canvas/no-blur vertical template
-  - clean title rendering
-  - editable caption metadata
-  - processed output can be added to the Publish Queue
+  - downloads, processed Reels, logs, browser profiles, temp files, and caches
+- Instagram-first source and publishing workflow:
+  - Apify-backed source intake
+  - public Reel/post download and local MP4 import
+  - shared niche pools, global media deduplication, assignments, and multi-account distribution
+  - smart draft generation with editable title/caption options
+  - Instagram-ready rendering and export
+  - publish now, scheduling, batch publishing, and automatic due-post checks
+  - account session health and publish safeguards
+- YouTube/YouTube Shorts via `yt-dlp` as a secondary intake path
+- Background workers for scraping, generation, rendering, and publishing
+- Packaged Windows delivery
 
-## Out of Scope (Later)
+## Active Milestone
 
-- Official Instagram Graph API intake and publishing automation
-- TikTok ingestion
-- "Stealth" automation such as fingerprinting, human-sim input, or logged-in scraping
-- Reposting Instagram content without rights
-- ML verification pipeline such as embeddings, drift detection, or Whisper
-- Analytics dashboards beyond manual metric tracking
+Migrate the Processing workflow as the first pywebview/React vertical slice while preserving the current PyQt workflow until the replacement is packaged and validated.
+
+See `UI_MIGRATION_PLAN.md` for the migration contract and `SOURCING_POOLING_PLAN.md` for the current sourcing/distribution architecture.
+
+## Out of Scope For Now
+
+- TikTok ingestion or publishing
+- Official Instagram Graph API integration
+- Evasion or stealth systems intended to bypass platform safeguards
+- Reposting content without rights
+- Cloud sync and multi-device web access
+- Broad analytics dashboards
+- Speculative ML pipelines such as embeddings, virality scoring, or drift detection
+- Rewriting the Python backend, replacing SQLite, or moving media processing into the frontend
 
 ## Non-Goals
 
-- Cross-platform packaging in MVP; keep code mostly portable, but ship Windows first
-- Perfect UI/UX polish; functional and reliable comes first
+- Cross-platform packaging during the current migration
+- Migrating every screen before the Processing vertical slice is packaged and validated

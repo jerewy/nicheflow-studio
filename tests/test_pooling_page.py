@@ -8,7 +8,15 @@ from types import SimpleNamespace
 
 from nicheflow_studio.app.main_window import MainWindow
 from nicheflow_studio.db.assignments import distribute_niche
-from nicheflow_studio.db.models import Account, Assignment, DownloadItem, PoolItem, ScrapeCandidate
+from nicheflow_studio.db.models import (
+    Account,
+    Assignment,
+    DownloadItem,
+    MediaAsset,
+    PoolItem,
+    ScrapeCandidate,
+    Source,
+)
 from nicheflow_studio.db.pools import accept_candidate_into_pool
 from nicheflow_studio.db.session import get_session, init_db
 
@@ -305,10 +313,11 @@ def test_pool_niche_filter_limits_table_to_selected_niche(qt_app, tmp_path: Path
         _teardown(window)
 
 
-def test_pool_add_source_attaches_to_niche_accounts(qt_app, tmp_path: Path) -> None:
+def test_pool_add_source_registers_one_niche_seed_source(qt_app, tmp_path: Path) -> None:
     init_db()
     with get_session() as session:
         session.add(Account(name="Hist A", platform="instagram", instagram_profile="ha", niche="history"))
+        session.add(Account(name="Hist B", platform="instagram", instagram_profile="hb", niche="history"))
         session.commit()
 
     window = MainWindow()
@@ -322,9 +331,10 @@ def test_pool_add_source_attaches_to_niche_accounts(qt_app, tmp_path: Path) -> N
         window._on_pool_add_source_clicked()
         qt_app.processEvents()
 
-        from nicheflow_studio.db.models import Source
         with get_session() as session:
-            urls = [s.source_url for s in session.query(Source).all()]
+            sources = session.query(Source).all()
+            urls = [s.source_url for s in sources]
+        assert len(sources) == 1
         assert any("thehistologian" in u for u in urls)
     finally:
         _teardown(window)
@@ -377,7 +387,6 @@ def test_pool_accept_only_uses_downloads_from_that_niche(qt_app, tmp_path: Path)
 
 def test_pool_source_inventory_shows_scraped_source_counts(qt_app, tmp_path: Path) -> None:
     init_db()
-    from nicheflow_studio.db.models import ScrapeCandidate, Source
 
     with get_session() as session:
         account = Account(
@@ -443,8 +452,305 @@ def test_pool_source_inventory_shows_scraped_source_counts(qt_app, tmp_path: Pat
         qt_app.processEvents()
 
         assert window._pooling_source_table.rowCount() == 1
-        assert window._pooling_source_table.item(0, 0).text() == "@theanomalists"
-        assert window._pooling_source_table.item(0, 2).text() == "2"
-        assert window._pooling_source_table.item(0, 3).text() == "1"
+        assert window._pooling_source_table.item(0, 0).text() == "Combined sources"
+        assert window._pooling_source_table.horizontalHeaderItem(1).text() == "Niche"
+        assert window._pooling_source_table.item(0, 1).text() == "History"
+        assert window._pooling_source_table.item(0, 2).text() == "1"
+        assert window._pooling_source_table.item(0, 3).text() == "2"
+        assert window._pooling_source_table.item(0, 4).text() == "2"
+    finally:
+        _teardown(window)
+
+
+def test_pool_source_inventory_groups_duplicate_seed_sources(qt_app, tmp_path: Path) -> None:
+    init_db()
+
+    with get_session() as session:
+        first = Account(
+            name="Past Moments Daily",
+            platform="instagram",
+            instagram_profile="pastmomentsdaily",
+            niche="history",
+        )
+        second = Account(
+            name="History Clips Daily",
+            platform="instagram",
+            instagram_profile="historyclipsdaily",
+            niche="history",
+        )
+        session.add_all([first, second])
+        session.flush()
+        first_source = Source(
+            account_id=first.id,
+            platform="instagram",
+            source_type="instagram_profile",
+            label="@crazyfactscorner",
+            source_url="https://www.instagram.com/crazyfactscorner/",
+        )
+        second_source = Source(
+            account_id=second.id,
+            platform="instagram",
+            source_type="instagram_profile",
+            label="@crazyfactscorner",
+            source_url="https://www.instagram.com/crazyfactscorner/",
+        )
+        session.add_all([first_source, second_source])
+        session.flush()
+        session.add(
+            ScrapeCandidate(
+                scrape_source_url=first_source.source_url,
+                source_url="https://www.instagram.com/reel/CRAZY01/",
+                extractor="instagram",
+                video_id="CRAZY01",
+                title="Crazy facts clip",
+                channel_name="crazyfactscorner",
+                state="candidate",
+                source_id=first_source.id,
+                account_id=first.id,
+            )
+        )
+        session.add(
+            ScrapeCandidate(
+                scrape_source_url=second_source.source_url,
+                source_url="https://www.instagram.com/reel/CRAZY01/?utm_source=copy",
+                extractor="instagram",
+                video_id="CRAZY01",
+                title="Same crazy facts clip",
+                channel_name="crazyfactscorner",
+                state="candidate",
+                source_id=second_source.id,
+                account_id=second.id,
+            )
+        )
+        session.commit()
+
+    window = MainWindow()
+    try:
+        window.show()
+        window._set_current_page("pooling")
+        window._pooling_niche_combo.setCurrentIndex(window._pooling_niche_combo.findData("history"))
+        qt_app.processEvents()
+
+        assert window._pooling_source_table.rowCount() == 1
+        assert window._pooling_source_table.item(0, 0).text() == "Combined sources"
+        assert window._pooling_source_table.item(0, 1).text() == "History"
+        assert window._pooling_source_table.item(0, 2).text() == "1"
+        assert window._pooling_source_table.item(0, 3).text() == "2"
+        assert window._pooling_source_table.item(0, 4).text() == "1"
+        assert window._pooling_source_table.item(0, 5).text() == "1"
+    finally:
+        _teardown(window)
+
+
+def test_pool_source_summary_counts_unique_candidates_across_sources(
+    qt_app, tmp_path: Path
+) -> None:
+    init_db()
+
+    with get_session() as session:
+        account = Account(
+            name="Past Moments Daily",
+            platform="instagram",
+            instagram_profile="pastmomentsdaily",
+            niche="history",
+        )
+        session.add(account)
+        session.flush()
+        anomalists = Source(
+            account_id=account.id,
+            platform="instagram",
+            source_type="instagram_profile",
+            label="@theanomalists",
+            source_url="https://www.instagram.com/theanomalists/",
+        )
+        crazy = Source(
+            account_id=account.id,
+            platform="instagram",
+            source_type="instagram_profile",
+            label="@crazyfactscorner",
+            source_url="https://www.instagram.com/crazyfactscorner/",
+        )
+        session.add_all([anomalists, crazy])
+        session.flush()
+        session.add(
+            ScrapeCandidate(
+                scrape_source_url=anomalists.source_url,
+                source_url="https://www.instagram.com/reel/SAME01/",
+                extractor="instagram",
+                video_id="SAME01",
+                title="Shared clip",
+                channel_name="theanomalists",
+                state="candidate",
+                source_id=anomalists.id,
+                account_id=account.id,
+            )
+        )
+        session.add(
+            ScrapeCandidate(
+                scrape_source_url=crazy.source_url,
+                source_url="https://www.instagram.com/reel/SAME01/?utm_source=copy",
+                extractor="instagram",
+                video_id="SAME01",
+                title="Shared clip repost",
+                channel_name="crazyfactscorner",
+                state="candidate",
+                source_id=crazy.id,
+                account_id=account.id,
+            )
+        )
+        session.commit()
+
+    window = MainWindow()
+    try:
+        window.show()
+        window._set_current_page("pooling")
+        window._pooling_niche_combo.setCurrentIndex(window._pooling_niche_combo.findData("history"))
+        qt_app.processEvents()
+
+        assert "2 scraped, 1 unique, 1 duplicate across sources" in (
+            window._pooling_sources_label.text()
+        )
+    finally:
+        _teardown(window)
+
+
+def test_pool_source_inventory_counts_candidates(qt_app) -> None:
+    # Footage-fingerprint dedup used to be computed here (an O(n^2) match over the
+    # whole pool on every page refresh), which hung the page on a large pool. It's
+    # been retired from the page — footage dedup runs in the dedicated download/
+    # fingerprint flow instead — so the (now hidden) "video dupes" column reads 0.
+    init_db()
+
+    with get_session() as session:
+        account = Account(
+            name="Past Moments Daily",
+            platform="instagram",
+            instagram_profile="pastmomentsdaily",
+            niche="history",
+        )
+        session.add(account)
+        session.flush()
+        source = Source(
+            account_id=account.id,
+            platform="instagram",
+            source_type="instagram_profile",
+            label="@theanomalists",
+            source_url="https://www.instagram.com/theanomalists/",
+        )
+        session.add(source)
+        session.flush()
+        first_asset = MediaAsset(
+            platform="instagram",
+            canonical_source_url="https://www.instagram.com/reel/VIDEOA",
+            source_shortcode="VIDEOA",
+            download_status="downloaded",
+            content_hash="1111111111111111,2222222222222222",
+        )
+        second_asset = MediaAsset(
+            platform="instagram",
+            canonical_source_url="https://www.instagram.com/reel/VIDEOB",
+            source_shortcode="VIDEOB",
+            download_status="downloaded",
+            content_hash="1111111111111111,2222222222222222",
+        )
+        session.add_all([first_asset, second_asset])
+        session.add_all(
+            [
+                ScrapeCandidate(
+                    scrape_source_url=source.source_url,
+                    source_url="https://www.instagram.com/reel/VIDEOA/",
+                    extractor="instagram",
+                    video_id="VIDEOA",
+                    title="First video",
+                    channel_name="theanomalists",
+                    state="candidate",
+                    source_id=source.id,
+                    account_id=account.id,
+                ),
+                ScrapeCandidate(
+                    scrape_source_url=source.source_url,
+                    source_url="https://www.instagram.com/reel/VIDEOB/",
+                    extractor="instagram",
+                    video_id="VIDEOB",
+                    title="Second repost",
+                    channel_name="theanomalists",
+                    state="candidate",
+                    source_id=source.id,
+                    account_id=account.id,
+                ),
+            ]
+        )
+        session.commit()
+
+    window = MainWindow()
+    try:
+        window.show()
+        window._set_current_page("pooling")
+        window._pooling_niche_combo.setCurrentIndex(window._pooling_niche_combo.findData("history"))
+        qt_app.processEvents()
+
+        assert window._pooling_source_table.item(0, 3).text() == "2"  # scraped
+        assert window._pooling_source_table.item(0, 4).text() == "2"  # unique URLs
+        assert window._pooling_source_table.item(0, 5).text() == "0"  # URL dupes
+        # Video-dupe counting retired from the page refresh (was an O(n^2) hang).
+        assert window._pooling_source_table.item(0, 6).text() == "0"
+    finally:
+        _teardown(window)
+
+
+def test_pool_archive_scrape_starts_selected_source_job(qt_app, monkeypatch) -> None:
+    init_db()
+    captured = {}
+
+    with get_session() as session:
+        account = Account(
+            name="Past Moments Daily",
+            platform="instagram",
+            instagram_profile="pastmomentsdaily",
+            niche="history",
+            scrape_max_items=50,
+        )
+        session.add(account)
+        session.flush()
+        source = Source(
+            account_id=account.id,
+            platform="instagram",
+            source_type="instagram_profile",
+            label="@crazyfactscorner",
+            source_url="https://www.instagram.com/crazyfactscorner/",
+        )
+        session.add(source)
+        session.commit()
+        source_id = source.id
+
+    window = MainWindow()
+    try:
+        monkeypatch.setattr(window, "_confirm_instagram_scrape", lambda **_: True)
+
+        def fake_start_scrape_job(job):
+            captured["account_id"] = job.account_id
+            captured["source_ids"] = job.source_ids
+            captured["max_items"] = job.max_items
+            captured["max_age_days"] = job.max_age_days
+            captured["min_view_count"] = job.min_view_count
+            captured["min_like_count"] = job.min_like_count
+            captured["archive_backfill"] = job.archive_backfill
+
+        monkeypatch.setattr(window, "_start_scrape_job", fake_start_scrape_job)
+
+        window.show()
+        window._set_current_page("pooling")
+        window._pooling_niche_combo.setCurrentIndex(window._pooling_niche_combo.findData("history"))
+        window._pooling_archive_limit_input.setValue(1314)
+        qt_app.processEvents()
+
+        window._on_pool_scrape_source_clicked(archive_backfill=True)
+
+        assert captured["source_ids"] == [source_id]
+        assert captured["max_items"] == 1314
+        assert captured["max_age_days"] is None
+        assert captured["min_view_count"] == 0
+        assert captured["min_like_count"] == 0
+        assert captured["archive_backfill"] is True
     finally:
         _teardown(window)

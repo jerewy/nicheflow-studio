@@ -420,6 +420,9 @@ CONTENT_RECT_ROW_SHARP_MIN = 0.18
 # sharp-edge gate because of the text drawn on them.
 CONTENT_RECT_OVERLAY_BAR_BRIGHTNESS_MIN = 200.0
 CONTENT_RECT_OVERLAY_BAR_MOTION_MAX = 1.5
+# The bottom edge often lands on the subtitle ink bbox. Keep a small guard so
+# descenders/antialias pixels in baked-in captions ("g", "p", "y") survive.
+CONTENT_RECT_BOTTOM_DESCENDER_PADDING_RATIO = 0.006
 
 
 def _downscale_frame(frame, target_width: int):  # noqa: ANN001
@@ -687,11 +690,12 @@ def detect_content_rectangle(input_path: Path, probe: VideoProbe) -> CropSetting
         buffer = max(4, int(min_h * 0.008))
         top_band_index = min(last_text_y + 1 + buffer, scan_end)
 
+    bottom_padding = max(4, int(probe.height * CONTENT_RECT_BOTTOM_DESCENDER_PADDING_RATIO))
     crop = CropSettings(
         left=int((col_band[0] / min_w) * probe.width),
         top=int((top_band_index / min_h) * probe.height),
         right=int(((min_w - 1 - col_band[1]) / min_w) * probe.width),
-        bottom=int(((min_h - 1 - row_band[1]) / min_h) * probe.height),
+        bottom=max(0, int(((min_h - 1 - row_band[1]) / min_h) * probe.height) - bottom_padding),
     )
     remaining_w = probe.width - crop.left - crop.right
     remaining_h = probe.height - crop.top - crop.bottom

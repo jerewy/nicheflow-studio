@@ -759,6 +759,31 @@ def test_detect_content_rectangle_finds_moving_footage(monkeypatch, tmp_path: Pa
     assert abs(rect.right - 40) <= 30
 
 
+def test_detect_content_rectangle_keeps_bottom_descender_padding(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import numpy as np
+
+    input_path = tmp_path / "clip.mp4"
+    input_path.write_bytes(b"video")
+    probe = VideoProbe(width=200, height=400, duration_seconds=20.0)
+    rng = np.random.default_rng(0)
+
+    def fake_load(path, timestamp):  # noqa: ANN001, ARG001
+        frame = np.zeros((400, 200, 3), dtype=np.uint8)
+        frame[100:300, 40:160, :] = rng.integers(60, 255, size=(200, 120, 3), dtype=np.uint8)
+        return frame
+
+    monkeypatch.setattr(video, "_load_video_frame_at", fake_load)
+
+    rect = video.detect_content_rectangle(input_path, probe)
+
+    assert rect is not None
+    # Without the descender guard this synthetic rectangle ends near bottom=100.
+    assert rect.bottom < 100
+    assert rect.bottom >= 90
+
+
 def test_detect_content_rectangle_returns_none_for_full_frame_footage(
     monkeypatch, tmp_path: Path
 ) -> None:

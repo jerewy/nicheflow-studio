@@ -3474,6 +3474,229 @@ def test_processing_add_to_schedule_updates_existing_export_job(qt_app, tmp_path
         window.close()
 
 
+def test_processing_auto_schedule_assigns_future_slot(qt_app, tmp_path: Path) -> None:
+    init_db()
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"video")
+    output_path = processed_dir() / "clip_cropped.mp4"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(b"processed")
+
+    with get_session() as session:
+        account = Account(
+            name="IG Main",
+            platform="instagram",
+            instagram_profile="main",
+            upload_timezone="Asia/Bangkok",
+            upload_schedule_slots="09:00, 18:00",
+        )
+        session.add(account)
+        session.flush()
+        item = DownloadItem(
+            source_url="https://instagram.com/reel/clip",
+            title="Original Clip",
+            status="downloaded",
+            account_id=account.id,
+            file_path=str(video_path),
+        )
+        session.add(item)
+        session.commit()
+        item_id = item.id
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._current_account_combo.setCurrentIndex(1)
+        window._set_current_page("processing")
+        qt_app.processEvents()
+        window._selected_processing_item_id = item_id
+        window._processing_last_output_path = output_path
+
+        window._on_processing_auto_schedule_clicked()
+
+        with get_session() as session:
+            job = session.query(UploadJob).one()
+
+        assert job.status == "scheduled"
+        assert job.scheduled_at is not None
+        scheduled_at = job.scheduled_at
+        if scheduled_at.tzinfo is None:
+            scheduled_at = scheduled_at.replace(tzinfo=dt.timezone.utc)
+        assert scheduled_at > dt.datetime.now(dt.timezone.utc)
+        assert job.timezone == "Asia/Bangkok"
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_processing_auto_schedule_skips_already_taken_slot(qt_app, tmp_path: Path) -> None:
+    init_db()
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"video")
+    first_output = processed_dir() / "clip_a.mp4"
+    second_output = processed_dir() / "clip_b.mp4"
+    first_output.parent.mkdir(parents=True, exist_ok=True)
+    first_output.write_bytes(b"processed-a")
+    second_output.write_bytes(b"processed-b")
+
+    with get_session() as session:
+        account = Account(
+            name="IG Main",
+            platform="instagram",
+            instagram_profile="main",
+            upload_schedule_slots="09:00, 18:00",
+        )
+        session.add(account)
+        session.flush()
+        item = DownloadItem(
+            source_url="https://instagram.com/reel/clip",
+            title="Original Clip",
+            status="downloaded",
+            account_id=account.id,
+            file_path=str(video_path),
+        )
+        session.add(item)
+        session.commit()
+        item_id = item.id
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._current_account_combo.setCurrentIndex(1)
+        window._set_current_page("processing")
+        qt_app.processEvents()
+        window._selected_processing_item_id = item_id
+
+        window._processing_last_output_path = first_output
+        window._on_processing_auto_schedule_clicked()
+        # The post-action refresh clears the processing selection, so re-select
+        # the item before scheduling the second export (mirrors the real flow
+        # where the user picks the next clip).
+        window._selected_processing_item_id = item_id
+        window._processing_last_output_path = second_output
+        window._on_processing_auto_schedule_clicked()
+
+        with get_session() as session:
+            times = [
+                job.scheduled_at
+                for job in session.query(UploadJob).order_by(UploadJob.id.asc()).all()
+            ]
+
+        assert len(times) == 2 and all(t is not None for t in times)
+        # The two exports land on distinct slots, not stacked on one moment.
+        assert abs((times[1] - times[0]).total_seconds()) > 60 * 60
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_processing_publish_now_confirms_then_launches_worker(qt_app, tmp_path: Path) -> None:
+    init_db()
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"video")
+    output_path = processed_dir() / "clip_cropped.mp4"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(b"processed")
+
+    with get_session() as session:
+        account = Account(name="IG Main", platform="instagram", instagram_profile="main")
+        session.add(account)
+        session.flush()
+        item = DownloadItem(
+            source_url="https://instagram.com/reel/clip",
+            title="Original Clip",
+            status="downloaded",
+            account_id=account.id,
+            file_path=str(video_path),
+        )
+        session.add(item)
+        session.commit()
+        item_id = item.id
+
+    window = MainWindow()
+    confirmed: list[int] = []
+    launched: list = []
+    # Stub the high-stakes confirm + the worker launch so no dialog/thread runs.
+    window._confirm_publish_target = lambda job_id: confirmed.append(job_id) or True  # type: ignore[method-assign]
+    window._launch_publish_worker = lambda *a, **k: launched.append(a)  # type: ignore[method-assign]
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._current_account_combo.setCurrentIndex(1)
+        window._set_current_page("processing")
+        qt_app.processEvents()
+        window._selected_processing_item_id = item_id
+        window._processing_last_output_path = output_path
+
+        window._on_processing_publish_now_clicked()
+
+        with get_session() as session:
+            job = session.query(UploadJob).one()
+
+        assert confirmed == [job.id]  # confirm dialog gated the publish
+        assert len(launched) == 1
+        assert launched[0][0] == job.id  # worker launched for the upserted job
+        assert job.status == "ready"
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_processing_publish_now_aborts_when_confirm_declined(qt_app, tmp_path: Path) -> None:
+    init_db()
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"video")
+    output_path = processed_dir() / "clip_cropped.mp4"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(b"processed")
+
+    with get_session() as session:
+        account = Account(name="IG Main", platform="instagram", instagram_profile="main")
+        session.add(account)
+        session.flush()
+        item = DownloadItem(
+            source_url="https://instagram.com/reel/clip",
+            title="Original Clip",
+            status="downloaded",
+            account_id=account.id,
+            file_path=str(video_path),
+        )
+        session.add(item)
+        session.commit()
+        item_id = item.id
+
+    window = MainWindow()
+    launched: list = []
+    window._confirm_publish_target = lambda _job_id: False  # type: ignore[method-assign]
+    window._launch_publish_worker = lambda *a, **k: launched.append(a)  # type: ignore[method-assign]
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._current_account_combo.setCurrentIndex(1)
+        window._set_current_page("processing")
+        qt_app.processEvents()
+        window._selected_processing_item_id = item_id
+        window._processing_last_output_path = output_path
+
+        window._on_processing_publish_now_clicked()
+
+        assert launched == []  # declined confirm -> nothing posted
+        assert window._publish_in_progress is False
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
 def test_processing_export_path_is_unique_per_run(
     monkeypatch,
     qt_app,
@@ -3674,6 +3897,14 @@ def test_processing_export_persists_latest_numbered_output_for_queue(
 
         assert second_window._processing_latest_output_label.text() == "reel_006.mp4"
         assert second_window._processing_add_to_schedule_button.isEnabled() is True
+        assert second_window._processing_add_to_schedule_button.text() == "Publish  ▾"
+        assert second_window._processing_add_to_schedule_button.property(
+            "compactMenuButton"
+        ) is True
+        assert (
+            second_window._processing_add_to_schedule_button.menu().objectName()
+            == "processingPublishMenu"
+        )
 
         second_window._on_add_processed_to_schedule_clicked()
 
@@ -4432,6 +4663,43 @@ def test_schedule_page_keeps_overflow_inside_fixed_table(qt_app, tmp_path: Path)
         window.close()
 
 
+def test_publish_page_clears_stale_processing_height_while_workspace_is_gated(qt_app) -> None:
+    init_db()
+
+    with get_session() as session:
+        session.add(Account(name="IG Main", platform="instagram"))
+        session.commit()
+
+    window = MainWindow()
+    try:
+        window.resize(1280, 760)
+        window.show()
+        qt_app.processEvents()
+
+        window._current_account_combo.setCurrentIndex(1)
+        window._set_current_page("processing")
+        qt_app.processEvents()
+        processing_height = window._processing_page.height()
+
+        window._current_account_combo.setCurrentIndex(0)
+        window._set_current_page("uploads")
+        qt_app.processEvents()
+
+        assert processing_height > window._scroll_area.viewport().height()
+        assert window._uploads_page.height() == window._scroll_area.viewport().height()
+
+        window._current_account_combo.setCurrentIndex(1)
+        qt_app.processEvents()
+
+        assert window._uploads_page.height() == window._scroll_area.viewport().height()
+        assert window._scroll_area.verticalScrollBar().maximum() == 0
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
 def test_processing_generate_drafts_uses_visual_first_smart_drafts(
     monkeypatch,
     qt_app,
@@ -4703,6 +4971,70 @@ def test_processing_copy_chat_prompt_includes_cinema_visual_style_recommendation
         assert "Recommended Style 1:" in prompt
         assert "Recommended Style 2:" in prompt
         assert "Recommended Style 3:" in prompt
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
+def test_processing_copy_chat_prompt_uses_cinema_bold_keyword_title_modes(
+    monkeypatch,
+    qt_app,
+    tmp_path: Path,
+) -> None:
+    init_db()
+    video_path = tmp_path / "cinema_bold_clip.mp4"
+    video_path.write_bytes(b"video")
+
+    with get_session() as session:
+        account = Account(
+            name="Cinema Files Daily",
+            platform="instagram",
+            niche_label="Movie scenes, film recommendations, cinematic moments",
+        )
+        session.add(account)
+        session.flush()
+        session.add(
+            DownloadItem(
+                source_url="https://www.instagram.com/p/DWTz3EgATbi/",
+                title="Batman visual study",
+                source_description="The clip highlights orange light, rain, and a clue.",
+                status="downloaded",
+                account_id=account.id,
+                file_path=str(video_path),
+            )
+        )
+        session.commit()
+        account_id = account.id
+
+    monkeypatch.setattr(
+        "nicheflow_studio.app.main_window.probe_video",
+        lambda _: VideoProbe(width=1080, height=1920, duration_seconds=18.0),
+    )
+    qt_app.clipboard().clear()
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        account_index = window._current_account_combo.findData(account_id)
+        window._current_account_combo.setCurrentIndex(account_index)
+        window._set_current_page("processing")
+        qt_app.processEvents()
+
+        window._apply_processing_template("cinema_bold_keywords")
+        window._on_copy_generation_chat_prompt_clicked()
+        prompt = qt_app.clipboard().text()
+
+        assert "Cinema Bold Keywords" in prompt
+        assert "MIXED INGREDIENTS" in prompt
+        assert "TITLE MODES" in prompt
+        assert "watch-if-you-like" in prompt
+        assert "direct and plain" in prompt
+        assert "rewatch/detail hook" in prompt
+        assert "3 rewrites of the same idea" in prompt
+        assert "TEMPLATE F" not in prompt
     finally:
         window._refresh_timer.stop()
         window._toast_timer.stop()

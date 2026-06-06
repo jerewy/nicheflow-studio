@@ -1,243 +1,106 @@
 # NicheFlow Studio Status
 
-Last updated: 2026-04-16
-
-> **Stale notice (2026-05-31):** this status predates the Instagram auto-publish,
-> session-health, and publish-scheduler work, and predates the Apify shared-pool
-> direction. For the current sourcing/pooling plan see `docs/SOURCING_POOLING_PLAN.md`.
-> The "Windows-only YouTube via yt-dlp" framing below is no longer the product target.
+Last updated: 2026-06-06
 
 ## Current Focus
 
-Finish and harden the first real Processing workflow: better draft generation, more reliable auto-crop, readable title overlays, and faster inspection of processed outputs.
+Begin the incremental UI-layer migration with a Processing-first pywebview/React vertical slice.
 
-## What Is Implemented
+Keep the existing Python backend and operational PyQt workflow working while extracting only the services and background-job boundaries required by the new Processing screen. Package and validate the first replacement slice before migrating another screen.
 
-- Desktop app boots via `python -m nicheflow_studio`
-- PyQt6 main window exists with URL entry, account workspace gating, account CRUD, library table, filters, detail panel, review actions, assignment, retry, remove, open, and reveal-folder flows
-- SQLite schema exists for accounts and download history, with lightweight compatibility upgrades for older DBs
-- `yt-dlp` YouTube / Shorts download wrapper exists and prefers single-file MP4 output
-- Background queue exists with queued/downloading/downloaded/failed states plus retry support
-- Failure messages are sanitized before reaching the UI
-- Run and dev PowerShell scripts exist
-- Runtime data path behavior is now split correctly by context:
-  - source/dev runs default to repo-local `./data`
-  - `NICHEFLOW_DATA_DIR` override still works
-  - packaged Windows runs are coded to default to per-user app data
-- Minimal Windows packaging flow exists via PyInstaller
-- One real packaged smoke test has been completed
-- One real packaged YouTube download has been verified with persisted runtime data after restart
-- Packaged shell-handoff code has now been inspected:
-  - `Open Video` currently uses `os.startfile(file_path)`
-  - `Open Folder` currently uses `os.startfile(path.parent)`
-  - this means current code opens the containing folder, not true Explorer file selection
-- Real packaged shell validation has now been completed manually:
-  - `Open Video` works on a real packaged downloaded file
-  - `Open Folder` works on a real packaged downloaded file
-  - current behavior is acceptable for MVP
-- Lightweight YouTube / Shorts URL validation now runs before queueing
-- Clearer pre-submit messages now exist for malformed, unsupported, playlist, and channel/profile YouTube URLs
-- Minimum useful duplicate protection now blocks same-video resubmits per account across watch/share/shorts URL variants
-- Common downloader-side `yt-dlp` failures now map to clearer UI messages
-- A small maintainability pass has reduced repeated status/toast/refresh logic in `main_window.py` without changing workflow behavior
-- The library UI now surfaces stored extractor/video-id metadata in the detail panel and search flow
-- Account records now store scraping/intake configuration:
-  - YouTube source URLs
-  - max intake items
-  - max candidate age in days
-- A YouTube scraping/intake module now exists at `src/nicheflow_studio/scraper/youtube.py`
-- Scraped candidates now persist separately from download history in a `scrape_candidates` table
-- The main UI now includes a source-intake panel that can:
-  - fetch candidates for the selected account
-  - show candidate rows
-  - ignore candidates
-  - queue one selected candidate into the existing download flow
-- Scraping is now source-driven with first-class `Source` and `ScrapeRun` records
-- Scrape execution now runs in a background worker with live progress updates, so the UI stays responsive during source fetches
-- The app now uses a sidebar-based shell with separate module pages for:
-  - Scraping
-  - Downloads
-  - Processing
-  - Uploads
-  - Accounts
-- The sidebar rail has now been refreshed for better compact usability:
-  - the old boxed `NF` tile has been replaced with a passive `NicheFlow` brand label
-  - the compact rail width is now widened slightly to avoid clipped icons
-  - the active navigation item now exposes a clear selected state
-  - the bottom account-toggle control is anchored cleanly at the end of the rail
-- Account management now has its own page destination instead of being mixed into the main workspace flow
-- Candidate intake now has stronger visual review cues:
-  - color-coded candidate states
-  - a candidate-state filter
-  - a taller candidate table for easier scanning
-- The scraping page is now split into focused tabs for:
-  - Sources
-  - Candidates
-  - Runs
-- Source management is now more structured:
-  - filter by all/enabled/disabled
-  - sort by priority/status/last scraped/label
-  - enable/disable directly from a row dropdown
-- A visible scrape progress bar now shows source-level progress while scraping runs
-- Intake source URLs now normalize channel/profile subpages like `/@name/shorts` to the channel/profile root
-- Library filtering now keeps unassigned downloads visible so preserved files do not disappear from the UI
-- Removing a download history row now resets any linked scrape candidates so they can be queued again later
-- Candidate review semantics are now clearer in the UI:
-  - `candidate` displays as `ready`
-  - `Ignore For Now` is reversible through `Return To Review`
-  - selected candidates show a state-specific action hint
-- Download review semantics are now closer to the scraping workflow:
-  - `new` displays as `ready`
-  - `rejected` displays as `ignored`
-  - download review actions now use clearer labels like `Keep For This Account`, `Ignore From Library`, and `Return To Review`
-  - the Downloads detail panel now shows a state-specific review hint
-- Downloads now support batch-safe review actions:
-  - multi-row selection is enabled in the library table
-  - `Keep Selected`, `Ignore Selected`, and `Return Selected To Review` are available
-  - batch actions are limited to review-state updates only, not delete/retry/file actions
-- Scrape intake duplicate handling is now account-scoped again:
-  - the same YouTube video is deduped within the current account
-  - same-account re-scrapes still refresh the existing candidate row instead of duplicating it
-  - the same source video is allowed in a different account when accounts intentionally overlap
-- A reusable two-scenario smoke checklist now exists in `docs/DEVELOPMENT.md`
-- Packaged update/upgrade expectations are now documented in `docs/INSTALLATION.md`
-- The Accounts page now includes runtime-management tools:
-  - visible runtime paths for data, DB, downloads, logs, and backups
-  - local backup zip creation
-  - restore from a supplied backup zip path or the latest backup
-- The Processing page now includes:
-  - source preview with full-duration playback controls
-  - processed-output preview mode
-  - latest-output visibility and direct open
-  - clearer generation/loading progress
-  - transcript + smart draft generation only for the chosen video
-  - three editable smart draft options instead of four
-- Processing smart generation now uses richer context:
-  - local transcript when available
-  - sampled video frames for visual grounding
-  - provider fallback plus deterministic local fallback when hosted output is unusable
-- Processing export now supports:
-  - title-only rendered output
-  - automatic crop suggestion
-  - dark title-band / blank-band trimming when detected
-  - adaptive title sizing and wrapping so narrow outputs do not get oversized headers
-- Automated tests exist for path setup, DB initialization/compatibility, queue behavior, and major UI flows
+## Current Product Reality
 
-## What In The Previous Status Was Stale Or Inaccurate
+- Windows-first desktop application
+- Current UI: PyQt6
+- Target UI: pywebview + Vite/React/TypeScript/Tailwind/shadcn
+- Backend: Python, SQLite, FFmpeg, yt-dlp, Apify integrations, AI providers, and Playwright
+- Primary target: Instagram sourcing, processing, multi-account distribution, scheduling, and publishing
+- Secondary intake path: YouTube/YouTube Shorts through `yt-dlp`
 
-- The repo no longer lacks a packaged-runtime path policy; that behavior is now implemented in `src/nicheflow_studio/core/paths.py`
-- “Decide the packaged Windows default data directory” is no longer the next task; the remaining work is to package around the implemented path behavior and validate it in a real frozen build
-- The earlier status implied path behavior was the main unresolved runtime question; that is narrower now
+The earlier manual-publishing and Processing-only status is stale. The repository has already shipped beyond those gates.
 
-## What Is Not Yet Proven
+## Implemented Capabilities
 
-- The latest Processing crop/title behavior has not yet been manually re-checked against a broader set of real videos
-- The new dark-band trimming behavior has not yet been manually validated across different Shorts layouts
-- Smart draft quality is improved but still not yet proven across multiple niches and silent-video cases
-- Manual retry/remove/selection-persistence/refresh behavior has not yet been explicitly re-checked in the packaged workflow
-- Candidate ingestion has not yet been manually validated against multiple real-world YouTube channel/profile sources
-- The refined Accounts page, source tabs, progress bar, candidate-action hints, and unassigned-download workflow have not yet been manually re-checked in a full daily-use pass
-- The aligned Downloads review labels and detail-panel hint have not yet been manually re-checked in a full daily-use pass
-- The new batch-safe Downloads review actions have not yet been manually re-checked in a full daily-use pass
-- The new backup restore flow has not yet been manually re-checked through the Accounts page in a full daily-use pass
-- The packaged `.exe` in `dist/` has not yet been re-verified after the latest sidebar rail refresh
+### Source, Library, And Distribution
 
-## Notes On Verification
+- Account management, account health, and per-account configuration
+- Apify-backed Instagram source intake and single-URL import
+- Public Instagram media download and local MP4 import
+- Secondary YouTube/Shorts intake via `yt-dlp`
+- Download queue, retry/failure handling, review actions, and local library
+- Global media registration/deduplication
+- Shared niche pools, pool intake/pruning tools, assignments, and balanced distribution
+- Pool/admin scripts and in-app pooling/distribution controls
 
-- Focused path tests now exist for:
-  - source/dev default path behavior
-  - `NICHEFLOW_DATA_DIR` override behavior
-  - simulated packaged Windows default path behavior
-  - override precedence even under simulated packaged runtime
-- Queue tests still mock the downloader, so they validate queue state handling more than live `yt-dlp` compatibility
-- UI tests still run offscreen and do not prove packaged Windows shell integration
-- Submit-path tests now cover accepted and rejected YouTube / Shorts URL cases plus duplicate-prevention behavior
-- Queue tests now cover clearer failure-message mapping for common `yt-dlp` error cases
-- Code inspection shows the current shell behavior is simple Windows `os.startfile(...)` handoff rather than any packaged-specific integration layer
-- `scripts/smoke_packaged.ps1 -KeepRuntimeData` now prepares a real packaged runtime item and prints the packaged file path/metadata for manual shell checks
-- Scraping/intake behavior is now covered by:
-  - `.\.venv\Scripts\python -m pytest -q tests/test_main_window.py`
-  - `.\.venv\Scripts\python -m pytest -q tests/test_paths_and_db.py tests/test_queue.py tests/test_scraper.py tests/test_downloader.py`
-- The current Processing crop/title changes were verified with:
-  - `.\.venv\Scripts\python -m pytest -q tests/test_processing.py` -> `9 passed`
-  - `.\.venv\Scripts\python -m pytest -q tests/test_main_window.py -k processing` -> `12 passed, 47 deselected`
-  - `.\.venv\Scripts\python -m pytest -q tests/test_main_window.py` -> `59 passed`
-- The `main_window.py` maintainability pass was verified with:
-  - `.\.venv\Scripts\python -m pytest -q tests/test_main_window.py`
-  - `.\.venv\Scripts\python -m pytest -q tests/test_queue.py tests/test_paths_and_db.py`
-- The sidebar rail refresh was verified with:
-  - `.\.venv\Scripts\python.exe -m pytest tests\test_main_window.py::test_workspace_is_blocked_without_current_account tests\test_main_window.py::test_sidebar_brand_is_display_only tests\test_main_window.py::test_sidebar_selected_state_and_compact_width tests\test_main_window.py::test_sidebar_toggle_and_compact_library_behavior tests\test_main_window.py::test_account_panel_does_not_overlap_sidebar_or_workspace tests\test_main_window.py::test_accounts_page_keeps_account_manager_visible -v` -> `6 passed`
-  - timed local app startup smoke via `.venv\Scripts\python.exe` with real `MainWindow()` creation -> `main-window-smoke-ok`
-- Sidebar-specific regression coverage now includes:
-  - passive brand label behavior
-  - compact rail width and explicit selected-state behavior
-  - account-panel vs sidebar/workspace non-overlap geometry
+### Processing
 
-## Best Next Milestone
+- Source preview and processed-output preview
+- Transcript and visual-context support
+- Smart title/caption generation with account/profile/style rules
+- Three editable draft option cards, recommendations, notes, and style metadata
+- Copy Chat Prompt and Paste Draft fallback workflow
+- Cinema Bold keyword markup support
+- Automatic crop/title-band handling
+- Title overlay rendering, cover/thumbnail selection, and Reel export
+- Export-to-publish-queue handoff
 
-Make the first Processing output trustworthy for repeated daily use.
+### Publishing
 
-The scrape/download foundation is already in place. The next highest-value work is validating Processing against real videos, tightening auto-crop/title behavior, and keeping AI-assisted generation useful without turning it into a bulk-cost workflow.
+- Publish Queue and Publishing Dashboard
+- Publish now
+- Scheduled publishing and account posting slots
+- Batch publishing and Publish All Due
+- Automatic due-post polling
+- Playwright Instagram Reel publisher
+- Safe mode, daily caps, cooldowns, checkpoint handling, and account session health
+- Posted URL/state persistence and duplicate queue-row collapse
+
+### Runtime And Packaging
+
+- SQLite compatibility upgrades and local runtime path policy
+- Repo-local development data and packaged per-user data behavior
+- PyInstaller build flow and packaged smoke-test scripts
+- Broad automated coverage across processing, UI flows, pooling, assignments, scheduling, publishing, and data helpers
+
+## Active Architectural Decision
+
+Keep the backend stack. Replace only the UI layer incrementally.
+
+- First slice: Processing
+- Long-running AI, scrape, download, FFmpeg, file, and Playwright work runs as UI-independent background jobs
+- Bridge calls return quickly with structured data or job IDs
+- Poll job progress first; add pushed events only if polling proves insufficient
+- Keep PyQt paths until replacement parity is packaged and validated
+
+See `docs/UI_MIGRATION_PLAN.md` for the authoritative migration contract.
 
 ## Next Actions
 
-1. Manually validate the latest Processing output on a few real videos, especially Shorts with blank/title bars
-2. Keep tuning title sizing and crop precision against real exports
-3. Continue improving caption draft quality as editable copy only
-4. Later add a manual direct-link intake path for a single YouTube / Shorts URL without broadening the scraping scope
+1. Create the minimal pywebview shell and Vite/React/TypeScript frontend.
+2. Define the smallest UI-independent background-job contract.
+3. Extract the minimum Processing application services currently embedded in `main_window.py`.
+4. Implement the React Processing workspace with direct structured draft generation/revision.
+5. Connect saved selection, export progress, scheduling, and publish actions.
+6. Build and smoke-test the packaged Windows Processing slice.
+7. Only then choose the next screen to migrate.
 
-## Commands Used Or Recommended For Verification
+## Known Risks And Constraints
 
-- `Get-Content AGENTS.md`
-- `Get-Content PLAN.md`
-- `Get-Content STATUS.md`
-- `Get-Content PROMPT.md`
-- `Get-Content src/nicheflow_studio/app/main_window.py`
-- `Get-Content src/nicheflow_studio/core/paths.py`
-- `Get-Content tests/test_paths_and_db.py`
-- `Get-ChildItem -Recurse -File -Exclude *.pyc | Where-Object { $_.FullName -notlike '*\.venv\*' -and $_.FullName -notlike '*\.git\*' } | Select-String -Pattern 'PyInstaller|pyinstaller|\.spec'`
-- `.\.venv\Scripts\python.exe --version`
-- `.\.venv\Scripts\python -m pytest -q tests/test_paths_and_db.py`
-- `.\.venv\Scripts\python -m pytest -q tests/test_processing.py`
+- `src/nicheflow_studio/app/main_window.py` remains a large mixed UI/workflow module; extraction must stay scoped to the active slice.
+- React improves layout, state handling, and maintainability but does not make FFmpeg, AI, Playwright, database, or file operations faster by itself.
+- Background work must not block pywebview bridge calls or hold SQLite transactions while waiting on external operations.
+- The packaged pywebview/React asset path and bridge behavior must be validated early.
+- The current git worktree contains substantial ongoing changes; migration work must preserve them.
+- Platform, originality, rights, and account-footprint risks documented in `docs/SOURCING_POOLING_PLAN.md` remain accepted/current.
 
-## Open Decisions / Blockers
+## Deferred
 
-- Should `yt-dlp` be bundled with the packaged app, installed separately, or pinned and updated another way?
-- Which Windows versions must the packaged MVP support?
-- Are the current candidate and download review semantics now sufficient, or do they still need more consolidation later?
-- How much candidate metadata is actually needed next: channel name/date may be enough, or users may want richer fields before wider scraping
-- Should future versions show a cross-account duplicate warning without blocking intake?
-- Should backup restore eventually add a file picker and stronger overwrite confirmation flow?
-- When the manual direct-link intake path is added, should it land in Scraping, Downloads, or as a small shared ingest action?
+- Rewriting the Python backend or replacing SQLite
+- Local HTTP API, Next.js, or Electron for the first desktop migration
+- Migrating all screens before the first packaged vertical slice
+- Multi-device/cloud-hosted web app
+- TikTok, cloud sync, broad analytics, and speculative ML features
 
 ## Resume Here
 
-Next highest-value task:
-Manually validate the updated Processing crop/title behavior against real exported videos and keep tightening the output quality.
-
-## Session Handoff: 2026-04-16 Sidebar Rail Refresh
-
-What changed in this session:
-
-- refreshed the compact left sidebar rail in `src/nicheflow_studio/app/main_window.py`
-- replaced the button-like `NF` mark with a passive `NicheFlow` label
-- increased compact rail width from the too-tight old size to reduce icon clipping
-- added explicit selected-state styling for active navigation
-- anchored the bottom account-toggle control more cleanly in the rail
-- added regression tests in `tests/test_main_window.py` for:
-  - passive brand label behavior
-  - compact rail width and selected-state behavior
-  - account panel / sidebar / workspace non-overlap geometry
-
-Important context for the next chat:
-
-- `src/nicheflow_studio/app/main_window.py` already had large preexisting uncommitted changes relative to `HEAD` before this sidebar work
-- because of that dirty same-file baseline, this sidebar refresh was intentionally not isolated into a clean feature-only commit
-- the workspace branch during this session was `codex/groq-two-step-processing`
-- the packaged Windows `.exe` was not tested in this session; only Python-run launch + targeted sidebar tests were verified
-
-Best immediate continuation if resuming this thread:
-
-1. verify whether the packaged `.exe` in `dist/` launches with the refreshed sidebar
-2. visually confirm the sidebar appearance in the packaged build
-3. if packaging is fine, return to the broader Processing validation work listed above
+Start with the Processing-first implementation sequence in `docs/UI_MIGRATION_PLAN.md`. Do not resume from the old manual Publish Queue or Processing-only milestone descriptions.

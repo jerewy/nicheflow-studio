@@ -14,6 +14,7 @@ if str(SRC_ROOT) not in sys.path:
 
 from nicheflow_studio.db.models import Account, ScrapeCandidate
 from nicheflow_studio.db.session import get_session, init_db
+from nicheflow_studio.db.sources import advance_source_newest_date
 from nicheflow_studio.downloader.instagram import instagram_shortcode_from_url
 from nicheflow_studio.core.instagram_session import (
     DEFAULT_PROFILE_NAME,
@@ -162,7 +163,28 @@ def _persist_candidates(*, account_name: str, candidates: list[object]) -> tuple
             session.add(candidate_row)
             existing[key] = candidate_row
             saved += 1
+
+        # Advance this source's newest-content cursor to the newest post date we
+        # now hold, so a later incremental scrape (onlyPostsNewerThan) resumes
+        # from real content rather than wall-clock time. The source URL is the
+        # account's profile page; manual single-URL imports and bulk scrapes for
+        # the same handle therefore share one cursor.
+        session.flush()
+        source = advance_source_newest_date(
+            session,
+            account=account,
+            source_url=f"https://www.instagram.com/{account_name}/",
+            label=account_name,
+        )
+        newest_at = source.last_scraped_at
+        newest_shortcode = source.last_seen_external_id
         session.commit()
+
+    newest_label = newest_at.date().isoformat() if newest_at is not None else "none"
+    print(
+        f"source cursor for {account_name!r}: newest post {newest_label} "
+        f"(shortcode {newest_shortcode or '-'})"
+    )
     return (saved, refreshed)
 
 

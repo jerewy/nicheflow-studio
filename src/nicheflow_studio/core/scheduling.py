@@ -68,3 +68,56 @@ def upcoming_slot_times(
         day = day + timedelta(days=1)
         days_checked += 1
     return result[:count]
+
+
+def next_open_slot_time(
+    slots: str | None,
+    *,
+    after: datetime,
+    occupied: list[datetime] | tuple[datetime, ...] = (),
+    jitter_minutes: int = DEFAULT_JITTER_MINUTES,
+    rng: _random.Random | None = None,
+    collision_minutes: int | None = None,
+    max_days: int = 60,
+) -> datetime | None:
+    """Return the next future slot time that isn't already taken, jittered.
+
+    Walks this account's slots forward from ``after`` and returns the first slot
+    that no existing post occupies. A slot counts as occupied when any datetime
+    in ``occupied`` (e.g. the account's already-scheduled posts) lands within
+    ``collision_minutes`` of the round slot moment — so auto-scheduling several
+    exports in a row spreads them across distinct slots/days instead of stacking
+    two reels on the same minute. The returned time has the same 0..jitter
+    offset treatment as :func:`upcoming_slot_times` so it never lands on a
+    robotic round number. Returns ``None`` when there are no valid slots or none
+    is open within ``max_days``.
+    """
+    parsed = parse_slots(slots)
+    if not parsed:
+        return None
+    rng = rng or _random
+    jitter_seconds = max(0, jitter_minutes) * 60
+    if collision_minutes is None:
+        # Guard window: a candidate within jitter range of an existing post could
+        # collide once jitter is applied, so keep at least the jitter span plus a
+        # small buffer between posts.
+        collision_minutes = max(jitter_minutes, 1) + 5
+    collision_seconds = max(0, collision_minutes) * 60
+
+    day = after.date()
+    days_checked = 0
+    while days_checked <= max_days:
+        for hour, minute in parsed:
+            base = datetime(day.year, day.month, day.day, hour, minute, tzinfo=after.tzinfo)
+            if base <= after:
+                continue
+            if any(
+                abs((taken - base).total_seconds()) <= collision_seconds
+                for taken in occupied
+            ):
+                continue
+            offset = rng.randint(0, jitter_seconds) if jitter_seconds else 0
+            return base + timedelta(seconds=offset)
+        day = day + timedelta(days=1)
+        days_checked += 1
+    return None

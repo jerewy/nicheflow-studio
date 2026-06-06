@@ -20,7 +20,7 @@ import datetime as dt
 from dataclasses import dataclass
 from pathlib import Path
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from nicheflow_studio.core.niche import NICHE_HISTORY, NICHE_MOVIE
 from nicheflow_studio.core.text_dedup import normalize_caption
@@ -533,3 +533,191 @@ def pool_contents(session: Session, niche: str) -> list[PoolContentRow]:
             )
         )
     return rows
+
+
+# --- Library view (niche -> sources -> clips) -------------------------------
+# Backs the simplified Pool & Distribute screen: pick a niche, see its sources
+# with counts, click a source to list its clips. Source is attributed from the
+# originating scrape candidate's handle (channel_name); clips with no candidate
+# fall under "—".
+
+
+# SQLite caps bound parameters per statement (default 999); chunk IN() lists so a
+# large pool's shortcode batch doesn't blow that limit.
+_SQLITE_IN_CHUNK = 900
+
+
+def _candidates_by_shortcode(
+    session: Session, shortcodes: set[str]
+) -> dict[str, tuple[str | None, dt.datetime | None, str | None, str | None, int | None]]:
+    """Batch-load candidate metadata keyed by shortcode in a few chunked queries
+    instead of one query per pool item (avoids the N+1 that made the pool page
+    slow). Value tuple: (channel_name, published_at, description, title, like_count)."""
+    codes = [code for code in shortcodes if code]
+    out: dict[str, tuple] = {}
+    for start in range(0, len(codes), _SQLITE_IN_CHUNK):
+        chunk = codes[start : start + _SQLITE_IN_CHUNK]
+        rows = (
+            session.query(
+                ScrapeCandidate.video_id,
+                ScrapeCandidate.channel_name,
+                ScrapeCandidate.published_at,
+                ScrapeCandidate.description,
+                ScrapeCandidate.title,
+                ScrapeCandidate.like_count,
+            )
+            .filter(ScrapeCandidate.video_id.in_(chunk))
+            .all()
+        )
+        for video_id, channel, published, description, title, likes in rows:
+            out.setdefault(video_id, (channel, published, description, title, likes))
+    return out
+
+
+def _naive(value: dt.datetime | None) -> dt.datetime:
+    """Sort key for nullable, possibly tz-naive (SQLite) datetimes: missing
+    dates sort oldest, and tzinfo is dropped so naive/aware never compare."""
+    if value is None:
+        return dt.datetime.min
+    return value.replace(tzinfo=None)
+
+
+@dataclass(frozen=True)
+class PoolSourceRow:
+    """One source's footprint in a niche pool: how many accepted clips it
+    contributed and the newest post date among them."""
+
+    source_label: str
+    clip_count: int
+    newest_post_at: dt.datetime | None
+
+
+@dataclass(frozen=True)
+class PoolClipRow:
+    """One accepted clip with the metadata a library row needs: the original IG
+    URL to open it, caption, likes, post date, download state, distribution."""
+
+    pool_item_id: int
+    shortcode: str | None
+    source_url: str | None
+    caption: str | None
+    like_count: int | None
+    published_at: dt.datetime | None
+    download_status: str
+    distributed_to: tuple[str, ...]
+
+    @property
+    def is_distributed(self) -> bool:
+        return bool(self.distributed_to)
+
+
+def pool_source_summary(session: Session, niche: str) -> list[PoolSourceRow]:
+    """Per-source clip counts + newest post date for a niche's accepted pool,
+    busiest source first."""
+    niche = _validate_niche(niche)
+    items = (
+        session.query(PoolItem)
+        .options(joinedload(PoolItem.media_asset))
+        .filter(PoolItem.niche == niche, PoolItem.acceptance_status == POOL_STATUS_ACCEPTED)
+        .all()
+    )
+    shortcodes = {
+        item.media_asset.source_shortcode
+        for item in items
+        if item.media_asset is not None and item.media_asset.source_shortcode
+    }
+    candidates = _candidates_by_shortcode(session, shortcodes)
+    counts: dict[str, int] = {}
+    newest: dict[str, dt.datetime | None] = {}
+    for item in items:
+        asset = item.media_asset
+        meta = candidates.get(asset.source_shortcode) if asset and asset.source_shortcode else None
+        source = meta[0] if meta and meta[0] else "—"
+        counts[source] = counts.get(source, 0) + 1
+        published = meta[1] if meta else None
+        if published is not None and (
+            newest.get(source) is None or _naive(published) > _naive(newest[source])
+        ):
+            newest[source] = published
+        elif source not in newest:
+            newest[source] = None
+    rows = [
+        PoolSourceRow(source_label=src, clip_count=counts[src], newest_post_at=newest.get(src))
+        for src in counts
+    ]
+    rows.sort(key=lambda r: (-r.clip_count, r.source_label))
+    return rows
+
+
+def pool_clips_for_source(
+    session: Session, niche: str, source_label: str
+) -> list[PoolClipRow]:
+    """Accepted clips in a niche pool contributed by ``source_label``, newest
+    post first, with the metadata + IG URL the library row needs."""
+    niche = _validate_niche(niche)
+    items = (
+        session.query(PoolItem)
+        .options(joinedload(PoolItem.media_asset), joinedload(PoolItem.assignments))
+        .filter(PoolItem.niche == niche, PoolItem.acceptance_status == POOL_STATUS_ACCEPTED)
+        .all()
+    )
+    shortcodes = {
+        item.media_asset.source_shortcode
+        for item in items
+        if item.media_asset is not None and item.media_asset.source_shortcode
+    }
+    candidates = _candidates_by_shortcode(session, shortcodes)
+    account_ids = {a.account_id for item in items for a in item.assignments}
+    account_names: dict[int, str | None] = {}
+    if account_ids:
+        for account_id, name in (
+            session.query(Account.id, Account.name)
+            .filter(Account.id.in_(list(account_ids)))
+            .all()
+        ):
+            account_names[account_id] = name
+
+    rows: list[PoolClipRow] = []
+    for item in items:
+        asset = item.media_asset
+        shortcode = asset.source_shortcode if asset else None
+        meta = candidates.get(shortcode) if shortcode else None
+        source = meta[0] if meta and meta[0] else "—"
+        if source != source_label:
+            continue
+        accounts = [
+            account_names.get(a.account_id) or f"#{a.account_id}" for a in item.assignments
+        ]
+        rows.append(
+            PoolClipRow(
+                pool_item_id=item.id,
+                shortcode=shortcode,
+                source_url=(asset.canonical_source_url if asset else None),
+                caption=((meta[2] or meta[3]) if meta else None),
+                like_count=(meta[4] if meta else None),
+                published_at=(meta[1] if meta else None),
+                download_status=(asset.download_status if asset else "—"),
+                distributed_to=tuple(accounts),
+            )
+        )
+    rows.sort(key=lambda r: _naive(r.published_at), reverse=True)
+    return rows
+
+
+def move_pool_item_niche(
+    session: Session, *, pool_item_id: int, target_niche: str
+) -> bool:
+    """Move a pooled clip to the other niche — the library's 'edit category'.
+
+    Validates ``target_niche`` is one of the two real niches and reassigns the
+    pool item. Existing assignments (if the clip was already distributed) keep
+    their original niche; the UI should warn before moving a distributed clip.
+    Returns ``True`` when the item was found. Does not commit.
+    """
+    target = _validate_niche(target_niche)
+    item = session.get(PoolItem, pool_item_id)
+    if item is None:
+        return False
+    item.niche = target
+    session.flush()
+    return True

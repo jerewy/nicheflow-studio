@@ -1281,7 +1281,7 @@ def _title_style_rules(title_style: str | None) -> list[str] | None:
         # marks the 1-3 highest-impact words with ``**word**`` so the overlay
         # renderer can draw them in a bold weight against the regular text.
         return [
-            *_caption_style_title_rules("cinema_hook"),
+            *_cinema_bold_keyword_mode_rules(),
             "- EMPHASIS MARKUP: wrap the 1-3 single most impactful words in each "
             "title with double asterisks, e.g. '**twist**', '**unravels**', "
             "'**alone**'. These markers are rendered as BOLD on-screen text — they "
@@ -1311,6 +1311,46 @@ def _title_style_rules(title_style: str | None) -> list[str] | None:
     # Unknown title_style: return None so the caller falls back to the
     # caption-derived rules instead of shipping an empty rule list.
     return None
+
+
+def _cinema_bold_keyword_mode_rules() -> list[str]:
+    """Return the non-emphasis rules for Cinema Bold Keywords titles."""
+    return [
+        "- HARD RULE: generate 3 meaningfully different on-screen title "
+        "directions, not 3 rewrites of the same idea. Preferred length is "
+        "5-11 words; slightly longer is allowed only when the line reads "
+        "naturally and still fits two centered overlay lines.",
+        "- BUILD EACH TITLE FROM MIXED INGREDIENTS: combine one concrete "
+        "visible anchor from the clip with one broader keyword angle and one "
+        "editorial mode. Visible anchors may include a character, face, "
+        "object, prop, room, vehicle, light, rain, street, city, doorway, "
+        "window, weapon, costume, crowd, color, gesture, final shot, or line "
+        "of dialogue. Keyword angles may include atmosphere, mystery, danger, "
+        "grief, obsession, beauty, dread, loneliness, revenge, memory, "
+        "tension, clue, reveal, corruption, romance, betrayal, survival, "
+        "calm, chaos, pressure, scale, detail, or ending.",
+        "- TITLE MODES: use 3 different modes across the 3 options. Choose "
+        "from visual hook, rewatch detail, watch-if-you-like, mood title, "
+        "character title, object/prop title, contrast title, or simple "
+        "recommendation title.",
+        "- OPTION VARIATION (HARD RULE): across the 3 options, vary the title "
+        "mode, opening words, visible anchor, emotional keyword, and sentence "
+        "rhythm. At least one option should be direct and plain, at least one "
+        "should feel like a rewatch/detail hook, and at least one should feel "
+        "like a recommendation or mood hook.",
+        "- DO NOT make all titles poetic fragments. DO NOT make all titles "
+        "emotional abstractions. Avoid repeated crutches such as 'that kind "
+        "of', 'the moment', 'the scene', 'everything changes', 'you never saw "
+        "it coming', 'whole story', and 'silence' unless truly specific to "
+        "the clip.",
+        "- PLAIN LANGUAGE: no film-school jargon. BANNED words include "
+        "'score', 'cinematography', 'mise-en-scene', 'diegetic', 'blocking', "
+        "'third act', 'framing device', and 'auteur'. Use everyday wording "
+        "such as 'music', 'the way it is shot', 'the shots', or 'the ending'.",
+        "- BANNED: short meme hooks ('bro thought he had it', 'wait for it'), "
+        "'me when', 'POV:', 'that friend who', news-headline form "
+        "('Director X Does Y'), titles under 5 words, emoji, and hashtags.",
+    ]
 
 
 def _caption_style_title_rules(caption_style: str | None) -> list[str]:

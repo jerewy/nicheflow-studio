@@ -1418,20 +1418,28 @@ def test_cinema_hook_title_rules_offer_varied_templates_not_one_dominant() -> No
     assert "'silence'" in joined
 
 
-def test_cinema_bold_keywords_inherits_templates_and_forces_distinct_bold() -> None:
-    """Cinema Bold Keywords must build on the cinema atmospheric rules (so the
-    template variety carries over) and additionally require the bolded word to
-    differ across the three options. The old example seeded '**silence**'."""
+def test_cinema_bold_keywords_uses_modes_keywords_and_distinct_bold() -> None:
+    """Cinema Bold Keywords should avoid the fixed cinema_hook template rhythm.
+
+    It needs broader editorial modes and keyword/anchor variation while keeping
+    optional bold keywords for the overlay renderer.
+    """
     rules = smart_drafts._title_style_rules("cinema_bold_keywords")
     assert rules is not None
     joined = "\n".join(rules)
-    # Inherits the varied templates from cinema_hook:
-    assert "TEMPLATE F" in joined
+    assert "TITLE MODES" in joined
+    assert "MIXED INGREDIENTS" in joined
+    assert "watch-if-you-like" in joined
+    assert "rewatch/detail hook" in joined
+    assert "direct and plain" in joined
+    assert "3 rewrites of the same idea" in joined
+    # Does not inherit the rigid cinema_hook template block:
+    assert "TEMPLATE F" not in joined
     # Bold markup rule is still present (we keep the **word** output):
     assert "EMPHASIS MARKUP" in joined
     # Distinct bold word across options is now enforced:
     assert "DISTINCT EMPHASIS" in joined
-    assert "differ across" in joined
+    assert "MUST differ" in joined
     # The seeded '**silence**' example must be gone:
     assert "**silence**" not in joined
 

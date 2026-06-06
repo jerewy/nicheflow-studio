@@ -2,16 +2,20 @@
 
 Multi-account content management (Windows-first MVP).
 
-## MVP (current)
+## Current Product
 
-- Desktop app: PyQt6
+- Desktop app: PyQt6 today, with an incremental pywebview + React migration starting from Processing
 - Local DB: SQLite (`data/nicheflow.db`)
-- YouTube ingestion: `yt-dlp` (supports YouTube Shorts URLs)
-- Instagram ingestion: public Reel/post URLs download through `yt-dlp`; manual references and MP4 import remain available as fallback paths
+- Backend: Python services, FFmpeg processing, Playwright publishing, and SQLite persistence
+- Instagram ingestion: Apify-backed source intake plus public Reel/post download and local MP4 import
+- Shared niche pools and multi-account distribution
+- Instagram-ready Processing with smart drafts, editable options, export, scheduling, and publishing
+- Instagram publishing: publish now, scheduled/batch publishing, automatic due-post checks, and account session health
+- YouTube ingestion: secondary `yt-dlp` path, including YouTube Shorts URLs
 - Local import: MP4 files can be copied into the library as already-downloaded clips
 - Local runtime data folder: `data/` (ignored by git)
 
-See `docs/MVP.md` for the current scope and what’s explicitly out of scope.
+See `docs/MVP.md`, `docs/SOURCING_POOLING_PLAN.md`, and `docs/UI_MIGRATION_PLAN.md` for the current scope and active roadmap.
 
 ## Quick Start (Windows PowerShell)
 
@@ -103,3 +107,5 @@ See `docs/DEVELOPMENT.md` for the current two-scenario smoke test checklist:
 - Development: `docs/DEVELOPMENT.md`
 - Installation: `docs/INSTALLATION.md`
 - Master plan: `PLAN.md`
+- UI migration plan: `docs/UI_MIGRATION_PLAN.md`
+- Sourcing/pooling plan: `docs/SOURCING_POOLING_PLAN.md`

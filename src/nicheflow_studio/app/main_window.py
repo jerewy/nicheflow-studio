@@ -7,10 +7,12 @@ import random
 import re
 import shutil
 import subprocess
+import time
 import zipfile
 import av
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -34,6 +36,7 @@ from PyQt6.QtWidgets import (
     QDateEdit,
     QDateTimeEdit,
     QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -85,6 +88,7 @@ from nicheflow_studio.db.media_library import (
     find_media_asset,
     find_or_register_media_asset,
     mark_media_asset_downloaded,
+    normalize_source_url,
 )
 from nicheflow_studio.db.models import (
     Account,
@@ -102,10 +106,14 @@ from nicheflow_studio.db.pools import (
     VALID_NICHES,
     accept_candidate_into_pool,
     accept_into_pool,
+    move_pool_item_niche,
     niche_pool_stats,
+    pool_clips_for_source,
     pool_contents,
     pool_size,
+    pool_source_summary,
     reject_candidate,
+    remove_pool_item,
 )
 from nicheflow_studio.db.session import get_session, init_db, reset_db_state
 from nicheflow_studio.processing.video import (
@@ -122,7 +130,7 @@ from nicheflow_studio.processing.video import (
     suggest_title_replacement_crop,
 )
 from nicheflow_studio.processing.watermark import replace_detected_watermark
-from nicheflow_studio.processing.dedup import compute_video_fingerprint
+from nicheflow_studio.processing.dedup import compute_video_fingerprint, fingerprints_match
 from nicheflow_studio.processing.thumbnail import (
     CoverCandidate,
     cover_candidate_path_for_output,
@@ -147,7 +155,7 @@ from nicheflow_studio.core.publishing_dashboard import (
     build_dashboard_row,
     summarize_dashboard,
 )
-from nicheflow_studio.core.scheduling import upcoming_slot_times
+from nicheflow_studio.core.scheduling import next_open_slot_time, upcoming_slot_times
 from nicheflow_studio.publisher.instagram_publisher import publish_reel
 from nicheflow_studio.publisher.instagram_web import (
     launch_instagram_login,
@@ -620,6 +628,32 @@ QPushButton#ghostButton {
 QPushButton#ghostButton:hover {
     background: #1a2734;
 }
+QPushButton[compactMenuButton="true"]::menu-indicator {
+    image: none;
+    width: 0px;
+}
+QMenu#processingPublishMenu {
+    background: #121a24;
+    border: 1px solid #273244;
+    border-radius: 8px;
+    padding: 6px;
+    color: #f3f7fb;
+}
+QMenu#processingPublishMenu::item {
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    padding: 8px 22px;
+}
+QMenu#processingPublishMenu::item:selected {
+    background: #223349;
+    border-color: #4b6178;
+}
+QMenu#processingPublishMenu::separator {
+    height: 1px;
+    background: #253142;
+    margin: 5px 2px;
+}
 QPushButton#smartOptionCard {
     background: #141d27;
     border: 1px solid #273244;
@@ -721,7 +755,11 @@ UPLOAD_PRIVACY_OPTIONS = {
 }
 MODULE_PAGES = ("scraping", "downloads", "processing", "uploads", "session_health")
 GLOBAL_MODULE_PAGES = {"session_health"}
-INSTAGRAM_MAX_RESULT_LIMIT = 1000
+# Upper bound for the "Results" spinbox on an Apify scrape. This is a UI guard,
+# NOT a budget limit — Apify can return more. Set to 2000 so a full source
+# backfill (e.g. crazyfactscorner's ~1315 posts) fits in one pull; the practical
+# ceiling per source is ~1800 (Apify range) and cost scales ~$2.7/1000.
+INSTAGRAM_MAX_RESULT_LIMIT = 2000
 TITLE_STYLE_PRESETS: dict[str, dict[str, object]] = {
     "clean_hook": {
         "label": "Clean Hook",
@@ -1084,6 +1122,11 @@ AUTO_PUBLISH_PROMPT_BATCH_SIZE = 3
 # ui_prefs key for whether the background auto-publisher is enabled. Persisted
 # so the toolbar checkbox keeps its state across restarts.
 AUTO_PUBLISH_ENABLED_PREF_KEY = "auto_publish_due_reels"
+
+# Sentinel for ``_upsert_publish_job_for_export(scheduled_at=...)`` so callers
+# can distinguish "derive the time from the account slots / status" (default)
+# from an explicit ``scheduled_at`` value, including ``None``.
+_DERIVE_SCHEDULED_AT = object()
 
 
 @dataclass(frozen=True)
@@ -1599,6 +1642,56 @@ class DownloadAssignedWorker(QObject):
             self.failed.emit(str(exc))
             return
         self.completed.emit(summary)
+
+
+class AddUrlToPoolWorker(QObject):
+    """Fetch one reel's metadata (yt-dlp) off the UI thread, then add it to the
+    niche pool with pool-first dedup. Network work stays off the UI thread so the
+    Add-to-pool button can never freeze the app."""
+
+    completed = pyqtSignal(object)  # PoolIntakeResult
+    failed = pyqtSignal(str)
+
+    def __init__(self, url: str, niche: str) -> None:
+        super().__init__()
+        self._url = url
+        self._niche = niche
+
+    def run(self) -> None:
+        try:
+            from nicheflow_studio.db.pool_intake import ReelMetadata, add_reel_to_pool
+            from nicheflow_studio.db.session import get_session
+            from nicheflow_studio.scraper.instagram import (
+                scrape_instagram_urls_with_stats,
+            )
+
+            candidates, _stats = scrape_instagram_urls_with_stats([self._url], max_items=1)
+            if not candidates:
+                self.failed.emit(
+                    "Couldn't read that reel's metadata (private, removed, or rate-limited)."
+                )
+                return
+            candidate = candidates[0]
+            duration = candidate.duration_seconds
+            metadata = ReelMetadata(
+                source_url=candidate.source_url,
+                shortcode=candidate.video_id,
+                channel_name=candidate.channel_name,
+                title=candidate.title,
+                description=candidate.description,
+                published_at=candidate.published_at,
+                view_count=candidate.view_count,
+                like_count=candidate.like_count,
+                comment_count=candidate.comment_count,
+                duration_seconds=int(duration) if duration is not None else None,
+                thumbnail_url=candidate.thumbnail_url,
+            )
+            with get_session() as session:
+                result = add_reel_to_pool(session, niche=self._niche, metadata=metadata)
+                session.commit()
+            self.completed.emit(result)
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
 
 
 class SuggestCropWorker(QObject):
@@ -2648,11 +2741,11 @@ class MainWindow(QWidget):
         self._candidate_state_filter.addItem("Already downloaded", "downloaded")
         self._candidate_state_filter.addItem("Ignored for now", "ignored")
         self._candidate_state_filter.currentIndexChanged.connect(self._on_candidate_filter_changed)
-        self._candidate_state_filter.setMinimumWidth(180)
+        self._candidate_state_filter.setMinimumWidth(140)
         self._candidate_source_filter = NoScrollComboBox()
         self._candidate_source_filter.addItem("Source: All", "all")
         self._candidate_source_filter.currentIndexChanged.connect(self._on_candidate_filter_changed)
-        self._candidate_source_filter.setMinimumWidth(220)
+        self._candidate_source_filter.setMinimumWidth(150)
 
         intake_actions = QHBoxLayout()
         intake_actions.setSpacing(10)
@@ -2663,8 +2756,12 @@ class MainWindow(QWidget):
         intake_actions.addWidget(self._candidate_state_filter)
         intake_actions.addWidget(self._candidate_source_filter)
         intake_actions.addStretch(1)
-        intake_actions.addWidget(self._candidate_accept_button)
-        intake_actions.addWidget(self._candidate_reject_button)
+        # Accept → Pool / Reject intentionally NOT shown on the Scrape tab:
+        # accepting/rejecting is a pool decision, not a discovery one, so it
+        # belongs to the Pool & Distribute flow (redesign Phase 2). The button
+        # objects are still built above because the selection logic toggles their
+        # enabled state; they're simply not placed in this toolbar. Scrape stays a
+        # lean "find + check the video" surface.
         intake_actions.addWidget(self._candidate_queue_button)
         intake_actions.addWidget(self._candidate_ignore_button)
         intake_actions.addWidget(self._candidate_restore_button)
@@ -3855,11 +3952,29 @@ class MainWindow(QWidget):
         self._processing_open_latest_output_button.clicked.connect(
             self._on_open_latest_processed_output_clicked
         )
-        self._processing_add_to_schedule_button = QPushButton("Update Publish Item")
+        # Publish actions live behind one dropdown so the export row stays tidy:
+        # update the queue item, schedule it (auto next-slot or a picked time), or
+        # post it to Instagram right now. Each action runs the same readiness
+        # checks; real upload work happens on a background worker.
+        self._processing_add_to_schedule_button = QPushButton("Publish  ▾")
         self._processing_add_to_schedule_button.setObjectName("ghostButton")
-        self._processing_add_to_schedule_button.clicked.connect(
-            self._on_add_processed_to_schedule_clicked
+        self._processing_add_to_schedule_button.setProperty("compactMenuButton", True)
+        self._processing_add_to_schedule_button.setToolTip(
+            "Add this export to the publish queue, schedule it, or post it now."
         )
+        publish_menu = QMenu(self._processing_add_to_schedule_button)
+        publish_menu.setObjectName("processingPublishMenu")
+        update_action = publish_menu.addAction("Update Publish Item")
+        update_action.triggered.connect(self._on_add_processed_to_schedule_clicked)
+        publish_menu.addSeparator()
+        auto_schedule_action = publish_menu.addAction("Auto-Schedule (next open slot)")
+        auto_schedule_action.triggered.connect(self._on_processing_auto_schedule_clicked)
+        schedule_at_action = publish_menu.addAction("Schedule at Date/Time…")
+        schedule_at_action.triggered.connect(self._on_processing_schedule_at_clicked)
+        publish_menu.addSeparator()
+        publish_now_action = publish_menu.addAction("Publish Now…")
+        publish_now_action.triggered.connect(self._on_processing_publish_now_clicked)
+        self._processing_add_to_schedule_button.setMenu(publish_menu)
         latest_output_row.addWidget(latest_output_label)
         latest_output_row.addWidget(self._processing_latest_output_label, stretch=1)
         latest_output_row.addWidget(self._processing_open_latest_output_button)
@@ -4027,6 +4142,11 @@ class MainWindow(QWidget):
     def _make_pooling_panel(self) -> QWidget:
         self._pooling_niche_labels: dict[str, QLabel] = {}
         self._pooling_download_buttons: dict[str, QPushButton] = {}
+        # Per-niche distribution rows, so the page can show only the active niche's
+        # controls instead of stacking History and Movie at once.
+        self._pooling_niche_rows: dict[str, QFrame] = {}
+        # Per-niche "posts per account" target so Distribute isn't locked to 28.
+        self._pooling_distribute_count: dict[str, NoScrollSpinBox] = {}
         panel = QFrame()
         panel.setObjectName("panel")
         layout = QVBoxLayout()
@@ -4036,9 +4156,9 @@ class MainWindow(QWidget):
         title = QLabel("Pool & Distribute")
         title.setObjectName("sectionTitle")
         subtitle = QLabel(
-            "Accept downloaded Instagram clips into a niche pool, then distribute "
-            "them across that niche's accounts — one clip per account, evenly, "
-            "with history and movie kept strictly separate."
+            "Scrape and review source candidates into a niche pool first, then "
+            "distribute accepted clips across that niche's accounts. Sources are "
+            "niche inventory; accounts only receive clips after Distribute."
         )
         subtitle.setObjectName("metaValue")
         subtitle.setWordWrap(True)
@@ -4058,7 +4178,9 @@ class MainWindow(QWidget):
         niche_caption = QLabel("Niche:")
         niche_caption.setObjectName("subtleLabel")
         self._pooling_niche_combo = NoScrollComboBox()
-        self._pooling_niche_combo.addItem("All niches", "all")
+        # The pool is always split History/Movie, so the library view is always
+        # scoped to one real niche — "All niches" was removed. History is the
+        # default (index 0).
         self._pooling_niche_combo.addItem("History", "history")
         self._pooling_niche_combo.addItem("Movie", "movie")
         self._pooling_niche_combo.currentIndexChanged.connect(self._refresh_pooling_page)
@@ -4070,15 +4192,153 @@ class MainWindow(QWidget):
         self._pooling_add_source_button = QPushButton("Add source to niche")
         self._pooling_add_source_button.setObjectName("downloadToolbarButton")
         self._pooling_add_source_button.setToolTip(
-            "Attach this source profile to the selected niche's account(s). Then "
-            "scrape it from Source Intake to pull clips into the pipeline."
+            "Register this source profile for the selected niche pool. It is not "
+            "assigned to an account until clips are distributed."
         )
         self._pooling_add_source_button.clicked.connect(self._on_pool_add_source_clicked)
+        self._pooling_source_select_combo = NoScrollComboBox()
+        self._pooling_source_select_combo.setMinimumWidth(220)
+        self._pooling_source_select_combo.setToolTip(
+            "Pick which configured source to scrape. The table below stays combined."
+        )
+        self._pooling_source_select_combo.currentIndexChanged.connect(
+            self._refresh_pooling_source_actions
+        )
+        self._pooling_scrape_source_button = QPushButton("Scrape Selected Source")
+        self._pooling_scrape_source_button.setObjectName("downloadToolbarButton")
+        self._pooling_scrape_source_button.setToolTip(
+            "Scrape the selected source row using the normal latest-cursor flow. "
+            "Results become candidates for review, not account assignments."
+        )
+        self._pooling_scrape_source_button.clicked.connect(
+            lambda _=False: self._on_pool_scrape_source_clicked(archive_backfill=False)
+        )
+        self._pooling_archive_source_button = QPushButton("Search Archive")
+        self._pooling_archive_source_button.setObjectName("downloadToolbarButton")
+        self._pooling_archive_source_button.setToolTip(
+            "Scrape a larger archive window for the selected source, ignoring the "
+            "latest cursor and deduping locally by URL/shortcode."
+        )
+        self._pooling_archive_source_button.clicked.connect(
+            lambda _=False: self._on_pool_scrape_source_clicked(archive_backfill=True)
+        )
+        self._pooling_archive_limit_input = NoScrollSpinBox()
+        self._pooling_archive_limit_input.setRange(1, INSTAGRAM_MAX_RESULT_LIMIT)
+        self._pooling_archive_limit_input.setValue(INSTAGRAM_MAX_RESULT_LIMIT)
+        self._pooling_archive_limit_input.setToolTip(
+            "Archive result limit for the selected source."
+        )
         pool_controls.addWidget(niche_caption)
         pool_controls.addWidget(self._pooling_niche_combo)
         pool_controls.addWidget(self._pooling_source_input, stretch=1)
         pool_controls.addWidget(self._pooling_add_source_button)
+        pool_controls.addWidget(self._pooling_source_select_combo)
+        pool_controls.addWidget(self._pooling_scrape_source_button)
+        pool_controls.addWidget(QLabel("Archive limit:"))
+        pool_controls.addWidget(self._pooling_archive_limit_input)
+        pool_controls.addWidget(self._pooling_archive_source_button)
         layout.addLayout(pool_controls)
+
+        # Add a single reel straight into the active niche's pool (Phase 2). The
+        # metadata fetch runs on a background thread, pool-first deduped — a reel
+        # already in any pool is skipped, not double-added.
+        add_url_row = QHBoxLayout()
+        add_url_row.setSpacing(10)
+        self._pool_add_url_input = QLineEdit()
+        self._pool_add_url_input.setPlaceholderText(
+            "Paste a reel URL to add to this niche's pool, e.g. "
+            "https://www.instagram.com/reel/XXXX/"
+        )
+        self._pool_add_url_button = QPushButton("Add to pool")
+        self._pool_add_url_button.setObjectName("downloadToolbarButton")
+        self._pool_add_url_button.setToolTip(
+            "Fetch this reel's metadata and add it to the active niche's pool. "
+            "Duplicates already in a pool are skipped."
+        )
+        self._pool_add_url_button.clicked.connect(self._on_pool_add_url_clicked)
+        add_url_row.addWidget(self._pool_add_url_input, stretch=1)
+        add_url_row.addWidget(self._pool_add_url_button)
+        layout.addLayout(add_url_row)
+
+        # --- Library view: niche -> sources -> clips (redesign Phase 1) -------
+        # The pool is a library: pick a niche, see its sources with counts, click
+        # a source to list its clips, then open/remove/move a clip. This replaces
+        # the cramped scrape-stats + contents tables below (kept hidden for now so
+        # the existing scrape/distribution wiring stays intact).
+        self._pool_lib_sources_label = QLabel("")
+        self._pool_lib_sources_label.setObjectName("subtleLabel")
+        self._pool_lib_sources_label.setWordWrap(True)
+        layout.addWidget(self._pool_lib_sources_label)
+
+        self._pool_lib_sources_table = TableFocusScrollWidget()
+        self._pool_lib_sources_table.setObjectName("downloadQueueTable")
+        self._pool_lib_sources_table.setColumnCount(3)
+        self._pool_lib_sources_table.setHorizontalHeaderLabels(["Source", "Clips", "Newest post"])
+        _lib_src_header = self._pool_lib_sources_table.horizontalHeader()
+        _lib_src_header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        _lib_src_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        _lib_src_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self._pool_lib_sources_table.verticalHeader().setVisible(False)
+        self._pool_lib_sources_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._pool_lib_sources_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self._pool_lib_sources_table.setMinimumHeight(120)
+        self._pool_lib_sources_table.setMaximumHeight(200)
+        self._pool_lib_sources_table.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self._pool_lib_sources_table.itemSelectionChanged.connect(
+            self._on_pool_lib_source_selected
+        )
+        layout.addWidget(self._pool_lib_sources_table)
+
+        self._pool_lib_clips_label = QLabel("Select a source above to see its clips.")
+        self._pool_lib_clips_label.setObjectName("subtleLabel")
+        self._pool_lib_clips_label.setWordWrap(True)
+        layout.addWidget(self._pool_lib_clips_label)
+
+        self._pool_lib_clips_table = TableFocusScrollWidget()
+        self._pool_lib_clips_table.setObjectName("downloadQueueTable")
+        self._pool_lib_clips_table.setColumnCount(6)
+        self._pool_lib_clips_table.setHorizontalHeaderLabels(
+            ["Clip", "Caption", "Likes", "Published", "Status", "Distribution"]
+        )
+        _lib_clip_header = self._pool_lib_clips_table.horizontalHeader()
+        _lib_clip_header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        for _col in (0, 2, 3, 4):
+            _lib_clip_header.setSectionResizeMode(_col, QHeaderView.ResizeMode.ResizeToContents)
+        self._pool_lib_clips_table.verticalHeader().setVisible(False)
+        self._pool_lib_clips_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._pool_lib_clips_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self._pool_lib_clips_table.setWordWrap(False)
+        self._pool_lib_clips_table.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self._pool_lib_clips_table.setMinimumHeight(160)
+        self._pool_lib_clips_table.setMaximumHeight(320)
+        self._pool_lib_clips_table.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self._pool_lib_clips_table.cellDoubleClicked.connect(
+            self._on_pool_lib_clip_double_clicked
+        )
+        self._pool_lib_clips_table.itemSelectionChanged.connect(self._update_pool_lib_actions)
+        layout.addWidget(self._pool_lib_clips_table)
+
+        _lib_actions = QHBoxLayout()
+        _lib_actions.setSpacing(10)
+        self._pool_lib_open_button = QPushButton("Open in Instagram")
+        self._pool_lib_open_button.setObjectName("downloadToolbarButton")
+        self._pool_lib_open_button.setToolTip("Open the selected clip's original post on Instagram.")
+        self._pool_lib_open_button.clicked.connect(self._on_pool_lib_open_clicked)
+        self._pool_lib_remove_button = QPushButton("Remove from pool")
+        self._pool_lib_remove_button.setObjectName("ghostButton")
+        self._pool_lib_remove_button.clicked.connect(self._on_pool_lib_remove_clicked)
+        self._pool_lib_move_button = QPushButton("Move to other niche")
+        self._pool_lib_move_button.setObjectName("ghostButton")
+        self._pool_lib_move_button.clicked.connect(self._on_pool_lib_move_clicked)
+        _lib_actions.addWidget(self._pool_lib_open_button)
+        _lib_actions.addWidget(self._pool_lib_remove_button)
+        _lib_actions.addWidget(self._pool_lib_move_button)
+        _lib_actions.addStretch(1)
+        layout.addLayout(_lib_actions)
 
         self._pooling_sources_label = QLabel("")
         self._pooling_sources_label.setObjectName("subtleLabel")
@@ -4087,13 +4347,22 @@ class MainWindow(QWidget):
 
         self._pooling_source_table = TableFocusScrollWidget()
         self._pooling_source_table.setObjectName("downloadQueueTable")
-        self._pooling_source_table.setColumnCount(6)
+        self._pooling_source_table.setColumnCount(8)
         self._pooling_source_table.setHorizontalHeaderLabels(
-            ["Source", "Account", "Candidates", "Downloaded", "Library", "Accepted"]
+            [
+                "Scope",
+                "Niche",
+                "Sources",
+                "Scraped",
+                "Unique URLs",
+                "URL Dupes",
+                "Video Dupes",
+                "Accepted",
+            ]
         )
         source_header = self._pooling_source_table.horizontalHeader()
         source_header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        for column in (2, 3, 4, 5):
+        for column in (2, 3, 4, 5, 6, 7):
             source_header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         self._pooling_source_table.verticalHeader().setVisible(False)
         self._pooling_source_table.setMinimumHeight(110)
@@ -4207,6 +4476,17 @@ class MainWindow(QWidget):
         self._pooling_status_label.setObjectName("subtleLabel")
         self._pooling_status_label.setWordWrap(True)
         layout.addWidget(self._pooling_status_label)
+        # Legacy scrape-stats + contents tables are replaced by the library view
+        # above. Kept built-but-hidden so the existing refresh/scrape/distribution
+        # wiring keeps working until the redesign's later phases remove them.
+        for _legacy in (
+            self._pooling_sources_label,
+            self._pooling_source_table,
+            self._pooling_contents_label,
+            self._pooling_contents_table,
+        ):
+            _legacy.setVisible(False)
+
         layout.addStretch(1)
         panel.setLayout(layout)
 
@@ -4235,13 +4515,23 @@ class MainWindow(QWidget):
         accept_btn = QPushButton(f"Accept downloaded → {niche.title()} pool")
         accept_btn.setObjectName("downloadToolbarButton")
         accept_btn.clicked.connect(lambda _=False, n=niche: self._on_pool_accept_clicked(n))
+        posts_label = QLabel("Posts/account:")
+        posts_label.setObjectName("subtleLabel")
+        count_spin = NoScrollSpinBox()
+        count_spin.setRange(1, 500)
+        count_spin.setValue(target_backlog())
+        count_spin.setToolTip(
+            "Fill each account up to this many clips (its backlog target). "
+            f"Default {target_backlog()} = {DEFAULT_DAILY_POSTS_PER_ACCOUNT}/day × "
+            f"{DEFAULT_PLANNING_WINDOW_DAYS} days. Bump it for 5/day, etc."
+        )
+        self._pooling_distribute_count[niche] = count_spin
         distribute_btn = QPushButton(f"Distribute {niche.title()}")
         distribute_btn.setObjectName("downloadToolbarButton")
         distribute_btn.setToolTip(
-            f"Top up every {niche} account to its backlog target "
-            f"({target_backlog()} clips = {DEFAULT_DAILY_POSTS_PER_ACCOUNT}/day × "
-            f"{DEFAULT_PLANNING_WINDOW_DAYS} days). Safe to re-run — accounts "
-            "already at target are left untouched, new accounts get filled."
+            f"Top up every {niche} account to the Posts/account target. Safe to "
+            "re-run — accounts already at target are left untouched, new accounts "
+            "get filled."
         )
         distribute_btn.clicked.connect(lambda _=False, n=niche: self._on_pool_distribute_clicked(n))
         download_btn = QPushButton(f"Download Assigned {niche.title()}")
@@ -4257,9 +4547,12 @@ class MainWindow(QWidget):
         self._pooling_download_buttons[niche] = download_btn
         row.addWidget(label, stretch=1)
         row.addWidget(accept_btn)
+        row.addWidget(posts_label)
+        row.addWidget(count_spin)
         row.addWidget(distribute_btn)
         row.addWidget(download_btn)
         frame.setLayout(row)
+        self._pooling_niche_rows[niche] = frame
         return frame
 
     def _downloaded_instagram_items(
@@ -4294,16 +4587,16 @@ class MainWindow(QWidget):
                 size = Path(item.file_path).stat().st_size
             except OSError:
                 size = None
-            content_hash = None
-            try:
-                content_hash = compute_video_fingerprint(Path(item.file_path))
-            except Exception:  # noqa: BLE001 - fingerprint is best-effort
-                content_hash = None
+            # Do NOT compute the perceptual fingerprint here: it reads and decodes
+            # the whole video, and doing that for every clip on the UI thread froze
+            # the app ("Not Responding"). Registration only needs to record the file
+            # on disk; the footage fingerprint is computed in the dedicated download/
+            # fingerprint flow (scripts/download_pool.py / pool_admin fingerprint).
             mark_media_asset_downloaded(
                 asset,
                 original_download_path=item.file_path,
                 file_size_bytes=size,
-                content_hash=content_hash,
+                content_hash=None,
             )
         return asset, created
 
@@ -4354,6 +4647,157 @@ class MainWindow(QWidget):
         )
         self._refresh_pooling_page()
 
+    def _pooling_source_id_for_current_row(self) -> int | None:
+        if hasattr(self, "_pooling_source_select_combo"):
+            value = self._pooling_source_select_combo.currentData()
+            return int(value) if value is not None else None
+        if not hasattr(self, "_pooling_source_table"):
+            return None
+        row = self._pooling_source_table.currentRow()
+        if row < 0:
+            return None
+        first = self._pooling_source_table.item(row, 0)
+        if first is None:
+            return None
+        source_id = first.data(Qt.ItemDataRole.UserRole)
+        return int(source_id) if source_id is not None else None
+
+    def _refresh_pooling_source_actions(self) -> None:
+        if not hasattr(self, "_pooling_scrape_source_button"):
+            return
+        selected_niche = self._pooling_niche_combo.currentData()
+        has_source = self._pooling_source_id_for_current_row() is not None
+        can_scrape = bool(
+            selected_niche in self._POOLING_NICHES
+            and has_source
+            and not self._scrape_in_progress
+        )
+        self._pooling_scrape_source_button.setEnabled(can_scrape)
+        self._pooling_archive_source_button.setEnabled(can_scrape)
+        self._pooling_archive_limit_input.setEnabled(
+            selected_niche in self._POOLING_NICHES and has_source
+        )
+
+    def _pooling_source_context(self) -> tuple[SimpleNamespace, SimpleNamespace] | None:
+        source_id = self._pooling_source_id_for_current_row()
+        if source_id is None:
+            self._notify("Select a source row first.", Tone.WARNING)
+            return None
+        with get_session() as session:
+            source = session.get(Source, source_id)
+            if source is None:
+                self._notify("Could not find the selected source.", Tone.ERROR)
+                return None
+            account = session.get(Account, source.account_id)
+            if account is None:
+                self._notify("Could not find the source's seed account.", Tone.ERROR)
+                return None
+            source_url = source.source_url
+            source_label = source.label
+            source_type = source.source_type
+            source_platform = source.platform
+            source_enabled = source.enabled
+            source_priority = source.priority
+            source_last_scraped_at = source.last_scraped_at
+            source_last_seen_external_id = source.last_seen_external_id
+            source_last_run_status = source.last_run_status
+            source_last_error_summary = source.last_error_summary
+            account_snapshot = SimpleNamespace(
+                id=account.id,
+                name=account.name,
+                platform=account.platform,
+                niche=account.niche,
+                scrape_max_items=account.scrape_max_items,
+                scrape_max_age_days=account.scrape_max_age_days,
+                discovery_keywords=account.discovery_keywords,
+                discovery_mode=account.discovery_mode,
+                auto_queue_limit=account.auto_queue_limit,
+                min_view_count=account.min_view_count,
+                min_like_count=account.min_like_count,
+                ranking_weight_views=account.ranking_weight_views,
+                ranking_weight_likes=account.ranking_weight_likes,
+                ranking_weight_recency=account.ranking_weight_recency,
+                ranking_weight_keyword_match=account.ranking_weight_keyword_match,
+            )
+        source_snapshot = SimpleNamespace(
+            id=source_id,
+            account_id=account_snapshot.id,
+            platform=source_platform,
+            source_type=source_type,
+            label=source_label,
+            source_url=source_url,
+            enabled=source_enabled,
+            priority=source_priority,
+            last_scraped_at=source_last_scraped_at,
+            last_seen_external_id=source_last_seen_external_id,
+            last_run_status=source_last_run_status,
+            last_error_summary=source_last_error_summary,
+        )
+        return account_snapshot, source_snapshot
+
+    def _on_pool_scrape_source_clicked(self, *, archive_backfill: bool) -> None:
+        if self._scrape_in_progress:
+            self._notify("A scrape is already running.", Tone.WARNING)
+            return
+        selected_niche = self._pooling_niche_combo.currentData()
+        if selected_niche not in self._POOLING_NICHES:
+            self._notify("Pick a specific niche (History or Movie) first.", Tone.WARNING)
+            return
+        context = self._pooling_source_context()
+        if context is None:
+            return
+        account, source = context
+        if (account.niche or "") != selected_niche:
+            self._notify("Selected source is not in the active niche.", Tone.WARNING)
+            return
+        if source.platform != "instagram":
+            self._notify("Pool source scraping currently supports Instagram sources.", Tone.WARNING)
+            return
+
+        if archive_backfill:
+            depth = self._pooling_archive_limit_input.value()
+            if not self._confirm_instagram_scrape(
+                mode_label="Search Archive",
+                result_limit=depth,
+                uses_latest_cursor=False,
+            ):
+                return
+            self._start_instagram_archive_backfill(account=account, source=source, depth=depth)
+            return
+
+        (
+            _sources,
+            keywords,
+            max_items,
+            max_age_days,
+            discovery_mode,
+            auto_queue_limit,
+            min_view_count,
+            min_like_count,
+            weights,
+        ) = self._account_scrape_config(account)
+        max_items = min(max(max_items, 1), INSTAGRAM_MAX_RESULT_LIMIT)
+        if not self._confirm_instagram_scrape(
+            mode_label="Find Latest",
+            result_limit=max_items,
+            uses_latest_cursor=True,
+        ):
+            return
+        self._start_scrape_job(
+            ScrapeJobConfig(
+                account_id=account.id,
+                source_ids=[source.id],
+                keywords=keywords,
+                max_items=max_items,
+                max_age_days=max_age_days,
+                discovery_mode=discovery_mode,
+                auto_queue_limit=auto_queue_limit,
+                min_view_count=min_view_count,
+                min_like_count=min_like_count,
+                weights=weights,
+            )
+        )
+
     def _on_pool_add_source_clicked(self) -> None:
         niche = self._pooling_niche_combo.currentData()
         if niche not in self._POOLING_NICHES:
@@ -4370,13 +4814,14 @@ class MainWindow(QWidget):
         assert normalized is not None
 
         with get_session() as session:
-            account_ids = [
-                a.id
-                for a in session.query(Account)
+            seed_account = (
+                session.query(Account)
                 .filter(Account.niche == niche, Account.platform == "instagram")
-                .all()
-            ]
-        if not account_ids:
+                .order_by(Account.id.asc())
+                .first()
+            )
+            seed_account_id = seed_account.id if seed_account is not None else None
+        if seed_account_id is None:
             self._notify(
                 f"No Instagram accounts in the '{niche}' niche yet. Set an account's "
                 f"niche to '{niche}' in account settings first.",
@@ -4384,18 +4829,16 @@ class MainWindow(QWidget):
             )
             return
 
-        created = 0
-        for account_id in account_ids:
-            created += self._ensure_source_rows(
-                account_id=account_id, platform="instagram", source_urls=[normalized]
-            )
-            self._sync_account_source_urls(account_id)
+        created = self._ensure_source_rows(
+            account_id=seed_account_id, platform="instagram", source_urls=[normalized]
+        )
+        self._sync_account_source_urls(seed_account_id)
         self._pooling_source_input.clear()
         self._refresh_pooling_page()
         if created:
             self._notify(
-                f"Added source to {len(account_ids)} '{niche}' account(s). "
-                f"Scrape it from Source Intake to pull clips into the pipeline.",
+                f"Added source to the '{niche}' pool. Select it and scrape from "
+                "this page to collect review candidates.",
                 Tone.SUCCESS,
             )
         else:
@@ -4411,11 +4854,12 @@ class MainWindow(QWidget):
                     Tone.WARNING,
                 )
                 return
-            # Top up every account to its backlog target instead of dumping the
-            # whole pool. Re-running is idempotent (accounts at target get
+            # Top up every account to the Posts/account target instead of dumping
+            # the whole pool. Re-running is idempotent (accounts at target get
             # nothing more) thanks to the existing-count seeding in
             # distribute_niche — see docs/SOURCING_POOLING_PLAN.md §4-§6.
-            target = target_backlog()
+            spin = self._pooling_distribute_count.get(niche)
+            target = spin.value() if spin is not None else target_backlog()
             created_count = len(distribute_niche(session, niche, max_per_account=target))
             session.commit()
             counts = assignment_counts_by_account(session, niche)
@@ -4581,9 +5025,17 @@ class MainWindow(QWidget):
         # Source-add only applies to a specific niche.
         self._pooling_add_source_button.setEnabled(selected_niche in self._POOLING_NICHES)
         niche_sources = self._refresh_pooling_source_inventory(selected_niche)
-        self._refresh_pooling_contents(selected_niche, niche_sources, pool_sizes)
+        # The contents table is hidden (replaced by the library Clips table). Only
+        # populate it when visible so its per-clip queries don't slow every refresh.
+        if self._pooling_contents_table.isVisible():
+            self._refresh_pooling_contents(selected_niche, niche_sources, pool_sizes)
 
         for niche in self._POOLING_NICHES:
+            # Show only the active niche's distribution controls; hide the other so
+            # History and Movie no longer stack on the page at once.
+            niche_row = self._pooling_niche_rows.get(niche)
+            if niche_row is not None:
+                niche_row.setVisible(niche == selected_niche)
             label = self._pooling_niche_labels.get(niche)
             if label is not None:
                 s = stats[niche]
@@ -4596,6 +5048,245 @@ class MainWindow(QWidget):
             f"History {stats['history'].pooled} pooled / {stats['history'].unused} unused · "
             f"Movie {stats['movie'].pooled} pooled / {stats['movie'].unused} unused."
         )
+
+        self._refresh_pool_library(selected_niche)
+
+    # --- Library view (niche -> sources -> clips) ---------------------------
+
+    def _current_pool_niche(self) -> str:
+        niche = (
+            self._pooling_niche_combo.currentData()
+            if hasattr(self, "_pooling_niche_combo")
+            else "history"
+        )
+        return niche if niche in self._POOLING_NICHES else "history"
+
+    def _refresh_pool_library(self, selected_niche: str) -> None:
+        """Populate the Sources library table for the active niche and reset the
+        clips table until a source is picked."""
+        if not hasattr(self, "_pool_lib_sources_table"):
+            return
+        niche = selected_niche if selected_niche in self._POOLING_NICHES else "history"
+        with get_session() as session:
+            rows = pool_source_summary(session, niche)
+        table = self._pool_lib_sources_table
+        table.blockSignals(True)
+        table.setRowCount(0)
+        for source_row in rows:
+            newest = (
+                f"{source_row.newest_post_at:%Y-%m-%d}"
+                if source_row.newest_post_at is not None
+                else "—"
+            )
+            row = table.rowCount()
+            table.insertRow(row)
+            for col, value in enumerate([source_row.source_label, str(source_row.clip_count), newest]):
+                cell = QTableWidgetItem(value)
+                cell.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                if col == 0:
+                    cell.setData(Qt.ItemDataRole.UserRole, source_row.source_label)
+                if col >= 1:
+                    cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                table.setItem(row, col, cell)
+        table.resizeRowsToContents()
+        table.blockSignals(False)
+        total = sum(r.clip_count for r in rows)
+        self._pool_lib_sources_label.setText(
+            f"{niche.title()} pool — {total} clip(s) across {len(rows)} source(s). "
+            "Click a source to see its clips."
+        )
+        self._pool_lib_clips_table.setRowCount(0)
+        self._pool_lib_clips_label.setText("Select a source above to see its clips.")
+        self._update_pool_lib_actions()
+
+    def _selected_pool_lib_source(self) -> str | None:
+        items = self._pool_lib_sources_table.selectedItems()
+        if not items:
+            return None
+        first = self._pool_lib_sources_table.item(items[0].row(), 0)
+        return first.data(Qt.ItemDataRole.UserRole) if first is not None else None
+
+    def _on_pool_lib_source_selected(self) -> None:
+        source = self._selected_pool_lib_source()
+        if source is None:
+            self._pool_lib_clips_table.setRowCount(0)
+            self._update_pool_lib_actions()
+            return
+        niche = self._current_pool_niche()
+        with get_session() as session:
+            clips = pool_clips_for_source(session, niche, source)
+        table = self._pool_lib_clips_table
+        table.blockSignals(True)
+        table.setRowCount(0)
+        for clip in clips:
+            likes = f"{clip.like_count:,}" if clip.like_count is not None else "—"
+            published = f"{clip.published_at:%Y-%m-%d}" if clip.published_at is not None else "—"
+            distribution = ", ".join(clip.distributed_to) if clip.distributed_to else "Not distributed"
+            values = [
+                clip.shortcode or "—",
+                (clip.caption or "").replace("\n", " ")[:80] or "—",
+                likes,
+                published,
+                clip.download_status,
+                distribution,
+            ]
+            row = table.rowCount()
+            table.insertRow(row)
+            for col, value in enumerate(values):
+                cell = QTableWidgetItem(value)
+                cell.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                if col == 0:
+                    cell.setData(Qt.ItemDataRole.UserRole, clip.pool_item_id)
+                    cell.setData(Qt.ItemDataRole.UserRole + 1, clip.source_url or "")
+                if col in (2, 3, 4):
+                    cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                table.setItem(row, col, cell)
+        table.resizeRowsToContents()
+        table.blockSignals(False)
+        self._pool_lib_clips_label.setText(
+            f"{source}: {len(clips)} clip(s). Double-click a row to open it on Instagram."
+        )
+        self._update_pool_lib_actions()
+
+    def _selected_pool_lib_clip(self) -> tuple[int, str] | None:
+        items = self._pool_lib_clips_table.selectedItems()
+        if not items:
+            return None
+        first = self._pool_lib_clips_table.item(items[0].row(), 0)
+        if first is None:
+            return None
+        pool_item_id = first.data(Qt.ItemDataRole.UserRole)
+        url = first.data(Qt.ItemDataRole.UserRole + 1) or ""
+        return (int(pool_item_id), url) if pool_item_id is not None else None
+
+    def _update_pool_lib_actions(self) -> None:
+        if not hasattr(self, "_pool_lib_move_button"):
+            return
+        has_clip = self._selected_pool_lib_clip() is not None
+        other = "Movie" if self._current_pool_niche() == "history" else "History"
+        self._pool_lib_move_button.setText(f"Move to {other}")
+        for button in (
+            self._pool_lib_open_button,
+            self._pool_lib_remove_button,
+            self._pool_lib_move_button,
+        ):
+            button.setEnabled(has_clip)
+
+    @staticmethod
+    def _open_instagram_url(url: str) -> None:
+        import webbrowser
+
+        if url:
+            webbrowser.open(url)
+
+    def _on_pool_lib_clip_double_clicked(self, row: int, _col: int) -> None:
+        item = self._pool_lib_clips_table.item(row, 0)
+        url = item.data(Qt.ItemDataRole.UserRole + 1) if item is not None else ""
+        if url:
+            self._open_instagram_url(url)
+        else:
+            self._notify("This clip has no source URL to open.", Tone.WARNING)
+
+    def _on_pool_lib_open_clicked(self) -> None:
+        selected = self._selected_pool_lib_clip()
+        if selected is None:
+            self._notify("Select a clip first.", Tone.WARNING)
+            return
+        _pool_item_id, url = selected
+        if url:
+            self._open_instagram_url(url)
+        else:
+            self._notify("This clip has no source URL to open.", Tone.WARNING)
+
+    def _on_pool_lib_remove_clicked(self) -> None:
+        selected = self._selected_pool_lib_clip()
+        if selected is None:
+            self._notify("Select a clip first.", Tone.WARNING)
+            return
+        pool_item_id, _url = selected
+        with get_session() as session:
+            remove_pool_item(session, pool_item_id=pool_item_id, reason="manual removal (library)")
+            session.commit()
+        self._notify("Removed clip from the pool.", Tone.SUCCESS)
+        self._refresh_pooling_page()
+
+    def _on_pool_lib_move_clicked(self) -> None:
+        selected = self._selected_pool_lib_clip()
+        if selected is None:
+            self._notify("Select a clip first.", Tone.WARNING)
+            return
+        pool_item_id, _url = selected
+        niche = self._current_pool_niche()
+        target = "movie" if niche == "history" else "history"
+        with get_session() as session:
+            item = session.get(PoolItem, pool_item_id)
+            distributed = bool(item and item.assignments)
+        if distributed:
+            response = QMessageBox.question(
+                self,
+                "Move clip to other niche",
+                f"This clip is already distributed in {niche.title()}. Moving it to "
+                f"{target.title()} leaves its existing assignments under {niche.title()}.\n\n"
+                "Move anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if response != QMessageBox.StandardButton.Yes:
+                return
+        with get_session() as session:
+            move_pool_item_niche(session, pool_item_id=pool_item_id, target_niche=target)
+            session.commit()
+        self._notify(f"Moved clip to the {target.title()} pool.", Tone.SUCCESS)
+        self._refresh_pooling_page()
+
+    # --- Add reel URL to pool (threaded, pool-first dedup) -------------------
+
+    def _on_pool_add_url_clicked(self) -> None:
+        if getattr(self, "_add_url_in_progress", False):
+            self._notify("Still adding the previous URL…", Tone.WARNING)
+            return
+        url = self._pool_add_url_input.text().strip()
+        if not url:
+            self._notify("Paste a reel URL first.", Tone.WARNING)
+            return
+        if instagram_shortcode_from_url(url) is None:
+            self._notify("That doesn't look like an Instagram reel/post URL.", Tone.WARNING)
+            return
+        niche = self._current_pool_niche()
+        self._add_url_in_progress = True
+        self._pool_add_url_button.setEnabled(False)
+        self._pool_add_url_button.setText("Adding…")
+
+        thread = QThread(self)
+        worker = AddUrlToPoolWorker(url, niche)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(self._on_add_url_completed)
+        worker.failed.connect(self._on_add_url_failed)
+        worker.completed.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._add_url_thread = thread
+        self._add_url_worker = worker
+        thread.start()
+
+    def _finish_add_url(self) -> None:
+        self._add_url_in_progress = False
+        self._pool_add_url_button.setEnabled(True)
+        self._pool_add_url_button.setText("Add to pool")
+
+    def _on_add_url_completed(self, result: object) -> None:
+        self._finish_add_url()
+        tone = Tone.SUCCESS if result.status == "added" else Tone.WARNING
+        self._notify(result.message, tone)
+        if result.status == "added":
+            self._pool_add_url_input.clear()
+        self._refresh_pooling_page()
+
+    def _on_add_url_failed(self, message: str) -> None:
+        self._finish_add_url()
+        self._notify(f"Couldn't add that URL: {message}", Tone.ERROR)
 
     def _fit_pooling_accounts_height(self) -> None:
         """Size the accounts table to its rows so every account is visible.
@@ -4686,13 +5377,23 @@ class MainWindow(QWidget):
         table = self._pooling_source_table
         table.blockSignals(True)
         table.setRowCount(0)
+        if hasattr(self, "_pooling_source_select_combo"):
+            self._pooling_source_select_combo.blockSignals(True)
+            self._pooling_source_select_combo.clear()
 
         if selected_niche not in self._POOLING_NICHES:
             table.blockSignals(False)
             table.setVisible(False)
+            self._pooling_source_candidate_summary = (0, 0, 0)
+            if hasattr(self, "_pooling_source_select_combo"):
+                self._pooling_source_select_combo.blockSignals(False)
+                self._pooling_source_select_combo.setEnabled(False)
+            self._refresh_pooling_source_actions()
             return []
 
-        table.setVisible(True)
+        # Legacy stats table stays hidden (replaced by the library Sources table);
+        # we still populate it + the source combo so scrape selection keeps working.
+        table.setVisible(False)
         with get_session() as session:
             sources = (
                 session.query(Source)
@@ -4702,56 +5403,73 @@ class MainWindow(QWidget):
                 .all()
             )
             source_labels: list[str] = []
+            grouped_sources: dict[tuple[str, str], list[Source]] = {}
             for source in sources:
-                source_labels.append(source.label)
-                candidates = list(source.candidates)
-                linked_ids = [
-                    candidate.queued_download_item_id
-                    for candidate in candidates
-                    if candidate.queued_download_item_id is not None
-                ]
-                linked_items = {
-                    item.id: item
-                    for item in session.query(DownloadItem).filter(DownloadItem.id.in_(linked_ids)).all()
-                } if linked_ids else {}
-                downloaded_count = 0
-                library_count = 0
-                accepted_count = 0
-                for candidate in candidates:
-                    linked_item = linked_items.get(candidate.queued_download_item_id)
-                    if candidate.state == "downloaded" or (
-                        linked_item is not None and linked_item.status == "downloaded"
-                    ):
-                        downloaded_count += 1
-                    asset = find_media_asset(
-                        session, source_url=candidate.source_url, shortcode=candidate.video_id
-                    )
-                    if asset is None:
-                        continue
-                    library_count += 1
-                    if any(item.niche == selected_niche for item in asset.pool_items):
-                        accepted_count += 1
+                grouped_sources.setdefault((source.label, source.source_url), []).append(source)
 
-                row = table.rowCount()
-                table.insertRow(row)
-                account_name = source.account.name if source.account else "—"
-                values = [
-                    source.label,
-                    account_name,
-                    str(len(candidates)),
-                    str(downloaded_count),
-                    str(library_count),
-                    str(accepted_count),
-                ]
-                for column, value in enumerate(values):
-                    cell = QTableWidgetItem(value)
-                    cell.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
-                    if column >= 2:
-                        cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                    table.setItem(row, column, cell)
+            if hasattr(self, "_pooling_source_select_combo"):
+                for (source_label, _source_url), source_group in grouped_sources.items():
+                    self._pooling_source_select_combo.addItem(source_label, source_group[0].id)
+
+            unique_candidates: dict[str, ScrapeCandidate] = {}
+            raw_candidate_count = 0
+            for (source_label, _source_url), source_group in grouped_sources.items():
+                source_labels.append(source_label)
+                for source in source_group:
+                    for candidate in source.candidates:
+                        key = candidate.video_id or normalize_source_url(candidate.source_url)
+                        raw_candidate_count += 1
+                        unique_candidates.setdefault(key, candidate)
+
+            unique_candidate_count = len(unique_candidates)
+            duplicate_count = max(0, raw_candidate_count - unique_candidate_count)
+            # The legacy stats table is now hidden (replaced by the library Sources
+            # table). Its "Accepted" / "Video Dupes" columns required a per-candidate
+            # asset lookup plus an O(n^2) footage-fingerprint match across the whole
+            # pool — ~millions of comparisons on a large pool, which hung the page on
+            # load. Since the table is hidden, those counts are reported as 0 and the
+            # expensive work is skipped. (Footage dedup still runs in the dedicated
+            # download/fingerprint flow, not on every page refresh.)
+            accepted_asset_ids: set[int] = set()
+            video_duplicate_asset_ids: set[int] = set()
+
+            row = table.rowCount()
+            table.insertRow(row)
+            values = [
+                "Combined sources",
+                selected_niche.title(),
+                str(len(grouped_sources)),
+                str(raw_candidate_count),
+                str(unique_candidate_count),
+                str(duplicate_count),
+                str(len(video_duplicate_asset_ids)),
+                str(len(accepted_asset_ids)),
+            ]
+            for column, value in enumerate(values):
+                cell = QTableWidgetItem(value)
+                cell.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                if column >= 2:
+                    cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                table.setItem(row, column, cell)
 
         table.resizeRowsToContents()
         table.blockSignals(False)
+        self._pooling_source_candidate_summary = (
+            raw_candidate_count,
+            unique_candidate_count,
+            duplicate_count,
+        )
+        if hasattr(self, "_pooling_source_select_combo"):
+            self._pooling_source_select_combo.blockSignals(False)
+            self._pooling_source_select_combo.setEnabled(bool(source_labels))
+        # Cross-source candidate dedup summary. The label is hidden now (the
+        # library Sources table is the visible surface), but the cheap count still
+        # runs here so the figure stays available.
+        self._pooling_sources_label.setText(
+            f"{raw_candidate_count} scraped, {unique_candidate_count} unique, "
+            f"{duplicate_count} duplicate across sources."
+        )
+        self._refresh_pooling_source_actions()
         return source_labels
 
     def _refresh_pooling_contents(self, selected_niche, niche_sources, pool_sizes) -> None:
@@ -4802,7 +5520,14 @@ class MainWindow(QWidget):
         table.blockSignals(False)
 
         configured = ", ".join(niche_sources) if niche_sources else "none yet — add one above."
-        self._pooling_sources_label.setText(f"Configured sources: {configured}")
+        raw_candidates, unique_candidates, duplicate_candidates = getattr(
+            self, "_pooling_source_candidate_summary", (0, 0, 0)
+        )
+        self._pooling_sources_label.setText(
+            f"Configured sources: {configured}.  Source candidates: "
+            f"{raw_candidates} scraped, {unique_candidates} unique, "
+            f"{duplicate_candidates} duplicate across sources."
+        )
         by_source_text = (
             "  By source: " + ", ".join(f"{label} ({count})" for label, count in by_source.most_common())
             if rows
@@ -5886,6 +6611,13 @@ class MainWindow(QWidget):
         )
         self._schedule_caption_preview.setReadOnly(True)
         self._schedule_caption_preview.setMinimumHeight(120)
+        # Cap the preview so a short caption can't expand to fill the page and
+        # push the action buttons / table off-screen. The table takes the slack.
+        self._schedule_caption_preview.setMaximumHeight(180)
+        self._schedule_caption_preview.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
 
         schedule_detail_row = QHBoxLayout()
         schedule_detail_row.setSpacing(10)
@@ -5930,11 +6662,17 @@ class MainWindow(QWidget):
         self._schedule_table.setWordWrap(False)
         self._schedule_table.setTextElideMode(Qt.TextElideMode.ElideRight)
         self._schedule_table.setMinimumHeight(230)
+        # Let the table absorb the page's leftover height (it already has
+        # stretch=1 in the panel layout) instead of the caption preview.
         self._schedule_table.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Fixed,
         )
         self._schedule_table.itemSelectionChanged.connect(self._on_schedule_selection_changed)
+        # Double-clicking a row opens its reel, mirroring the "Open Reel" button.
+        self._schedule_table.itemDoubleClicked.connect(
+            self._on_schedule_table_double_clicked
+        )
 
         panel = QFrame()
         panel.setObjectName("downloadQueuePanel")
@@ -8597,6 +9335,7 @@ class MainWindow(QWidget):
             self._processing_preview_timer.stop()
             self._processing_toggle_preview_button.setText("Play Full Video")
             return
+        started = time.perf_counter()
         try:
             frame = next(self._processing_preview_frame_iter)
         except StopIteration:
@@ -8612,8 +9351,12 @@ class MainWindow(QWidget):
         self._processing_preview_time_label.setText(
             f"{self._format_media_time(self._processing_preview_position_ms)} / {self._format_media_time(self._processing_effective_duration_ms())}"
         )
+        # Subtract the time just spent decoding + painting this frame so playback
+        # keeps real-time pace. Without this, each frame's wall-clock gap was
+        # (decode+paint time) + delay, so the video ran slow/choppy.
         delay_ms = self._processing_next_frame_delay(previous_frame_ms)
-        self._processing_preview_timer.start(delay_ms)
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        self._processing_preview_timer.start(max(1, delay_ms - elapsed_ms))
 
     def _processing_next_frame_delay(self, previous_frame_ms: int | None) -> int:
         if previous_frame_ms is None:
@@ -8636,10 +9379,14 @@ class MainWindow(QWidget):
             QImage.Format.Format_RGB888,
         )
         pixmap = QPixmap.fromImage(image.copy())
+        # FastTransformation (nearest-neighbour) instead of SmoothTransformation:
+        # the smooth bilinear rescale ran on the UI thread every frame and was the
+        # main cause of choppy preview playback. Fast scaling is plenty for a live
+        # preview; the exported video is unaffected (this is display-only).
         scaled = pixmap.scaled(
             self._processing_video_widget.size(),
             Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
+            Qt.TransformationMode.FastTransformation,
         )
         self._processing_video_widget.setPixmap(scaled)
         self._processing_video_widget.setText("")
@@ -9062,11 +9809,18 @@ class MainWindow(QWidget):
         except OSError as exc:
             self._notify(f"Could not open the processed output: {exc}", Tone.ERROR)
 
-    def _on_add_processed_to_schedule_clicked(self) -> None:
+    def _resolve_processing_export_path(self) -> Path | None:
+        """Resolve the processed output file for the selected processing item.
+
+        Shared by every Processing-page publish action (add to queue,
+        auto-schedule, schedule at, publish now). Prefers this session's last
+        export, then falls back to the item's recorded/inferred processed path.
+        Notifies and returns ``None`` when nothing publishable is available.
+        """
         item = self._processing_selected_item()
         if item is None:
             self._notify("Select a processed video first.", Tone.WARNING)
-            return
+            return None
 
         output_path = self._processing_last_output_path
         if (output_path is None or not output_path.exists()) and item.file_path:
@@ -9075,7 +9829,13 @@ class MainWindow(QWidget):
                 allow_latest_numbered_fallback=True,
             )
         if output_path is None or not output_path.exists():
-            self._notify("Process the video before adding it to the schedule.", Tone.WARNING)
+            self._notify("Process the video before publishing it.", Tone.WARNING)
+            return None
+        return output_path
+
+    def _on_add_processed_to_schedule_clicked(self) -> None:
+        output_path = self._resolve_processing_export_path()
+        if output_path is None:
             return
         result = self._upsert_publish_job_for_export(output_path, status="ready")
         if result is None:
@@ -9092,11 +9852,186 @@ class MainWindow(QWidget):
                 Tone.SUCCESS,
             )
 
+    def _account_occupied_schedule_times(
+        self, session, account_id: int
+    ) -> list[dt.datetime]:
+        """Future scheduled-post times for an account, as tz-aware datetimes.
+
+        Feeds the 'next open slot' search so auto-scheduling several exports in a
+        row lands them on distinct slots instead of stacking on one moment.
+        """
+        rows = (
+            session.query(UploadJob.scheduled_at)
+            .filter(
+                UploadJob.account_id == account_id,
+                UploadJob.posted_at.is_(None),
+                UploadJob.scheduled_at.is_not(None),
+            )
+            .all()
+        )
+        occupied: list[dt.datetime] = []
+        for (scheduled_at,) in rows:
+            if scheduled_at is None:
+                continue
+            if scheduled_at.tzinfo is None:
+                scheduled_at = scheduled_at.replace(tzinfo=dt.timezone.utc)
+            occupied.append(scheduled_at)
+        return occupied
+
+    def _on_processing_auto_schedule_clicked(self) -> None:
+        """Auto-schedule the export into the account's next open posting slot.
+
+        Uses the account's configured ``upload_schedule_slots`` with anti-bot
+        jitter and skips slots already taken by this account's queued posts.
+        """
+        output_path = self._resolve_processing_export_path()
+        if output_path is None:
+            return
+        item = self._processing_selected_item()
+        if item is None:
+            return
+        if item.account_id is None:
+            self._notify(
+                "Assign the video to an account before scheduling it.", Tone.WARNING
+            )
+            return
+        now_local = dt.datetime.now().astimezone()
+        with get_session() as session:
+            account = session.get(Account, item.account_id)
+            if account is None:
+                self._notify("The selected account no longer exists.", Tone.WARNING)
+                return
+            slots = account.upload_schedule_slots
+            occupied = self._account_occupied_schedule_times(session, account.id)
+        scheduled_local = next_open_slot_time(
+            slots, after=now_local, occupied=occupied
+        )
+        if scheduled_local is None:
+            self._notify(
+                "Set this account's schedule slots first (e.g. 09:00, 18:00) "
+                "in account settings.",
+                Tone.WARNING,
+            )
+            return
+        result = self._upsert_publish_job_for_export(
+            output_path,
+            status="scheduled",
+            scheduled_at=scheduled_local.astimezone(dt.timezone.utc),
+        )
+        if result is None:
+            return
+        self._refresh_schedule_page()
+        self._notify_and_refresh(
+            f"Auto-scheduled for {scheduled_local.astimezone():%a %d %b %H:%M}.",
+            Tone.SUCCESS,
+        )
+
+    def _on_processing_schedule_at_clicked(self) -> None:
+        """Schedule the export at a user-picked date/time."""
+        output_path = self._resolve_processing_export_path()
+        if output_path is None:
+            return
+        item = self._processing_selected_item()
+        if item is None:
+            return
+        if item.account_id is None:
+            self._notify(
+                "Assign the video to an account before scheduling it.", Tone.WARNING
+            )
+            return
+        now_local = dt.datetime.now().astimezone()
+        default_local: dt.datetime | None = None
+        with get_session() as session:
+            account = session.get(Account, item.account_id)
+            slots = account.upload_schedule_slots if account is not None else None
+        if slots:
+            upcoming = upcoming_slot_times(slots, 1, after=now_local)
+            if upcoming:
+                default_local = upcoming[0]
+        if default_local is None:
+            default_local = (now_local + dt.timedelta(hours=1)).replace(
+                second=0, microsecond=0
+            )
+        chosen_local = self._prompt_schedule_datetime(default_local)
+        if chosen_local is None:
+            return
+        result = self._upsert_publish_job_for_export(
+            output_path,
+            status="scheduled",
+            scheduled_at=chosen_local.astimezone(dt.timezone.utc),
+        )
+        if result is None:
+            return
+        self._refresh_schedule_page()
+        self._notify_and_refresh(
+            f"Scheduled for {chosen_local.astimezone():%a %d %b %H:%M}.",
+            Tone.SUCCESS,
+        )
+
+    def _prompt_schedule_datetime(self, default_local: dt.datetime) -> dt.datetime | None:
+        """Modal date/time picker. Returns the chosen local time, or None if cancelled."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Schedule Post")
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("Choose when to publish this reel:"))
+        edit = QDateTimeEdit(self._datetime_to_qdatetime(default_local))
+        edit.setCalendarPopup(True)
+        edit.setDisplayFormat("yyyy-MM-dd  HH:mm")
+        edit.setMinimumDateTime(
+            self._datetime_to_qdatetime(dt.datetime.now().astimezone())
+        )
+        layout.addWidget(edit)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        chosen = edit.dateTime()
+        qdate = chosen.date()
+        qtime = chosen.time()
+        local_naive = dt.datetime(
+            qdate.year(), qdate.month(), qdate.day(), qtime.hour(), qtime.minute()
+        )
+        return local_naive.astimezone()
+
+    def _on_processing_publish_now_clicked(self) -> None:
+        """Publish the export to Instagram immediately, behind a confirm dialog.
+
+        Real upload work runs on the existing :class:`PublishWorker` QThread —
+        the UI thread never blocks on network/browser work.
+        """
+        if self._publish_in_progress:
+            self._notify("A publish is already running.", Tone.WARNING)
+            return
+        if self._publish_batch_active:
+            self._notify(
+                "A publish batch is running. Wait for it to finish first.", Tone.WARNING
+            )
+            return
+        output_path = self._resolve_processing_export_path()
+        if output_path is None:
+            return
+        # Ensure a queue row exists for this export so completion bookkeeping
+        # (posted_at, duplicate collapse) has something to update.
+        result = self._upsert_publish_job_for_export(output_path, status="ready")
+        if result is None:
+            return
+        job_id = self._last_created_schedule_job_id
+        if job_id is None:
+            self._notify("Could not prepare the publish job.", Tone.ERROR)
+            return
+        self._refresh_schedule_page()
+        self._launch_publish_for_job(job_id, require_confirm=True)
+
     def _upsert_publish_job_for_export(
         self,
         output_path: Path,
         *,
         status: str | None,
+        scheduled_at: dt.datetime | None | object = _DERIVE_SCHEDULED_AT,
     ) -> bool | None:
         item = self._processing_selected_item()
         if item is None:
@@ -9115,11 +10050,12 @@ class MainWindow(QWidget):
             if account is None:
                 self._notify("The selected account no longer exists.", Tone.WARNING)
                 return None
-            scheduled_at = (
-                None
-                if status is not None
-                else self._next_upload_slot(account.upload_schedule_slots)
-            )
+            if scheduled_at is _DERIVE_SCHEDULED_AT:
+                scheduled_at = (
+                    None
+                    if status is not None
+                    else self._next_upload_slot(account.upload_schedule_slots)
+                )
             job_status = status or ("scheduled" if scheduled_at is not None else "draft")
             timezone_label = account.upload_timezone or "Asia/Bangkok"
             privacy_status = account.upload_default_privacy or "private"
@@ -9248,7 +10184,7 @@ class MainWindow(QWidget):
             self._scroll_area.verticalScrollBar().setValue(0)
             return
 
-        if self._current_page == "uploads" and self._workspace_content.isVisible():
+        if self._current_page == "uploads":
             height = max(self._scroll_area.viewport().height(), 1)
             for widget in (
                 self._uploads_page,
@@ -10257,6 +11193,10 @@ class MainWindow(QWidget):
         os.startfile(str(folder))
         self._notify("Opened output folder.", Tone.SUCCESS)
 
+    def _on_schedule_table_double_clicked(self, item: QTableWidgetItem) -> None:
+        # The double-click already selected the row, so reuse the Open Reel path.
+        self._on_open_schedule_output_clicked()
+
     def _on_open_schedule_output_clicked(self) -> None:
         job_id = self._selected_schedule_job_id()
         if job_id is None:
@@ -10388,7 +11328,18 @@ class MainWindow(QWidget):
         if job_id is None:
             self._notify("Select a publish job first.", Tone.WARNING)
             return
+        self._launch_publish_for_job(job_id, require_confirm=False)
 
+    def _launch_publish_for_job(self, job_id: int, *, require_confirm: bool) -> bool:
+        """Run the single-publish readiness guards for ``job_id`` and launch it.
+
+        Shared by the schedule-tab "Auto-publish selected" button and the
+        Processing-tab "Publish now" action. Enforces the same gates the rest of
+        the publish pipeline uses (already-posted, missing profile, checkpoint
+        cooldown, daily cap, missing file). When ``require_confirm`` is set, the
+        high-stakes confirm dialog must be accepted before anything is posted.
+        Returns ``True`` only when a publish worker was actually started.
+        """
         with get_session() as session:
             job = (
                 session.query(UploadJob)
@@ -10399,11 +11350,11 @@ class MainWindow(QWidget):
             if job is None:
                 self._notify("The selected publish job no longer exists.", Tone.WARNING)
                 self._refresh_schedule_page()
-                return
+                return False
             # Duplicate guard: never re-post something already posted.
             if job.posted_at is not None or job.status == "posted":
                 self._notify("This reel is already posted.", Tone.WARNING)
-                return
+                return False
             account_id = job.account_id
             profile_name = self._clean_profile(
                 job.account.instagram_profile if job.account else None
@@ -10420,7 +11371,7 @@ class MainWindow(QWidget):
                 "settings, then log in before publishing.",
                 Tone.WARNING,
             )
-            return
+            return False
         cooldown_until = self._account_publish_cooldown_until(account_id)
         if cooldown_until is not None:
             self._notify(
@@ -10428,16 +11379,19 @@ class MainWindow(QWidget):
                 "after a checkpoint.",
                 Tone.WARNING,
             )
-            return
+            return False
         if posts_today >= PUBLISH_DAILY_CAP and not self._daily_cap_bypass_enabled():
             self._notify(
                 f"Daily cap reached for this account today ({posts_today}/{PUBLISH_DAILY_CAP}).",
                 Tone.WARNING,
             )
-            return
+            return False
         if not video_path.exists():
             self._notify("Reel output file is missing.", Tone.ERROR)
-            return
+            return False
+
+        if require_confirm and not self._confirm_publish_target(job_id):
+            return False
 
         do_share = not self._schedule_dry_run_checkbox.isChecked()
         self._notify(
@@ -10454,6 +11408,7 @@ class MainWindow(QWidget):
             caption,
             do_share,
         )
+        return True
 
     def _launch_publish_worker(
         self,

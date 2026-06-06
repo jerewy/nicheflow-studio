@@ -1,47 +1,41 @@
 # NicheFlow Studio Prompt
 
-You are working on NicheFlow Studio, a Windows-first desktop MVP for building a local content library from YouTube and YouTube Shorts URLs.
+You are working on NicheFlow Studio, a Windows-first multi-account Instagram sourcing, processing, distribution, scheduling, and publishing application.
 
 ## Primary Objective
 
-Ship a small, reliable packaged Windows app that can:
+Preserve the working Python backend and operational Instagram workflow while incrementally replacing the PyQt6 UI with pywebview + React.
 
-- accept a supported URL
-- queue and download it in the background
-- store local metadata/history
-- show clear status and error states
-- support retry, remove, and open actions
+The first migration slice is Processing. It must support direct structured draft generation/revision, selection, export progress, scheduling, and publishing without requiring chat copy/paste.
 
 ## Current Priorities
 
-1. Packaging the app for Windows
-2. Verifying the packaged build works end to end
-3. Improving URL validation and failure clarity
-4. Keeping the UI code maintainable without unnecessary refactors
+1. Create the minimal pywebview + Vite/React/TypeScript shell.
+2. Define a UI-independent background-job contract for long-running work.
+3. Extract only the plain-Python Processing services needed by the first slice.
+4. Package and smoke-test the Processing replacement before migrating another screen.
 
-## Prioritization Rules
+## Architecture Rules
 
-- Choose the smallest working solution first.
-- Prefer reliability over feature count.
-- Prefer explicit, testable behavior over clever abstractions.
-- Match existing repo patterns unless there is a strong reason not to.
-- Avoid adding dependencies unless clearly necessary.
+- Keep Python, SQLite, FFmpeg, Playwright, Apify integrations, AI providers, pooling, scheduling, and publishing.
+- Long-running work runs in background jobs and exposes structured progress.
+- Bridge calls return quickly with small JSON payloads or job IDs.
+- Keep the existing PyQt workflow until replacement parity is packaged and validated.
+- Prefer narrow, reviewable extraction over broad backend refactoring.
 
 ## Scope Discipline
 
 Do not expand into:
 
-- new content platforms
-- automation/upload flows
-- analytics
-- cloud sync
-- ML/AI features
-
-unless the current packaged YouTube MVP is already solid.
+- backend rewrite or SQLite replacement
+- Next.js, Electron, or a local HTTP API for the first desktop slice
+- all-screen migration before Processing is validated
+- TikTok, cloud sync, broad analytics, or speculative ML features
 
 ## What Good Output Looks Like
 
 - narrow diffs
-- working checkpoints
-- clear explanation of tradeoffs when needed
-- evidence-based claims about what was verified
+- runnable checkpoints
+- preserved operational behavior
+- evidence-based verification
+- explicit packaging validation

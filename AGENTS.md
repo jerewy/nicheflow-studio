@@ -6,14 +6,17 @@
 
 ## Goal
 
-- Ship a small, reliable Windows-only desktop MVP first.
-- Primary workflow: ingest YouTube / YouTube Shorts URLs, download them locally, and manage them through a usable desktop UI.
+- Ship a reliable Windows-first multi-account Instagram clipping and publishing workflow.
+- Preserve the working Python backend while incrementally replacing the oversized PyQt6 UI.
 
 ## Product Boundaries
 
-- Current MVP is Windows-only.
-- Support YouTube and YouTube Shorts first via `yt-dlp`.
-- Defer multi-platform ingestion, ML scoring, analytics, cloud sync, and automation until the core local workflow is stable and packaged.
+- Current delivery target is Windows desktop.
+- Instagram is the primary sourcing/publishing target; YouTube/`yt-dlp` remains a secondary intake path.
+- Existing Instagram publishing, scheduling, shared-pool, and distribution behavior is in scope and must not regress.
+- The active UI direction is pywebview + Vite/React/TypeScript/Tailwind/shadcn, migrated one workflow at a time.
+- Keep Python, SQLite, FFmpeg, Playwright, scraping, processing, pooling, scheduling, and publishing as the backend.
+- Defer TikTok, cloud sync, broad analytics, and speculative ML features.
 
 ## Working Style
 
@@ -39,6 +42,9 @@
 - Keep core logic OS-agnostic where easy (`pathlib`, isolated filesystem logic), even though packaging is Windows-only for MVP.
 - Keep downloader-specific logic isolated from UI and database logic.
 - Add abstractions only when a second real use case exists.
+- Move workflow behavior out of PyQt widgets into plain Python services when touching it.
+- Long-running AI, FFmpeg, file, scrape, and Playwright operations must run as background jobs and expose structured progress.
+- Keep pywebview bridge calls thin and fast; pass small JSON payloads and file paths, not media bytes.
 
 ## Local Data
 
@@ -65,5 +71,7 @@
 
 ## What Not To Do Yet
 
-- Do not build for TikTok, Instagram, upload automation, analytics, cloud sync, or ML features until the YouTube core loop is stable and packaged.
-- Do not introduce architecture for speculative future platforms.
+- Do not rewrite the Python backend, replace SQLite, or introduce a local HTTP server for the first UI migration slice.
+- Do not migrate every screen before the Processing vertical slice is packaged and validated.
+- Do not add major new PyQt UI surfaces unless needed to preserve the current workflow during migration.
+- Do not build TikTok, cloud sync, broad analytics, or speculative ML features yet.

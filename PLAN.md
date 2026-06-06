@@ -1,8 +1,15 @@
 # NicheFlow Studio Plan
 
-Last updated: 2026-05-24
+Last updated: 2026-06-06
 Status: Active execution plan
-Current milestone: Make the Instagram-first manual publishing MVP coherent on top of the working scrape/download/processing flow. Niche account strategy locked in (see §2A).
+Current milestone: Start the incremental pywebview/React UI migration with a packaged Processing-first vertical slice while preserving the working Python backend and operational Instagram workflow.
+
+> **2026-06-06 UI direction update:** the old requirement to wait for Milestones 5A/5B
+> before changing the UI stack is retired. The repository has already shipped beyond
+> the old manual-publishing gate: Instagram publish-now/scheduling/batch/automatic
+> due-post behavior, account health, Apify intake, shared pools, assignments, and
+> distribution exist. Keep Python/SQLite/FFmpeg/Playwright and migrate only the UI,
+> one workflow at a time. See `docs/UI_MIGRATION_PLAN.md`.
 
 > **2026-05-31 direction update:** sourcing has moved to **Apify-sourced shared niche pools**
 > with a **publish-only multi-account network** (10 history + 3 movie), superseding the
@@ -437,7 +444,9 @@ Planned order after the current Reels MVP:
    - Generate AI fallback prompts when safe visuals are weak or unavailable; AI output should be marked internally as a visual recreation and should not be presented as a real historical photo.
    - Render a dark newspaper/archive-style template for single posts and carousel slides after the user approves the story and visual plan.
 
-### Milestone 5A: Instagram-First Manual Publish MVP
+### Milestone 5A: Instagram-First Manual Publish MVP (Superseded Baseline)
+
+Status: Superseded by the implemented automated publishing workflow. This section is retained as historical context; its unchecked boxes are not current roadmap gates.
 
 Goal: Make the app useful for preparing and manually posting Instagram Reels before any API automation.
 
@@ -456,7 +465,9 @@ Definition of done:
 
 - A user can process a clip, add it to the Publish Queue, manually post it to Instagram, mark it posted, and record basic results without any external API setup.
 
-### Milestone 5B: Instagram Manual Source Intake
+### Milestone 5B: Instagram Manual Source Intake (Superseded Baseline)
+
+Status: Superseded by Apify-backed Instagram intake and the shared-pool architecture in `docs/SOURCING_POOLING_PLAN.md`. This section is retained as historical context.
 
 Goal: Let the user track Instagram source ideas safely without raw Instagram scraping.
 
@@ -473,7 +484,9 @@ Definition of done:
 
 - A user can add Instagram Reel/profile/hashtag references, review them as candidate ideas, and keep them organized by account without automated Instagram scraping.
 
-## 7. Immediate Priority Backlog
+## 7. Historical Priority Backlog
+
+The detailed entries below record earlier Processing/prompt work. The current priority is the Processing-first UI migration defined in `docs/UI_MIGRATION_PLAN.md`.
 
 Last updated: 2026-05-24
 
@@ -772,48 +785,32 @@ Ordered next work:
 
 ## 12. What Not To Do Yet
 
-Do not spend time on these until the manual Instagram publishing MVP works:
-
-- embeddings / niche scoring
-- caption removal automation
-- advanced clip editing
-- TikTok support
-- Instagram upload automation through Meta APIs
-- logged-in Instagram scraping or bot automation
-- stealth / anti-detection work
-- complex scheduler logic
-- cloud sync
+- Do not rewrite the Python backend or replace SQLite.
+- Do not introduce Next.js, Electron, or a local HTTP server for the first desktop migration slice.
+- Do not migrate every screen before the Processing vertical slice is packaged and validated.
+- Do not remove the working PyQt Processing path before replacement parity is proven.
+- Do not add major new PyQt UI surfaces unless needed to preserve current operations.
+- Do not build TikTok, cloud sync, broad analytics, or speculative ML features yet.
 
 ## 13. Recommended Next Step
 
-Clean up the Publish Queue so it is manual Instagram-first instead of mixed with YouTube uploader automation, then add Instagram manual source intake for Reel/profile/hashtag references.
+Build the Processing-first vertical slice from `docs/UI_MIGRATION_PLAN.md`:
 
-## 14. UI Upgrade Plan (Post-MVP)
+1. create the pywebview + React shell
+2. extract the minimum plain-Python services and UI-independent background-job contract needed by Processing
+3. support direct structured draft generation/revision, selection, export progress, scheduling, and publishing
+4. package and smoke-test the replacement slice before migrating another screen
 
-Decided 2026-05-20: keep Python as the single backend and replace only the UI layer, after the Instagram-first MVP ships and is packaged. Do not start UI rewrite work until Milestones 5A/5B are done and a packaged build is validated.
+## 14. UI Upgrade Plan (Active)
 
-Confirmed 2026-05-24: a future web/multi-device direction remains viable and should be kept open. The current PyQt6 MVP should not be rewritten yet, but new workflow behavior should avoid being trapped in UI code. Prefer plain Python service/module boundaries so a later React frontend can call the same backend logic.
+Decision updated 2026-06-06: begin the UI-layer migration now. Keep Python as the backend and replace PyQt6 incrementally with pywebview + Vite/React/TypeScript/Tailwind/shadcn.
 
-### Phase A - Finish the MVP on PyQt6
+The migration is not a full rewrite. Existing SQLite, processing, scraping, pooling, scheduling, and Playwright publishing behavior remains the source of truth. Workflow behavior currently embedded in PyQt handlers should move into plain Python services only when required by the active migration slice.
 
-No UI-stack change. Complete the manual Instagram Publish Queue and Instagram manual source intake on the current PyQt6 UI, then package and smoke-test.
+Long-running AI, scrape, download, FFmpeg, file, and Playwright work must run through UI-independent background jobs that expose structured status/progress. Bridge calls start work and return quickly; polling is the initial progress mechanism.
 
-### Phase B - Rewrite the UI on pywebview + web frontend
+The first vertical slice is Processing. Keep Copy Chat Prompt and Paste Draft as temporary fallbacks, but the target workflow generates and revises structured draft options directly inside NicheFlow, then exports and schedules/publishes from the same saved state.
 
-- Shell: pywebview - native window via the OS webview, Python stays the main process, no local HTTP server.
-- Frontend: Vite + React + Tailwind + shadcn/ui in a new `frontend/` directory. Node is a build-time-only dependency.
-- Packaging: Vite build emits static assets, PyInstaller bundles them, pywebview loads them from the bundled path.
-- Steps: bridge spike (one screen) -> define a thin Python API/bridge layer over `core`/`db`/`processing`/`scraper` -> rebuild screens one at a time (Accounts, Scraping, Downloads, Processing, Publish Queue) -> retire PyQt6 and delete `main_window.py`.
-- Rationale: the bridge layer forces UI logic out of the 389 KB `main_window.py`; web styling is the fastest path to a minimalist look.
+Packaging is a checkpoint inside the migration, not a gate before it. The old PyQt workflow remains available until the new Processing slice passes a packaged Windows smoke test.
 
-Rejected for the immediate desktop-wrapper step: Next.js + Python-over-HTTP (web-server framework features go unused on a local desktop MVP, heavier packaging) and Electron (second runtime, large bundle).
-
-### Phase C - Optional Multi-Device Web App
-
-If the manual publishing workflow proves valuable and phone/tablet access becomes important, evolve from local desktop UI to a real web architecture:
-
-- Frontend: React/TypeScript web UI for review, captions, approvals, Publish Queue, and metrics.
-- Backend: Python API over the same service layer used by the desktop app.
-- Worker: Python/FFmpeg/yt-dlp/Groq processing stays on a PC or server worker, not in the phone browser.
-- Storage: keep SQLite/local files for local-web first; consider Postgres/object storage only when cloud sync or remote access is truly needed.
-- Rule: do not start the web rewrite until the current MVP loop is validated; keep current code migration-friendly by moving business logic out of PyQt widgets when touching it.
+See `docs/UI_MIGRATION_PLAN.md` for the authoritative migration sequence and definition of done.

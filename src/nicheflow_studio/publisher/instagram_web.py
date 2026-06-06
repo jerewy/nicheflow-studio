@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import subprocess
 import sys
@@ -8,6 +9,8 @@ from pathlib import Path
 
 from nicheflow_studio.core.instagram_session import DEFAULT_PROFILE_NAME, profile_dir
 
+
+log = logging.getLogger(__name__)
 
 INSTAGRAM_UPLOAD_URL = "https://www.instagram.com/"
 INSTAGRAM_LOGIN_URL = "https://www.instagram.com/accounts/login/"
@@ -45,8 +48,9 @@ def launch_instagram_upload_assist(
     profile_name: str | None = None,
     *,
     url: str = INSTAGRAM_UPLOAD_URL,
+    minimized: bool = True,
 ) -> subprocess.Popen[bytes]:
-    """Open Instagram in a visible browser using the saved Playwright profile."""
+    """Open Instagram using the saved Playwright profile."""
     selected_profile = (profile_name or DEFAULT_PROFILE_NAME).strip() or DEFAULT_PROFILE_NAME
     command = [
         sys.executable,
@@ -57,6 +61,8 @@ def launch_instagram_upload_assist(
         "--url",
         url,
     ]
+    if minimized:
+        command.append("--minimized")
     creationflags = 0
     if os.name == "nt":
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -68,8 +74,29 @@ def launch_instagram_upload_assist(
     )
 
 
-def open_visible_instagram_profile(profile_name: str, *, url: str = INSTAGRAM_UPLOAD_URL) -> None:
-    """Open a persistent visible Chromium profile and keep it alive until closed."""
+def _minimize_browser_window(context, page) -> None:  # noqa: ANN001
+    """Best-effort minimize for persistent Chrome windows."""
+    try:
+        cdp_session = context.new_cdp_session(page)
+        window_info = cdp_session.send("Browser.getWindowForTarget")
+        cdp_session.send(
+            "Browser.setWindowBounds",
+            {
+                "windowId": window_info["windowId"],
+                "bounds": {"windowState": "minimized"},
+            },
+        )
+    except Exception:  # noqa: BLE001 - minimizing is cosmetic
+        log.debug("could not minimize Instagram upload assist window", exc_info=True)
+
+
+def open_visible_instagram_profile(
+    profile_name: str,
+    *,
+    url: str = INSTAGRAM_UPLOAD_URL,
+    minimized: bool = True,
+) -> None:
+    """Open a persistent Chromium profile and keep it alive until closed."""
     from playwright.sync_api import Error as PlaywrightError
     from playwright.sync_api import sync_playwright
 
@@ -78,6 +105,8 @@ def open_visible_instagram_profile(profile_name: str, *, url: str = INSTAGRAM_UP
 
     with sync_playwright() as playwright:
         launch_kwargs: dict = {"headless": False, "viewport": None, "channel": "chrome"}
+        if minimized:
+            launch_kwargs["args"] = ["--start-minimized"]
         try:
             context = playwright.chromium.launch_persistent_context(
                 user_data_dir=str(user_data_dir), **launch_kwargs
@@ -88,8 +117,13 @@ def open_visible_instagram_profile(profile_name: str, *, url: str = INSTAGRAM_UP
                 user_data_dir=str(user_data_dir), **launch_kwargs
             )
         page = context.pages[0] if context.pages else context.new_page()
+        if minimized:
+            _minimize_browser_window(context, page)
         page.goto(url, wait_until="domcontentloaded")
-        page.bring_to_front()
+        if minimized:
+            _minimize_browser_window(context, page)
+        else:
+            page.bring_to_front()
         try:
             while context.pages:
                 page.wait_for_timeout(1000)
@@ -106,8 +140,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Open Instagram for assisted manual upload.")
     parser.add_argument("--profile", default=DEFAULT_PROFILE_NAME)
     parser.add_argument("--url", default=INSTAGRAM_UPLOAD_URL)
+    parser.add_argument(
+        "--minimized",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep the browser window minimized instead of bringing it to front.",
+    )
     args = parser.parse_args()
-    open_visible_instagram_profile(str(args.profile), url=str(args.url))
+    open_visible_instagram_profile(
+        str(args.profile),
+        url=str(args.url),
+        minimized=bool(args.minimized),
+    )
     return 0
 
 
