@@ -2536,9 +2536,11 @@ def _parse_final_drafts(
     content = _extract_message_content(response_payload)
     parsed = _parse_model_json(content)
     summary = _normalize_whitespace(str(parsed.get("final_summary") or parsed.get("summary") or ""))
-    title_options = _clean_options(parsed.get("title_options"), preserve_paragraphs=True)[
-        :SMART_DRAFT_OPTION_COUNT
-    ]
+    title_options = _clean_options(
+        parsed.get("title_options"),
+        preserve_paragraphs=True,
+        strip_wrapping_bold=True,
+    )[:SMART_DRAFT_OPTION_COUNT]
     caption_options = _clean_options(parsed.get("caption_options"), preserve_paragraphs=True)[
         :SMART_CAPTION_OPTION_COUNT
     ]
@@ -2828,7 +2830,12 @@ def _extract_first_json_object(text: str) -> str | None:
     return None
 
 
-def _clean_options(value: object, *, preserve_paragraphs: bool = False) -> list[str]:
+def _clean_options(
+    value: object,
+    *,
+    preserve_paragraphs: bool = False,
+    strip_wrapping_bold: bool = False,
+) -> list[str]:
     if not isinstance(value, list):
         return []
     cleaned: list[str] = []
@@ -2841,6 +2848,13 @@ def _clean_options(value: object, *, preserve_paragraphs: bool = False) -> list[
             if preserve_paragraphs
             else _normalize_whitespace(str(item))
         )
+        if (
+            strip_wrapping_bold
+            and text.startswith("**")
+            and text.endswith("**")
+            and text.count("**") == 2
+        ):
+            text = text[2:-2].strip()
         if text:
             cleaned.append(text)
     return cleaned

@@ -845,6 +845,22 @@ def test_clean_options_preserves_caption_paragraph_breaks() -> None:
     assert cleaned == ["Para one.\n\nPara two.\n\n#tag1 #tag2"]
 
 
+def test_clean_options_strips_only_whole_title_bold_wrapper() -> None:
+    cleaned = smart_drafts._clean_options(
+        [
+            "**Jason Paige Sang the Pokemon Theme in a Single Take**",
+            "The moment that **reframes** the fight.",
+        ],
+        preserve_paragraphs=True,
+        strip_wrapping_bold=True,
+    )
+
+    assert cleaned == [
+        "Jason Paige Sang the Pokemon Theme in a Single Take",
+        "The moment that **reframes** the fight.",
+    ]
+
+
 def test_parse_final_drafts_preserves_title_paragraph_breaks() -> None:
     inner = smart_drafts.json.dumps(
         {

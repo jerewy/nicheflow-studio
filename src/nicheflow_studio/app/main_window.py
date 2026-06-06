@@ -1194,8 +1194,9 @@ def parse_pasted_smart_draft(text: str) -> PastedSmartDraft:
     Recognises ``Title Option N:`` / ``Caption Option N:`` /
     ``Recommended Style N:`` blocks plus the ``Recommended Pick:`` / ``Why:`` /
     ``Selection Notes:`` footer. Title/style content is collapsed to one line;
-    caption content keeps its paragraph breaks. Bold ``**word**`` markers are
-    preserved verbatim. Indices in the result are 0-based.
+    caption content keeps its paragraph breaks. Internal bold ``**word**``
+    markers are preserved, but accidental whole-title Markdown wrappers are
+    removed. Indices in the result are 0-based.
     """
     titles: dict[int, list[str]] = {}
     captions: dict[int, list[str]] = {}
@@ -1245,12 +1246,18 @@ def parse_pasted_smart_draft(text: str) -> PastedSmartDraft:
     def _join_line(lines: list[str]) -> str:
         return " ".join(part.strip() for part in lines if part.strip()).strip()
 
+    def _join_title(lines: list[str]) -> str:
+        title = _join_line(lines)
+        if title.startswith("**") and title.endswith("**") and title.count("**") == 2:
+            return title[2:-2].strip()
+        return title
+
     def _join_caption(lines: list[str]) -> str:
         joined = "\n".join(lines).strip()
         return re.sub(r"\n{3,}", "\n\n", joined)
 
     max_index = max([*titles, *captions, *styles], default=0)
-    title_options = [_join_line(titles.get(i, [])) for i in range(1, max_index + 1)]
+    title_options = [_join_title(titles.get(i, [])) for i in range(1, max_index + 1)]
     caption_options = [_join_caption(captions.get(i, [])) for i in range(1, max_index + 1)]
     recommended_styles = [_join_line(styles.get(i, [])) for i in range(1, max_index + 1)]
 
@@ -7817,6 +7824,9 @@ class MainWindow(QWidget):
                 "- After the 3 options, recommend the strongest title/caption pair for this account and explain why in 1-2 sentences.",
                 "- Add a short selection note for each option so the user understands when to choose it.",
                 *visual_style_task_lines,
+                "- Return title wording as plain text. Do not wrap an entire title in Markdown "
+                "bold markers (`**...**`); only use internal emphasis markers when the Style "
+                "contract explicitly requests them.",
                 "- Follow the Style contract exactly; it overrides any generic caption habits.",
                 "- Use the clip premise as guidance, but do not invent unsupported facts.",
                 "- Keep the result ready to paste back into NicheFlow.",

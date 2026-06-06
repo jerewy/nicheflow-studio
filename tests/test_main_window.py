@@ -4901,6 +4901,7 @@ def test_processing_copy_chat_prompt_includes_local_file_and_niche_context(
         assert "Do not use generic filler hashtags like #fyp" in prompt
         assert "Generate 3 on-screen title options and 3 caption options" in prompt
         assert "recommend the strongest title/caption pair" in prompt
+        assert "Do not wrap an entire title in Markdown bold markers" in prompt
         assert "Recommended Pick:" in prompt
         assert "Selection Notes:" in prompt
     finally:
@@ -9040,6 +9041,28 @@ def test_parse_pasted_smart_draft_handles_missing_footer() -> None:
     assert draft.caption_options == ["A simple caption"]
     assert draft.recommended_title_index is None
     assert draft.reason is None
+
+
+def test_parse_pasted_smart_draft_strips_only_whole_title_bold_wrapper() -> None:
+    pasted = """Title Option 1:
+**Jason Paige Sang the Pokemon Theme in a Single Take**
+
+Caption Option 1:
+A caption.
+
+Title Option 2:
+The moment that **reframes** the fight.
+
+Caption Option 2:
+Another caption.
+"""
+
+    draft = parse_pasted_smart_draft(pasted)
+
+    assert draft.title_options == [
+        "Jason Paige Sang the Pokemon Theme in a Single Take",
+        "The moment that **reframes** the fight.",
+    ]
 
 
 def test_parse_pasted_smart_draft_empty_text_is_safe() -> None:
