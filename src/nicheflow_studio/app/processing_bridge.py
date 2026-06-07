@@ -105,11 +105,19 @@ class ProcessingBridge:
     def delete_account(self, account_id: int) -> dict:
         return accounts_svc.delete_account(account_id)
 
-    # --- Downloads / Library (migrated screen) --- #
+    @_guard
+    def get_active_account(self) -> dict:
+        return accounts_svc.get_active_account()
 
     @_guard
-    def list_library_items(self) -> list[dict]:
-        return library_svc.list_items()
+    def set_active_account(self, account_id: int | None = None) -> dict:
+        return accounts_svc.set_active_account(account_id)
+
+    # --- Library / Processing item list --- #
+
+    @_guard
+    def list_library_items(self, account_id: int | None = None) -> list[dict]:
+        return library_svc.list_items(account_id)
 
     @_guard
     def assign_account(self, item_id: int, account_id: int | None = None) -> dict:

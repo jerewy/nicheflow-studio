@@ -8,7 +8,7 @@ import { bridge, whenBridgeReady } from "@/lib/bridge";
 import type {
   DraftRevision,
   ExportResult,
-  ItemSummary,
+  LibraryItem,
   ProcessingContext,
   PublishJob,
   WorkflowSettings,
@@ -20,10 +20,28 @@ const JOB_TIMEOUT_MS = 180000;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-function itemStatus(item: ItemSummary): string {
-  if (item.has_processed) return "exported";
-  if (item.has_draft) return "draft";
-  return "ready";
+// Workflow status -> label + colored dot (Tailwind bg class) for the videos table.
+const STATUS_META: Record<string, { label: string; dot: string }> = {
+  new: { label: "New", dot: "bg-sky-500" },
+  draft: { label: "Draft", dot: "bg-amber-500" },
+  exported: { label: "Exported", dot: "bg-violet-500" },
+  posted: { label: "Posted", dot: "bg-emerald-500" },
+  skipped: { label: "Skipped", dot: "bg-zinc-500" },
+};
+
+function statusMeta(status: string): { label: string; dot: string } {
+  return STATUS_META[status] ?? { label: status, dot: "bg-zinc-400" };
+}
+
+function shortDate(iso: string | null): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? "" : d.toLocaleDateString();
+}
+
+interface ProcessingScreenProps {
+  activeAccountId: number;
+  activeAccountName: string | null;
 }
 
 function workflowPayload(workflow: WorkflowSettings | null): Record<string, unknown> {
@@ -75,8 +93,9 @@ function sameOptions(a: EditableOptions, revision: DraftRevision | null): boolea
   );
 }
 
-export function ProcessingScreen() {
+export function ProcessingScreen({ activeAccountId, activeAccountName }: ProcessingScreenProps) {
   const [context, setContext] = useState<ProcessingContext | null>(null);
+  const [itemsLoaded, setItemsLoaded] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -87,7 +106,7 @@ export function ProcessingScreen() {
     null,
   );
   const [exportedPath, setExportedPath] = useState<string | null>(null);
-  const [items, setItems] = useState<ItemSummary[]>([]);
+  const [items, setItems] = useState<LibraryItem[]>([]);
   const [publishJobs, setPublishJobs] = useState<PublishJob[]>([]);
   const [scheduleAt, setScheduleAt] = useState("");
   const [publishMessage, setPublishMessage] = useState<string | null>(null);
@@ -166,36 +185,36 @@ export function ProcessingScreen() {
     [loadRevisionIntoEditor, refreshPublishJobs],
   );
 
-  // Wait for the pywebview bridge to be injected before the first load, so a
-  // real desktop window doesn't briefly fall back to the browser mock.
+  // Load the active account's videos, then open the first one. Re-runs when the
+  // active niche account changes.
   useEffect(() => {
     let cancelled = false;
-    whenBridgeReady().then((ready) => {
+    whenBridgeReady().then(async (ready) => {
       if (cancelled) return;
       setIsDesktop(ready);
       bridge
         .canGenerate()
         .then(setCanGenerate)
         .catch(() => setCanGenerate(false));
-      bridge
-        .listItems()
-        .then((list) => {
-          if (!cancelled) setItems(list);
-        })
-        .catch(() => undefined);
-      bridge
-        .getContext()
-        .then((ctx) => {
+      try {
+        const list = await bridge.listLibraryItems(activeAccountId);
+        if (cancelled) return;
+        setItems(list);
+        setItemsLoaded(true);
+        if (list.length > 0) {
+          const ctx = await bridge.getContext(list[0].id);
           if (!cancelled) applyContext(ctx);
-        })
-        .catch((err: unknown) =>
-          setLoadError(err instanceof Error ? err.message : String(err)),
-        );
+        } else {
+          setContext(null);
+        }
+      } catch (err: unknown) {
+        if (!cancelled) setLoadError(err instanceof Error ? err.message : String(err));
+      }
     });
     return () => {
       cancelled = true;
     };
-  }, [applyContext]);
+  }, [applyContext, activeAccountId]);
 
   const switchItem = async (id: number) => {
     if (id === itemId) return;
@@ -382,7 +401,7 @@ export function ProcessingScreen() {
       const ctx = await bridge.getContext(itemId);
       setContext(ctx);
       refreshPublishJobs(itemId);
-      bridge.listItems().then(setItems).catch(() => undefined);
+      bridge.listLibraryItems(activeAccountId).then(setItems).catch(() => undefined);
     } catch (err: unknown) {
       setActionError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -443,6 +462,22 @@ export function ProcessingScreen() {
   }
 
   if (!context) {
+    if (itemsLoaded && items.length === 0) {
+      return (
+        <div className="mx-auto max-w-2xl p-8">
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-base">No videos for this account</CardTitle>
+            </CardHeader>
+            <CardContent className="text-sm text-muted-foreground">
+              {activeAccountName ? `"${activeAccountName}" has` : "This account has"} no downloaded
+              clips yet. Scrape or import clips in the desktop app (and assign them to this
+              account), then they'll appear here.
+            </CardContent>
+          </Card>
+        </div>
+      );
+    }
     return <div className="p-8 text-sm text-muted-foreground">Loading…</div>;
   }
 
@@ -453,8 +488,7 @@ export function ProcessingScreen() {
       ? item.exported_preview_url
       : item.original_preview_url;
   const filteredItems = items.filter((candidate) => {
-    const status = itemStatus(candidate);
-    const matchesStatus = itemFilter === "all" || status === itemFilter;
+    const matchesStatus = itemFilter === "all" || candidate.status === itemFilter;
     const search = itemSearch.trim().toLowerCase();
     const matchesSearch =
       !search ||
@@ -477,7 +511,8 @@ export function ProcessingScreen() {
             {dirty && <Badge variant="destructive">unsaved edits</Badge>}
           </div>
           <p className="text-sm text-muted-foreground">
-            {account?.niche_label ? `${account.niche_label}` : "no account"}
+            {activeAccountName ?? account?.name ?? "no account"}
+            {account?.niche_label ? ` · ${account.niche_label}` : ""}
           </p>
         </div>
       </header>
@@ -505,9 +540,11 @@ export function ProcessingScreen() {
                 onChange={(event) => setItemFilter(event.target.value)}
               >
                 <option value="all">All</option>
-                <option value="ready">Ready</option>
+                <option value="new">New</option>
                 <option value="draft">Draft</option>
                 <option value="exported">Exported</option>
+                <option value="posted">Posted</option>
+                <option value="skipped">Skipped</option>
               </select>
             </div>
           </div>
@@ -515,31 +552,49 @@ export function ProcessingScreen() {
             <table className="w-full table-fixed text-left text-sm">
               <thead className="sticky top-0 bg-muted text-xs text-muted-foreground">
                 <tr>
-                  <th className="w-24 px-3 py-2 font-medium">Status</th>
-                  <th className="w-16 px-3 py-2 font-medium">ID</th>
+                  <th className="w-28 px-3 py-2 font-medium">Status</th>
                   <th className="px-3 py-2 font-medium">Title</th>
+                  <th className="w-28 px-3 py-2 font-medium">Added</th>
                 </tr>
               </thead>
               <tbody>
-                {filteredItems.map((candidate) => (
-                  <tr
-                    key={candidate.id}
-                    className={`cursor-pointer border-t transition-colors hover:bg-accent ${
-                      candidate.id === item.id ? "bg-accent" : ""
-                    }`}
-                    onClick={() => switchItem(candidate.id)}
-                  >
-                    <td className="px-3 py-2">
-                      <Badge variant={candidate.has_processed ? "default" : "secondary"}>
-                        {itemStatus(candidate)}
-                      </Badge>
-                    </td>
-                    <td className="px-3 py-2 text-muted-foreground">#{candidate.id}</td>
-                    <td className="truncate px-3 py-2" title={candidate.title ?? candidate.source_url}>
-                      {candidate.title ?? candidate.source_url}
-                    </td>
-                  </tr>
-                ))}
+                {filteredItems.map((candidate) => {
+                  const meta = statusMeta(candidate.status);
+                  return (
+                    <tr
+                      key={candidate.id}
+                      className={`cursor-pointer border-t transition-colors hover:bg-accent ${
+                        candidate.id === item.id ? "bg-accent" : ""
+                      }`}
+                      onClick={() => switchItem(candidate.id)}
+                    >
+                      <td className="px-3 py-2">
+                        <span className="flex items-center gap-2">
+                          <span className={`h-2.5 w-2.5 shrink-0 rounded-full ${meta.dot}`} />
+                          <span>{meta.label}</span>
+                        </span>
+                      </td>
+                      <td
+                        className="truncate px-3 py-2"
+                        title={candidate.title ?? candidate.source_url}
+                      >
+                        <span className="flex items-center gap-2">
+                          {candidate.is_new && (
+                            <Badge variant="default" className="px-1.5 py-0 text-[10px]">
+                              NEW
+                            </Badge>
+                          )}
+                          <span className="truncate">
+                            #{candidate.id} {candidate.title ?? candidate.source_url}
+                          </span>
+                        </span>
+                      </td>
+                      <td className="px-3 py-2 text-xs text-muted-foreground">
+                        {shortDate(candidate.created_at)}
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>

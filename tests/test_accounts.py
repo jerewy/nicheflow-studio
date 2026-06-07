@@ -54,6 +54,31 @@ def test_update_unknown_raises() -> None:
         accounts_svc.update_account(99999, {"name": "x"})
 
 
+def test_active_account_set_get_and_clear() -> None:
+    created = accounts_svc.create_account({"name": "Active Acc"})
+    account_id = created["id"]
+
+    assert accounts_svc.get_active_account() == {"active_account_id": None}
+
+    accounts_svc.set_active_account(account_id)
+    assert accounts_svc.get_active_account() == {"active_account_id": account_id}
+
+    accounts_svc.set_active_account(None)
+    assert accounts_svc.get_active_account() == {"active_account_id": None}
+
+
+def test_set_active_account_unknown_raises() -> None:
+    with pytest.raises(AccountError):
+        accounts_svc.set_active_account(99999)
+
+
+def test_get_active_account_ignores_deleted() -> None:
+    created = accounts_svc.create_account({"name": "Temp"})
+    accounts_svc.set_active_account(created["id"])
+    accounts_svc.delete_account(created["id"])
+    assert accounts_svc.get_active_account() == {"active_account_id": None}
+
+
 def test_delete_unassigns_items_and_removes_jobs() -> None:
     created = accounts_svc.create_account({"name": "Acc"})
     account_id = created["id"]

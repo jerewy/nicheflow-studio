@@ -85,7 +85,11 @@ interface PywebviewApi {
     payload: Record<string, unknown>,
   ): Promise<Envelope<AccountDetail>>;
   delete_account(accountId: number): Promise<Envelope<DeleteAccountResult>>;
-  list_library_items(): Promise<Envelope<LibraryItem[]>>;
+  get_active_account(): Promise<Envelope<{ active_account_id: number | null }>>;
+  set_active_account(
+    accountId: number | null,
+  ): Promise<Envelope<{ active_account_id: number | null }>>;
+  list_library_items(accountId?: number | null): Promise<Envelope<LibraryItem[]>>;
   assign_account(
     itemId: number,
     accountId: number | null,
@@ -313,9 +317,19 @@ export const bridge = {
     return unwrap(window.pywebview!.api.delete_account(accountId));
   },
 
-  listLibraryItems(): Promise<LibraryItem[]> {
+  getActiveAccount(): Promise<{ active_account_id: number | null }> {
+    if (!hasBridge()) return Promise.resolve({ active_account_id: 1 });
+    return unwrap(window.pywebview!.api.get_active_account());
+  },
+
+  setActiveAccount(accountId: number | null): Promise<{ active_account_id: number | null }> {
+    if (!hasBridge()) return Promise.resolve({ active_account_id: accountId });
+    return unwrap(window.pywebview!.api.set_active_account(accountId));
+  },
+
+  listLibraryItems(accountId?: number | null): Promise<LibraryItem[]> {
     if (!hasBridge()) return mock.listLibraryItems();
-    return unwrap(window.pywebview!.api.list_library_items());
+    return unwrap(window.pywebview!.api.list_library_items(accountId ?? null));
   },
 
   assignAccount(itemId: number, accountId: number | null) {
@@ -570,7 +584,9 @@ const mock = {
         id: 1,
         title: "Mock clip (browser dev)",
         source_url: "https://instagram.com/reel/mock",
-        status: "completed",
+        status: "draft",
+        raw_status: "completed",
+        review_state: "new",
         file_path: "C:/clips/mock.mp4",
         has_file: true,
         has_processed: false,
@@ -578,6 +594,7 @@ const mock = {
         account_id: 1,
         account_name: "Mock Movie Account",
         created_at: new Date().toISOString(),
+        is_new: true,
       },
     ];
   },

@@ -170,7 +170,9 @@ export interface LibraryItem {
   id: number;
   title: string | null;
   source_url: string;
-  status: string;
+  status: string; // derived workflow status: new | draft | exported | posted | skipped
+  raw_status: string;
+  review_state: string | null;
   file_path: string | null;
   has_file: boolean;
   has_processed: boolean;
@@ -178,6 +180,7 @@ export interface LibraryItem {
   account_id: number | null;
   account_name: string | null;
   created_at: string | null;
+  is_new: boolean;
 }
 
 export interface PoolAssignmentCount {

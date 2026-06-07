@@ -49,7 +49,13 @@ function detailToForm(detail: AccountDetail): FormState {
   return form;
 }
 
-export function AccountManager() {
+interface AccountManagerProps {
+  activeId: number | null;
+  onAccountsChanged?: () => void;
+  onUseAccount?: (id: number) => void;
+}
+
+export function AccountManager({ activeId, onAccountsChanged, onUseAccount }: AccountManagerProps) {
   const [accounts, setAccounts] = useState<AccountSummary[]>([]);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [creating, setCreating] = useState(false);
@@ -62,10 +68,11 @@ export function AccountManager() {
   const refreshList = useCallback(async () => {
     try {
       setAccounts(await bridge.listAccounts());
+      onAccountsChanged?.();
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
     }
-  }, []);
+  }, [onAccountsChanged]);
 
   useEffect(() => {
     refreshList();
@@ -158,20 +165,40 @@ export function AccountManager() {
         </div>
         <div className="space-y-1">
           {accounts.map((acc) => (
-            <button
+            <div
               key={acc.id}
-              onClick={() => selectAccount(acc.id)}
               className={cn(
-                "w-full rounded-md border px-3 py-2 text-left text-sm transition-colors hover:bg-accent",
-                selectedId === acc.id && "border-ring bg-accent",
+                "rounded-md border px-3 py-2 text-sm transition-colors",
+                selectedId === acc.id && "border-ring",
+                activeId === acc.id && "bg-accent",
               )}
             >
-              <div className="font-medium">{acc.name}</div>
-              <div className="text-xs text-muted-foreground">
-                {acc.platform}
-                {acc.niche_label ? ` · ${acc.niche_label}` : ""}
-              </div>
-            </button>
+              <button
+                type="button"
+                onClick={() => selectAccount(acc.id)}
+                className="block w-full text-left"
+              >
+                <div className="flex items-center gap-2 font-medium">
+                  {acc.name}
+                  {activeId === acc.id && (
+                    <span className="text-[10px] font-semibold text-emerald-500">● ACTIVE</span>
+                  )}
+                </div>
+                <div className="text-xs text-muted-foreground">
+                  {acc.platform}
+                  {acc.niche_label ? ` · ${acc.niche_label}` : ""}
+                </div>
+              </button>
+              {activeId !== acc.id && onUseAccount && (
+                <button
+                  type="button"
+                  onClick={() => onUseAccount(acc.id)}
+                  className="mt-1 text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+                >
+                  Use as active niche
+                </button>
+              )}
+            </div>
           ))}
           {accounts.length === 0 && (
             <p className="text-sm text-muted-foreground">No accounts yet.</p>

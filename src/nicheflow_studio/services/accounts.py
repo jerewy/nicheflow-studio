@@ -22,8 +22,14 @@ from nicheflow_studio.db.models import (
     Source,
     UploadJob,
 )
+from nicheflow_studio.core.ui_prefs import get_ui_pref, set_ui_pref
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.services.errors import ServiceError
+
+# Pref holding the user's active niche account. The React shell gates Processing
+# and the Dashboard on this so work stays isolated to one account at a time
+# (mirrors the PyQt "Active Niche").
+ACTIVE_ACCOUNT_PREF_KEY = "active_account_id"
 
 # Free-text fields the editor can set directly (empty string -> NULL).
 _TEXT_FIELDS = (
@@ -153,6 +159,29 @@ def update_account(account_id: int, payload: dict | None = None) -> dict:
         _apply_payload(account, payload, partial=True)
         session.commit()
         return _account_detail(session, account)
+
+
+def get_active_account() -> dict:
+    """Return the persisted active account id (validated), or ``None``."""
+    value = get_ui_pref(ACTIVE_ACCOUNT_PREF_KEY, None)
+    if not isinstance(value, int):
+        return {"active_account_id": None}
+    with get_session() as session:
+        if session.get(Account, value) is None:
+            return {"active_account_id": None}
+    return {"active_account_id": value}
+
+
+def set_active_account(account_id: int | None) -> dict:
+    """Persist the active niche account (or clear it with ``None``)."""
+    if account_id is None:
+        set_ui_pref(ACTIVE_ACCOUNT_PREF_KEY, None)
+        return {"active_account_id": None}
+    with get_session() as session:
+        if session.get(Account, account_id) is None:
+            raise AccountError(f"No account with id {account_id}.")
+    set_ui_pref(ACTIVE_ACCOUNT_PREF_KEY, int(account_id))
+    return {"active_account_id": int(account_id)}
 
 
 def delete_account(account_id: int) -> dict:

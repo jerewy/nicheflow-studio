@@ -97,6 +97,14 @@
   .dark select {
     background-color: oklch(0.175 0.004 285);
   }
+  .dark select option {
+    background-color: var(--popover);
+    color: var(--popover-foreground);
+  }
+  .dark select option:checked {
+    background-color: var(--accent);
+    color: var(--accent-foreground);
+  }
   .dark input:focus,
   .dark textarea:focus,
   .dark select:focus {

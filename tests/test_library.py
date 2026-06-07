@@ -47,6 +47,46 @@ def test_list_items_includes_account_name_and_flags() -> None:
     assert row["account_name"] == "Movies"
     assert row["has_file"] is True
     assert row["has_processed"] is False
+    # Freshly created item reads as "new" with the New flag set.
+    assert row["status"] == "new"
+    assert row["is_new"] is True
+
+
+def test_list_items_filters_by_account() -> None:
+    a = _make_account("A")
+    b = _make_account("B")
+    item_a = _make_item(account_id=a)
+    _make_item(account_id=b)
+
+    rows = library.list_items(account_id=a)
+
+    assert [r["id"] for r in rows] == [item_a]
+
+
+def test_status_derivation_draft_exported_posted() -> None:
+    from nicheflow_studio.db.models import UploadJob
+
+    account_id = _make_account()
+    draft = _make_item(account_id=account_id)
+    exported = _make_item(account_id=account_id)
+    posted = _make_item(account_id=account_id)
+    with get_session() as session:
+        session.get(DownloadItem, draft).title_draft = "A title"
+        session.get(DownloadItem, exported).processed_path = "C:/out.mp4"
+        session.add(
+            UploadJob(
+                account_id=account_id,
+                download_item_id=posted,
+                processed_path="C:/posted.mp4",
+                status="posted",
+            )
+        )
+        session.commit()
+
+    by_id = {r["id"]: r["status"] for r in library.list_items(account_id=account_id)}
+    assert by_id[draft] == "draft"
+    assert by_id[exported] == "exported"
+    assert by_id[posted] == "posted"
 
 
 def test_assign_and_clear_account() -> None:
