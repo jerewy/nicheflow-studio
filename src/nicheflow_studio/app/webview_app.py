@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import threading
 from pathlib import Path
 
@@ -41,7 +42,12 @@ _BOOTSTRAP_HTML = """<!doctype html>
 
 
 def _frontend_dist_index() -> Path:
-    # src/nicheflow_studio/app/webview_app.py -> repo root is parents[3].
+    # In a PyInstaller build the frontend is bundled under sys._MEIPASS via
+    # --add-data "frontend/dist;frontend/dist"; in dev it lives in the repo
+    # (this file is src/nicheflow_studio/app/webview_app.py -> root is parents[3]).
+    if getattr(sys, "frozen", False):
+        base = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+        return base / "frontend" / "dist" / "index.html"
     return Path(__file__).resolve().parents[3] / "frontend" / "dist" / "index.html"
 
 
