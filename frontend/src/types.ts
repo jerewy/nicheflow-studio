@@ -180,6 +180,34 @@ export interface LibraryItem {
   created_at: string | null;
 }
 
+export interface PoolAssignmentCount {
+  account_id: number;
+  account_name: string;
+  count: number;
+}
+
+export interface NichePool {
+  niche: string;
+  pooled: number;
+  assigned: number;
+  unused: number;
+  rejected: number;
+  assignments_by_account: PoolAssignmentCount[];
+}
+
+export interface PoolingOverview {
+  niches: NichePool[];
+}
+
+export interface PoolClip {
+  pool_item_id: number;
+  clip_label: string;
+  source_label: string;
+  accepted_at: string | null;
+  distributed_to: string[];
+  is_distributed: boolean;
+}
+
 export interface PublishQueueJob {
   id: number;
   account_id: number | null;

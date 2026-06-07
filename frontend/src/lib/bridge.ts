@@ -17,6 +17,8 @@ import type {
   ItemSummary,
   JobSnapshot,
   LibraryItem,
+  PoolClip,
+  PoolingOverview,
   ProcessingContext,
   PublishJob,
   PublishQueueJob,
@@ -99,6 +101,8 @@ interface PywebviewApi {
   reschedule_job(jobId: number, scheduledAt: string): Promise<Envelope<PublishQueueJob>>;
   unschedule_job(jobId: number): Promise<Envelope<PublishQueueJob>>;
   remove_publish_job(jobId: number): Promise<Envelope<{ removed_job_id: number }>>;
+  pooling_overview(): Promise<Envelope<PoolingOverview>>;
+  list_pool_items(niche: string): Promise<Envelope<PoolClip[]>>;
 }
 
 declare global {
@@ -349,6 +353,16 @@ export const bridge = {
     if (!hasBridge()) return Promise.resolve({ removed_job_id: jobId });
     return unwrap(window.pywebview!.api.remove_publish_job(jobId));
   },
+
+  poolingOverview(): Promise<PoolingOverview> {
+    if (!hasBridge()) return mock.poolingOverview();
+    return unwrap(window.pywebview!.api.pooling_overview());
+  },
+
+  listPoolItems(niche: string): Promise<PoolClip[]> {
+    if (!hasBridge()) return mock.listPoolItems();
+    return unwrap(window.pywebview!.api.list_pool_items(niche));
+  },
 };
 
 // --- browser-only mock ---------------------------------------------------- //
@@ -513,6 +527,42 @@ const mock = {
   },
   async listPublishQueue(): Promise<PublishQueueJob[]> {
     return [await mock.publishQueueJob()];
+  },
+  async poolingOverview(): Promise<PoolingOverview> {
+    return {
+      niches: [
+        {
+          niche: "history",
+          pooled: 3,
+          assigned: 2,
+          unused: 1,
+          rejected: 0,
+          assignments_by_account: [
+            { account_id: 1, account_name: "Past Moments Daily", count: 2 },
+          ],
+        },
+        {
+          niche: "movie",
+          pooled: 0,
+          assigned: 0,
+          unused: 0,
+          rejected: 0,
+          assignments_by_account: [],
+        },
+      ],
+    };
+  },
+  async listPoolItems(): Promise<PoolClip[]> {
+    return [
+      {
+        pool_item_id: 1,
+        clip_label: "abc123",
+        source_label: "thehistologian",
+        accepted_at: new Date().toISOString(),
+        distributed_to: ["Past Moments Daily"],
+        is_distributed: true,
+      },
+    ];
   },
   async listLibraryItems(): Promise<LibraryItem[]> {
     return [

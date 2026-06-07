@@ -2,11 +2,12 @@ import { useState } from "react";
 
 import { AccountManager } from "@/components/AccountManager";
 import { LibraryScreen } from "@/components/LibraryScreen";
+import { PoolingScreen } from "@/components/PoolingScreen";
 import { ProcessingScreen } from "@/components/ProcessingScreen";
 import { PublishingScreen } from "@/components/PublishingScreen";
 import { cn } from "@/lib/utils";
 
-type Tab = "accounts" | "library" | "processing" | "publishing";
+type Tab = "accounts" | "library" | "processing" | "publishing" | "pooling";
 
 // Ordered to match the workflow: account -> library -> process -> publish.
 const TABS: { id: Tab; label: string }[] = [
@@ -14,6 +15,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "library", label: "Library" },
   { id: "processing", label: "Processing" },
   { id: "publishing", label: "Publishing" },
+  { id: "pooling", label: "Pool & Distribute" },
 ];
 
 function App() {
@@ -41,6 +43,7 @@ function App() {
       {tab === "library" && <LibraryScreen />}
       {tab === "processing" && <ProcessingScreen />}
       {tab === "publishing" && <PublishingScreen />}
+      {tab === "pooling" && <PoolingScreen />}
     </main>
   );
 }

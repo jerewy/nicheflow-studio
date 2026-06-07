@@ -31,6 +31,7 @@ from nicheflow_studio.services import (
     draft_revisions as svc,
     export as export_svc,
     library as library_svc,
+    pooling,
     publish_queue,
     publishing,
     processing_workflow,
@@ -139,6 +140,16 @@ class ProcessingBridge:
     @_guard
     def remove_publish_job(self, job_id: int) -> dict:
         return publish_queue.remove_job(job_id)
+
+    # --- Pooling / Distribution (migrated screen, read-only) --- #
+
+    @_guard
+    def pooling_overview(self) -> dict:
+        return pooling.overview()
+
+    @_guard
+    def list_pool_items(self, niche: str) -> list[dict]:
+        return pooling.list_pool_items(niche)
 
     @_guard
     def get_context(self, item_id: int | None = None) -> dict:
