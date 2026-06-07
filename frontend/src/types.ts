@@ -166,6 +166,31 @@ export interface DeleteAccountResult {
   removed_upload_jobs: number;
 }
 
+export interface SourceProfile {
+  id: number;
+  label: string;
+  source_url: string;
+  source_type: string;
+  platform: string;
+  enabled: boolean;
+  priority: number;
+  last_scraped_at: string | null;
+  last_run_status: string | null;
+  last_error_summary: string | null;
+}
+
+export interface ScrapeCandidate {
+  id: number;
+  title: string | null;
+  source_url: string;
+  channel_name: string | null;
+  state: string;
+  like_count: number | null;
+  view_count: number | null;
+  published_at: string | null;
+  thumbnail_url: string | null;
+}
+
 export interface LibraryItem {
   id: number;
   title: string | null;

@@ -3,15 +3,17 @@ import { useCallback, useEffect, useState } from "react";
 import { AccountManager } from "@/components/AccountManager";
 import { Dashboard } from "@/components/Dashboard";
 import { ProcessingScreen } from "@/components/ProcessingScreen";
+import { ScrapingScreen } from "@/components/ScrapingScreen";
 import { bridge, whenBridgeReady } from "@/lib/bridge";
 import { cn } from "@/lib/utils";
 import type { AccountSummary } from "@/types";
 
-type Tab = "accounts" | "processing" | "dashboard";
+type Tab = "accounts" | "dashboard" | "scraping" | "processing";
 
 const TABS: { id: Tab; label: string; gated: boolean }[] = [
   { id: "accounts", label: "Accounts", gated: false },
   { id: "dashboard", label: "Dashboard", gated: true },
+  { id: "scraping", label: "Scraping", gated: true },
   { id: "processing", label: "Processing", gated: true },
 ];
 
@@ -115,6 +117,9 @@ function App() {
           <ProcessingScreen activeAccountId={activeId} activeAccountName={activeName} />
         ) : null)}
       {effectiveTab === "dashboard" && activeId !== null ? <Dashboard /> : null}
+      {effectiveTab === "scraping" && activeId !== null ? (
+        <ScrapingScreen activeAccountId={activeId} activeAccountName={activeName} />
+      ) : null}
 
       {loaded && activeId === null && effectiveTab === "accounts" && (
         <p className="px-6 pb-6 text-sm text-muted-foreground">

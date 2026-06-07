@@ -27,6 +27,8 @@ import type {
   PublishQueueJob,
   AccountReadiness,
   QueueResult,
+  ScrapeCandidate,
+  SourceProfile,
   WorkflowSettings,
 } from "@/types";
 
@@ -119,6 +121,15 @@ interface PywebviewApi {
   dashboard_account_readiness(): Promise<Envelope<AccountReadiness>>;
   dashboard_start_live_health_check(): Promise<Envelope<{ job_id: string }>>;
   dashboard_relogin(accountId: number): Promise<Envelope<{ profile: string }>>;
+  list_sources(accountId: number): Promise<Envelope<SourceProfile[]>>;
+  add_source(accountId: number, sourceUrl: string): Promise<Envelope<SourceProfile>>;
+  set_source_enabled(sourceId: number, enabled: boolean): Promise<Envelope<SourceProfile>>;
+  remove_source(sourceId: number): Promise<Envelope<{ removed_source_id: number }>>;
+  list_candidates(accountId: number, state: string): Promise<Envelope<ScrapeCandidate[]>>;
+  set_candidate_state(
+    candidateId: number,
+    state: string,
+  ): Promise<Envelope<{ candidate_id: number; state: string }>>;
 }
 
 declare global {
@@ -429,6 +440,39 @@ export const bridge = {
     if (!hasBridge()) return Promise.resolve({ profile: String(accountId) });
     return unwrap(window.pywebview!.api.dashboard_relogin(accountId));
   },
+
+  listSources(accountId: number): Promise<SourceProfile[]> {
+    if (!hasBridge()) return mock.listSources();
+    return unwrap(window.pywebview!.api.list_sources(accountId));
+  },
+
+  addSource(accountId: number, sourceUrl: string): Promise<SourceProfile> {
+    if (!hasBridge()) return mock.source();
+    return unwrap(window.pywebview!.api.add_source(accountId, sourceUrl));
+  },
+
+  setSourceEnabled(sourceId: number, enabled: boolean): Promise<SourceProfile> {
+    if (!hasBridge()) return mock.source();
+    return unwrap(window.pywebview!.api.set_source_enabled(sourceId, enabled));
+  },
+
+  removeSource(sourceId: number): Promise<{ removed_source_id: number }> {
+    if (!hasBridge()) return Promise.resolve({ removed_source_id: sourceId });
+    return unwrap(window.pywebview!.api.remove_source(sourceId));
+  },
+
+  listCandidates(accountId: number, state: string): Promise<ScrapeCandidate[]> {
+    if (!hasBridge()) return mock.listCandidates();
+    return unwrap(window.pywebview!.api.list_candidates(accountId, state));
+  },
+
+  setCandidateState(
+    candidateId: number,
+    state: string,
+  ): Promise<{ candidate_id: number; state: string }> {
+    if (!hasBridge()) return Promise.resolve({ candidate_id: candidateId, state });
+    return unwrap(window.pywebview!.api.set_candidate_state(candidateId, state));
+  },
 };
 
 // --- browser-only mock ---------------------------------------------------- //
@@ -627,6 +671,38 @@ const mock = {
         accepted_at: new Date().toISOString(),
         distributed_to: ["Past Moments Daily"],
         is_distributed: true,
+      },
+    ];
+  },
+  async source(): Promise<SourceProfile> {
+    return {
+      id: 1,
+      label: "@thehistologian",
+      source_url: "https://www.instagram.com/thehistologian",
+      source_type: "instagram_profile",
+      platform: "instagram",
+      enabled: true,
+      priority: 100,
+      last_scraped_at: null,
+      last_run_status: null,
+      last_error_summary: null,
+    };
+  },
+  async listSources(): Promise<SourceProfile[]> {
+    return [await mock.source()];
+  },
+  async listCandidates(): Promise<ScrapeCandidate[]> {
+    return [
+      {
+        id: 1,
+        title: "Mock candidate clip",
+        source_url: "https://instagram.com/reel/mock",
+        channel_name: "thehistologian",
+        state: "candidate",
+        like_count: 1234,
+        view_count: 56789,
+        published_at: new Date().toISOString(),
+        thumbnail_url: null,
       },
     ];
   },

@@ -36,6 +36,7 @@ from nicheflow_studio.services import (
     publishing_dashboard,
     publishing,
     processing_workflow,
+    sourcing,
 )
 from nicheflow_studio.services.errors import ServiceError
 from nicheflow_studio.services.jobs import JobManager
@@ -149,6 +150,32 @@ class ProcessingBridge:
     @_guard
     def remove_publish_job(self, job_id: int) -> dict:
         return publish_queue.remove_job(job_id)
+
+    # --- Scraping / Sources (per active account) --- #
+
+    @_guard
+    def list_sources(self, account_id: int) -> list[dict]:
+        return sourcing.list_sources(account_id)
+
+    @_guard
+    def add_source(self, account_id: int, source_url: str) -> dict:
+        return sourcing.add_source(account_id, source_url)
+
+    @_guard
+    def set_source_enabled(self, source_id: int, enabled: bool) -> dict:
+        return sourcing.set_source_enabled(source_id, enabled)
+
+    @_guard
+    def remove_source(self, source_id: int) -> dict:
+        return sourcing.remove_source(source_id)
+
+    @_guard
+    def list_candidates(self, account_id: int, state: str = "all") -> list[dict]:
+        return sourcing.list_candidates(account_id, state)
+
+    @_guard
+    def set_candidate_state(self, candidate_id: int, state: str) -> dict:
+        return sourcing.set_candidate_state(candidate_id, state)
 
     # --- Pooling / Distribution (migrated screen, read-only) --- #
 
