@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import threading
 
 import pytest
 
@@ -43,6 +44,22 @@ def test_bridge_get_context_ok_envelope() -> None:
 
     assert result["ok"] is True
     assert result["data"]["item"]["id"] == item_id
+    assert "preview_url" in result["data"]["item"]
+    assert "original_preview_url" in result["data"]["item"]
+    assert "exported_preview_url" in result["data"]["item"]
+
+
+def test_bridge_get_context_waits_for_media_mapping(tmp_path: Path) -> None:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake")
+    item_id = _make_item(file_path=str(source))
+    ready = threading.Event()
+    bridge = ProcessingBridge(ready)
+
+    result = bridge.get_context(item_id)
+
+    assert result["ok"] is True
+    assert result["data"]["item"]["preview_url"] is None
 
 
 def test_bridge_get_context_unknown_item_returns_error_envelope() -> None:
@@ -255,6 +272,23 @@ def test_bridge_queue_without_export_returns_error() -> None:
 
     assert result["ok"] is False
     assert "export" in result["error"].lower()
+
+
+def test_bridge_auto_schedule_for_publish() -> None:
+    item_id = _make_item()
+    bridge = ProcessingBridge()
+    with get_session() as session:
+        item = session.get(DownloadItem, item_id)
+        item.processed_path = "C:/processed/out.mp4"
+        account = session.get(Account, item.account_id)
+        account.upload_schedule_slots = "09:00, 18:00"
+        session.commit()
+
+    result = bridge.auto_schedule_for_publish(item_id)
+
+    assert result["ok"] is True
+    assert result["data"]["status"] == "scheduled"
+    assert result["data"]["scheduled_at"] is not None
 
 
 # --------------------------------------------------------------------------- #

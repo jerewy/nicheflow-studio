@@ -4,9 +4,9 @@ Last updated: 2026-06-06
 
 ## Current Focus
 
-Begin the incremental UI-layer migration with a Processing-first pywebview/React vertical slice.
+Complete packaged validation of the Processing-first pywebview/React vertical slice, then migrate Account Manager.
 
-Keep the existing Python backend and operational PyQt workflow working while extracting only the services and background-job boundaries required by the new Processing screen. Package and validate the first replacement slice before migrating another screen.
+The Processing workflow is functionally implemented in React, including database-backed draft handoff, local and exported previews, generation, option selection/editing, final draft persistence, template-aware export, publish-queue handoff, manual scheduling, and next-open-slot auto scheduling. Keep the existing Python backend and operational PyQt workflow available until the packaged replacement is validated.
 
 ## Current Product Reality
 
@@ -79,16 +79,13 @@ See `docs/UI_MIGRATION_PLAN.md` for the authoritative migration contract.
 
 ## Next Actions
 
-1. Add the versioned draft-revision SQLite model and shared Python service.
-2. Add `scripts/nicheflow_drafts.py` so Codex can read active context and save/revise/apply structured options.
-3. Prove a Codex-written revision can be read without restarting the current app.
-4. Create the minimal pywebview shell and Vite/React/TypeScript frontend.
-5. Poll/refetch the latest draft revision in React with dirty-edit protection.
-6. Define the smallest UI-independent background-job contract.
-7. Extract the minimum Processing application services currently embedded in `main_window.py`.
-8. Connect direct generation/revision, saved selection, export progress, scheduling, and publish actions.
-9. Build and smoke-test the packaged Windows Processing slice.
-10. Only then choose the next screen to migrate.
+1. Build and smoke-test the packaged Windows Processing slice.
+2. Fix only Processing-parity or packaged-runtime issues found by the smoke test.
+3. Migrate Account Manager and account settings as the next React workflow.
+4. Migrate Publishing Dashboard / Publish Queue.
+5. Migrate downloads and source intake.
+6. Migrate pooling and distribution.
+7. Retire PyQt6 only after all required replacement workflows are validated.
 
 ## Known Risks And Constraints
 
@@ -110,4 +107,4 @@ See `docs/UI_MIGRATION_PLAN.md` for the authoritative migration contract.
 
 ## Resume Here
 
-Start with the Processing-first implementation sequence in `docs/UI_MIGRATION_PLAN.md`. Do not resume from the old manual Publish Queue or Processing-only milestone descriptions.
+Run the packaged Windows smoke test for Processing. After it passes, start the Account Manager React migration defined in `docs/UI_MIGRATION_PLAN.md`.

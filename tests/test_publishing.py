@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import datetime as dt
+
 import pytest
 
 from nicheflow_studio.db.models import Account, DownloadItem, UploadJob
@@ -66,6 +68,28 @@ def test_queue_with_schedule_sets_scheduled_status() -> None:
 
     assert result["status"] == "scheduled"
     assert result["scheduled_at"] is not None
+
+
+def test_auto_schedule_uses_next_open_account_slot() -> None:
+    item_id = _make_item()
+    with get_session() as session:
+        item = session.get(DownloadItem, item_id)
+        account = session.get(Account, item.account_id)
+        account.upload_schedule_slots = "09:00, 18:00"
+        session.commit()
+
+    result = publishing.auto_schedule_for_publish(item_id)
+
+    assert result["status"] == "scheduled"
+    scheduled = dt.datetime.fromisoformat(result["scheduled_at"])
+    assert scheduled > dt.datetime.now(dt.timezone.utc)
+
+
+def test_auto_schedule_requires_account_slots() -> None:
+    item_id = _make_item()
+
+    with pytest.raises(PublishError, match="schedule slots"):
+        publishing.auto_schedule_for_publish(item_id)
 
 
 def test_queue_requires_export() -> None:

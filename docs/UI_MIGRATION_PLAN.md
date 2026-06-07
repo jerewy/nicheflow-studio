@@ -1,7 +1,7 @@
 # NicheFlow Studio UI Migration Plan
 
 Last updated: 2026-06-06
-Status: Approved direction; implementation not started
+Status: Processing functionally complete; packaged smoke validation pending
 
 ## Decision
 
@@ -151,11 +151,13 @@ Initial job types should cover draft generation/revision, export, scraping/downl
 ## Later Migration Order
 
 1. Processing
-2. Publishing Dashboard / Publish Queue
-3. Pooling and distribution
+2. Account Manager and account settings
+3. Publishing Dashboard / Publish Queue
 4. Downloads and source intake
-5. Accounts and settings
+5. Pooling and distribution
 6. Retire PyQt6 and delete `main_window.py` only after all required workflows are replaced
+
+Account Manager is intentionally second because later workflows depend on account-level posting slots, timezone, styles, templates, session health, and publishing configuration. Migrating it before Publish Queue reduces duplicated settings UI and gives the remaining React screens one account source of truth.
 
 ## Deferred
 

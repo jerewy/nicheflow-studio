@@ -11,6 +11,7 @@ import type {
   ItemSummary,
   ProcessingContext,
   PublishJob,
+  WorkflowSettings,
 } from "@/types";
 
 const POLL_INTERVAL_MS = 4000;
@@ -18,6 +19,21 @@ const JOB_POLL_INTERVAL_MS = 1000;
 const JOB_TIMEOUT_MS = 180000;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function itemStatus(item: ItemSummary): string {
+  if (item.has_processed) return "exported";
+  if (item.has_draft) return "draft";
+  return "ready";
+}
+
+function workflowPayload(workflow: WorkflowSettings | null): Record<string, unknown> {
+  return {
+    clip_premise: workflow?.clip_premise ?? "",
+    caption_style: workflow?.caption_style ?? "",
+    title_style: workflow?.title_style ?? "",
+    template: workflow?.template ?? "",
+  };
+}
 
 // Poll a background job until it finishes; resolve with its result or throw the
 // job's error message. Reports progress on each poll.
@@ -76,6 +92,14 @@ export function ProcessingScreen() {
   const [scheduleAt, setScheduleAt] = useState("");
   const [publishMessage, setPublishMessage] = useState<string | null>(null);
   const [isDesktop, setIsDesktop] = useState(false);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [itemSearch, setItemSearch] = useState("");
+  const [itemFilter, setItemFilter] = useState("all");
+  const [handoffMessage, setHandoffMessage] = useState<string | null>(null);
+  const [workflow, setWorkflow] = useState<WorkflowSettings | null>(null);
+  const [finalTitle, setFinalTitle] = useState("");
+  const [finalCaption, setFinalCaption] = useState("");
+  const [previewMode, setPreviewMode] = useState<"original" | "exported">("original");
 
   // The revision currently loaded into the editor, and the user's edits on top.
   const [loadedRevision, setLoadedRevision] = useState<DraftRevision | null>(null);
@@ -91,9 +115,18 @@ export function ProcessingScreen() {
   // Keep the latest dirty flag readable inside the polling closure without
   // resubscribing the interval on every keystroke.
   const dirtyRef = useRef(dirty);
-  dirtyRef.current = dirty;
   const loadedRef = useRef<DraftRevision | null>(loadedRevision);
-  loadedRef.current = loadedRevision;
+
+  useEffect(() => {
+    dirtyRef.current = dirty;
+    loadedRef.current = loadedRevision;
+  }, [dirty, loadedRevision]);
+
+  useEffect(() => {
+    if (!actionError) return;
+    const timer = window.setTimeout(() => setActionError(null), 8000);
+    return () => window.clearTimeout(timer);
+  }, [actionError]);
 
   const loadRevisionIntoEditor = useCallback((revision: DraftRevision | null) => {
     setLoadedRevision(revision);
@@ -114,7 +147,18 @@ export function ProcessingScreen() {
       loadRevisionIntoEditor(ctx.latest_revision);
       setExportedPath(null);
       setPublishMessage(null);
+      setPreviewError(null);
+      setPreviewMode(ctx.item.exported_preview_url ? "exported" : "original");
+      setHandoffMessage(null);
       refreshPublishJobs(ctx.item.id);
+      bridge
+        .getWorkflowSettings(ctx.item.id)
+        .then((settings) => {
+          setWorkflow(settings);
+          setFinalTitle(settings.title_draft);
+          setFinalCaption(settings.caption_draft);
+        })
+        .catch(() => setWorkflow(null));
       // Tell the backend which item is active so the Codex CLI `current`
       // command follows this window's selection. Best-effort.
       void bridge.setActiveItem(ctx.item.id).catch(() => undefined);
@@ -182,6 +226,25 @@ export function ProcessingScreen() {
     }
   };
 
+  const autoScheduleForPublish = async () => {
+    if (itemId === null) return;
+    setBusy(true);
+    setActionError(null);
+    setPublishMessage(null);
+    try {
+      const result = await bridge.autoScheduleForPublish(itemId);
+      const scheduled = result.scheduled_at
+        ? new Date(result.scheduled_at).toLocaleString()
+        : "the next open slot";
+      setPublishMessage(`Auto-scheduled for ${scheduled}.`);
+      refreshPublishJobs(itemId);
+    } catch (err: unknown) {
+      setActionError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   // Poll for newer revisions (Codex writes, or another window's edits).
   useEffect(() => {
     if (itemId === null) return;
@@ -222,7 +285,11 @@ export function ProcessingScreen() {
     setGenerating(true);
     setActionError(null);
     try {
-      const { job_id } = await bridge.startGeneration(itemId, {});
+      const { job_id } = await bridge.startGeneration(itemId, {
+        clip_premise: workflow?.clip_premise ?? "",
+        caption_style: workflow?.caption_style ?? null,
+        title_style: workflow?.title_style || null,
+      });
       const revision = (await waitForJob(job_id)) as DraftRevision;
       // Respect dirty-edit protection: don't clobber unsaved edits.
       if (dirtyRef.current) {
@@ -234,6 +301,68 @@ export function ProcessingScreen() {
       setActionError(err instanceof Error ? err.message : String(err));
     } finally {
       setGenerating(false);
+    }
+  };
+
+  const copyChatPrompt = async () => {
+    if (itemId === null) return;
+    setActionError(null);
+    setHandoffMessage(null);
+    try {
+      const { prompt } = await bridge.buildChatPrompt(itemId, workflowPayload(workflow));
+      await navigator.clipboard.writeText(prompt);
+      setHandoffMessage("Chat prompt copied. Paste it into ChatGPT, Claude, Codex, or Claude Code.");
+    } catch (err: unknown) {
+      setActionError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const saveWorkflow = async () => {
+    if (itemId === null || !workflow) return;
+    setBusy(true);
+    setActionError(null);
+    try {
+      setWorkflow(await bridge.saveWorkflowSettings(itemId, workflowPayload(workflow)));
+      setHandoffMessage("Workflow settings saved.");
+    } catch (err: unknown) {
+      setActionError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const saveFinalDraft = async () => {
+    if (itemId === null) return;
+    setBusy(true);
+    setActionError(null);
+    try {
+      await bridge.saveFinalDraft(itemId, finalTitle, finalCaption);
+      const ctx = await bridge.getContext(itemId);
+      setContext(ctx);
+      setPreviewMode("exported");
+      setHandoffMessage("Selected title and caption saved.");
+    } catch (err: unknown) {
+      setActionError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const pasteDraft = async () => {
+    if (itemId === null) return;
+    setBusy(true);
+    setActionError(null);
+    setHandoffMessage(null);
+    try {
+      const text = await navigator.clipboard.readText();
+      if (!text.trim()) throw new Error("Clipboard is empty. Copy the generated draft first.");
+      const revision = await bridge.importPastedDraft(itemId, text);
+      loadRevisionIntoEditor(revision);
+      setHandoffMessage(`Imported clipboard draft as revision ${revision.revision_number}.`);
+    } catch (err: unknown) {
+      setActionError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -267,7 +396,9 @@ export function ProcessingScreen() {
     setBusy(true);
     setActionError(null);
     try {
-      await bridge.applyRevision(itemId, optionNumber, loadedRevision?.id ?? null);
+      const applied = await bridge.applyRevision(itemId, optionNumber, loadedRevision?.id ?? null);
+      setFinalTitle(applied.title_draft);
+      setFinalCaption(applied.caption_draft);
       const ctx = await bridge.getContext(itemId);
       setContext(ctx);
     } catch (err: unknown) {
@@ -317,9 +448,24 @@ export function ProcessingScreen() {
 
   const { item, account } = context;
   const appliedIndex = loadedRevision?.applied_title_index ?? null;
+  const previewUrl =
+    previewMode === "exported" && item.exported_preview_url
+      ? item.exported_preview_url
+      : item.original_preview_url;
+  const filteredItems = items.filter((candidate) => {
+    const status = itemStatus(candidate);
+    const matchesStatus = itemFilter === "all" || status === itemFilter;
+    const search = itemSearch.trim().toLowerCase();
+    const matchesSearch =
+      !search ||
+      String(candidate.id).includes(search) ||
+      (candidate.title ?? "").toLowerCase().includes(search) ||
+      candidate.source_url.toLowerCase().includes(search);
+    return matchesStatus && matchesSearch;
+  });
 
   return (
-    <div className="mx-auto max-w-5xl space-y-4 p-6">
+    <div className="mx-auto max-w-7xl space-y-4 p-6">
       <header className="flex items-start justify-between gap-4">
         <div className="space-y-1">
           <div className="flex items-center gap-2">
@@ -333,34 +479,266 @@ export function ProcessingScreen() {
           <p className="text-sm text-muted-foreground">
             {account?.niche_label ? `${account.niche_label}` : "no account"}
           </p>
-          {items.length > 0 && (
-            <select
-              className="mt-1 h-9 w-full max-w-md rounded-md border border-input bg-transparent px-2 text-sm"
-              value={item.id}
-              onChange={(e) => switchItem(Number(e.target.value))}
-            >
-              {items.map((it) => (
-                <option key={it.id} value={it.id}>
-                  #{it.id} — {it.title ?? it.source_url}
-                  {it.has_processed ? " ✓exported" : it.has_draft ? " ·draft" : ""}
-                </option>
-              ))}
-            </select>
-          )}
-        </div>
-        <div className="flex flex-col items-end gap-1">
-          <Button
-            onClick={generate}
-            disabled={generating || busy || !canGenerate}
-            title={canGenerate ? undefined : "No draft provider configured (set GROQ_API_KEY)"}
-          >
-            {generating ? "Generating…" : "Generate options"}
-          </Button>
-          {!canGenerate && (
-            <span className="text-xs text-muted-foreground">no provider configured</span>
-          )}
         </div>
       </header>
+
+      <div className="grid items-start gap-4 lg:grid-cols-[minmax(300px,0.8fr)_minmax(360px,1.2fr)]">
+        <section className="overflow-hidden rounded-xl border bg-card">
+          <div className="space-y-3 border-b p-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm font-semibold">Videos</p>
+                <p className="text-xs text-muted-foreground">{filteredItems.length} shown</p>
+              </div>
+              <Badge variant="secondary">{items.length} total</Badge>
+            </div>
+            <div className="grid grid-cols-[1fr_120px] gap-2">
+              <input
+                className="h-9 min-w-0 rounded-md border border-input bg-transparent px-3 text-sm"
+                placeholder="Search videos..."
+                value={itemSearch}
+                onChange={(event) => setItemSearch(event.target.value)}
+              />
+              <select
+                className="h-9 rounded-md border border-input bg-transparent px-2 text-sm"
+                value={itemFilter}
+                onChange={(event) => setItemFilter(event.target.value)}
+              >
+                <option value="all">All</option>
+                <option value="ready">Ready</option>
+                <option value="draft">Draft</option>
+                <option value="exported">Exported</option>
+              </select>
+            </div>
+          </div>
+          <div className="max-h-[600px] overflow-auto">
+            <table className="w-full table-fixed text-left text-sm">
+              <thead className="sticky top-0 bg-muted text-xs text-muted-foreground">
+                <tr>
+                  <th className="w-24 px-3 py-2 font-medium">Status</th>
+                  <th className="w-16 px-3 py-2 font-medium">ID</th>
+                  <th className="px-3 py-2 font-medium">Title</th>
+                </tr>
+              </thead>
+              <tbody>
+                {filteredItems.map((candidate) => (
+                  <tr
+                    key={candidate.id}
+                    className={`cursor-pointer border-t transition-colors hover:bg-accent ${
+                      candidate.id === item.id ? "bg-accent" : ""
+                    }`}
+                    onClick={() => switchItem(candidate.id)}
+                  >
+                    <td className="px-3 py-2">
+                      <Badge variant={candidate.has_processed ? "default" : "secondary"}>
+                        {itemStatus(candidate)}
+                      </Badge>
+                    </td>
+                    <td className="px-3 py-2 text-muted-foreground">#{candidate.id}</td>
+                    <td className="truncate px-3 py-2" title={candidate.title ?? candidate.source_url}>
+                      {candidate.title ?? candidate.source_url}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section className="overflow-hidden rounded-xl bg-zinc-950">
+          <div className="flex items-center justify-between border-b border-white/10 px-4 py-3 text-white">
+            <div>
+              <p className="text-xs font-medium uppercase tracking-wider text-zinc-400">
+                Preview
+              </p>
+              <p className="mt-1 text-sm">{previewMode === "exported" ? "Exported reel" : "Original video"}</p>
+            </div>
+            <div className="flex items-center gap-2">
+              <Button
+                size="sm"
+                variant={previewMode === "original" ? "default" : "ghost"}
+                onClick={() => {
+                  setPreviewError(null);
+                  setPreviewMode("original");
+                }}
+                disabled={!item.original_preview_url}
+              >
+                Original
+              </Button>
+              <Button
+                size="sm"
+                variant={previewMode === "exported" ? "default" : "ghost"}
+                onClick={() => {
+                  setPreviewError(null);
+                  setPreviewMode("exported");
+                }}
+                disabled={!item.exported_preview_url}
+              >
+                Exported
+              </Button>
+            </div>
+          </div>
+          <div className="flex min-h-[600px] items-center justify-center bg-black p-4">
+            <div className="flex aspect-[9/16] max-h-[568px] w-full max-w-[320px] items-center justify-center overflow-hidden bg-black">
+              {previewUrl && !previewError ? (
+                <video
+                  key={previewUrl}
+                  className="h-full w-full object-contain"
+                  src={previewUrl}
+                  controls
+                  preload="metadata"
+                  onError={(event) => {
+                    const code = event.currentTarget.error?.code;
+                    const message = event.currentTarget.error?.message;
+                    setPreviewError(
+                      `Media error${code ? ` ${code}` : ""}${message ? `: ${message}` : ""}`,
+                    );
+                  }}
+                />
+              ) : (
+                <p className="px-4 text-center text-sm text-zinc-400">
+                  {previewError
+                    ? `The selected video could not be loaded. ${previewError}`
+                    : "This item has no local video file to preview."}
+                </p>
+              )}
+            </div>
+          </div>
+        </section>
+      </div>
+
+      {workflow && (
+        <Card>
+          <CardHeader className="flex-row items-center justify-between space-y-0">
+            <div>
+              <CardTitle className="text-base">Workflow Settings</CardTitle>
+              <p className="mt-1 text-sm text-muted-foreground">
+                These values guide Groq and the copied Codex/Claude prompt.
+              </p>
+            </div>
+            <Button variant="outline" onClick={() => bridge.openItemFolder(item.id)}>
+              Open Folder
+            </Button>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <label className="block space-y-1">
+              <span className="text-sm font-medium">Clip premise</span>
+              <textarea
+                className="min-h-20 w-full rounded-md border border-input bg-transparent p-3 text-sm"
+                placeholder="Optional direction, context, joke, or anomaly for the AI..."
+                value={workflow.clip_premise}
+                onChange={(event) =>
+                  setWorkflow({ ...workflow, clip_premise: event.target.value })
+                }
+              />
+            </label>
+            <div className="grid gap-3 md:grid-cols-3">
+              <label className="space-y-1">
+                <span className="text-sm font-medium">Caption Style</span>
+                <select
+                  className="h-10 w-full rounded-md border border-input bg-transparent px-2 text-sm"
+                  value={workflow.caption_style}
+                  onChange={(event) =>
+                    setWorkflow({ ...workflow, caption_style: event.target.value })
+                  }
+                >
+                  {workflow.caption_style_options.map((option) => (
+                    <option key={option.value} value={option.value}>{option.label}</option>
+                  ))}
+                </select>
+              </label>
+              <label className="space-y-1">
+                <span className="text-sm font-medium">Title Style</span>
+                <select
+                  className="h-10 w-full rounded-md border border-input bg-transparent px-2 text-sm"
+                  value={workflow.title_style}
+                  onChange={(event) =>
+                    setWorkflow({ ...workflow, title_style: event.target.value })
+                  }
+                >
+                  {workflow.title_style_options.map((option) => (
+                    <option key={option.value || "auto"} value={option.value}>{option.label}</option>
+                  ))}
+                </select>
+              </label>
+              <label className="space-y-1">
+                <span className="text-sm font-medium">Template</span>
+                <select
+                  className="h-10 w-full rounded-md border border-input bg-transparent px-2 text-sm"
+                  value={workflow.template}
+                  onChange={(event) =>
+                    setWorkflow({ ...workflow, template: event.target.value })
+                  }
+                >
+                  {workflow.template_options.map((option) => (
+                    <option key={option.value} value={option.value}>{option.label}</option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            <Button onClick={saveWorkflow} disabled={busy}>Save workflow settings</Button>
+          </CardContent>
+        </Card>
+      )}
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">Draft Generation</CardTitle>
+          <p className="text-sm text-muted-foreground">
+            Generate directly with Groq, or use a chat/coding agent and return the result
+            through the clipboard or automatic database handoff.
+          </p>
+        </CardHeader>
+        <CardContent className="grid gap-4 md:grid-cols-2">
+          <section className="space-y-3 rounded-lg border p-4">
+            <div>
+              <p className="font-medium">Generate with Groq API</p>
+              <p className="text-sm text-muted-foreground">
+                Runs in the background and saves the generated options as a new revision.
+              </p>
+            </div>
+            <Button
+              onClick={generate}
+              disabled={generating || busy || !canGenerate}
+              title={canGenerate ? undefined : "No draft provider configured (set GROQ_API_KEY)"}
+            >
+              {generating ? "Generating…" : "Generate with Groq"}
+            </Button>
+            {!canGenerate && (
+              <p className="text-xs text-muted-foreground">
+                No provider configured. Set GROQ_API_KEY or use the chat prompt path.
+              </p>
+            )}
+          </section>
+
+          <section className="space-y-3 rounded-lg border p-4">
+            <div>
+              <p className="font-medium">Copy Chat Prompt</p>
+              <p className="text-sm text-muted-foreground">
+                Use ChatGPT, Claude, Codex, or Claude Code to inspect the local video and
+                write the options.
+              </p>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <Button variant="secondary" onClick={copyChatPrompt} disabled={busy}>
+                Copy Chat Prompt
+              </Button>
+              <Button variant="outline" onClick={pasteDraft} disabled={busy}>
+                Paste Draft from Clipboard
+              </Button>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Automatic Codex/Claude Code handoff: ask the agent to save through
+              <code className="mx-1">scripts/nicheflow_drafts.py</code>. New revisions
+              appear here automatically without pasting.
+            </p>
+          </section>
+
+          {handoffMessage && (
+            <p className="text-sm text-emerald-600 md:col-span-2">{handoffMessage}</p>
+          )}
+        </CardContent>
+      </Card>
 
       {pendingRevision && (
         <Card className="border-amber-500/50 bg-amber-500/5">
@@ -386,7 +764,21 @@ export function ProcessingScreen() {
       )}
 
       {actionError && (
-        <p className="text-sm text-destructive">{actionError}</p>
+        <div
+          role="alert"
+          aria-live="assertive"
+          className="fixed right-5 top-5 z-50 flex max-w-md items-start gap-3 rounded-lg border border-destructive/60 bg-destructive px-4 py-3 text-sm font-medium text-destructive-foreground shadow-2xl shadow-black/40"
+        >
+          <span className="grow">{actionError}</span>
+          <button
+            type="button"
+            aria-label="Dismiss warning"
+            className="rounded px-1 text-lg leading-none text-destructive-foreground/80 transition hover:bg-black/20 hover:text-destructive-foreground active:scale-90"
+            onClick={() => setActionError(null)}
+          >
+            ×
+          </button>
+        </div>
       )}
 
       {loadedRevision?.summary && (
@@ -402,7 +794,7 @@ export function ProcessingScreen() {
           </CardContent>
         </Card>
       ) : (
-        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+        <div className="grid gap-4 md:grid-cols-3">
           {edits.titles.map((title, index) => (
             <OptionCard
               key={index}
@@ -443,6 +835,34 @@ export function ProcessingScreen() {
         </footer>
       )}
 
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">Selected Title and Caption</CardTitle>
+          <p className="text-sm text-muted-foreground">
+            Applying an option fills these fields. Edit and save the final text used for export and publishing.
+          </p>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <label className="block space-y-1">
+            <span className="text-sm font-medium">Title</span>
+            <textarea
+              className="min-h-20 w-full rounded-md border border-input bg-transparent p-3 text-sm"
+              value={finalTitle}
+              onChange={(event) => setFinalTitle(event.target.value)}
+            />
+          </label>
+          <label className="block space-y-1">
+            <span className="text-sm font-medium">Caption</span>
+            <textarea
+              className="min-h-48 w-full rounded-md border border-input bg-transparent p-3 text-sm"
+              value={finalCaption}
+              onChange={(event) => setFinalCaption(event.target.value)}
+            />
+          </label>
+          <Button onClick={saveFinalDraft} disabled={busy}>Save selected title and caption</Button>
+        </CardContent>
+      </Card>
+
       {exportProgress && (
         <div className="space-y-1">
           <div className="h-2 w-full overflow-hidden rounded-full bg-secondary">
@@ -480,6 +900,13 @@ export function ProcessingScreen() {
               onClick={() => queueForPublish(null)}
             >
               Add to Publish Queue
+            </Button>
+            <Button
+              variant="secondary"
+              disabled={!item.processed_path || busy}
+              onClick={autoScheduleForPublish}
+            >
+              Auto Schedule
             </Button>
             <input
               type="datetime-local"

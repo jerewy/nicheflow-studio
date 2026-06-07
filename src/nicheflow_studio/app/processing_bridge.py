@@ -20,13 +20,17 @@ Design rules:
 from __future__ import annotations
 
 import logging
+import threading
 
+from nicheflow_studio.app.local_media import media_url
 from nicheflow_studio.core.ui_prefs import set_ui_pref
 from nicheflow_studio.services import (
     draft_generation,
+    draft_handoff,
     draft_revisions as svc,
     export as export_svc,
     publishing,
+    processing_workflow,
 )
 from nicheflow_studio.services.errors import ServiceError
 from nicheflow_studio.services.jobs import JobManager
@@ -65,9 +69,10 @@ def _guard(func):
 class ProcessingBridge:
     """Methods exposed to the React Processing screen via pywebview."""
 
-    def __init__(self) -> None:
+    def __init__(self, media_ready: threading.Event | None = None) -> None:
         # One job manager per window; tracks background generation/export work.
         self._jobs = JobManager()
+        self._media_ready = media_ready
 
     @_guard
     def list_items(self) -> list[dict]:
@@ -77,7 +82,13 @@ class ProcessingBridge:
     @_guard
     def get_context(self, item_id: int | None = None) -> dict:
         """Active Processing context for ``item_id`` (or the resolved current item)."""
-        return svc.active_context(item_id)
+        context = svc.active_context(item_id)
+        item = context["item"]
+        mapping_ready = self._media_ready is None or self._media_ready.wait(timeout=5)
+        item["original_preview_url"] = media_url(item.get("file_path")) if mapping_ready else None
+        item["exported_preview_url"] = media_url(item.get("processed_path")) if mapping_ready else None
+        item["preview_url"] = item["exported_preview_url"] or item["original_preview_url"]
+        return context
 
     @_guard
     def get_latest_revision(self, item_id: int) -> dict | None:
@@ -145,6 +156,30 @@ class ProcessingBridge:
         return {"can_generate": draft_generation.can_generate()}
 
     @_guard
+    def build_chat_prompt(self, item_id: int, payload: dict | None = None) -> dict:
+        return {"prompt": draft_handoff.build_chat_prompt(item_id, payload)}
+
+    @_guard
+    def import_pasted_draft(self, item_id: int, text: str) -> dict:
+        return draft_handoff.import_pasted_draft(item_id, text).to_dict()
+
+    @_guard
+    def get_workflow_settings(self, item_id: int) -> dict:
+        return processing_workflow.get_settings(item_id)
+
+    @_guard
+    def save_workflow_settings(self, item_id: int, payload: dict | None = None) -> dict:
+        return processing_workflow.save_settings(item_id, payload or {})
+
+    @_guard
+    def save_final_draft(self, item_id: int, title: str, caption: str) -> dict:
+        return processing_workflow.save_final_draft(item_id, title, caption)
+
+    @_guard
+    def open_item_folder(self, item_id: int) -> dict:
+        return processing_workflow.open_folder(item_id)
+
+    @_guard
     def start_generation(self, item_id: int, payload: dict | None = None) -> dict:
         """Start background draft generation; return a job id to poll via
         :meth:`get_job`. The job result is the saved revision as a dict."""
@@ -190,3 +225,8 @@ class ProcessingBridge:
         """Add/update the item's exported reel in the publish queue (draft, or
         scheduled when ``scheduled_at`` is given)."""
         return publishing.queue_for_publish(item_id, scheduled_at=scheduled_at)
+
+    @_guard
+    def auto_schedule_for_publish(self, item_id: int) -> dict:
+        """Schedule the exported reel in the account's next open posting slot."""
+        return publishing.auto_schedule_for_publish(item_id)

@@ -35,6 +35,7 @@ from nicheflow_studio.core.instagram_session import (
 log = logging.getLogger(__name__)
 
 INSTAGRAM_URL = "https://www.instagram.com/"
+_IGNORED_CHROMIUM_DEFAULT_ARGS = ("--enable-automation",)
 
 # --- Selectors. Instagram relabels/restructures these periodically; keep each
 # step tolerant by listing several candidates. ----------------------------
@@ -393,7 +394,11 @@ async def _publish_reel_async(
                 "--start-minimized",
                 "--disable-blink-features=AutomationControlled",
             ],
-            "ignore_default_args": ["--enable-automation"],
+            # Playwright disables Chromium's sandbox by default. Explicitly keep
+            # it enabled so headed publishing does not show Chrome's
+            # unsupported --no-sandbox security warning.
+            "chromium_sandbox": True,
+            "ignore_default_args": list(_IGNORED_CHROMIUM_DEFAULT_ARGS),
         }
         if channel:  # real Chrome looks less like automation than bundled Chromium
             launch_kwargs["channel"] = channel

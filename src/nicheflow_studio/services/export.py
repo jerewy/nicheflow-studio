@@ -22,6 +22,7 @@ from nicheflow_studio.db.models import DownloadItem
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.processing import video
 from nicheflow_studio.services.errors import ServiceError
+from nicheflow_studio.services.processing_workflow import render_config
 
 ProgressFn = Callable[[float, str], None]
 
@@ -66,12 +67,18 @@ def export_item(item_id: int, *, progress: ProgressFn | None = None) -> dict:
         crop = video.CropSettings()
 
     report(0.35, "Rendering reel…")
+    render = render_config(item_id)
     result_path = video.export_cropped_video(
         input_path=input_path,
         output_path=output_path,
         crop=crop,
         title_text=title_text,
-        title_layout="top_band",
+        title_layout=str(render.get("layout", "top_band")),
+        title_font_size=int(render.get("font_size", 54)),
+        title_font_name=str(render.get("font_name") or "arial_bold"),
+        title_color=str(render.get("color", "#FFFFFF")),
+        title_background=str(render.get("background", "none")),
+        enable_bold_keywords=bool(render.get("bold_keywords", False)),
     )
 
     report(0.9, "Saving…")

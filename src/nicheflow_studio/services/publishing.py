@@ -17,6 +17,7 @@ import datetime as dt
 
 from sqlalchemy import select
 
+from nicheflow_studio.core.scheduling import next_open_slot_time
 from nicheflow_studio.db.models import Account, DownloadItem, UploadJob
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.services.errors import ServiceError
@@ -187,3 +188,45 @@ def queue_for_publish(item_id: int, *, scheduled_at: str | None = None) -> dict:
             "scheduled_at": _iso(scheduled),
             "created": True,
         }
+
+
+def auto_schedule_for_publish(item_id: int) -> dict:
+    """Queue an exported item in its account's next open posting slot."""
+    now_local = dt.datetime.now().astimezone()
+    with get_session() as session:
+        item = session.get(DownloadItem, item_id)
+        if item is None:
+            raise PublishError(f"No download item with id {item_id}.")
+        if not item.processed_path:
+            raise PublishError("Export the reel before scheduling it.")
+        if item.account_id is None:
+            raise PublishError("Assign this item to an account before scheduling it.")
+
+        account = session.get(Account, item.account_id)
+        if account is None:
+            raise PublishError("The item's account no longer exists.")
+
+        occupied = [
+            row.scheduled_at.replace(tzinfo=dt.timezone.utc)
+            if row.scheduled_at.tzinfo is None
+            else row.scheduled_at
+            for row in session.scalars(
+                select(UploadJob)
+                .where(UploadJob.account_id == account.id)
+                .where(UploadJob.posted_at.is_(None))
+                .where(UploadJob.scheduled_at.is_not(None))
+            ).all()
+            if row.scheduled_at is not None
+        ]
+        scheduled_local = next_open_slot_time(
+            account.upload_schedule_slots,
+            after=now_local,
+            occupied=occupied,
+        )
+
+    if scheduled_local is None:
+        raise PublishError(
+            "Set this account's schedule slots first (e.g. 09:00, 18:00) "
+            "in account settings."
+        )
+    return queue_for_publish(item_id, scheduled_at=scheduled_local.isoformat())

@@ -16,6 +16,7 @@ import type {
   ProcessingContext,
   PublishJob,
   QueueResult,
+  WorkflowSettings,
 } from "@/types";
 
 type Envelope<T> = { ok: true; data: T } | { ok: false; error: string };
@@ -41,6 +42,22 @@ interface PywebviewApi {
   ): Promise<Envelope<ApplyResult>>;
   set_active_item(itemId: number): Promise<Envelope<unknown>>;
   can_generate(): Promise<Envelope<{ can_generate: boolean }>>;
+  build_chat_prompt(
+    itemId: number,
+    payload: Record<string, unknown>,
+  ): Promise<Envelope<{ prompt: string }>>;
+  import_pasted_draft(itemId: number, text: string): Promise<Envelope<DraftRevision>>;
+  get_workflow_settings(itemId: number): Promise<Envelope<WorkflowSettings>>;
+  save_workflow_settings(
+    itemId: number,
+    payload: Record<string, unknown>,
+  ): Promise<Envelope<WorkflowSettings>>;
+  save_final_draft(
+    itemId: number,
+    title: string,
+    caption: string,
+  ): Promise<Envelope<{ title_draft: string; caption_draft: string }>>;
+  open_item_folder(itemId: number): Promise<Envelope<{ folder: string }>>;
   start_generation(
     itemId: number,
     payload: Record<string, unknown>,
@@ -52,6 +69,7 @@ interface PywebviewApi {
     itemId: number,
     scheduledAt?: string | null,
   ): Promise<Envelope<QueueResult>>;
+  auto_schedule_for_publish(itemId: number): Promise<Envelope<QueueResult>>;
 }
 
 declare global {
@@ -133,6 +151,11 @@ export const bridge = {
     return unwrap(window.pywebview!.api.queue_for_publish(itemId, scheduledAt ?? null));
   },
 
+  autoScheduleForPublish(itemId: number): Promise<QueueResult> {
+    if (!hasBridge()) return mock.autoScheduleForPublish();
+    return unwrap(window.pywebview!.api.auto_schedule_for_publish(itemId));
+  },
+
   getLatestRevision(itemId: number): Promise<DraftRevision | null> {
     if (!hasBridge()) return mock.getLatest();
     return unwrap(window.pywebview!.api.get_latest_revision(itemId));
@@ -174,6 +197,39 @@ export const bridge = {
   canGenerate(): Promise<boolean> {
     if (!hasBridge()) return Promise.resolve(true);
     return unwrap(window.pywebview!.api.can_generate()).then((d) => d.can_generate);
+  },
+
+  buildChatPrompt(
+    itemId: number,
+    payload: Record<string, unknown>,
+  ): Promise<{ prompt: string }> {
+    if (!hasBridge()) return Promise.resolve({ prompt: "Browser preview prompt" });
+    return unwrap(window.pywebview!.api.build_chat_prompt(itemId, payload));
+  },
+
+  importPastedDraft(itemId: number, text: string): Promise<DraftRevision> {
+    if (!hasBridge()) return mock.getLatest() as Promise<DraftRevision>;
+    return unwrap(window.pywebview!.api.import_pasted_draft(itemId, text));
+  },
+
+  getWorkflowSettings(itemId: number): Promise<WorkflowSettings> {
+    if (!hasBridge()) return mock.getWorkflowSettings();
+    return unwrap(window.pywebview!.api.get_workflow_settings(itemId));
+  },
+
+  saveWorkflowSettings(itemId: number, payload: Record<string, unknown>): Promise<WorkflowSettings> {
+    if (!hasBridge()) return mock.getWorkflowSettings();
+    return unwrap(window.pywebview!.api.save_workflow_settings(itemId, payload));
+  },
+
+  saveFinalDraft(itemId: number, title: string, caption: string) {
+    if (!hasBridge()) return Promise.resolve({ title_draft: title, caption_draft: caption });
+    return unwrap(window.pywebview!.api.save_final_draft(itemId, title, caption));
+  },
+
+  openItemFolder(itemId: number) {
+    if (!hasBridge()) return Promise.resolve({ folder: "" });
+    return unwrap(window.pywebview!.api.open_item_folder(itemId));
   },
 
   startGeneration(
@@ -239,6 +295,9 @@ const mock = {
         source_description: null,
         file_path: "C:/clips/mock.mp4",
         processed_path: null,
+        preview_url: null,
+        original_preview_url: null,
+        exported_preview_url: null,
         status: "completed",
         review_state: "new",
         transcript_text: "",
@@ -303,6 +362,14 @@ const mock = {
   async queueForPublish() {
     return { job_id: 1, status: "draft", scheduled_at: null, created: true };
   },
+  async autoScheduleForPublish() {
+    return {
+      job_id: 1,
+      status: "scheduled",
+      scheduled_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      created: true,
+    };
+  },
   async getJob(): Promise<JobSnapshot> {
     return {
       id: "mock-job",
@@ -311,6 +378,19 @@ const mock = {
       message: "Done",
       result: mockRevision,
       error: null,
+    };
+  },
+  async getWorkflowSettings(): Promise<WorkflowSettings> {
+    return {
+      clip_premise: "",
+      caption_style: "contextual_info",
+      title_style: "",
+      template: "gaming_meme_black",
+      title_draft: "",
+      caption_draft: "",
+      caption_style_options: [{ value: "contextual_info", label: "Context / info" }],
+      title_style_options: [{ value: "", label: "Auto" }],
+      template_options: [{ value: "gaming_meme_black", label: "Gaming Meme Black" }],
     };
   },
 };

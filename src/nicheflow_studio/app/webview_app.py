@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from pathlib import Path
 
+from nicheflow_studio.app.local_media import install_windows_mapping
 from nicheflow_studio.app.processing_bridge import ProcessingBridge
 from nicheflow_studio.core.env import load_dotenv
 from nicheflow_studio.core.logging import configure_logging
@@ -33,6 +35,9 @@ logger = logging.getLogger(__name__)
 # Vite dev server default. Set NICHEFLOW_WEBVIEW_URL to override (or to point at a
 # different port); when unset we load the static production build instead.
 _DEFAULT_DEV_URL = "http://localhost:5173"
+_BOOTSTRAP_HTML = """<!doctype html>
+<html><body style="margin:0;background:#fff"></body></html>
+"""
 
 
 def _frontend_dist_index() -> Path:
@@ -68,16 +73,30 @@ def run_webview() -> None:
     import webview  # lazy: keep GUI runtime out of plain imports/tests
 
     entry = resolve_entry()
-    bridge = ProcessingBridge()
+    media_ready = threading.Event()
+    bridge = ProcessingBridge(media_ready)
     logger.info("Opening Processing webview at %s", entry)
-    webview.create_window(
+    window = webview.create_window(
         "NicheFlow Studio — Processing",
-        url=entry,
+        html=_BOOTSTRAP_HTML,
         js_api=bridge,
         width=1280,
         height=860,
         min_size=(960, 640),
     )
+
+    mapping_installed = False
+
+    def install_mapping_and_open_app() -> None:
+        nonlocal mapping_installed
+        if mapping_installed:
+            return
+        install_windows_mapping(window)
+        media_ready.set()
+        mapping_installed = True
+        window.load_url(entry)
+
+    window.events.loaded += install_mapping_and_open_app
     webview.start()
 
 

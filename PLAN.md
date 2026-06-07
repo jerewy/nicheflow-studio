@@ -800,15 +800,14 @@ Ordered next work:
 
 ## 13. Recommended Next Step
 
-Build the Processing-first vertical slice from `docs/UI_MIGRATION_PLAN.md` (order matches `STATUS.md` and `docs/UI_MIGRATION_PLAN.md`: build the database handoff first so Codex-to-SQLite value lands before the React screen exists):
+Finish and validate the Processing-first vertical slice, then migrate Account Manager:
 
-1. add the versioned SQLite draft-revision model, shared service, and Codex-facing CLI
-2. prove Codex can save drafts into SQLite and the running app can read them without restart
-3. create the pywebview + React shell
-4. poll/refetch the latest draft revision in React with dirty-edit protection
-5. extract the minimum plain-Python services and UI-independent background-job contract needed by Processing
-6. support direct structured draft generation/revision, selection, export progress, scheduling, and publishing
-7. package and smoke-test the replacement slice before migrating another screen
+1. run a packaged Windows smoke test of the React Processing workflow
+2. fix only packaged-runtime or Processing-parity issues found by that smoke test
+3. migrate Account Manager as the next React workflow
+4. continue with Publish Queue / Publishing Dashboard
+5. migrate source intake and downloads, then pooling/distribution
+6. retire PyQt6 only after every required workflow has replacement parity
 
 ## 14. UI Upgrade Plan (Active)
 
@@ -819,6 +818,10 @@ The migration is not a full rewrite. Existing SQLite, processing, scraping, pool
 Long-running AI, scrape, download, FFmpeg, file, and Playwright work must run through UI-independent background jobs that expose structured status/progress. Bridge calls start work and return quickly; polling is the initial progress mechanism.
 
 The first vertical slice is Processing. Keep Copy Chat Prompt and Paste Draft as temporary fallbacks, but the target workflow generates and revises structured draft options directly inside NicheFlow, then exports and schedules/publishes from the same saved state.
+
+As of 2026-06-06, the React Processing slice has functional workflow parity for selection, local previews, database-backed draft handoff, generation, option application/editing, final title/caption persistence, template selection, export, publish-queue handoff, manual scheduling, and next-open-slot auto scheduling. Its remaining gate is a packaged Windows smoke test.
+
+After Processing passes that packaged smoke test, Account Manager is the next migration priority. It establishes the account configuration, posting slots, styles, templates, and session-health context used by the later Publishing and intake screens.
 
 SQLite is the handoff between Codex, the Processing service, and the React UI. Generated options are stored as versioned draft revisions; the selected final title/caption remains on the existing Processing item for export/publish compatibility. A single repository CLI lets Codex read active context and save/revise/apply structured options through the shared service. The React UI polls/refetches revisions and updates without restart, while dirty-edit protection prevents automatic replacement of unsaved user changes.
 

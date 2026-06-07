@@ -31,6 +31,9 @@ export interface ProcessingItem {
   source_description: string | null;
   file_path: string | null;
   processed_path: string | null;
+  preview_url: string | null;
+  original_preview_url: string | null;
+  exported_preview_url: string | null;
   status: string;
   review_state: string;
   transcript_text: string;
@@ -112,4 +115,21 @@ export interface QueueResult {
   status: string;
   scheduled_at: string | null;
   created: boolean;
+}
+
+export interface WorkflowOption {
+  value: string;
+  label: string;
+}
+
+export interface WorkflowSettings {
+  clip_premise: string;
+  caption_style: string;
+  title_style: string;
+  template: string;
+  title_draft: string;
+  caption_draft: string;
+  caption_style_options: WorkflowOption[];
+  title_style_options: WorkflowOption[];
+  template_options: WorkflowOption[];
 }

@@ -55,6 +55,7 @@ def test_export_sets_processed_path_and_reports_progress(
     # The applied title is burned in.
     assert captured["title_text"] == "Chosen title"
     assert captured["title_layout"] == "top_band"
+    assert captured["title_font_name"] == "arial_bold"
     # processed_path persisted on the item.
     with get_session() as session:
         item = session.get(DownloadItem, item_id)

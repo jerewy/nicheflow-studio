@@ -2,6 +2,7 @@ import asyncio
 from pathlib import Path
 
 from nicheflow_studio.publisher.instagram_publisher import (
+    _IGNORED_CHROMIUM_DEFAULT_ARGS,
     PublishResult,
     _capture_posted_url,
     publish_reel,
@@ -18,6 +19,10 @@ def test_publish_result_ok_is_true_for_posted_and_dry_run() -> None:
 def test_publish_result_flags_checkpoint() -> None:
     assert PublishResult("checkpoint", error_message="suspicious").is_checkpoint is True
     assert PublishResult("posted").is_checkpoint is False
+
+
+def test_publish_browser_only_ignores_automation_default_arg() -> None:
+    assert _IGNORED_CHROMIUM_DEFAULT_ARGS == ("--enable-automation",)
 
 
 def test_publish_reel_fails_fast_when_video_missing(tmp_path: Path) -> None:
