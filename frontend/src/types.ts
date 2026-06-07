@@ -179,3 +179,21 @@ export interface LibraryItem {
   account_name: string | null;
   created_at: string | null;
 }
+
+export interface PublishQueueJob {
+  id: number;
+  account_id: number | null;
+  account_name: string | null;
+  download_item_id: number | null;
+  title: string | null;
+  status: string;
+  scheduled_at: string | null;
+  posted_at: string | null;
+  posted_url: string | null;
+  posted_views: number | null;
+  posted_likes: number | null;
+  posted_comments: number | null;
+  posted_shares: number | null;
+  content_type: string | null;
+  processed_path: string | null;
+}

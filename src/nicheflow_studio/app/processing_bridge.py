@@ -31,6 +31,7 @@ from nicheflow_studio.services import (
     draft_revisions as svc,
     export as export_svc,
     library as library_svc,
+    publish_queue,
     publishing,
     processing_workflow,
 )
@@ -116,6 +117,28 @@ class ProcessingBridge:
     @_guard
     def remove_library_item(self, item_id: int) -> dict:
         return library_svc.remove_item(item_id)
+
+    # --- Publishing Dashboard / Publish Queue (migrated screen) --- #
+
+    @_guard
+    def list_publish_queue(self, account_id: int | None = None) -> list[dict]:
+        return publish_queue.list_jobs(account_id)
+
+    @_guard
+    def mark_job_posted(self, job_id: int, payload: dict | None = None) -> dict:
+        return publish_queue.mark_posted(job_id, payload or {})
+
+    @_guard
+    def reschedule_job(self, job_id: int, scheduled_at: str) -> dict:
+        return publish_queue.reschedule(job_id, scheduled_at)
+
+    @_guard
+    def unschedule_job(self, job_id: int) -> dict:
+        return publish_queue.unschedule(job_id)
+
+    @_guard
+    def remove_publish_job(self, job_id: int) -> dict:
+        return publish_queue.remove_job(job_id)
 
     @_guard
     def get_context(self, item_id: int | None = None) -> dict:

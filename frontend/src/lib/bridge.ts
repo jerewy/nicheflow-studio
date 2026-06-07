@@ -19,6 +19,7 @@ import type {
   LibraryItem,
   ProcessingContext,
   PublishJob,
+  PublishQueueJob,
   QueueResult,
   WorkflowSettings,
 } from "@/types";
@@ -90,6 +91,14 @@ interface PywebviewApi {
   remove_library_item(
     itemId: number,
   ): Promise<Envelope<{ removed_item_id: number; deleted_revisions: number }>>;
+  list_publish_queue(accountId?: number | null): Promise<Envelope<PublishQueueJob[]>>;
+  mark_job_posted(
+    jobId: number,
+    payload: Record<string, unknown>,
+  ): Promise<Envelope<PublishQueueJob>>;
+  reschedule_job(jobId: number, scheduledAt: string): Promise<Envelope<PublishQueueJob>>;
+  unschedule_job(jobId: number): Promise<Envelope<PublishQueueJob>>;
+  remove_publish_job(jobId: number): Promise<Envelope<{ removed_job_id: number }>>;
 }
 
 declare global {
@@ -315,6 +324,31 @@ export const bridge = {
     if (!hasBridge()) return Promise.resolve({ removed_item_id: itemId, deleted_revisions: 0 });
     return unwrap(window.pywebview!.api.remove_library_item(itemId));
   },
+
+  listPublishQueue(accountId?: number | null): Promise<PublishQueueJob[]> {
+    if (!hasBridge()) return mock.listPublishQueue();
+    return unwrap(window.pywebview!.api.list_publish_queue(accountId ?? null));
+  },
+
+  markJobPosted(jobId: number, payload: Record<string, unknown>): Promise<PublishQueueJob> {
+    if (!hasBridge()) return mock.publishQueueJob();
+    return unwrap(window.pywebview!.api.mark_job_posted(jobId, payload));
+  },
+
+  rescheduleJob(jobId: number, scheduledAt: string): Promise<PublishQueueJob> {
+    if (!hasBridge()) return mock.publishQueueJob();
+    return unwrap(window.pywebview!.api.reschedule_job(jobId, scheduledAt));
+  },
+
+  unscheduleJob(jobId: number): Promise<PublishQueueJob> {
+    if (!hasBridge()) return mock.publishQueueJob();
+    return unwrap(window.pywebview!.api.unschedule_job(jobId));
+  },
+
+  removePublishJob(jobId: number) {
+    if (!hasBridge()) return Promise.resolve({ removed_job_id: jobId });
+    return unwrap(window.pywebview!.api.remove_publish_job(jobId));
+  },
 };
 
 // --- browser-only mock ---------------------------------------------------- //
@@ -457,6 +491,28 @@ const mock = {
         instagram_handle: "mockmovies",
       },
     ];
+  },
+  publishQueueJob(): Promise<PublishQueueJob> {
+    return Promise.resolve({
+      id: 1,
+      account_id: 1,
+      account_name: "Mock Movie Account",
+      download_item_id: 1,
+      title: "Mock reel",
+      status: "draft",
+      scheduled_at: null,
+      posted_at: null,
+      posted_url: null,
+      posted_views: null,
+      posted_likes: null,
+      posted_comments: null,
+      posted_shares: null,
+      content_type: null,
+      processed_path: "C:/processed/mock.mp4",
+    });
+  },
+  async listPublishQueue(): Promise<PublishQueueJob[]> {
+    return [await mock.publishQueueJob()];
   },
   async listLibraryItems(): Promise<LibraryItem[]> {
     return [
