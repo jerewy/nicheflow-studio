@@ -30,6 +30,7 @@ from nicheflow_studio.services import (
     draft_handoff,
     draft_revisions as svc,
     export as export_svc,
+    library as library_svc,
     publishing,
     processing_workflow,
 )
@@ -101,6 +102,20 @@ class ProcessingBridge:
     @_guard
     def delete_account(self, account_id: int) -> dict:
         return accounts_svc.delete_account(account_id)
+
+    # --- Downloads / Library (migrated screen) --- #
+
+    @_guard
+    def list_library_items(self) -> list[dict]:
+        return library_svc.list_items()
+
+    @_guard
+    def assign_account(self, item_id: int, account_id: int | None = None) -> dict:
+        return library_svc.assign_account(item_id, account_id)
+
+    @_guard
+    def remove_library_item(self, item_id: int) -> dict:
+        return library_svc.remove_item(item_id)
 
     @_guard
     def get_context(self, item_id: int | None = None) -> dict:

@@ -1,18 +1,21 @@
 import { useState } from "react";
 
 import { AccountManager } from "@/components/AccountManager";
+import { LibraryScreen } from "@/components/LibraryScreen";
 import { ProcessingScreen } from "@/components/ProcessingScreen";
 import { cn } from "@/lib/utils";
 
-type Tab = "processing" | "accounts";
+type Tab = "accounts" | "library" | "processing";
 
+// Ordered to match the workflow: set up an account, review the library, process.
 const TABS: { id: Tab; label: string }[] = [
-  { id: "processing", label: "Processing" },
   { id: "accounts", label: "Accounts" },
+  { id: "library", label: "Library" },
+  { id: "processing", label: "Processing" },
 ];
 
 function App() {
-  const [tab, setTab] = useState<Tab>("processing");
+  const [tab, setTab] = useState<Tab>("accounts");
 
   return (
     <main className="dark min-h-screen bg-background text-foreground">
@@ -32,7 +35,9 @@ function App() {
           </button>
         ))}
       </nav>
-      {tab === "processing" ? <ProcessingScreen /> : <AccountManager />}
+      {tab === "accounts" && <AccountManager />}
+      {tab === "library" && <LibraryScreen />}
+      {tab === "processing" && <ProcessingScreen />}
     </main>
   );
 }

@@ -16,6 +16,7 @@ import type {
   DraftRevision,
   ItemSummary,
   JobSnapshot,
+  LibraryItem,
   ProcessingContext,
   PublishJob,
   QueueResult,
@@ -81,6 +82,14 @@ interface PywebviewApi {
     payload: Record<string, unknown>,
   ): Promise<Envelope<AccountDetail>>;
   delete_account(accountId: number): Promise<Envelope<DeleteAccountResult>>;
+  list_library_items(): Promise<Envelope<LibraryItem[]>>;
+  assign_account(
+    itemId: number,
+    accountId: number | null,
+  ): Promise<Envelope<{ item_id: number; account_id: number | null; account_name: string | null }>>;
+  remove_library_item(
+    itemId: number,
+  ): Promise<Envelope<{ removed_item_id: number; deleted_revisions: number }>>;
 }
 
 declare global {
@@ -290,6 +299,22 @@ export const bridge = {
       });
     return unwrap(window.pywebview!.api.delete_account(accountId));
   },
+
+  listLibraryItems(): Promise<LibraryItem[]> {
+    if (!hasBridge()) return mock.listLibraryItems();
+    return unwrap(window.pywebview!.api.list_library_items());
+  },
+
+  assignAccount(itemId: number, accountId: number | null) {
+    if (!hasBridge())
+      return Promise.resolve({ item_id: itemId, account_id: accountId, account_name: null });
+    return unwrap(window.pywebview!.api.assign_account(itemId, accountId));
+  },
+
+  removeLibraryItem(itemId: number) {
+    if (!hasBridge()) return Promise.resolve({ removed_item_id: itemId, deleted_revisions: 0 });
+    return unwrap(window.pywebview!.api.remove_library_item(itemId));
+  },
 };
 
 // --- browser-only mock ---------------------------------------------------- //
@@ -430,6 +455,23 @@ const mock = {
         niche_label: "movie",
         niche: "movie",
         instagram_handle: "mockmovies",
+      },
+    ];
+  },
+  async listLibraryItems(): Promise<LibraryItem[]> {
+    return [
+      {
+        id: 1,
+        title: "Mock clip (browser dev)",
+        source_url: "https://instagram.com/reel/mock",
+        status: "completed",
+        file_path: "C:/clips/mock.mp4",
+        has_file: true,
+        has_processed: false,
+        has_draft: true,
+        account_id: 1,
+        account_name: "Mock Movie Account",
+        created_at: new Date().toISOString(),
       },
     ];
   },

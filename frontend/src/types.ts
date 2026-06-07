@@ -165,3 +165,17 @@ export interface DeleteAccountResult {
   unassigned_download_items: number;
   removed_upload_jobs: number;
 }
+
+export interface LibraryItem {
+  id: number;
+  title: string | null;
+  source_url: string;
+  status: string;
+  file_path: string | null;
+  has_file: boolean;
+  has_processed: boolean;
+  has_draft: boolean;
+  account_id: number | null;
+  account_name: string | null;
+  created_at: string | null;
+}
