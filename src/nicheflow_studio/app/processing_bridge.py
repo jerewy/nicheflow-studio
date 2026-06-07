@@ -33,6 +33,7 @@ from nicheflow_studio.services import (
     library as library_svc,
     pooling,
     publish_queue,
+    publishing_dashboard,
     publishing,
     processing_workflow,
 )
@@ -158,6 +159,38 @@ class ProcessingBridge:
     @_guard
     def list_pool_items(self, niche: str) -> list[dict]:
         return pooling.list_pool_items(niche)
+
+    @_guard
+    def list_pool_sources(self, niche: str) -> list[dict]:
+        return pooling.list_sources(niche)
+
+    @_guard
+    def list_pool_source_clips(self, niche: str, source_label: str) -> list[dict]:
+        return pooling.list_source_clips(niche, source_label)
+
+    @_guard
+    def dashboard_publish_jobs(self) -> dict:
+        return publishing_dashboard.list_global_publish_jobs()
+
+    @_guard
+    def dashboard_mark_ready(self, job_ids: list[int] | None = None) -> dict:
+        return publishing_dashboard.mark_ready(job_ids or [])
+
+    @_guard
+    def dashboard_open_output(self, job_id: int) -> dict:
+        return publishing_dashboard.open_output(job_id)
+
+    @_guard
+    def dashboard_account_readiness(self) -> dict:
+        return publishing_dashboard.account_readiness()
+
+    @_guard
+    def dashboard_start_live_health_check(self) -> dict:
+        return {"job_id": self._jobs.start(publishing_dashboard.check_all_live)}
+
+    @_guard
+    def dashboard_relogin(self, account_id: int) -> dict:
+        return publishing_dashboard.relogin(account_id)
 
     @_guard
     def get_context(self, item_id: int | None = None) -> dict:

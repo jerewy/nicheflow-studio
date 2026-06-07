@@ -1,7 +1,8 @@
 import { useState } from "react";
 
 import { PoolingScreen } from "@/components/PoolingScreen";
-import { Card, CardContent } from "@/components/ui/card";
+import { MultiAccountPublish } from "@/components/MultiAccountPublish";
+import { AccountReadiness } from "@/components/AccountReadiness";
 import { cn } from "@/lib/utils";
 
 type Sub = "pool" | "publish" | "readiness";
@@ -43,29 +44,8 @@ export function Dashboard() {
       </div>
 
       {sub === "pool" && <PoolingScreen />}
-      {sub === "publish" && (
-        <ComingSoon
-          title="Multi-Account Publish"
-          detail="Batch publish/schedule due reels across a niche's accounts. Migrating next; for now this runs in the desktop app."
-        />
-      )}
-      {sub === "readiness" && (
-        <ComingSoon
-          title="Account Readiness"
-          detail="Per-account session health, daily caps, cooldowns, and publishability. Migrating next; for now this runs in the desktop app."
-        />
-      )}
+      {sub === "publish" && <MultiAccountPublish />}
+      {sub === "readiness" && <AccountReadiness />}
     </div>
-  );
-}
-
-function ComingSoon({ title, detail }: { title: string; detail: string }) {
-  return (
-    <Card>
-      <CardContent className="space-y-1 p-6">
-        <p className="text-sm font-medium">{title}</p>
-        <p className="text-sm text-muted-foreground">{detail}</p>
-      </CardContent>
-    </Card>
   );
 }

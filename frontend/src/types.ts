@@ -211,6 +211,69 @@ export interface PoolClip {
   is_distributed: boolean;
 }
 
+export interface PoolSource {
+  source_label: string;
+  clip_count: number;
+  newest_post_at: string | null;
+}
+
+export interface PoolSourceClip {
+  pool_item_id: number;
+  shortcode: string | null;
+  source_url: string | null;
+  caption: string | null;
+  like_count: number | null;
+  published_at: string | null;
+  download_status: string;
+  distributed_to: string[];
+}
+
+export interface DashboardPublishJob {
+  id: number;
+  account_name: string;
+  video: string;
+  title: string | null;
+  status: string;
+  is_due: boolean;
+  scheduled_at: string | null;
+  profile: string | null;
+  output_name: string;
+  processed_path: string;
+}
+
+export interface DashboardPublishQueue {
+  jobs: DashboardPublishJob[];
+  due_count: number;
+  draft: number;
+  ready: number;
+  scheduled: number;
+}
+
+export interface ReadinessRow {
+  account_id: number;
+  account_name: string;
+  profile: string | null;
+  login_identifier: string | null;
+  session_state: string;
+  session_label: string;
+  detail: string;
+  due_now: number;
+  scheduled: number;
+  next_post_at: string | null;
+  publishable: boolean;
+}
+
+export interface AccountReadiness {
+  rows: ReadinessRow[];
+  totals: {
+    account_count: number;
+    total_due_now: number;
+    total_scheduled: number;
+    blocked_accounts: number;
+    next_post_at: string | null;
+  };
+}
+
 export interface PublishQueueJob {
   id: number;
   account_id: number | null;

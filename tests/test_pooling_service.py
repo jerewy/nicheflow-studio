@@ -61,3 +61,15 @@ def test_list_pool_items_returns_accepted_clip() -> None:
 def test_list_pool_items_unknown_niche_raises() -> None:
     with pytest.raises(PoolingError):
         pooling.list_pool_items("not-a-niche")
+
+
+def test_source_drilldown_returns_source_and_clip_rows() -> None:
+    _seed_history_pool()
+
+    sources = pooling.list_sources("history")
+    assert sources == [{"source_label": "—", "clip_count": 1, "newest_post_at": None}]
+
+    clips = pooling.list_source_clips("history", "—")
+    assert len(clips) == 1
+    assert clips[0]["shortcode"] == "abc"
+    assert clips[0]["download_status"] == "downloaded"

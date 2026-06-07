@@ -11,8 +11,8 @@ type Tab = "accounts" | "processing" | "dashboard";
 
 const TABS: { id: Tab; label: string; gated: boolean }[] = [
   { id: "accounts", label: "Accounts", gated: false },
-  { id: "processing", label: "Processing", gated: true },
   { id: "dashboard", label: "Dashboard", gated: true },
+  { id: "processing", label: "Processing", gated: true },
 ];
 
 function App() {
@@ -20,6 +20,7 @@ function App() {
   const [activeId, setActiveId] = useState<number | null>(null);
   const [tab, setTab] = useState<Tab>("accounts");
   const [loaded, setLoaded] = useState(false);
+  const [activeAccountError, setActiveAccountError] = useState<string | null>(null);
 
   const refreshAccounts = useCallback(async () => {
     try {
@@ -46,8 +47,9 @@ function App() {
     try {
       const result = await bridge.setActiveAccount(id);
       setActiveId(result.active_account_id);
-    } catch {
-      /* ignore */
+      setActiveAccountError(null);
+    } catch (err: unknown) {
+      setActiveAccountError(err instanceof Error ? err.message : String(err));
     }
   };
 
@@ -95,6 +97,9 @@ function App() {
               </option>
             ))}
           </select>
+          {activeAccountError && (
+            <span className="text-xs text-destructive">{activeAccountError}</span>
+          )}
         </div>
       </nav>
 

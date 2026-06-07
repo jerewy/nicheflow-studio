@@ -78,3 +78,42 @@ def list_pool_items(niche: str) -> list[dict]:
             }
             for row in rows
         ]
+
+
+def list_sources(niche: str) -> list[dict]:
+    """Source summary rows for the selected niche pool."""
+    with get_session() as session:
+        try:
+            rows = pools.pool_source_summary(session, niche)
+        except ValueError as exc:
+            raise PoolingError(str(exc)) from exc
+        return [
+            {
+                "source_label": row.source_label,
+                "clip_count": row.clip_count,
+                "newest_post_at": _iso(row.newest_post_at),
+            }
+            for row in rows
+        ]
+
+
+def list_source_clips(niche: str, source_label: str) -> list[dict]:
+    """Detailed clip rows for one source in a niche pool."""
+    with get_session() as session:
+        try:
+            rows = pools.pool_clips_for_source(session, niche, source_label)
+        except ValueError as exc:
+            raise PoolingError(str(exc)) from exc
+        return [
+            {
+                "pool_item_id": row.pool_item_id,
+                "shortcode": row.shortcode,
+                "source_url": row.source_url,
+                "caption": row.caption,
+                "like_count": row.like_count,
+                "published_at": _iso(row.published_at),
+                "download_status": row.download_status,
+                "distributed_to": list(row.distributed_to),
+            }
+            for row in rows
+        ]

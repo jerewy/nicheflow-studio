@@ -14,14 +14,18 @@ import type {
   ApplyResult,
   DeleteAccountResult,
   DraftRevision,
+  DashboardPublishQueue,
   ItemSummary,
   JobSnapshot,
   LibraryItem,
   PoolClip,
+  PoolSource,
+  PoolSourceClip,
   PoolingOverview,
   ProcessingContext,
   PublishJob,
   PublishQueueJob,
+  AccountReadiness,
   QueueResult,
   WorkflowSettings,
 } from "@/types";
@@ -107,6 +111,14 @@ interface PywebviewApi {
   remove_publish_job(jobId: number): Promise<Envelope<{ removed_job_id: number }>>;
   pooling_overview(): Promise<Envelope<PoolingOverview>>;
   list_pool_items(niche: string): Promise<Envelope<PoolClip[]>>;
+  list_pool_sources(niche: string): Promise<Envelope<PoolSource[]>>;
+  list_pool_source_clips(niche: string, sourceLabel: string): Promise<Envelope<PoolSourceClip[]>>;
+  dashboard_publish_jobs(): Promise<Envelope<DashboardPublishQueue>>;
+  dashboard_mark_ready(jobIds: number[]): Promise<Envelope<{ updated: number }>>;
+  dashboard_open_output(jobId: number): Promise<Envelope<{ opened: string }>>;
+  dashboard_account_readiness(): Promise<Envelope<AccountReadiness>>;
+  dashboard_start_live_health_check(): Promise<Envelope<{ job_id: string }>>;
+  dashboard_relogin(accountId: number): Promise<Envelope<{ profile: string }>>;
 }
 
 declare global {
@@ -376,6 +388,46 @@ export const bridge = {
   listPoolItems(niche: string): Promise<PoolClip[]> {
     if (!hasBridge()) return mock.listPoolItems();
     return unwrap(window.pywebview!.api.list_pool_items(niche));
+  },
+
+  listPoolSources(niche: string): Promise<PoolSource[]> {
+    if (!hasBridge()) return Promise.resolve([]);
+    return unwrap(window.pywebview!.api.list_pool_sources(niche));
+  },
+
+  listPoolSourceClips(niche: string, sourceLabel: string): Promise<PoolSourceClip[]> {
+    if (!hasBridge()) return Promise.resolve([]);
+    return unwrap(window.pywebview!.api.list_pool_source_clips(niche, sourceLabel));
+  },
+
+  dashboardPublishJobs(): Promise<DashboardPublishQueue> {
+    if (!hasBridge()) return Promise.resolve({ jobs: [], due_count: 0, draft: 0, ready: 0, scheduled: 0 });
+    return unwrap(window.pywebview!.api.dashboard_publish_jobs());
+  },
+
+  dashboardMarkReady(jobIds: number[]): Promise<{ updated: number }> {
+    if (!hasBridge()) return Promise.resolve({ updated: jobIds.length });
+    return unwrap(window.pywebview!.api.dashboard_mark_ready(jobIds));
+  },
+
+  dashboardOpenOutput(jobId: number): Promise<{ opened: string }> {
+    if (!hasBridge()) return Promise.resolve({ opened: String(jobId) });
+    return unwrap(window.pywebview!.api.dashboard_open_output(jobId));
+  },
+
+  dashboardAccountReadiness(): Promise<AccountReadiness> {
+    if (!hasBridge()) return Promise.resolve({ rows: [], totals: { account_count: 0, total_due_now: 0, total_scheduled: 0, blocked_accounts: 0, next_post_at: null } });
+    return unwrap(window.pywebview!.api.dashboard_account_readiness());
+  },
+
+  dashboardStartLiveHealthCheck(): Promise<{ job_id: string }> {
+    if (!hasBridge()) return Promise.resolve({ job_id: "mock-health" });
+    return unwrap(window.pywebview!.api.dashboard_start_live_health_check());
+  },
+
+  dashboardRelogin(accountId: number): Promise<{ profile: string }> {
+    if (!hasBridge()) return Promise.resolve({ profile: String(accountId) });
+    return unwrap(window.pywebview!.api.dashboard_relogin(accountId));
   },
 };
 
