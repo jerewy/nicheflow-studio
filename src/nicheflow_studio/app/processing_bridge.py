@@ -25,6 +25,7 @@ import threading
 from nicheflow_studio.app.local_media import media_url
 from nicheflow_studio.core.ui_prefs import set_ui_pref
 from nicheflow_studio.services import (
+    accounts as accounts_svc,
     draft_generation,
     draft_handoff,
     draft_revisions as svc,
@@ -79,6 +80,28 @@ class ProcessingBridge:
         """Recent downloaded items the user can select to process."""
         return publishing.list_items()
 
+    # --- Account Manager (migrated screen) --- #
+
+    @_guard
+    def list_accounts(self) -> list[dict]:
+        return accounts_svc.list_accounts()
+
+    @_guard
+    def get_account(self, account_id: int) -> dict:
+        return accounts_svc.get_account(account_id)
+
+    @_guard
+    def create_account(self, payload: dict | None = None) -> dict:
+        return accounts_svc.create_account(payload or {})
+
+    @_guard
+    def update_account(self, account_id: int, payload: dict | None = None) -> dict:
+        return accounts_svc.update_account(account_id, payload or {})
+
+    @_guard
+    def delete_account(self, account_id: int) -> dict:
+        return accounts_svc.delete_account(account_id)
+
     @_guard
     def get_context(self, item_id: int | None = None) -> dict:
         """Active Processing context for ``item_id`` (or the resolved current item)."""
@@ -86,7 +109,9 @@ class ProcessingBridge:
         item = context["item"]
         mapping_ready = self._media_ready is None or self._media_ready.wait(timeout=5)
         item["original_preview_url"] = media_url(item.get("file_path")) if mapping_ready else None
-        item["exported_preview_url"] = media_url(item.get("processed_path")) if mapping_ready else None
+        item["exported_preview_url"] = (
+            media_url(item.get("processed_path")) if mapping_ready else None
+        )
         item["preview_url"] = item["exported_preview_url"] or item["original_preview_url"]
         return context
 

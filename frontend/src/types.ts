@@ -133,3 +133,35 @@ export interface WorkflowSettings {
   title_style_options: WorkflowOption[];
   template_options: WorkflowOption[];
 }
+
+export interface AccountSummary {
+  id: number;
+  name: string;
+  platform: string;
+  niche_label: string | null;
+  niche: string | null;
+  instagram_handle: string | null;
+}
+
+export interface AccountDetail extends AccountSummary {
+  login_identifier: string | null;
+  instagram_profile: string | null;
+  credential_blob: string | null;
+  writing_tone: string | null;
+  target_audience: string | null;
+  hook_style: string | null;
+  banned_phrases: string | null;
+  title_style_notes: string | null;
+  caption_style_notes: string | null;
+  upload_timezone: string | null;
+  upload_default_privacy: string | null;
+  upload_schedule_slots: string | null;
+  download_item_count: number;
+  upload_job_count: number;
+}
+
+export interface DeleteAccountResult {
+  deleted_account_id: number;
+  unassigned_download_items: number;
+  removed_upload_jobs: number;
+}

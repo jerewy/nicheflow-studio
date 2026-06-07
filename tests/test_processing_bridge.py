@@ -201,6 +201,37 @@ def test_bridge_get_unknown_job_returns_error() -> None:
     assert result["ok"] is False
 
 
+# --------------------------------------------------------------------------- #
+# account manager
+# --------------------------------------------------------------------------- #
+
+
+def test_bridge_account_crud_roundtrip() -> None:
+    bridge = ProcessingBridge()
+
+    created = bridge.create_account({"name": "Bridge Acc", "instagram_handle": "@bridge"})
+    assert created["ok"] is True
+    account_id = created["data"]["id"]
+    assert created["data"]["instagram_handle"] == "bridge"
+
+    listed = bridge.list_accounts()
+    assert any(a["id"] == account_id for a in listed["data"])
+
+    updated = bridge.update_account(account_id, {"writing_tone": "playful"})
+    assert updated["data"]["writing_tone"] == "playful"
+
+    deleted = bridge.delete_account(account_id)
+    assert deleted["ok"] is True
+    assert deleted["data"]["deleted_account_id"] == account_id
+
+
+def test_bridge_create_account_requires_name() -> None:
+    bridge = ProcessingBridge()
+    result = bridge.create_account({"platform": "instagram"})
+    assert result["ok"] is False
+    assert "name" in result["error"].lower()
+
+
 def test_bridge_start_export_runs_job(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     from nicheflow_studio.processing import video
 

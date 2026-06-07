@@ -9,7 +9,10 @@
 // shell.
 
 import type {
+  AccountDetail,
+  AccountSummary,
   ApplyResult,
+  DeleteAccountResult,
   DraftRevision,
   ItemSummary,
   JobSnapshot,
@@ -70,6 +73,14 @@ interface PywebviewApi {
     scheduledAt?: string | null,
   ): Promise<Envelope<QueueResult>>;
   auto_schedule_for_publish(itemId: number): Promise<Envelope<QueueResult>>;
+  list_accounts(): Promise<Envelope<AccountSummary[]>>;
+  get_account(accountId: number): Promise<Envelope<AccountDetail>>;
+  create_account(payload: Record<string, unknown>): Promise<Envelope<AccountDetail>>;
+  update_account(
+    accountId: number,
+    payload: Record<string, unknown>,
+  ): Promise<Envelope<AccountDetail>>;
+  delete_account(accountId: number): Promise<Envelope<DeleteAccountResult>>;
 }
 
 declare global {
@@ -249,6 +260,36 @@ export const bridge = {
     if (!hasBridge()) return mock.getJob();
     return unwrap(window.pywebview!.api.get_job(jobId));
   },
+
+  listAccounts(): Promise<AccountSummary[]> {
+    if (!hasBridge()) return mock.listAccounts();
+    return unwrap(window.pywebview!.api.list_accounts());
+  },
+
+  getAccount(accountId: number): Promise<AccountDetail> {
+    if (!hasBridge()) return mock.getAccount();
+    return unwrap(window.pywebview!.api.get_account(accountId));
+  },
+
+  createAccount(payload: Record<string, unknown>): Promise<AccountDetail> {
+    if (!hasBridge()) return mock.getAccount();
+    return unwrap(window.pywebview!.api.create_account(payload));
+  },
+
+  updateAccount(accountId: number, payload: Record<string, unknown>): Promise<AccountDetail> {
+    if (!hasBridge()) return mock.getAccount();
+    return unwrap(window.pywebview!.api.update_account(accountId, payload));
+  },
+
+  deleteAccount(accountId: number): Promise<DeleteAccountResult> {
+    if (!hasBridge())
+      return Promise.resolve({
+        deleted_account_id: accountId,
+        unassigned_download_items: 0,
+        removed_upload_jobs: 0,
+      });
+    return unwrap(window.pywebview!.api.delete_account(accountId));
+  },
 };
 
 // --- browser-only mock ---------------------------------------------------- //
@@ -378,6 +419,42 @@ const mock = {
       message: "Done",
       result: mockRevision,
       error: null,
+    };
+  },
+  async listAccounts(): Promise<AccountSummary[]> {
+    return [
+      {
+        id: 1,
+        name: "Mock Movie Account",
+        platform: "instagram",
+        niche_label: "movie",
+        niche: "movie",
+        instagram_handle: "mockmovies",
+      },
+    ];
+  },
+  async getAccount(): Promise<AccountDetail> {
+    return {
+      id: 1,
+      name: "Mock Movie Account",
+      platform: "instagram",
+      niche_label: "movie",
+      niche: "movie",
+      instagram_handle: "mockmovies",
+      login_identifier: null,
+      instagram_profile: null,
+      credential_blob: null,
+      writing_tone: "cinematic",
+      target_audience: null,
+      hook_style: null,
+      banned_phrases: null,
+      title_style_notes: null,
+      caption_style_notes: null,
+      upload_timezone: "Asia/Jakarta",
+      upload_default_privacy: "private",
+      upload_schedule_slots: null,
+      download_item_count: 0,
+      upload_job_count: 0,
     };
   },
   async getWorkflowSettings(): Promise<WorkflowSettings> {
