@@ -76,6 +76,19 @@ def test_build_chat_prompt_bans_dashes_and_avoids_pipe_corruption() -> None:
     assert "Get-Content <draft-json-file> |" not in prompt
 
 
+def test_build_chat_prompt_requires_same_index_recommendation() -> None:
+    # The app applies title+caption as one unit; cross-paired recommendations
+    # (Title 2 + Caption 3) render misleadingly, so the contract forbids them.
+    item_id = _make_item()
+
+    prompt = draft_handoff.build_chat_prompt(item_id)
+
+    assert "MUST share the same option number" in prompt
+    assert "never recommend Title 2 + Caption 3" in prompt
+    assert "MUST be equal to each other" in prompt
+    assert "never a file path" in prompt
+
+
 def test_build_chat_prompt_includes_stored_vision_payload() -> None:
     item_id = _make_item()
     with get_session() as session:

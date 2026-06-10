@@ -80,6 +80,22 @@ class DraftRevisionDTO:
         return asdict(self)
 
 
+def _coerce_str_list(value: object) -> list[str] | None:
+    """Accept a list of strings OR a dict like {"option_1": "note", ...}.
+
+    Coding agents saving through the CLI sometimes send option_notes/option_tiers
+    as an object keyed by option; iterating that dict stored its KEYS as the
+    notes. Take the values (in key order) instead of silently storing junk.
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return [str(v) for v in value.values()]
+    if isinstance(value, (list, tuple)):
+        return [str(v) for v in value]
+    return [str(value)]
+
+
 def _dump_list(values: list[str] | None) -> str | None:
     if not values:
         return None
@@ -219,17 +235,23 @@ def save_revision(
     if not captions:
         raise DraftRevisionError("caption_options must contain at least one non-empty caption.")
 
+    source_value = (source or "codex").strip() or "codex"
+    # Agents occasionally misread "source" as the source VIDEO and send a file
+    # path; provenance labels never contain path separators.
+    if "/" in source_value or "\\" in source_value:
+        source_value = "codex"
+
     with get_session() as session:
         _require_item(session, item_id)
         revision = DraftRevision(
             download_item_id=item_id,
             revision_number=_next_revision_number(session, item_id),
-            source=(source or "codex").strip() or "codex",
+            source=source_value,
             summary=(summary or None),
             title_options=_dump_list(titles),
             caption_options=_dump_list(captions),
-            option_notes=_dump_list(option_notes),
-            option_tiers=_dump_list(option_tiers),
+            option_notes=_dump_list(_coerce_str_list(option_notes)),
+            option_tiers=_dump_list(_coerce_str_list(option_tiers)),
             recommended_title_index=recommended_title_index,
             recommended_caption_index=recommended_caption_index,
             recommendation_reason=(recommendation_reason or None),

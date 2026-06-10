@@ -1165,6 +1165,19 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
       {loadedRevision?.summary && (
         <p className="text-sm text-muted-foreground">{loadedRevision.summary}</p>
       )}
+      {loadedRevision?.recommended_title_index != null && (
+        <p className="text-sm">
+          <span className="font-medium">Recommended pick:</span>{" "}
+          Title Option {loadedRevision.recommended_title_index}
+          {loadedRevision.recommended_caption_index != null &&
+          loadedRevision.recommended_caption_index !== loadedRevision.recommended_title_index
+            ? ` + Caption Option ${loadedRevision.recommended_caption_index}`
+            : ""}
+          {loadedRevision.recommendation_reason
+            ? ` : ${loadedRevision.recommendation_reason}`
+            : ""}
+        </p>
+      )}
 
       {!loadedRevision ? (
         <Card>

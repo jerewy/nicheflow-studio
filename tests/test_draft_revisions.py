@@ -348,6 +348,23 @@ def test_save_revision_normalizes_dashes_in_published_copy() -> None:
     )
 
 
+def test_save_revision_coerces_dict_notes_and_path_source() -> None:
+    # Agents saving via the CLI have sent option_notes as an object (storing
+    # its KEYS as junk notes) and a video file path in the source field.
+    item_id = _make_item()
+
+    saved = svc.save_revision(
+        item_id,
+        title_options=["T1", "T2"],
+        caption_options=["C1", "C2"],
+        option_notes={"option_1": "clearest hook", "option_2": "best for reach"},  # type: ignore[arg-type]
+        source="C:\\clips\\video.mp4",
+    )
+
+    assert saved.option_notes == ["clearest hook", "best for reach"]
+    assert saved.source == "codex"
+
+
 def test_save_revision_keeps_hyphenated_words_intact() -> None:
     item_id = _make_item()
 

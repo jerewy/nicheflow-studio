@@ -194,6 +194,9 @@ def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
             "Never write em dashes or double hyphens ('--') in titles or captions; "
             "use a comma, period, or colon instead. Long dashes read as AI-generated copy.",
             "Recommend the strongest title/caption pair and add one short selection note per option.",
+            "The recommended title and caption MUST share the same option number: the app "
+            "applies title+caption as ONE unit, so rearrange your options before returning "
+            "until the strongest pair sits together (never recommend Title 2 + Caption 3).",
             "Do not invent unsupported facts.",
             "",
             "Automatic NicheFlow handoff for Codex or Claude Code:",
@@ -202,8 +205,12 @@ def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
             f"  .venv\\Scripts\\python.exe scripts\\nicheflow_drafts.py save --item-id {item_id} --file <draft-json-path>",
             "- Do NOT pipe the JSON through Get-Content into --stdin: PowerShell re-decodes "
             "the bytes and silently corrupts em dashes and emoji before Python sees them.",
-            "- Use JSON fields title_options, caption_options, option_notes, recommended_title_index, recommended_caption_index, recommendation_reason, provider_label, and source.",
-            "- Recommended indexes are 1-based. Set provider_label/source to Codex or Claude Code.",
+            "- Use JSON fields title_options, caption_options, option_notes (a LIST of "
+            "strings, one per option, NOT an object), recommended_title_index, "
+            "recommended_caption_index, recommendation_reason, provider_label, and source.",
+            "- Recommended indexes are 1-based and MUST be equal to each other. Set "
+            "provider_label to 'Codex' or 'Claude Code' and source to 'codex' or "
+            "'claude-code' (a short label, never a file path).",
             "- The running Processing screen automatically detects the saved revision. Do not ask the user to paste it manually.",
             "",
             "Return format (write every section header exactly as shown, plain text — "
