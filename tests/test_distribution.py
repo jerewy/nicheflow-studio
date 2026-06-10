@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import datetime as dt
 import random
 
 import pytest
 
 from nicheflow_studio.core.distribution import (
     distribution_counts,
+    engagement_score,
     plan_first_cycle,
+    ranked_clip_order,
     target_backlog,
 )
 
@@ -163,3 +166,86 @@ def test_existing_counts_none_matches_clean_first_cycle() -> None:
     # max_per_account=28 caps each account; 10 x 28 = 280 placed, 20 left over.
     assert all(v == 28 for v in counts.values())
     assert len(plan) == 280
+
+
+# --------------------------------------------------------------------------- #
+# engagement scoring + ranked ordering
+# --------------------------------------------------------------------------- #
+
+
+_NOW = dt.datetime(2026, 6, 8, tzinfo=dt.timezone.utc)
+
+
+def test_engagement_score_is_zero_without_likes() -> None:
+    assert engagement_score(like_count=None) == 0.0
+    assert engagement_score(like_count=0) == 0.0
+
+
+def test_engagement_score_increases_with_likes() -> None:
+    low = engagement_score(like_count=100, published_at=_NOW, now=_NOW)
+    high = engagement_score(like_count=100_000, published_at=_NOW, now=_NOW)
+    assert high > low > 0.0
+
+
+def test_engagement_score_is_log_damped_not_linear() -> None:
+    """100x the likes must NOT yield ~100x the score — mega-viral can't dominate."""
+    low = engagement_score(like_count=1_000, published_at=_NOW, now=_NOW)
+    high = engagement_score(like_count=100_000, published_at=_NOW, now=_NOW)
+    assert high < low * 3  # log10 growth, far short of the 100x linear ratio
+
+
+def test_engagement_score_decays_with_age() -> None:
+    fresh = engagement_score(like_count=10_000, published_at=_NOW, now=_NOW)
+    old = engagement_score(
+        like_count=10_000,
+        published_at=_NOW - dt.timedelta(days=365),
+        now=_NOW,
+    )
+    assert fresh > old > 0.0
+
+
+def test_engagement_score_recency_floors_at_half() -> None:
+    """A very old clip keeps at least half its popularity weight (evergreen-safe)."""
+    ancient = engagement_score(
+        like_count=10_000,
+        published_at=_NOW - dt.timedelta(days=36_500),
+        now=_NOW,
+    )
+    no_recency = engagement_score(like_count=10_000)  # popularity only
+    assert ancient >= no_recency * 0.5 - 1e-9
+
+
+def test_ranked_clip_order_puts_strongest_tier_first() -> None:
+    # Scores 1..20; top tier (highest scores) must all precede the bottom tier.
+    scored = [(i, float(i)) for i in range(1, 21)]
+    order = ranked_clip_order(scored, rng=random.Random(1), tier_fraction=0.25)
+    assert sorted(order) == [i for i, _ in scored]  # permutation, nothing lost
+    top_tier = set(order[:5])
+    bottom_tier = set(order[-5:])
+    assert top_tier == {16, 17, 18, 19, 20}  # 5 highest scores, in some order
+    assert bottom_tier == {1, 2, 3, 4, 5}  # 5 lowest scores
+
+
+def test_ranked_clip_order_jitters_within_a_tier() -> None:
+    # Equal scores -> different seeds should yield different orders (jitter on).
+    scored = [(i, 1.0) for i in range(1, 13)]
+    a = ranked_clip_order(scored, rng=random.Random(1))
+    b = ranked_clip_order(scored, rng=random.Random(2))
+    assert sorted(a) == sorted(b) == [i for i, _ in scored]
+    assert a != b
+
+
+def test_ranked_clip_order_empty() -> None:
+    assert ranked_clip_order([], rng=random.Random(1)) == []
+
+
+def test_plan_first_cycle_preserves_order_when_not_shuffling() -> None:
+    """With shuffle_items=False the best clips (front of the list) are placed
+    first: one account each, in order, before any account gets a second clip."""
+    items = [10, 20, 30, 40, 50, 60]  # already ranked best-first
+    accounts = [1, 2, 3]
+    plan = plan_first_cycle(
+        items, accounts, rng=random.Random(0), max_per_account=1, shuffle_items=False
+    )
+    # Only the top 3 clips are placed (cap 1 each), and they are the first three.
+    assert {a.pool_item_id for a in plan} == {10, 20, 30}

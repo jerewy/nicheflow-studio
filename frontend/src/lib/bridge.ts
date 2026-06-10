@@ -11,13 +11,17 @@
 import type {
   AccountDetail,
   AccountSummary,
+  ApifyUsage,
   ApplyResult,
+  CropRect,
   DeleteAccountResult,
+  DistributeNicheResult,
   DraftRevision,
   DashboardPublishQueue,
   ItemSummary,
   JobSnapshot,
   LibraryItem,
+  NicheAccount,
   PoolClip,
   PoolSource,
   PoolSourceClip,
@@ -71,6 +75,15 @@ interface PywebviewApi {
     caption: string,
   ): Promise<Envelope<{ title_draft: string; caption_draft: string }>>;
   open_item_folder(itemId: number): Promise<Envelope<{ folder: string }>>;
+  get_crop_override(itemId: number): Promise<Envelope<CropRect | null>>;
+  get_crop_preview(itemId: number): Promise<Envelope<{ item_id: number; preview_url: string }>>;
+  save_crop_override(
+    itemId: number,
+    payload: CropRect,
+  ): Promise<Envelope<{ item_id: number; crop_override: CropRect }>>;
+  clear_crop_override(
+    itemId: number,
+  ): Promise<Envelope<{ item_id: number; crop_override: null }>>;
   start_generation(
     itemId: number,
     payload: Record<string, unknown>,
@@ -83,6 +96,11 @@ interface PywebviewApi {
     scheduledAt?: string | null,
   ): Promise<Envelope<QueueResult>>;
   auto_schedule_for_publish(itemId: number): Promise<Envelope<QueueResult>>;
+  start_publish_now(itemId: number): Promise<Envelope<{ job_id: string }>>;
+  publish_due_count(): Promise<Envelope<{ due: number }>>;
+  start_publish_due(): Promise<Envelope<{ job_id: string }>>;
+  get_auto_publish(): Promise<Envelope<{ enabled: boolean }>>;
+  set_auto_publish(enabled: boolean): Promise<Envelope<{ enabled: boolean }>>;
   list_accounts(): Promise<Envelope<AccountSummary[]>>;
   get_account(accountId: number): Promise<Envelope<AccountDetail>>;
   create_account(payload: Record<string, unknown>): Promise<Envelope<AccountDetail>>;
@@ -103,6 +121,33 @@ interface PywebviewApi {
   remove_library_item(
     itemId: number,
   ): Promise<Envelope<{ removed_item_id: number; deleted_revisions: number }>>;
+  remove_item_from_pool(
+    itemId: number,
+    reason: string,
+  ): Promise<Envelope<{ item_id: number; removed_pool_items: number }>>;
+  reject_item(
+    itemId: number,
+    reason: string,
+  ): Promise<
+    Envelope<{
+      item_id: number;
+      rejected_candidates: number;
+      removed_pool_items: number;
+      review_state: string;
+    }>
+  >;
+  reject_item_globally(
+    itemId: number,
+    reason: string,
+  ): Promise<
+    Envelope<{
+      item_id: number;
+      removed_pool_items: number;
+      dropped_assignments: number;
+      review_state: string;
+      blocked: boolean;
+    }>
+  >;
   list_publish_queue(accountId?: number | null): Promise<Envelope<PublishQueueJob[]>>;
   mark_job_posted(
     jobId: number,
@@ -114,7 +159,27 @@ interface PywebviewApi {
   pooling_overview(): Promise<Envelope<PoolingOverview>>;
   list_pool_items(niche: string): Promise<Envelope<PoolClip[]>>;
   list_pool_sources(niche: string): Promise<Envelope<PoolSource[]>>;
-  list_pool_source_clips(niche: string, sourceLabel: string): Promise<Envelope<PoolSourceClip[]>>;
+  list_pool_source_clips(
+    niche: string,
+    sourceLabel: string,
+    includeRemoved?: boolean,
+  ): Promise<Envelope<PoolSourceClip[]>>;
+  remove_pool_item(
+    poolItemId: number,
+    reason: string,
+  ): Promise<Envelope<{ pool_item_id: number; acceptance_status: string }>>;
+  restore_pool_item(
+    poolItemId: number,
+  ): Promise<Envelope<{ pool_item_id: number; acceptance_status: string }>>;
+  pool_niche_accounts(niche: string): Promise<Envelope<NicheAccount[]>>;
+  distribute_pool_item(
+    poolItemId: number,
+    accountIds: number[],
+  ): Promise<Envelope<{ pool_item_id: number; assigned: number }>>;
+  distribute_niche(
+    niche: string,
+    maxPerAccount?: number | null,
+  ): Promise<Envelope<DistributeNicheResult>>;
   dashboard_publish_jobs(): Promise<Envelope<DashboardPublishQueue>>;
   dashboard_mark_ready(jobIds: number[]): Promise<Envelope<{ updated: number }>>;
   dashboard_open_output(jobId: number): Promise<Envelope<{ opened: string }>>;
@@ -130,6 +195,22 @@ interface PywebviewApi {
     candidateId: number,
     state: string,
   ): Promise<Envelope<{ candidate_id: number; state: string }>>;
+  accept_candidate(
+    candidateId: number,
+  ): Promise<Envelope<{ candidate_id: number; state: string; pool_item_id: number; niche: string }>>;
+  reject_candidate(
+    candidateId: number,
+    reason: string,
+  ): Promise<Envelope<{ candidate_id: number; state: string; removed_pool_items: number }>>;
+  candidate_preview(
+    candidateId: number,
+  ): Promise<Envelope<{ preview_url: string | null; thumbnail_url: string | null }>>;
+  apify_usage(): Promise<Envelope<ApifyUsage>>;
+  start_source_scrape(
+    sourceId: number,
+    maxItems: number,
+  ): Promise<Envelope<{ job_id: string }>>;
+  start_candidate_download(candidateId: number): Promise<Envelope<{ job_id: string }>>;
 }
 
 declare global {
@@ -216,6 +297,31 @@ export const bridge = {
     return unwrap(window.pywebview!.api.auto_schedule_for_publish(itemId));
   },
 
+  startPublishNow(itemId: number): Promise<{ job_id: string }> {
+    if (!hasBridge()) return Promise.resolve({ job_id: "mock-publish" });
+    return unwrap(window.pywebview!.api.start_publish_now(itemId));
+  },
+
+  publishDueCount(): Promise<{ due: number }> {
+    if (!hasBridge()) return Promise.resolve({ due: 0 });
+    return unwrap(window.pywebview!.api.publish_due_count());
+  },
+
+  startPublishDue(): Promise<{ job_id: string }> {
+    if (!hasBridge()) return Promise.resolve({ job_id: "mock-publish-due" });
+    return unwrap(window.pywebview!.api.start_publish_due());
+  },
+
+  getAutoPublish(): Promise<{ enabled: boolean }> {
+    if (!hasBridge()) return Promise.resolve({ enabled: false });
+    return unwrap(window.pywebview!.api.get_auto_publish());
+  },
+
+  setAutoPublish(enabled: boolean): Promise<{ enabled: boolean }> {
+    if (!hasBridge()) return Promise.resolve({ enabled });
+    return unwrap(window.pywebview!.api.set_auto_publish(enabled));
+  },
+
   getLatestRevision(itemId: number): Promise<DraftRevision | null> {
     if (!hasBridge()) return mock.getLatest();
     return unwrap(window.pywebview!.api.get_latest_revision(itemId));
@@ -292,6 +398,29 @@ export const bridge = {
     return unwrap(window.pywebview!.api.open_item_folder(itemId));
   },
 
+  getCropOverride(itemId: number): Promise<CropRect | null> {
+    if (!hasBridge()) return Promise.resolve(null);
+    return unwrap(window.pywebview!.api.get_crop_override(itemId));
+  },
+
+  getCropPreview(itemId: number): Promise<{ item_id: number; preview_url: string }> {
+    if (!hasBridge()) return Promise.resolve({ item_id: itemId, preview_url: "" });
+    return unwrap(window.pywebview!.api.get_crop_preview(itemId));
+  },
+
+  saveCropOverride(
+    itemId: number,
+    rect: CropRect,
+  ): Promise<{ item_id: number; crop_override: CropRect }> {
+    if (!hasBridge()) return Promise.resolve({ item_id: itemId, crop_override: rect });
+    return unwrap(window.pywebview!.api.save_crop_override(itemId, rect));
+  },
+
+  clearCropOverride(itemId: number): Promise<{ item_id: number; crop_override: null }> {
+    if (!hasBridge()) return Promise.resolve({ item_id: itemId, crop_override: null });
+    return unwrap(window.pywebview!.api.clear_crop_override(itemId));
+  },
+
   startGeneration(
     itemId: number,
     payload: Record<string, unknown> = {},
@@ -366,6 +495,54 @@ export const bridge = {
     return unwrap(window.pywebview!.api.remove_library_item(itemId));
   },
 
+  removeItemFromPool(
+    itemId: number,
+    reason = "manual removal",
+  ): Promise<{ item_id: number; removed_pool_items: number }> {
+    if (!hasBridge()) return Promise.resolve({ item_id: itemId, removed_pool_items: 0 });
+    return unwrap(window.pywebview!.api.remove_item_from_pool(itemId, reason));
+  },
+
+  rejectItem(
+    itemId: number,
+    reason = "low_quality",
+  ): Promise<{
+    item_id: number;
+    rejected_candidates: number;
+    removed_pool_items: number;
+    review_state: string;
+  }> {
+    if (!hasBridge())
+      return Promise.resolve({
+        item_id: itemId,
+        rejected_candidates: 0,
+        removed_pool_items: 0,
+        review_state: "rejected",
+      });
+    return unwrap(window.pywebview!.api.reject_item(itemId, reason));
+  },
+
+  rejectItemGlobally(
+    itemId: number,
+    reason = "globally rejected",
+  ): Promise<{
+    item_id: number;
+    removed_pool_items: number;
+    dropped_assignments: number;
+    review_state: string;
+    blocked: boolean;
+  }> {
+    if (!hasBridge())
+      return Promise.resolve({
+        item_id: itemId,
+        removed_pool_items: 0,
+        dropped_assignments: 0,
+        review_state: "blocked",
+        blocked: true,
+      });
+    return unwrap(window.pywebview!.api.reject_item_globally(itemId, reason));
+  },
+
   listPublishQueue(accountId?: number | null): Promise<PublishQueueJob[]> {
     if (!hasBridge()) return mock.listPublishQueue();
     return unwrap(window.pywebview!.api.list_publish_queue(accountId ?? null));
@@ -406,9 +583,52 @@ export const bridge = {
     return unwrap(window.pywebview!.api.list_pool_sources(niche));
   },
 
-  listPoolSourceClips(niche: string, sourceLabel: string): Promise<PoolSourceClip[]> {
+  listPoolSourceClips(
+    niche: string,
+    sourceLabel: string,
+    includeRemoved = false,
+  ): Promise<PoolSourceClip[]> {
     if (!hasBridge()) return Promise.resolve([]);
-    return unwrap(window.pywebview!.api.list_pool_source_clips(niche, sourceLabel));
+    return unwrap(
+      window.pywebview!.api.list_pool_source_clips(niche, sourceLabel, includeRemoved),
+    );
+  },
+
+  removePoolItem(
+    poolItemId: number,
+    reason = "manual removal",
+  ): Promise<{ pool_item_id: number; acceptance_status: string }> {
+    if (!hasBridge())
+      return Promise.resolve({ pool_item_id: poolItemId, acceptance_status: "removed" });
+    return unwrap(window.pywebview!.api.remove_pool_item(poolItemId, reason));
+  },
+
+  restorePoolItem(
+    poolItemId: number,
+  ): Promise<{ pool_item_id: number; acceptance_status: string }> {
+    if (!hasBridge())
+      return Promise.resolve({ pool_item_id: poolItemId, acceptance_status: "accepted" });
+    return unwrap(window.pywebview!.api.restore_pool_item(poolItemId));
+  },
+
+  poolNicheAccounts(niche: string): Promise<NicheAccount[]> {
+    if (!hasBridge()) return Promise.resolve([]);
+    return unwrap(window.pywebview!.api.pool_niche_accounts(niche));
+  },
+
+  distributePoolItem(
+    poolItemId: number,
+    accountIds: number[],
+  ): Promise<{ pool_item_id: number; assigned: number }> {
+    if (!hasBridge())
+      return Promise.resolve({ pool_item_id: poolItemId, assigned: accountIds.length });
+    return unwrap(window.pywebview!.api.distribute_pool_item(poolItemId, accountIds));
+  },
+
+  distributeNiche(niche: string, maxPerAccount?: number | null): Promise<DistributeNicheResult> {
+    if (!hasBridge())
+      return Promise.resolve({ niche, assigned: 0, max_per_account: maxPerAccount ?? 28, accounts: [], reason: "no_accounts" as const });
+    return unwrap(window.pywebview!.api.distribute_niche(niche, maxPerAccount ?? null));
   },
 
   dashboardPublishJobs(): Promise<DashboardPublishQueue> {
@@ -472,6 +692,55 @@ export const bridge = {
   ): Promise<{ candidate_id: number; state: string }> {
     if (!hasBridge()) return Promise.resolve({ candidate_id: candidateId, state });
     return unwrap(window.pywebview!.api.set_candidate_state(candidateId, state));
+  },
+
+  acceptCandidate(
+    candidateId: number,
+  ): Promise<{ candidate_id: number; state: string; pool_item_id: number; niche: string }> {
+    if (!hasBridge())
+      return Promise.resolve({
+        candidate_id: candidateId,
+        state: "pooled",
+        pool_item_id: candidateId,
+        niche: "history",
+      });
+    return unwrap(window.pywebview!.api.accept_candidate(candidateId));
+  },
+
+  rejectCandidate(
+    candidateId: number,
+    reason: string,
+  ): Promise<{ candidate_id: number; state: string; removed_pool_items: number }> {
+    if (!hasBridge())
+      return Promise.resolve({
+        candidate_id: candidateId,
+        state: `rejected_${reason}`,
+        removed_pool_items: 0,
+      });
+    return unwrap(window.pywebview!.api.reject_candidate(candidateId, reason));
+  },
+
+  apifyUsage(): Promise<ApifyUsage> {
+    if (!hasBridge())
+      return Promise.resolve({
+        month: "",
+        used: 0,
+        free_cap: 1850,
+        remaining: 1850,
+        over_free_tier: false,
+        warn: false,
+      });
+    return unwrap(window.pywebview!.api.apify_usage());
+  },
+
+  startSourceScrape(sourceId: number, maxItems = 30): Promise<{ job_id: string }> {
+    if (!hasBridge()) return Promise.resolve({ job_id: "mock-scrape" });
+    return unwrap(window.pywebview!.api.start_source_scrape(sourceId, maxItems));
+  },
+
+  startCandidateDownload(candidateId: number): Promise<{ job_id: string }> {
+    if (!hasBridge()) return Promise.resolve({ job_id: "mock-candidate-dl" });
+    return unwrap(window.pywebview!.api.start_candidate_download(candidateId));
   },
 };
 
@@ -701,7 +970,11 @@ const mock = {
         state: "candidate",
         like_count: 1234,
         view_count: 56789,
+        comment_count: 42,
+        duration_seconds: 18,
+        description: "Mock candidate description for browser dev.",
         published_at: new Date().toISOString(),
+        created_at: new Date().toISOString(),
         thumbnail_url: null,
       },
     ];

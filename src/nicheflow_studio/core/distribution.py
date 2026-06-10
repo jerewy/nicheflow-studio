@@ -15,6 +15,8 @@ Kept pure so it is trivially testable and reusable from a future web backend.
 """
 from __future__ import annotations
 
+import datetime as dt
+import math
 import random as _random
 from collections import Counter
 from dataclasses import dataclass
@@ -53,6 +55,94 @@ class PlannedAssignment:
     account_id: int
 
 
+# Default recency half-life for the engagement score: a clip's like signal is
+# halved every ~6 months, so a fresh clip edges out an equally-liked old one
+# (older reposts are more saturated on-platform) without erasing strong evergreens.
+DEFAULT_RECENCY_HALF_LIFE_DAYS = 180.0
+# Default tier size for ranked_clip_order, as a fraction of the pool. 0.25 = four
+# tiers; clips are distributed best-tier-first, shuffled WITHIN a tier so the
+# network doesn't funnel the single top clip onto every account (which would
+# maximize cross-account duplication — the main originality risk).
+DEFAULT_TIER_FRACTION = 0.25
+
+
+def _age_days(published_at: dt.datetime | None, now: dt.datetime) -> float:
+    """Age of a post in days, tz-robust. SQLite hands back naive datetimes while
+    ``now`` is usually aware, so both are flattened to naive before subtracting.
+    Missing or future dates clamp to 0 (treated as brand new)."""
+    if published_at is None:
+        return 0.0
+    published_naive = published_at.replace(tzinfo=None)
+    now_naive = now.replace(tzinfo=None)
+    return max(0.0, (now_naive - published_naive).total_seconds() / 86400.0)
+
+
+def engagement_score(
+    *,
+    like_count: int | None,
+    published_at: dt.datetime | None = None,
+    now: dt.datetime | None = None,
+    recency_half_life_days: float = DEFAULT_RECENCY_HALF_LIFE_DAYS,
+) -> float:
+    """Intrinsic "worth distributing" score for a pool clip.
+
+    Two ideas, both deliberate (see the distribution-strategy discussion):
+
+    1. **log-damped likes** — ``log10(1 + likes)`` so a mega-viral clip doesn't
+       dwarf everything and the raw follower-size/age bias of likes is blunted.
+       Proven engagement still ranks higher; it just isn't winner-take-all.
+    2. **gentle recency decay** — fresher clips edge out equally-liked older ones
+       because old viral clips are the most reposted/saturated on-platform. The
+       decay floors at 0.5 so a strong evergreen never drops below half its
+       popularity weight.
+
+    Returns ``0.0`` when there is no like signal, so clips with no metadata sink
+    to the bottom instead of being randomly favored.
+    """
+    likes = max(0, int(like_count or 0))
+    popularity = math.log10(1.0 + likes)
+    if popularity <= 0.0:
+        return 0.0
+    if published_at is None:
+        return popularity
+    now = now or dt.datetime.now(dt.timezone.utc)
+    if recency_half_life_days <= 0:
+        return popularity
+    recency = 0.5 ** (_age_days(published_at, now) / recency_half_life_days)
+    return popularity * (0.5 + 0.5 * recency)
+
+
+def ranked_clip_order(
+    scored: list[tuple[int, float]],
+    *,
+    rng: _random.Random | None = None,
+    tier_fraction: float = DEFAULT_TIER_FRACTION,
+) -> list[int]:
+    """Order pool-item ids best-first, randomized WITHIN score tiers.
+
+    Pure ranking step used before :func:`plan_first_cycle`: sort by score
+    descending, split into equal tiers, then shuffle each tier. The strongest
+    clips still go out first (quality), but the exact #1/#2/#3 ordering is
+    jittered so re-running doesn't deterministically push the same single clip to
+    the front for every account — combined with one-clip-one-account assignment
+    this spreads unique strong clips instead of cloning the top viral one.
+
+    ``scored`` is ``(pool_item_id, score)`` pairs. Returns just the ordered ids.
+    """
+    rng = rng or _random.Random()
+    if not scored:
+        return []
+    ordered = sorted(scored, key=lambda pair: pair[1], reverse=True)
+    count = len(ordered)
+    tier_size = max(1, round(count * tier_fraction)) if tier_fraction > 0 else count
+    result: list[int] = []
+    for start in range(0, count, tier_size):
+        tier_ids = [pool_item_id for pool_item_id, _ in ordered[start : start + tier_size]]
+        rng.shuffle(tier_ids)
+        result.extend(tier_ids)
+    return result
+
+
 def plan_first_cycle(
     pool_item_ids: list[int],
     account_ids: list[int],
@@ -60,6 +150,7 @@ def plan_first_cycle(
     rng: _random.Random | None = None,
     max_per_account: int | None = None,
     existing_counts: dict[int, int] | None = None,
+    shuffle_items: bool = True,
 ) -> list[PlannedAssignment]:
     """Assign each pool item to exactly one account, balanced and shuffled.
 
@@ -98,7 +189,10 @@ def plan_first_cycle(
     rng = rng or _random.Random()
     items = list(pool_item_ids)
     accounts = list(account_ids)
-    rng.shuffle(items)
+    # shuffle_items=False preserves a caller-supplied order (e.g. an engagement
+    # ranking from ranked_clip_order) so the strongest clips are placed first.
+    if shuffle_items:
+        rng.shuffle(items)
     rng.shuffle(accounts)
 
     # Seed each account's running count with the backlog it already holds so

@@ -14,11 +14,24 @@ from pathlib import Path
 
 from sqlalchemy.orm import Session
 
-from nicheflow_studio.core.distribution import plan_first_cycle
-from nicheflow_studio.db.models import Account, Assignment, MediaAsset, PoolItem
+from nicheflow_studio.core.distribution import (
+    engagement_score,
+    plan_first_cycle,
+    ranked_clip_order,
+)
+from nicheflow_studio.db.models import (
+    Account,
+    Assignment,
+    MediaAsset,
+    PoolItem,
+    ScrapeCandidate,
+)
 from nicheflow_studio.db.pools import VALID_NICHES, pool_items_for_niche
 
 import random as _random
+
+# SQLite caps a statement at ~999 bound variables; chunk IN() lists below that.
+_SCORE_IN_CHUNK = 500
 
 # An assignment whose clip turned out to be duplicate footage at download time.
 # Excluded from per-account counts so the next Distribute refills the slot.
@@ -56,6 +69,60 @@ def account_ids_for_niche(session: Session, niche: str) -> list[int]:
     return [row[0] for row in rows]
 
 
+def _engagement_scores_for_pool_items(
+    session: Session, pool_item_ids: list[int]
+) -> dict[int, float]:
+    """Engagement score per pool item, for ranked distribution.
+
+    Two chunked IN() lookups (pool item -> source shortcode -> candidate
+    like_count/published_at) instead of an N+1 per-item query, then the pure
+    :func:`engagement_score`. Items whose footage carries no candidate metadata
+    score 0.0 and sink to the bottom of the ranking.
+    """
+    if not pool_item_ids:
+        return {}
+    # pool item -> source shortcode (via its media asset)
+    id_to_shortcode: dict[int, str] = {}
+    for start in range(0, len(pool_item_ids), _SCORE_IN_CHUNK):
+        chunk = pool_item_ids[start : start + _SCORE_IN_CHUNK]
+        rows = (
+            session.query(PoolItem.id, MediaAsset.source_shortcode)
+            .join(MediaAsset, MediaAsset.id == PoolItem.media_asset_id)
+            .filter(PoolItem.id.in_(chunk))
+            .all()
+        )
+        for pool_item_id, shortcode in rows:
+            if shortcode:
+                id_to_shortcode[pool_item_id] = shortcode
+    # source shortcode -> (like_count, published_at)
+    shortcodes = list(set(id_to_shortcode.values()))
+    meta: dict[str, tuple[int | None, dt.datetime | None]] = {}
+    for start in range(0, len(shortcodes), _SCORE_IN_CHUNK):
+        chunk = shortcodes[start : start + _SCORE_IN_CHUNK]
+        rows = (
+            session.query(
+                ScrapeCandidate.video_id,
+                ScrapeCandidate.like_count,
+                ScrapeCandidate.published_at,
+            )
+            .filter(ScrapeCandidate.video_id.in_(chunk))
+            .all()
+        )
+        for video_id, like_count, published_at in rows:
+            meta.setdefault(video_id, (like_count, published_at))
+    now = dt.datetime.now(dt.timezone.utc)
+    scores: dict[int, float] = {}
+    for pool_item_id in pool_item_ids:
+        shortcode = id_to_shortcode.get(pool_item_id)
+        like_count, published_at = (
+            meta.get(shortcode, (None, None)) if shortcode else (None, None)
+        )
+        scores[pool_item_id] = engagement_score(
+            like_count=like_count, published_at=published_at, now=now
+        )
+    return scores
+
+
 def distribute_niche(
     session: Session,
     niche: str,
@@ -82,17 +149,28 @@ def distribute_niche(
     if not unassigned_ids:
         return []
 
+    rng = rng or _random.Random()
+    # Rank the undistributed pool by intrinsic engagement (likes + recency) so the
+    # strongest clips go out first, jittered within tiers so the network doesn't
+    # funnel the same top clip onto every account. plan_first_cycle then places
+    # them one-per-account, best-first (shuffle_items=False preserves the rank).
+    scores = _engagement_scores_for_pool_items(session, unassigned_ids)
+    ranked_ids = ranked_clip_order(
+        [(pool_item_id, scores.get(pool_item_id, 0.0)) for pool_item_id in unassigned_ids],
+        rng=rng,
+    )
     # Pass each account's existing backlog so max_per_account is a TOTAL target:
     # re-running "Distribute" only tops up accounts below target and never piles
     # a second full batch onto accounts that already reached it. With
     # max_per_account=None this has no effect (uncapped fill).
     existing_counts = assignment_counts_by_account(session, niche)
     plan = plan_first_cycle(
-        unassigned_ids,
+        ranked_ids,
         account_ids,
         rng=rng,
         max_per_account=max_per_account,
         existing_counts=existing_counts,
+        shuffle_items=False,
     )
 
     created: list[Assignment] = []
@@ -105,6 +183,46 @@ def distribute_niche(
             reuse_iteration=0,
         )
         session.add(assignment)
+        created.append(assignment)
+    session.flush()
+    return created
+
+
+def assign_pool_item_to_accounts(
+    session: Session, *, pool_item_id: int, account_ids: list[int]
+) -> list[Assignment]:
+    """Assign one accepted pool item to specific accounts in its niche.
+
+    The manual counterpart to :func:`distribute_niche`: the user picks exactly
+    which accounts get this clip. Niche isolation holds — accounts outside the
+    clip's niche are ignored. Idempotent: accounts that already hold the clip are
+    skipped, so re-distributing only adds the new ones. Returns the created
+    assignments. Does not commit; the caller owns the transaction.
+    """
+    item = session.get(PoolItem, pool_item_id)
+    if item is None:
+        raise ValueError(f"No pool item with id {pool_item_id}.")
+    niche = item.niche
+    in_niche = set(account_ids_for_niche(session, niche))
+    already = {
+        account_id
+        for (account_id,) in session.query(Assignment.account_id)
+        .filter(Assignment.pool_item_id == pool_item_id)
+        .all()
+    }
+    created: list[Assignment] = []
+    for account_id in account_ids:
+        if account_id not in in_niche or account_id in already:
+            continue
+        assignment = Assignment(
+            pool_item_id=pool_item_id,
+            account_id=account_id,
+            niche=niche,
+            status="assigned",
+            reuse_iteration=0,
+        )
+        session.add(assignment)
+        already.add(account_id)
         created.append(assignment)
     session.flush()
     return created

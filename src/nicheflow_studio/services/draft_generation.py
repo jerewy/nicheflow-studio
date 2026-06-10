@@ -84,20 +84,34 @@ def generate_revision_for_item(
 ) -> DraftRevisionDTO:
     """Generate options for an item and save them as a new draft revision.
 
-    Raises :class:`DraftRevisionError` for a missing item or a missing
-    transcript (the generator needs grounding), so the failure surfaces as a
-    clean message instead of a generic provider error.
+    Raises :class:`DraftRevisionError` for a missing item, or when the item has
+    nothing to ground on at all (no transcript, no video on disk, no
+    caption/niche). A missing transcript alone is fine — the generator falls back
+    to vision over the video frames plus the source caption (smart_drafts'
+    "No-transcript mode"), which is the normal path for speechless reels.
     """
     with get_session() as session:
         item = session.get(DownloadItem, item_id)
         if item is None:
             raise DraftRevisionError(f"No download item with id {item_id}.")
-        if not (item.transcript_text and item.transcript_text.strip()):
-            raise DraftRevisionError(
-                "This item has no transcript yet. Add or generate a transcript before "
-                "generating draft options."
-            )
         account = session.get(Account, item.account_id) if item.account_id else None
+        # Don't hard-require a transcript: most scraped reels have no speech, and
+        # the generator grounds drafts on the video frames (vision) + source
+        # caption + niche in that case (smart_drafts' "No-transcript mode").
+        # Refuse only when there is nothing at all to anchor to.
+        has_transcript = bool(item.transcript_text and item.transcript_text.strip())
+        has_video = bool(item.file_path and Path(item.file_path).exists())
+        niche_context = (account.niche_label or account.niche) if account is not None else None
+        has_text_context = bool(
+            (item.title or "").strip()
+            or (item.source_description or "").strip()
+            or niche_context
+        )
+        if not (has_transcript or has_video or has_text_context):
+            raise DraftRevisionError(
+                "This item has nothing to generate from yet — no transcript, no video "
+                "on disk, and no source caption. Add a transcript or caption first."
+            )
         voice = _account_voice(account, clip_premise)
         recent_titles, recent_captions = _recent_drafts(session, item.account_id, item.id)
         gen_kwargs = {

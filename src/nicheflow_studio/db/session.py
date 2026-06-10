@@ -184,6 +184,12 @@ def _ensure_compatibility() -> None:
             )
         if "account_id" not in columns:
             connection.execute(text("ALTER TABLE download_items ADD COLUMN account_id INTEGER"))
+        if "crop_override" not in columns:
+            connection.execute(
+                text("ALTER TABLE download_items ADD COLUMN crop_override VARCHAR(256)")
+            )
+        if "seen_at" not in columns:
+            connection.execute(text("ALTER TABLE download_items ADD COLUMN seen_at DATETIME"))
 
         account_columns = {column["name"] for column in inspect(connection).get_columns("accounts")}
         if "scrape_source_urls" not in account_columns:

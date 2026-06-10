@@ -71,6 +71,47 @@ def test_bridge_get_context_unknown_item_returns_error_envelope() -> None:
     assert "99999" in result["error"]
 
 
+def test_bridge_list_pool_source_clips_passes_include_removed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str, bool]] = []
+
+    def list_source_clips(
+        niche: str, source_label: str, include_removed: bool = False
+    ) -> list[dict]:
+        calls.append((niche, source_label, include_removed))
+        return []
+
+    monkeypatch.setattr(
+        "nicheflow_studio.app.processing_bridge.pooling.list_source_clips",
+        list_source_clips,
+    )
+
+    result = ProcessingBridge().list_pool_source_clips("history", "theanomalists", True)
+
+    assert result["ok"] is True
+    assert result["data"] == []
+    assert calls == [("history", "theanomalists", True)]
+
+
+def test_bridge_get_crop_preview_returns_media_url(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    preview = tmp_path / "data" / "processed" / "crop-previews" / "item-1.jpg"
+    preview.parent.mkdir(parents=True)
+    preview.write_bytes(b"jpeg")
+    monkeypatch.setenv("NICHEFLOW_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setattr(
+        "nicheflow_studio.app.processing_bridge.export_svc.crop_preview_frame",
+        lambda _item_id: preview,
+    )
+
+    result = ProcessingBridge().get_crop_preview(1)
+
+    assert result["ok"] is True
+    assert result["data"]["preview_url"].endswith("/processed/crop-previews/item-1.jpg")
+
+
 def test_bridge_save_then_get_latest_revision() -> None:
     item_id = _make_item()
     bridge = ProcessingBridge()
@@ -182,9 +223,15 @@ def test_bridge_start_generation_runs_job_and_saves_revision(
 
 
 def test_bridge_generation_job_reports_failure(monkeypatch: pytest.MonkeyPatch) -> None:
-    # No transcript -> generate_revision_for_item raises -> job fails (handled).
-    item_id = _make_item(transcript=None)
+    # A generation that raises inside the worker is caught and reported as a
+    # failed job (the JobManager error path), not surfaced as an exception.
+    item_id = _make_item(transcript="A transcript with enough grounding to generate.")
     bridge = ProcessingBridge()
+
+    def boom(**_):
+        raise RuntimeError("provider exploded")
+
+    monkeypatch.setattr(smart_drafts, "generate_smart_drafts", boom)
 
     started = bridge.start_generation(item_id, {})
     job_id = started["data"]["job_id"]
@@ -192,7 +239,7 @@ def test_bridge_generation_job_reports_failure(monkeypatch: pytest.MonkeyPatch) 
 
     job = bridge.get_job(job_id)
     assert job["data"]["status"] == "failed"
-    assert "transcript" in job["data"]["error"].lower()
+    assert "provider exploded" in job["data"]["error"]
 
 
 def test_bridge_get_unknown_job_returns_error() -> None:

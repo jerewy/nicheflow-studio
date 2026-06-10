@@ -78,7 +78,7 @@ export function AccountManager({ activeId, onAccountsChanged, onUseAccount }: Ac
     refreshList();
   }, [refreshList]);
 
-  const selectAccount = async (id: number) => {
+  const selectAccount = useCallback(async (id: number) => {
     setError(null);
     setMessage(null);
     setCreating(false);
@@ -90,7 +90,16 @@ export function AccountManager({ activeId, onAccountsChanged, onUseAccount }: Ac
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
     }
-  };
+  }, []);
+
+  // Default the panel to the active account's profile, so opening Accounts shows
+  // the current account instead of an empty selector. Only kicks in when an
+  // active account exists and nothing is already being viewed or created.
+  useEffect(() => {
+    if (activeId === null || selectedId !== null || creating) return;
+    const timer = window.setTimeout(() => selectAccount(activeId), 0);
+    return () => window.clearTimeout(timer);
+  }, [activeId, selectedId, creating, selectAccount]);
 
   const startNew = () => {
     setError(null);

@@ -12,7 +12,9 @@ that remain in the desktop app and the pool-admin scripts
 from __future__ import annotations
 
 import datetime as dt
+from collections import Counter
 
+from nicheflow_studio.core.distribution import target_backlog
 from nicheflow_studio.db import assignments as assignments_db, pools
 from nicheflow_studio.db.models import Account
 from nicheflow_studio.db.session import get_session
@@ -97,11 +99,20 @@ def list_sources(niche: str) -> list[dict]:
         ]
 
 
-def list_source_clips(niche: str, source_label: str) -> list[dict]:
-    """Detailed clip rows for one source in a niche pool."""
+def list_source_clips(
+    niche: str, source_label: str, include_removed: bool = False
+) -> list[dict]:
+    """Detailed clip rows for one source in a niche pool.
+
+    ``original_download_path`` is the local original file; the bridge turns it
+    into an in-app ``preview_url``. With ``include_removed`` the reversibly
+    removed clips are included too (so they can be restored).
+    """
     with get_session() as session:
         try:
-            rows = pools.pool_clips_for_source(session, niche, source_label)
+            rows = pools.pool_clips_for_source(
+                session, niche, source_label, include_removed=include_removed
+            )
         except ValueError as exc:
             raise PoolingError(str(exc)) from exc
         return [
@@ -113,7 +124,130 @@ def list_source_clips(niche: str, source_label: str) -> list[dict]:
                 "like_count": row.like_count,
                 "published_at": _iso(row.published_at),
                 "download_status": row.download_status,
+                "acceptance_status": row.acceptance_status,
+                "original_download_path": row.original_download_path,
                 "distributed_to": list(row.distributed_to),
+                "score": round(row.score, 3),
             }
             for row in rows
         ]
+
+
+def remove_pool_item(pool_item_id: int, reason: str = "manual removal") -> dict:
+    """Reversibly remove a clip from its niche pool so it stops distributing.
+
+    Existing assignments are left untouched; restore the clip to undo it. The
+    manual post-pool review gate (SOURCING_POOLING_PLAN.md §2).
+    """
+    with get_session() as session:
+        if not pools.remove_pool_item(session, pool_item_id=pool_item_id, reason=reason):
+            raise PoolingError(f"No pool item with id {pool_item_id}.")
+        session.commit()
+        return {"pool_item_id": pool_item_id, "acceptance_status": "removed"}
+
+
+def restore_pool_item(pool_item_id: int) -> dict:
+    """Undo a removal — return the clip to the active pool."""
+    with get_session() as session:
+        if not pools.restore_pool_item(session, pool_item_id=pool_item_id):
+            raise PoolingError(f"No pool item with id {pool_item_id}.")
+        session.commit()
+        return {"pool_item_id": pool_item_id, "acceptance_status": "accepted"}
+
+
+def niche_accounts(niche: str) -> list[dict]:
+    """Accounts in a niche (id + name), for the per-clip distribute picker."""
+    with get_session() as session:
+        try:
+            ids = assignments_db.account_ids_for_niche(session, niche)
+        except ValueError as exc:
+            raise PoolingError(str(exc)) from exc
+        names = (
+            {a.id: a.name for a in session.query(Account).filter(Account.id.in_(ids)).all()}
+            if ids
+            else {}
+        )
+        return [{"id": account_id, "name": names.get(account_id, f"#{account_id}")} for account_id in ids]
+
+
+def distribute_clip(pool_item_id: int, account_ids: list[int]) -> dict:
+    """Distribute one pooled clip to the chosen accounts (idempotent, same-niche).
+
+    Returns how many new assignments were created (accounts that already had the
+    clip are skipped).
+    """
+    cleaned = [int(account_id) for account_id in (account_ids or [])]
+    with get_session() as session:
+        try:
+            created = assignments_db.assign_pool_item_to_accounts(
+                session, pool_item_id=pool_item_id, account_ids=cleaned
+            )
+        except ValueError as exc:
+            raise PoolingError(str(exc)) from exc
+        session.commit()
+        return {"pool_item_id": pool_item_id, "assigned": len(created)}
+
+
+def distribute_niche(niche: str, max_per_account: int | None = None) -> dict:
+    """Auto-distribute a niche's undistributed pool across its accounts.
+
+    Ranks the unassigned pool by intrinsic engagement (likes + recency), spreads
+    the strongest clips one-per-account (volume-balanced, jittered within score
+    tiers so accounts don't all get the same top clip), and tops each account up
+    to ``max_per_account`` TOTAL (default :func:`target_backlog`, 28). Idempotent:
+    re-running only places clips for accounts still under target and never
+    double-books a clip. Returns how many assignments were created, a per-account
+    breakdown, and a ``reason`` string when assigned is 0 so the caller can show
+    a specific message instead of a generic one:
+    - ``"no_accounts"``  — no accounts are in this niche yet.
+    - ``"all_at_cap"``   — every account already holds ``max_per_account`` clips.
+    - ``"pool_empty"``   — all accepted clips are already assigned.
+    """
+    cap = max_per_account if max_per_account is not None else target_backlog()
+    with get_session() as session:
+        try:
+            created = assignments_db.distribute_niche(session, niche, max_per_account=cap)
+        except ValueError as exc:  # unknown niche from _validate_niche
+            raise PoolingError(str(exc)) from exc
+
+        reason: str | None = None
+        if not created:
+            acct_ids = assignments_db.account_ids_for_niche(session, niche)
+            if not acct_ids:
+                reason = "no_accounts"
+            else:
+                existing = assignments_db.assignment_counts_by_account(session, niche)
+                reason = (
+                    "all_at_cap"
+                    if all(existing.get(a, 0) >= cap for a in acct_ids)
+                    else "pool_empty"
+                )
+
+        per_account = Counter(assignment.account_id for assignment in created)
+        names = (
+            {
+                account_id: name
+                for account_id, name in session.query(Account.id, Account.name)
+                .filter(Account.id.in_(list(per_account)))
+                .all()
+            }
+            if per_account
+            else {}
+        )
+        session.commit()
+        result: dict = {
+            "niche": niche,
+            "assigned": len(created),
+            "max_per_account": cap,
+            "accounts": [
+                {
+                    "account_id": account_id,
+                    "account_name": names.get(account_id, f"#{account_id}"),
+                    "count": count,
+                }
+                for account_id, count in sorted(per_account.items(), key=lambda kv: -kv[1])
+            ],
+        }
+        if reason is not None:
+            result["reason"] = reason
+        return result

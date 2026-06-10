@@ -75,11 +75,40 @@ def test_generate_saves_revision_and_maps_recommended_index(
     assert captured["niche_label"] == "movie"
 
 
-def test_generate_without_transcript_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_generate_without_transcript_succeeds_via_vision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No transcript is fine: speechless reels are grounded by vision + the source
+    # caption/niche, so generation should proceed instead of being gated.
     item_id = _make_item(transcript=None)
     monkeypatch.setattr(smart_drafts, "generate_smart_drafts", lambda **_: _fake_drafts())
 
-    with pytest.raises(DraftRevisionError):
+    dto = draft_generation.generate_revision_for_item(item_id)
+
+    assert dto.revision_number == 1
+    assert dto.title_options == ["Title one", "Title two", "Title three"]
+
+
+def test_generate_without_any_grounding_raises() -> None:
+    # No transcript, no video on disk, and no title/caption/niche — there is
+    # nothing for the generator to anchor to, so it still fails cleanly.
+    with get_session() as session:
+        account = Account(name="Bare", platform="instagram")
+        session.add(account)
+        session.commit()
+        item = DownloadItem(
+            source_url="https://instagram.com/reel/bare",
+            title=None,
+            file_path=None,
+            transcript_text=None,
+            status="completed",
+            account_id=account.id,
+        )
+        session.add(item)
+        session.commit()
+        item_id = item.id
+
+    with pytest.raises(DraftRevisionError, match="nothing to generate"):
         draft_generation.generate_revision_for_item(item_id)
 
 

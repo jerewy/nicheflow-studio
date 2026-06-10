@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { CropEditor } from "@/components/CropEditor";
 import { OptionCard } from "@/components/OptionCard";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -17,6 +18,10 @@ import type {
 const POLL_INTERVAL_MS = 4000;
 const JOB_POLL_INTERVAL_MS = 1000;
 const JOB_TIMEOUT_MS = 180000;
+// Publishing drives a real browser and can take several minutes.
+const PUBLISH_TIMEOUT_MS = 480000;
+// How often the opt-in auto-publish loop checks for due scheduled reels.
+const AUTO_PUBLISH_INTERVAL_MS = 60000;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -27,6 +32,13 @@ const STATUS_META: Record<string, { label: string; dot: string }> = {
   exported: { label: "Exported", dot: "bg-violet-500" },
   posted: { label: "Posted", dot: "bg-emerald-500" },
   skipped: { label: "Skipped", dot: "bg-zinc-500" },
+};
+
+const REVIEW_REASON_LABELS: Record<string, string> = {
+  wrong_niche: "Wrong niche",
+  low_quality: "Low quality",
+  duplicate: "Duplicate",
+  ad_campaign: "Ad / promo",
 };
 
 function statusMeta(status: string): { label: string; dot: string } {
@@ -58,8 +70,9 @@ function workflowPayload(workflow: WorkflowSettings | null): Record<string, unkn
 async function waitForJob(
   jobId: string,
   onProgress?: (progress: number, message: string) => void,
+  timeoutMs: number = JOB_TIMEOUT_MS,
 ): Promise<unknown> {
-  const deadline = Date.now() + JOB_TIMEOUT_MS;
+  const deadline = Date.now() + timeoutMs;
   for (;;) {
     const snapshot = await bridge.getJob(jobId);
     onProgress?.(snapshot.progress, snapshot.message);
@@ -110,6 +123,11 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
   const [publishJobs, setPublishJobs] = useState<PublishJob[]>([]);
   const [scheduleAt, setScheduleAt] = useState("");
   const [publishMessage, setPublishMessage] = useState<string | null>(null);
+  // Live-posting state: a post running now, the opt-in auto-publish toggle, and
+  // how many scheduled reels are currently past due.
+  const [publishingNow, setPublishingNow] = useState(false);
+  const [autoPublish, setAutoPublish] = useState(false);
+  const [dueCount, setDueCount] = useState(0);
   const [isDesktop, setIsDesktop] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [itemSearch, setItemSearch] = useState("");
@@ -118,7 +136,13 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
   const [workflow, setWorkflow] = useState<WorkflowSettings | null>(null);
   const [finalTitle, setFinalTitle] = useState("");
   const [finalCaption, setFinalCaption] = useState("");
-  const [previewMode, setPreviewMode] = useState<"original" | "exported">("original");
+  // Separate error state for the exported-reel preview shown beside the final
+  // title/caption, so a broken export file there doesn't affect the top preview.
+  const [exportPreviewError, setExportPreviewError] = useState<string | null>(null);
+  // Reason used by the Processing "Reject clip" cleanup action.
+  const [reviewReason, setReviewReason] = useState("wrong_niche");
+  // Whether the manual crop editor is open.
+  const [cropOpen, setCropOpen] = useState(false);
 
   // The revision currently loaded into the editor, and the user's edits on top.
   const [loadedRevision, setLoadedRevision] = useState<DraftRevision | null>(null);
@@ -167,7 +191,7 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
       setExportedPath(null);
       setPublishMessage(null);
       setPreviewError(null);
-      setPreviewMode(ctx.item.exported_preview_url ? "exported" : "original");
+      setExportPreviewError(null);
       setHandoffMessage(null);
       refreshPublishJobs(ctx.item.id);
       bridge
@@ -219,6 +243,9 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
   const switchItem = async (id: number) => {
     if (id === itemId) return;
     setActionError(null);
+    // Opening an item clears its NEW badge (the backend marks it seen on
+    // getContext); reflect that immediately in the list.
+    setItems((prev) => prev.map((it) => (it.id === id ? { ...it, is_new: false } : it)));
     try {
       const ctx = await bridge.getContext(id);
       applyContext(ctx);
@@ -233,7 +260,19 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
     setActionError(null);
     setPublishMessage(null);
     try {
-      const result = await bridge.queueForPublish(itemId, scheduled);
+      let scheduledIso: string | null = null;
+      if (scheduled) {
+        // datetime-local gives a naive string like "2026-06-09T12:05". Convert
+        // to a UTC ISO string so the backend never guesses the local timezone.
+        const d = new Date(scheduled);
+        if (isNaN(d.getTime())) throw new Error("Invalid scheduled time.");
+        if (d.getTime() <= Date.now()) {
+          throw new Error("Scheduled time is in the past — pick a future time.");
+        }
+        // Python 3.10 fromisoformat does not support "Z"; use "+00:00" instead.
+        scheduledIso = d.toISOString().replace("Z", "+00:00");
+      }
+      const result = await bridge.queueForPublish(itemId, scheduledIso);
       setPublishMessage(
         `${result.created ? "Added to" : "Updated in"} publish queue as ${result.status}.`,
       );
@@ -263,6 +302,138 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
       setBusy(false);
     }
   };
+
+  // --- Live publishing (Publish Now + opt-in auto-publish-due) --- //
+
+  const publishingRef = useRef(false);
+  useEffect(() => {
+    publishingRef.current = publishingNow;
+  }, [publishingNow]);
+
+  const refreshDueCount = useCallback(async () => {
+    try {
+      setDueCount((await bridge.publishDueCount()).due);
+    } catch {
+      // Non-fatal; the due count just won't update.
+    }
+  }, []);
+
+  const publishNow = async () => {
+    if (itemId === null) return;
+    if (
+      !window.confirm(
+        "Post this reel to your Instagram account now? This logs in and publishes live — it can't be undone.",
+      )
+    )
+      return;
+    setPublishingNow(true);
+    setBusy(true);
+    setActionError(null);
+    setPublishMessage(null);
+    try {
+      const { job_id } = await bridge.startPublishNow(itemId);
+      const result = (await waitForJob(job_id, undefined, PUBLISH_TIMEOUT_MS)) as {
+        status: string;
+        posted_url?: string | null;
+        error?: string | null;
+      };
+      if (result.status === "posted") {
+        setPublishMessage(
+          `Posted to Instagram${result.posted_url ? ` — ${result.posted_url}` : ""}.`,
+        );
+      } else {
+        setActionError(`Publish ${result.status}${result.error ? `: ${result.error}` : ""}.`);
+      }
+      refreshPublishJobs(itemId);
+      bridge.listLibraryItems(activeAccountId).then(setItems).catch(() => undefined);
+      const ctx = await bridge.getContext(itemId);
+      setContext(ctx);
+    } catch (err: unknown) {
+      setActionError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setPublishingNow(false);
+      setBusy(false);
+    }
+  };
+
+  const publishDueNow = async (silent = false) => {
+    if (publishingRef.current) return;
+    if (
+      !silent &&
+      !window.confirm(`Post ${dueCount} due scheduled reel(s) to Instagram now? This publishes live.`)
+    )
+      return;
+    setPublishingNow(true);
+    if (!silent) {
+      setActionError(null);
+      setPublishMessage(null);
+    }
+    try {
+      const { job_id } = await bridge.startPublishDue();
+      const result = (await waitForJob(job_id, undefined, PUBLISH_TIMEOUT_MS)) as {
+        due: number;
+        posted: number;
+        failed: number;
+      };
+      if (result.due > 0) {
+        setPublishMessage(
+          `Auto-publish: posted ${result.posted}, failed ${result.failed} of ${result.due} due.`,
+        );
+      }
+      await refreshDueCount();
+      if (itemId !== null) refreshPublishJobs(itemId);
+      bridge.listLibraryItems(activeAccountId).then(setItems).catch(() => undefined);
+    } catch (err: unknown) {
+      if (!silent) setActionError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setPublishingNow(false);
+    }
+  };
+
+  // Let the auto-publish interval call the latest publishDueNow without
+  // resubscribing the timer on every render.
+  const publishDueNowRef = useRef(publishDueNow);
+  useEffect(() => {
+    publishDueNowRef.current = publishDueNow;
+  });
+
+  const toggleAutoPublish = async (next: boolean) => {
+    if (
+      next &&
+      !window.confirm(
+        "Turn on auto-publish? While this window is open, scheduled reels will post to Instagram automatically once their time passes.",
+      )
+    )
+      return;
+    try {
+      const { enabled } = await bridge.setAutoPublish(next);
+      setAutoPublish(enabled);
+    } catch (err: unknown) {
+      setActionError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  // Load the auto-publish toggle + due count on mount.
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      bridge
+        .getAutoPublish()
+        .then((r) => setAutoPublish(r.enabled))
+        .catch(() => undefined);
+      void refreshDueCount();
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [refreshDueCount]);
+
+  // Opt-in auto-publish loop: while on, post any due scheduled reels each minute.
+  useEffect(() => {
+    if (!autoPublish) return;
+    const timer = window.setInterval(() => {
+      if (publishingRef.current) return;
+      void publishDueNowRef.current(true);
+    }, AUTO_PUBLISH_INTERVAL_MS);
+    return () => window.clearInterval(timer);
+  }, [autoPublish]);
 
   // Poll for newer revisions (Codex writes, or another window's edits).
   useEffect(() => {
@@ -358,8 +529,122 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
       await bridge.saveFinalDraft(itemId, finalTitle, finalCaption);
       const ctx = await bridge.getContext(itemId);
       setContext(ctx);
-      setPreviewMode("exported");
       setHandoffMessage("Selected title and caption saved.");
+    } catch (err: unknown) {
+      setActionError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // --- Niche review / cleanup (keep the shared pool + candidate queue clean) --- //
+
+  const removeFromPool = async () => {
+    if (itemId === null) return;
+    if (
+      !window.confirm(
+        "Remove this clip's footage from its niche pool? It stops distributing but is reversible from Pool & Distribute.",
+      )
+    )
+      return;
+    setBusy(true);
+    setActionError(null);
+    setHandoffMessage(null);
+    try {
+      const result = await bridge.removeItemFromPool(itemId);
+      setHandoffMessage(
+        result.removed_pool_items > 0
+          ? `Removed from pool (${result.removed_pool_items} item${result.removed_pool_items === 1 ? "" : "s"}).`
+          : "This clip wasn't in any pool.",
+      );
+    } catch (err: unknown) {
+      setActionError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const rejectClip = async (targetItemId: number = itemId ?? 0) => {
+    if (!targetItemId) return;
+    const reasonLabel = REVIEW_REASON_LABELS[reviewReason] ?? reviewReason;
+    const blocksFutureScrapes = reviewReason === "ad_campaign";
+    if (
+      !window.confirm(
+        blocksFutureScrapes
+          ? `Block this clip as "${reasonLabel}"? It will be hidden, removed from pools, and saved to the blocked-assets list so future scrapes skip it.`
+          : `Reject this clip as "${reasonLabel}"? It ignores the originating candidate and removes the footage from the pool. Reversible.`,
+      )
+    )
+      return;
+    setBusy(true);
+    setActionError(null);
+    setHandoffMessage(null);
+    try {
+      if (blocksFutureScrapes) {
+        const result = await bridge.rejectItemGlobally(targetItemId, reasonLabel);
+        const list = await bridge.listLibraryItems(activeAccountId);
+        setItems(list);
+        setHandoffMessage(
+          `Blocked as ${reasonLabel} - removed ${result.removed_pool_items} pool item(s), ` +
+            `dropped ${result.dropped_assignments} assignment(s), and future scrapes will skip it.`,
+        );
+        if (targetItemId === itemId) {
+          if (list.length > 0) {
+            const nextItem = list.find((row) => row.id !== targetItemId) ?? list[0];
+            const ctx = await bridge.getContext(nextItem.id);
+            applyContext(ctx);
+          } else {
+            setContext(null);
+          }
+        }
+        return;
+      }
+      const result = await bridge.rejectItem(targetItemId, reviewReason);
+      setHandoffMessage(
+        `Rejected — ${result.rejected_candidates} candidate(s) ignored, ${result.removed_pool_items} pool item(s) removed.`,
+      );
+      // Reflect the new 'skipped' status in the list and the loaded context.
+      const list = await bridge.listLibraryItems(activeAccountId);
+      setItems(list);
+      if (targetItemId === itemId) {
+        const ctx = await bridge.getContext(targetItemId);
+        setContext(ctx);
+      }
+    } catch (err: unknown) {
+      setActionError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const rejectGlobally = async () => {
+    if (itemId === null) return;
+    if (
+      !window.confirm(
+        "Globally reject this clip? It's removed from the pool and every account, " +
+          "blocklisted so future scrapes skip it, and hidden from Processing. " +
+          "The local file is kept.",
+      )
+    )
+      return;
+    setBusy(true);
+    setActionError(null);
+    setHandoffMessage(null);
+    try {
+      const result = await bridge.rejectItemGlobally(itemId);
+      // The item is now hidden; reload the list and open the first remaining one.
+      const list = await bridge.listLibraryItems(activeAccountId);
+      setItems(list);
+      setHandoffMessage(
+        `Globally rejected & blocklisted — removed ${result.removed_pool_items} pool item(s), ` +
+          `dropped ${result.dropped_assignments} assignment(s).`,
+      );
+      if (list.length > 0) {
+        const ctx = await bridge.getContext(list[0].id);
+        applyContext(ctx);
+      } else {
+        setContext(null);
+      }
     } catch (err: unknown) {
       setActionError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -390,6 +675,7 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
     setExporting(true);
     setActionError(null);
     setExportedPath(null);
+    setExportPreviewError(null);
     setExportProgress({ value: 0, message: "Starting…" });
     try {
       const { job_id } = await bridge.startExport(itemId);
@@ -483,10 +769,7 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
 
   const { item, account } = context;
   const appliedIndex = loadedRevision?.applied_title_index ?? null;
-  const previewUrl =
-    previewMode === "exported" && item.exported_preview_url
-      ? item.exported_preview_url
-      : item.original_preview_url;
+  const previewUrl = item.original_preview_url;
   const filteredItems = items.filter((candidate) => {
     const matchesStatus = itemFilter === "all" || candidate.status === itemFilter;
     const search = itemSearch.trim().toLowerCase();
@@ -505,9 +788,6 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
           <div className="flex items-center gap-2">
             <h1 className="text-2xl font-semibold tracking-tight">Processing</h1>
             {!isDesktop && <Badge variant="outline">browser preview</Badge>}
-            {loadedRevision && (
-              <Badge variant="secondary">revision {loadedRevision.revision_number}</Badge>
-            )}
             {dirty && <Badge variant="destructive">unsaved edits</Badge>}
           </div>
           <p className="text-sm text-muted-foreground">
@@ -527,7 +807,7 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
               </div>
               <Badge variant="secondary">{items.length} total</Badge>
             </div>
-            <div className="grid grid-cols-[1fr_120px] gap-2">
+            <div className="grid grid-cols-[1fr_120px_120px] gap-2">
               <input
                 className="h-9 min-w-0 rounded-md border border-input bg-transparent px-3 text-sm"
                 placeholder="Search videos..."
@@ -546,6 +826,17 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
                 <option value="posted">Posted</option>
                 <option value="skipped">Skipped</option>
               </select>
+              <select
+                className="h-9 rounded-md border border-input bg-transparent px-2 text-sm"
+                value={reviewReason}
+                title="Reason used by the row Reject buttons"
+                onChange={(event) => setReviewReason(event.target.value)}
+              >
+                <option value="wrong_niche">Wrong niche</option>
+                <option value="ad_campaign">Ad / promo</option>
+                <option value="low_quality">Low quality</option>
+                <option value="duplicate">Duplicate</option>
+              </select>
             </div>
           </div>
           <div className="max-h-[600px] overflow-auto">
@@ -554,12 +845,15 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
                 <tr>
                   <th className="w-28 px-3 py-2 font-medium">Status</th>
                   <th className="px-3 py-2 font-medium">Title</th>
-                  <th className="w-28 px-3 py-2 font-medium">Added</th>
+                  <th className="w-24 px-3 py-2 font-medium">Added</th>
+                  <th className="w-20 px-3 py-2 text-right font-medium">Action</th>
                 </tr>
               </thead>
               <tbody>
                 {filteredItems.map((candidate) => {
                   const meta = statusMeta(candidate.status);
+                  const rejected = candidate.review_state === "rejected";
+                  const posted = candidate.status === "posted";
                   return (
                     <tr
                       key={candidate.id}
@@ -592,6 +886,25 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
                       <td className="px-3 py-2 text-xs text-muted-foreground">
                         {shortDate(candidate.created_at)}
                       </td>
+                      <td
+                        className="px-2 py-1 text-right"
+                        onClick={(event) => event.stopPropagation()}
+                      >
+                        {posted ? (
+                          <span className="text-xs text-muted-foreground">Posted</span>
+                        ) : (
+                          <Button
+                            size="sm"
+                            variant={rejected ? "ghost" : "destructive"}
+                            className="h-7 px-2 text-xs"
+                            disabled={busy || rejected}
+                            title={`Reject as ${REVIEW_REASON_LABELS[reviewReason] ?? reviewReason}`}
+                            onClick={() => void rejectClip(candidate.id)}
+                          >
+                            {rejected ? "Rejected" : "Reject"}
+                          </Button>
+                        )}
+                      </td>
                     </tr>
                   );
                 })}
@@ -606,36 +919,16 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
               <p className="text-xs font-medium uppercase tracking-wider text-zinc-400">
                 Preview
               </p>
-              <p className="mt-1 text-sm">{previewMode === "exported" ? "Exported reel" : "Original video"}</p>
-            </div>
-            <div className="flex items-center gap-2">
-              <Button
-                size="sm"
-                variant={previewMode === "original" ? "default" : "ghost"}
-                onClick={() => {
-                  setPreviewError(null);
-                  setPreviewMode("original");
-                }}
-                disabled={!item.original_preview_url}
-              >
-                Original
-              </Button>
-              <Button
-                size="sm"
-                variant={previewMode === "exported" ? "default" : "ghost"}
-                onClick={() => {
-                  setPreviewError(null);
-                  setPreviewMode("exported");
-                }}
-                disabled={!item.exported_preview_url}
-              >
-                Exported
-              </Button>
+              <p className="mt-1 text-sm">Original video</p>
             </div>
           </div>
           <div className="flex min-h-[600px] items-center justify-center bg-black p-4">
             <div className="flex aspect-[9/16] max-h-[568px] w-full max-w-[320px] items-center justify-center overflow-hidden bg-black">
-              {previewUrl && !previewError ? (
+              {cropOpen ? (
+                <p className="px-4 text-center text-sm text-zinc-400">
+                  Original preview is paused while adjusting the crop below.
+                </p>
+              ) : previewUrl && !previewError ? (
                 <video
                   key={previewUrl}
                   className="h-full w-full object-contain"
@@ -661,6 +954,39 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
           </div>
         </section>
       </div>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">Niche review &amp; cleanup</CardTitle>
+          <p className="text-sm text-muted-foreground">
+            Off-niche, or a clip that slipped past dedup? Remove its footage from the shared pool,
+            reject it (also ignores the candidate), or globally reject it — which blocklists the
+            footage so it never re-pools and hides it here.
+          </p>
+        </CardHeader>
+        <CardContent className="flex flex-wrap items-center gap-2">
+          <Button variant="outline" disabled={busy} onClick={removeFromPool}>
+            Remove from pool
+          </Button>
+          <Button variant="outline" disabled={busy} onClick={rejectGlobally}>
+            Reject globally (block)
+          </Button>
+          <div className="grow" />
+          <select
+            className="h-9 rounded-md border border-input bg-transparent px-2 text-sm"
+            value={reviewReason}
+            onChange={(event) => setReviewReason(event.target.value)}
+          >
+            <option value="wrong_niche">Wrong niche</option>
+            <option value="low_quality">Low quality</option>
+            <option value="duplicate">Duplicate (dedup missed)</option>
+            <option value="ad_campaign">Ad / promo</option>
+          </select>
+          <Button variant="destructive" disabled={busy} onClick={() => void rejectClip()}>
+            Reject clip
+          </Button>
+        </CardContent>
+      </Card>
 
       {workflow && (
         <Card>
@@ -897,24 +1223,95 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
             Applying an option fills these fields. Edit and save the final text used for export and publishing.
           </p>
         </CardHeader>
-        <CardContent className="space-y-3">
-          <label className="block space-y-1">
-            <span className="text-sm font-medium">Title</span>
-            <textarea
-              className="min-h-20 w-full rounded-md border border-input bg-transparent p-3 text-sm"
-              value={finalTitle}
-              onChange={(event) => setFinalTitle(event.target.value)}
-            />
-          </label>
-          <label className="block space-y-1">
-            <span className="text-sm font-medium">Caption</span>
-            <textarea
-              className="min-h-48 w-full rounded-md border border-input bg-transparent p-3 text-sm"
-              value={finalCaption}
-              onChange={(event) => setFinalCaption(event.target.value)}
-            />
-          </label>
-          <Button onClick={saveFinalDraft} disabled={busy}>Save selected title and caption</Button>
+        <CardContent>
+          <div className="grid gap-4 lg:grid-cols-[1fr_minmax(220px,300px)]">
+            <div className="space-y-3">
+              <label className="block space-y-1">
+                <span className="text-sm font-medium">Title</span>
+                <textarea
+                  className="min-h-20 w-full rounded-md border border-input bg-transparent p-3 text-sm"
+                  value={finalTitle}
+                  onChange={(event) => setFinalTitle(event.target.value)}
+                />
+              </label>
+              <label className="block space-y-1">
+                <span className="text-sm font-medium">Caption</span>
+                <textarea
+                  className="min-h-48 w-full rounded-md border border-input bg-transparent p-3 text-sm"
+                  value={finalCaption}
+                  onChange={(event) => setFinalCaption(event.target.value)}
+                />
+              </label>
+              <Button onClick={saveFinalDraft} disabled={busy}>Save selected title and caption</Button>
+            </div>
+            {/* Exported reel preview, kept beside the final text so the result is
+                visible right after Export without scrolling back to the top. */}
+            <div className="space-y-2">
+              <div className="flex items-start justify-between gap-2">
+                <div>
+                  <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+                    Exported reel
+                  </p>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    Adjust the source crop, then re-export to update this result.
+                  </p>
+                </div>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => setCropOpen((open) => !open)}
+                  disabled={!item.original_preview_url}
+                  title="Adjust the source crop used for the exported reel"
+                >
+                  {cropOpen ? "Close crop editor" : "Adjust crop"}
+                </Button>
+              </div>
+              <div className="flex aspect-[9/16] w-full items-center justify-center overflow-hidden rounded-lg border bg-black">
+                {cropOpen ? (
+                  <p className="px-3 text-center text-xs text-zinc-400">
+                    Exported preview is paused while adjusting the source crop.
+                  </p>
+                ) : item.exported_preview_url && !exportPreviewError ? (
+                  <video
+                    key={item.exported_preview_url}
+                    className="h-full w-full object-contain"
+                    src={item.exported_preview_url}
+                    controls
+                    preload="metadata"
+                    onError={(event) => {
+                      const code = event.currentTarget.error?.code;
+                      const message = event.currentTarget.error?.message;
+                      setExportPreviewError(
+                        `Media error${code ? ` ${code}` : ""}${message ? `: ${message}` : ""}`,
+                      );
+                    }}
+                  />
+                ) : (
+                  <p className="px-3 text-center text-xs text-zinc-400">
+                    {exportPreviewError
+                      ? `Could not load the exported reel. ${exportPreviewError}`
+                      : "Export the reel to preview it here."}
+                  </p>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {cropOpen && item.original_preview_url && (
+            <div className="mt-4">
+              <CropEditor
+                itemId={item.id}
+                onClose={() => setCropOpen(false)}
+                onSaved={(msg) => {
+                  setHandoffMessage(msg);
+                  setCropOpen(false);
+                  // If the clip was already exported, re-render now so the new
+                  // crop is actually applied and the preview refreshes.
+                  if (item.processed_path) void exportReel();
+                }}
+              />
+            </div>
+          )}
         </CardContent>
       </Card>
 
@@ -975,6 +1372,36 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
             >
               Schedule
             </Button>
+            <Button
+              disabled={!item.processed_path || busy || publishingNow}
+              onClick={publishNow}
+            >
+              {publishingNow ? "Publishing…" : "Publish Now"}
+            </Button>
+          </div>
+          <div className="flex flex-wrap items-center gap-3 border-t border-border pt-3 text-sm">
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={autoPublish}
+                onChange={(event) => toggleAutoPublish(event.target.checked)}
+              />
+              Auto-publish scheduled reels when due
+            </label>
+            <span className="text-muted-foreground">
+              {dueCount > 0 ? `${dueCount} due now` : "none due"}
+            </span>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={publishingNow || dueCount === 0}
+              onClick={() => publishDueNow(false)}
+            >
+              {publishingNow ? "Publishing…" : `Publish due now${dueCount > 0 ? ` (${dueCount})` : ""}`}
+            </Button>
+            <span className="text-xs text-muted-foreground">
+              Live posts run only while this window is open.
+            </span>
           </div>
           {publishMessage && <p className="text-sm text-emerald-600">{publishMessage}</p>}
           {publishJobs.length > 0 ? (
@@ -998,6 +1425,7 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
           )}
         </CardContent>
       </Card>
+
     </div>
   );
 }

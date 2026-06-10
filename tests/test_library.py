@@ -37,6 +37,20 @@ def _make_item(*, account_id: int | None = None, file_path: str | None = "C:/x.m
         return item.id
 
 
+def _pool_item_footage(source_url: str, video_id: str | None = None, niche: str = "history") -> int:
+    """Register a media asset for ``source_url`` and accept it into a niche pool."""
+    from nicheflow_studio.db.media_library import find_or_register_media_asset
+    from nicheflow_studio.db.pools import accept_into_pool
+
+    with get_session() as session:
+        asset, _ = find_or_register_media_asset(
+            session, source_url=source_url, shortcode=video_id, platform="instagram"
+        )
+        pool_item = accept_into_pool(session, media_asset=asset, niche=niche)
+        session.commit()
+        return pool_item.id
+
+
 def test_list_items_includes_account_name_and_flags() -> None:
     account_id = _make_account("Movies")
     item_id = _make_item(account_id=account_id)
@@ -143,3 +157,112 @@ def test_remove_item_cleans_dependents() -> None:
         assert candidate.state == "candidate"
         job = session.scalars(select(UploadJob)).first()
         assert job.download_item_id is None
+
+
+def test_remove_item_from_pool_marks_removed() -> None:
+    from nicheflow_studio.db.models import PoolItem
+    from nicheflow_studio.db.pools import POOL_STATUS_REMOVED
+
+    account_id = _make_account()
+    item_id = _make_item(account_id=account_id)  # source_url .../reel/abc
+    pool_item_id = _pool_item_footage("https://instagram.com/reel/abc")
+
+    result = library.remove_item_from_pool(item_id)
+
+    assert result["removed_pool_items"] == 1
+    with get_session() as session:
+        assert session.get(PoolItem, pool_item_id).acceptance_status == POOL_STATUS_REMOVED
+
+
+def test_remove_item_from_pool_without_pool_is_noop() -> None:
+    account_id = _make_account()
+    item_id = _make_item(account_id=account_id)
+
+    result = library.remove_item_from_pool(item_id)
+
+    assert result["removed_pool_items"] == 0
+
+
+def test_reject_item_rejects_candidate_and_removes_from_pool() -> None:
+    from nicheflow_studio.db.models import PoolItem
+    from nicheflow_studio.db.pools import POOL_STATUS_REMOVED
+
+    account_id = _make_account()
+    item_id = _make_item(account_id=account_id)
+    pool_item_id = _pool_item_footage("https://instagram.com/reel/abc")
+    with get_session() as session:
+        session.add(
+            ScrapeCandidate(
+                scrape_source_url="https://s",
+                source_url="https://instagram.com/reel/abc",
+                state="downloaded",
+                queued_download_item_id=item_id,
+                account_id=account_id,
+            )
+        )
+        session.commit()
+
+    result = library.reject_item(item_id, "wrong_niche")
+
+    assert result["rejected_candidates"] == 1
+    assert result["removed_pool_items"] == 1
+    assert result["review_state"] == "rejected"
+    with get_session() as session:
+        candidate = session.scalars(select(ScrapeCandidate)).first()
+        assert candidate.state == "rejected_wrong_niche"
+        assert session.get(PoolItem, pool_item_id).acceptance_status == POOL_STATUS_REMOVED
+        assert session.get(DownloadItem, item_id).review_state == "rejected"
+
+
+def test_reject_item_unknown_reason_raises() -> None:
+    account_id = _make_account()
+    item_id = _make_item(account_id=account_id)
+    with pytest.raises(LibraryError):
+        library.reject_item(item_id, "nope")
+
+
+def _row_for(account_id: int, item_id: int):
+    return next(r for r in library.list_items(account_id=account_id) if r["id"] == item_id)
+
+
+def test_mark_seen_clears_new_flag() -> None:
+    account_id = _make_account()
+    item_id = _make_item(account_id=account_id)
+
+    assert _row_for(account_id, item_id)["is_new"] is True
+
+    library.mark_seen(item_id)
+
+    assert _row_for(account_id, item_id)["is_new"] is False
+
+
+def test_reject_item_globally_blocks_hides_and_drops_assignments() -> None:
+    from nicheflow_studio.db.blocklist import is_blocked
+    from nicheflow_studio.db.models import Assignment, PoolItem
+    from nicheflow_studio.db.pools import POOL_STATUS_REMOVED
+
+    account_id = _make_account()
+    item_id = _make_item(account_id=account_id)  # source .../reel/abc
+    pool_item_id = _pool_item_footage("https://instagram.com/reel/abc")
+    with get_session() as session:
+        session.add(
+            Assignment(
+                pool_item_id=pool_item_id,
+                account_id=account_id,
+                niche="history",
+                status="assigned",
+            )
+        )
+        session.commit()
+
+    result = library.reject_item_globally(item_id, "ad campaign")
+
+    assert result["blocked"] is True
+    assert result["removed_pool_items"] == 1
+    assert result["dropped_assignments"] == 1
+    # Hidden from the Processing list.
+    assert all(r["id"] != item_id for r in library.list_items(account_id=account_id))
+    with get_session() as session:
+        assert is_blocked(session, source_url="https://instagram.com/reel/abc") is True
+        assert session.get(PoolItem, pool_item_id).acceptance_status == POOL_STATUS_REMOVED
+        assert session.query(Assignment).count() == 0

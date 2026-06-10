@@ -40,6 +40,9 @@ For smart title/caption generation, copy `.env.example` to `.env`, set `GROQ_API
 
 For the stable MVP path, paste an Instagram Reel/post URL into Source Intake to save it as a manual candidate with Apify metadata, then download or import the MP4 you want to process. The normal Instagram source scrape path also uses Apify via `APIFY_TOKEN`, so the app does not need your Instagram login cookies for scraping.
 
+For one-click capture from Chrome or Edge directly into a shared pool, see
+`docs/CAPTURE_EXTENSION.md`.
+
 Set your Apify token in `.env`:
 
 ```

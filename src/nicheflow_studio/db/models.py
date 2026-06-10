@@ -100,6 +100,10 @@ class DownloadItem(Base):
     caption_style_preset: Mapped[str | None] = mapped_column(String(128), nullable=True)
     title_style_config: Mapped[str | None] = mapped_column(String(4096), nullable=True)
     caption_style_config: Mapped[str | None] = mapped_column(String(4096), nullable=True)
+    # Per-item manual crop override (JSON: normalized keep-region {x,y,w,h} in
+    # [0,1]). When set, export uses it instead of auto-detecting the crop, so a
+    # bad auto-crop can be fixed for one clip without changing the algorithm.
+    crop_override: Mapped[str | None] = mapped_column(String(256), nullable=True)
     smart_summary: Mapped[str | None] = mapped_column(String(4096), nullable=True)
     smart_title_options: Mapped[str | None] = mapped_column(String(8192), nullable=True)
     smart_caption_options: Mapped[str | None] = mapped_column(String(16384), nullable=True)
@@ -110,6 +114,9 @@ class DownloadItem(Base):
         DateTime(timezone=True), nullable=True
     )
     review_state: Mapped[str] = mapped_column(String(32), default="new")
+    # When the user first opened this item in Processing. Used to clear the "NEW"
+    # badge once a clip has been looked at (the badge is "recent AND unseen").
+    seen_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     account_id: Mapped[int | None] = mapped_column(ForeignKey("accounts.id"), nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="queued")
 
@@ -290,6 +297,28 @@ class MediaAsset(Base):
     content_hash: Mapped[str | None] = mapped_column(String(1024), nullable=True)
 
     pool_items: Mapped[list["PoolItem"]] = relationship(back_populates="media_asset")
+
+
+class BlockedAsset(Base):
+    """Footage the user globally rejected — the 'never pool this again' list.
+
+    Keyed like the media-library dedup (shortcode first, then canonical URL) so a
+    blocked clip is recognized even if it is re-scraped before any MediaAsset row
+    exists for it. Pool intake checks this list before accepting a clip, so an
+    ad/off-niche/bad clip the dedup passes missed cannot keep coming back.
+    """
+
+    __tablename__ = "blocked_assets"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: dt.datetime.now(dt.timezone.utc)
+    )
+    canonical_source_url: Mapped[str | None] = mapped_column(
+        String(2048), nullable=True, index=True
+    )
+    source_shortcode: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    reason: Mapped[str | None] = mapped_column(String(256), nullable=True)
 
 
 class PoolItem(Base):

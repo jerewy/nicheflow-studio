@@ -22,6 +22,7 @@ from pathlib import Path
 
 from sqlalchemy.orm import Session, joinedload
 
+from nicheflow_studio.core.distribution import engagement_score
 from nicheflow_studio.core.niche import NICHE_HISTORY, NICHE_MOVIE
 from nicheflow_studio.core.text_dedup import normalize_caption
 from nicheflow_studio.db.media_library import find_or_register_media_asset
@@ -419,6 +420,31 @@ def restore_pool_item(session: Session, *, pool_item_id: int) -> bool:
     return True
 
 
+def remove_pool_items_for_asset(
+    session: Session, *, media_asset_id: int, reason: str
+) -> int:
+    """Reversibly remove every active pool item backing one media asset.
+
+    The shared "pull this footage out of distribution" primitive: used when a
+    candidate is rejected or a clip is cleaned out from Processing, so the same
+    footage stops distributing in whichever niche pool it reached. Returns the
+    number of items removed. Does not commit; the caller owns the transaction.
+    """
+    items = (
+        session.query(PoolItem)
+        .filter(
+            PoolItem.media_asset_id == media_asset_id,
+            PoolItem.acceptance_status != POOL_STATUS_REMOVED,
+        )
+        .all()
+    )
+    for item in items:
+        item.acceptance_status = POOL_STATUS_REMOVED
+        item.accepted_reason = reason
+    session.flush()
+    return len(items)
+
+
 @dataclass(frozen=True)
 class PoolReviewRow:
     """One pool item for the manual-review list: id, status, label, caption."""
@@ -594,8 +620,9 @@ class PoolSourceRow:
 
 @dataclass(frozen=True)
 class PoolClipRow:
-    """One accepted clip with the metadata a library row needs: the original IG
-    URL to open it, caption, likes, post date, download state, distribution."""
+    """One pool clip with the metadata a library row needs: the original IG URL
+    to open it, caption, likes, post date, download state, distribution, plus the
+    pool acceptance status and the local original file (for an in-app preview)."""
 
     pool_item_id: int
     shortcode: str | None
@@ -604,7 +631,12 @@ class PoolClipRow:
     like_count: int | None
     published_at: dt.datetime | None
     download_status: str
+    acceptance_status: str
+    original_download_path: str | None
     distributed_to: tuple[str, ...]
+    # Intrinsic "worth distributing" score (log-damped likes + recency); drives
+    # the engagement ranking in the Pool & Distribute clip list. 0.0 with no likes.
+    score: float = 0.0
 
     @property
     def is_distributed(self) -> bool:
@@ -650,15 +682,25 @@ def pool_source_summary(session: Session, niche: str) -> list[PoolSourceRow]:
 
 
 def pool_clips_for_source(
-    session: Session, niche: str, source_label: str
+    session: Session, niche: str, source_label: str, *, include_removed: bool = False
 ) -> list[PoolClipRow]:
-    """Accepted clips in a niche pool contributed by ``source_label``, newest
-    post first, with the metadata + IG URL the library row needs."""
+    """Clips in a niche pool contributed by ``source_label``, newest post first,
+    with the metadata + IG URL the library row needs.
+
+    By default only active (accepted) clips. With ``include_removed=True`` it also
+    returns clips that were reversibly removed (so the UI can show and restore
+    them), accepted first.
+    """
     niche = _validate_niche(niche)
+    allowed_statuses = (
+        [POOL_STATUS_ACCEPTED, POOL_STATUS_REMOVED]
+        if include_removed
+        else [POOL_STATUS_ACCEPTED]
+    )
     items = (
         session.query(PoolItem)
         .options(joinedload(PoolItem.media_asset), joinedload(PoolItem.assignments))
-        .filter(PoolItem.niche == niche, PoolItem.acceptance_status == POOL_STATUS_ACCEPTED)
+        .filter(PoolItem.niche == niche, PoolItem.acceptance_status.in_(allowed_statuses))
         .all()
     )
     shortcodes = {
@@ -697,10 +739,20 @@ def pool_clips_for_source(
                 like_count=(meta[4] if meta else None),
                 published_at=(meta[1] if meta else None),
                 download_status=(asset.download_status if asset else "—"),
+                acceptance_status=item.acceptance_status,
+                original_download_path=(asset.original_download_path if asset else None),
                 distributed_to=tuple(accounts),
+                score=engagement_score(
+                    like_count=(meta[4] if meta else None),
+                    published_at=(meta[1] if meta else None),
+                ),
             )
         )
+    # Strongest clips first (engagement-ranked), tie-broken by newest post, then
+    # float active clips above reversibly-removed ones (all stable sorts).
     rows.sort(key=lambda r: _naive(r.published_at), reverse=True)
+    rows.sort(key=lambda r: r.score, reverse=True)
+    rows.sort(key=lambda r: r.acceptance_status != POOL_STATUS_ACCEPTED)
     return rows
 
 

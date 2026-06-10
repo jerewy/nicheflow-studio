@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from pathlib import Path
 
 from nicheflow_studio.app.local_media import media_url
 from nicheflow_studio.core.ui_prefs import set_ui_pref
@@ -32,10 +33,12 @@ from nicheflow_studio.services import (
     export as export_svc,
     library as library_svc,
     pooling,
+    publish_now as publish_now_svc,
     publish_queue,
     publishing_dashboard,
     publishing,
     processing_workflow,
+    scraping,
     sourcing,
 )
 from nicheflow_studio.services.errors import ServiceError
@@ -50,6 +53,20 @@ def _ok(data: object = None) -> dict:
 
 def _fail(message: str) -> dict:
     return {"ok": False, "error": message}
+
+
+def _cache_busted(url: str | None, path: str | None) -> str | None:
+    """Append the file's mtime so a file re-rendered at the same path isn't served
+    stale from the WebView cache — e.g. a re-export with a new manual crop writes
+    the same ``processed_path``, so without this the preview shows the old video."""
+    if not url or not path:
+        return url
+    try:
+        token = int(Path(path).stat().st_mtime)
+    except OSError:
+        return url
+    separator = "&" if "?" in url else "?"
+    return f"{url}{separator}v={token}"
 
 
 def _guard(func):
@@ -129,6 +146,18 @@ class ProcessingBridge:
     def remove_library_item(self, item_id: int) -> dict:
         return library_svc.remove_item(item_id)
 
+    @_guard
+    def remove_item_from_pool(self, item_id: int, reason: str = "manual removal") -> dict:
+        return library_svc.remove_item_from_pool(item_id, reason)
+
+    @_guard
+    def reject_item(self, item_id: int, reason: str = "low_quality") -> dict:
+        return library_svc.reject_item(item_id, reason)
+
+    @_guard
+    def reject_item_globally(self, item_id: int, reason: str = "globally rejected") -> dict:
+        return library_svc.reject_item_globally(item_id, reason)
+
     # --- Publishing Dashboard / Publish Queue (migrated screen) --- #
 
     @_guard
@@ -177,6 +206,41 @@ class ProcessingBridge:
     def set_candidate_state(self, candidate_id: int, state: str) -> dict:
         return sourcing.set_candidate_state(candidate_id, state)
 
+    @_guard
+    def accept_candidate(self, candidate_id: int) -> dict:
+        return sourcing.accept_candidate(candidate_id)
+
+    @_guard
+    def reject_candidate(self, candidate_id: int, reason: str = "low_quality") -> dict:
+        return sourcing.reject_candidate(candidate_id, reason)
+
+    @_guard
+    def candidate_preview(self, candidate_id: int) -> dict:
+        """Preview source for a candidate: a local video URL if its footage is
+        downloaded, else the (possibly expired) scraped thumbnail."""
+        data = sourcing.candidate_preview(candidate_id)
+        mapping_ready = self._media_ready is None or self._media_ready.wait(timeout=5)
+        data["preview_url"] = media_url(data.get("local_path")) if mapping_ready else None
+        return data
+
+    @_guard
+    def apify_usage(self) -> dict:
+        """This month's Apify free-tier usage, for the Scraping-tab reminder."""
+        return scraping.apify_usage()
+
+    @_guard
+    def start_source_scrape(self, source_id: int, max_items: int = 30) -> dict:
+        """Start a background Apify scrape of a source into its niche pool."""
+        job_id = self._jobs.start(scraping.scrape_source_to_pool, source_id, max_items=max_items)
+        return {"job_id": job_id}
+
+    @_guard
+    def start_candidate_download(self, candidate_id: int) -> dict:
+        """Start a background job to add a candidate into Processing (reuse the
+        file if on disk, else download it). Poll the job via :meth:`get_job`."""
+        job_id = self._jobs.start(scraping.add_candidate_to_processing, candidate_id)
+        return {"job_id": job_id}
+
     # --- Pooling / Distribution (migrated screen, read-only) --- #
 
     @_guard
@@ -192,8 +256,40 @@ class ProcessingBridge:
         return pooling.list_sources(niche)
 
     @_guard
-    def list_pool_source_clips(self, niche: str, source_label: str) -> list[dict]:
-        return pooling.list_source_clips(niche, source_label)
+    def list_pool_source_clips(
+        self, niche: str, source_label: str, include_removed: bool = False
+    ) -> list[dict]:
+        clips = pooling.list_source_clips(niche, source_label, include_removed=include_removed)
+        # Same virtual-host gating as get_context: only hand out media URLs once
+        # the WebView folder mapping is installed.
+        mapping_ready = self._media_ready is None or self._media_ready.wait(timeout=5)
+        for clip in clips:
+            clip["preview_url"] = (
+                media_url(clip.get("original_download_path")) if mapping_ready else None
+            )
+        return clips
+
+    @_guard
+    def remove_pool_item(self, pool_item_id: int, reason: str = "manual removal") -> dict:
+        return pooling.remove_pool_item(pool_item_id, reason)
+
+    @_guard
+    def restore_pool_item(self, pool_item_id: int) -> dict:
+        return pooling.restore_pool_item(pool_item_id)
+
+    @_guard
+    def pool_niche_accounts(self, niche: str) -> list[dict]:
+        return pooling.niche_accounts(niche)
+
+    @_guard
+    def distribute_pool_item(self, pool_item_id: int, account_ids: list[int] | None = None) -> dict:
+        return pooling.distribute_clip(pool_item_id, account_ids or [])
+
+    @_guard
+    def distribute_niche(self, niche: str, max_per_account: int | None = None) -> dict:
+        """Auto-distribute the niche's undistributed pool across its accounts,
+        engagement-ranked (likes + recency)."""
+        return pooling.distribute_niche(niche, max_per_account)
 
     @_guard
     def dashboard_publish_jobs(self) -> dict:
@@ -226,10 +322,16 @@ class ProcessingBridge:
         item = context["item"]
         mapping_ready = self._media_ready is None or self._media_ready.wait(timeout=5)
         item["original_preview_url"] = media_url(item.get("file_path")) if mapping_ready else None
-        item["exported_preview_url"] = (
-            media_url(item.get("processed_path")) if mapping_ready else None
-        )
+        exported_url = media_url(item.get("processed_path")) if mapping_ready else None
+        # Cache-bust so re-exports (e.g. after a manual crop change) aren't served
+        # stale from the WebView cache at the same processed_path.
+        item["exported_preview_url"] = _cache_busted(exported_url, item.get("processed_path"))
         item["preview_url"] = item["exported_preview_url"] or item["original_preview_url"]
+        # Opening an item clears its NEW badge (best-effort; never block the read).
+        try:
+            library_svc.mark_seen(item["id"])
+        except Exception:  # noqa: BLE001
+            logger.exception("mark_seen failed for item %s", item.get("id"))
         return context
 
     @_guard
@@ -322,6 +424,28 @@ class ProcessingBridge:
         return processing_workflow.open_folder(item_id)
 
     @_guard
+    def get_crop_override(self, item_id: int) -> dict | None:
+        """The item's manual crop keep-region, or ``None`` if it auto-crops."""
+        return export_svc.get_crop_override(item_id)
+
+    @_guard
+    def get_crop_preview(self, item_id: int) -> dict:
+        """A still-frame URL for the crop editor; avoids WebView video crashes."""
+        preview_path = export_svc.crop_preview_frame(item_id)
+        preview_url = media_url(str(preview_path))
+        if preview_url is None:
+            raise ServiceError("Could not expose the crop preview to the Processing window.")
+        return {"item_id": item_id, "preview_url": preview_url}
+
+    @_guard
+    def save_crop_override(self, item_id: int, payload: dict | None = None) -> dict:
+        return export_svc.save_crop_override(item_id, payload or {})
+
+    @_guard
+    def clear_crop_override(self, item_id: int) -> dict:
+        return export_svc.clear_crop_override(item_id)
+
+    @_guard
     def start_generation(self, item_id: int, payload: dict | None = None) -> dict:
         """Start background draft generation; return a job id to poll via
         :meth:`get_job`. The job result is the saved revision as a dict."""
@@ -367,6 +491,32 @@ class ProcessingBridge:
         """Add/update the item's exported reel in the publish queue (draft, or
         scheduled when ``scheduled_at`` is given)."""
         return publishing.queue_for_publish(item_id, scheduled_at=scheduled_at)
+
+    @_guard
+    def start_publish_now(self, item_id: int) -> dict:
+        """Start a background job that posts the item's reel to Instagram now
+        (live). Poll it via :meth:`get_job`."""
+        job_id = self._jobs.start(publish_now_svc.publish_item_now, item_id)
+        return {"job_id": job_id}
+
+    @_guard
+    def publish_due_count(self) -> dict:
+        """How many scheduled jobs are currently due (past their time)."""
+        return {"due": publish_now_svc.due_count()}
+
+    @_guard
+    def start_publish_due(self) -> dict:
+        """Start a background job that posts all currently-due scheduled reels."""
+        job_id = self._jobs.start(publish_now_svc.publish_due_jobs)
+        return {"job_id": job_id}
+
+    @_guard
+    def get_auto_publish(self) -> dict:
+        return {"enabled": publish_now_svc.auto_publish_enabled()}
+
+    @_guard
+    def set_auto_publish(self, enabled: bool = False) -> dict:
+        return {"enabled": publish_now_svc.set_auto_publish_enabled(enabled)}
 
     @_guard
     def auto_schedule_for_publish(self, item_id: int) -> dict:

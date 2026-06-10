@@ -954,6 +954,24 @@ def sample_video_frame_data_urls(input_path: Path, *, max_frames: int = 5) -> li
     return sampled_urls
 
 
+def extract_video_preview_frame(input_path: Path, output_path: Path) -> Path:
+    """Extract a middle-frame JPEG suitable for lightweight UI previews."""
+    resolved_input = input_path.expanduser().resolve()
+    resolved_output = output_path.expanduser().resolve()
+    ffmpeg_path = ffmpeg_binary()
+    if ffmpeg_path is None:
+        raise RuntimeError("ffmpeg is not installed.")
+    if not resolved_input.exists():
+        raise FileNotFoundError(f"Video file not found: {resolved_input}")
+
+    probe = probe_video(resolved_input)
+    timestamps = _sample_timestamps(probe, count=1)
+    timestamp = timestamps[0] if timestamps else 0.0
+    resolved_output.parent.mkdir(parents=True, exist_ok=True)
+    _extract_frame_image(ffmpeg_path, resolved_input, timestamp, resolved_output)
+    return resolved_output
+
+
 def _bounded_margin(values: list[int]) -> int:
     if not values:
         return 0

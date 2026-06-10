@@ -8,16 +8,29 @@ so this stays naturally isolated to one account.
 Scope: manage + review only. Running the actual Apify scrape, queuing a candidate
 for download, and accepting a candidate into the shared niche pool remain in the
 desktop app (heavy/external or cross-account pool mutations). The review actions
-here are limited to the safe, reversible ``ignored`` <-> ``candidate`` toggle.
+here are the reversible ``ignored`` <-> ``candidate`` toggle plus a reason-tagged
+reject that also pulls any pooled copy of the clip out of distribution (both
+reversible from the desktop app / Pool & Distribute).
 """
 
 from __future__ import annotations
 
 import datetime as dt
+from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
+from nicheflow_studio.db.media_library import find_media_asset
 from nicheflow_studio.db.models import Account, ScrapeCandidate, ScrapeRun, Source
+from nicheflow_studio.db.pools import (
+    REJECT_REASONS,
+    VALID_NICHES,
+    CrossNicheError,
+    DuplicateContentError,
+    remove_pool_items_for_asset,
+)
+from nicheflow_studio.db.pools import accept_candidate_into_pool as _accept_candidate_into_pool_db
+from nicheflow_studio.db.pools import reject_candidate as _reject_candidate_db
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.db.sources import find_or_create_source
 from nicheflow_studio.services.errors import ServiceError
@@ -142,17 +155,27 @@ def list_candidates(
     """Scrape candidates for an account's review queue, newest first."""
     with get_session() as session:
         _require_account(session, account_id)
-        rows = session.scalars(
+        query = (
             select(ScrapeCandidate)
             .where(ScrapeCandidate.account_id == account_id)
             .order_by(ScrapeCandidate.id.desc())
             .limit(limit)
-        ).all()
+        )
+        if state == "candidate":
+            query = query.where(
+                or_(
+                    ScrapeCandidate.state == "candidate",
+                    ScrapeCandidate.state == "new",
+                    ScrapeCandidate.state == "",
+                    ScrapeCandidate.state.is_(None),
+                )
+            )
+        elif state != "all":
+            query = query.where(ScrapeCandidate.state == state)
+        rows = session.scalars(query).all()
         result = []
         for row in rows:
             normalized = _normalize_state(row.state)
-            if state != "all" and normalized != state:
-                continue
             result.append(
                 {
                     "id": row.id,
@@ -162,7 +185,11 @@ def list_candidates(
                     "state": normalized,
                     "like_count": row.like_count,
                     "view_count": row.view_count,
+                    "comment_count": row.comment_count,
+                    "duration_seconds": row.duration_seconds,
+                    "description": row.description,
                     "published_at": _iso(row.published_at),
+                    "created_at": _iso(row.created_at),
                     "thumbnail_url": row.thumbnail_url,
                 }
             )
@@ -187,3 +214,108 @@ def set_candidate_state(candidate_id: int, state: str) -> dict:
         candidate.state = state
         session.commit()
         return {"candidate_id": candidate_id, "state": state}
+
+
+def accept_candidate(candidate_id: int) -> dict:
+    """Accept a candidate into its account's niche pool."""
+    with get_session() as session:
+        candidate = session.get(ScrapeCandidate, candidate_id)
+        if candidate is None:
+            raise SourcingError(f"No candidate with id {candidate_id}.")
+        if candidate.account_id is None:
+            raise SourcingError("Candidate is not assigned to an account.")
+        account = _require_account(session, candidate.account_id)
+        # Pool isolation keys off the strict niche ("history"/"movie"), not the
+        # free-text niche_label shown in the UI — mirroring the desktop accept
+        # path (main_window._on_candidate_accept_pool_clicked). Using niche_label
+        # here sent the whole label sentence into _validate_niche and surfaced as
+        # a generic "Unexpected error".
+        niche = (account.niche or "").strip().lower()
+        if niche not in VALID_NICHES:
+            raise SourcingError(
+                "This candidate's account has no pool niche (history/movie) set. "
+                "Set the account's niche in account settings first."
+            )
+        try:
+            pool_item = _accept_candidate_into_pool_db(
+                session,
+                candidate=candidate,
+                niche=niche,
+            )
+        except (CrossNicheError, DuplicateContentError, ValueError) as exc:
+            # Real guardrails (niche mixing / duplicate footage / bad niche);
+            # surface the reason instead of a generic "Unexpected error".
+            raise SourcingError(str(exc)) from exc
+        session.commit()
+        return {
+            "candidate_id": candidate_id,
+            "state": candidate.state,
+            "pool_item_id": pool_item.id,
+            "niche": pool_item.niche,
+        }
+
+
+def reject_candidate(candidate_id: int, reason: str = "low_quality") -> dict:
+    """Reject a bad candidate and pull any pooled copy out of distribution.
+
+    For clips the dedup passes missed (a near-duplicate or a low-quality clip
+    that slipped through), this both flags the candidate ``rejected_<reason>``
+    and marks every pool item backing its footage ``removed`` so it stops
+    distributing. ``reason`` is a :data:`REJECT_REASONS` key (``ad_campaign``,
+    ``duplicate``, ``wrong_niche``, ``low_quality``).
+
+    Reversible: the candidate state and the pool item can both be restored from
+    the desktop app / Pool & Distribute. Returns the stored state and the number
+    of pool items removed.
+    """
+    key = (reason or "").strip().lower()
+    if key not in REJECT_REASONS:
+        raise SourcingError(
+            f"Unknown reject reason {reason!r}. Use one of {sorted(REJECT_REASONS)}."
+        )
+    with get_session() as session:
+        candidate = session.get(ScrapeCandidate, candidate_id)
+        if candidate is None:
+            raise SourcingError(f"No candidate with id {candidate_id}.")
+        state = _reject_candidate_db(session, candidate=candidate, reason=key)
+        # Pull the same footage out of the pool, if it ever made it in. A
+        # candidate links to its pool item(s) through its MediaAsset (by
+        # shortcode/URL); look it up without creating a stray pending asset.
+        removed = 0
+        asset = find_media_asset(
+            session, source_url=candidate.source_url, shortcode=candidate.video_id
+        )
+        if asset is not None:
+            removed = remove_pool_items_for_asset(
+                session, media_asset_id=asset.id, reason=f"candidate rejected: {key}"
+            )
+        session.commit()
+        return {"candidate_id": candidate_id, "state": state, "removed_pool_items": removed}
+
+
+def candidate_preview(candidate_id: int) -> dict:
+    """Best available preview source for a candidate.
+
+    Scraped IG thumbnail URLs are signed and expire within days, so for an older
+    candidate the remote thumbnail no longer loads. When the footage has been
+    downloaded (e.g. via "Add to Processing"), return its local file for a real
+    video preview; otherwise fall back to the (possibly expired) thumbnail. The
+    bridge turns ``local_path`` into an in-app ``preview_url``.
+    """
+    with get_session() as session:
+        candidate = session.get(ScrapeCandidate, candidate_id)
+        if candidate is None:
+            raise SourcingError(f"No candidate with id {candidate_id}.")
+        local_path = None
+        asset = find_media_asset(
+            session, source_url=candidate.source_url, shortcode=candidate.video_id
+        )
+        if asset is not None and asset.original_download_path:
+            path = Path(asset.original_download_path)
+            if path.exists():
+                local_path = str(path)
+        return {
+            "candidate_id": candidate_id,
+            "local_path": local_path,
+            "thumbnail_url": candidate.thumbnail_url,
+        }

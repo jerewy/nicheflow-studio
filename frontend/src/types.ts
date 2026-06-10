@@ -187,8 +187,40 @@ export interface ScrapeCandidate {
   state: string;
   like_count: number | null;
   view_count: number | null;
+  comment_count: number | null;
+  duration_seconds: number | null;
+  description: string | null;
   published_at: string | null;
+  created_at: string | null;
   thumbnail_url: string | null;
+}
+
+// Normalized keep-region for a per-item manual export crop (fractions of the
+// source width/height, in [0,1]).
+export interface CropRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+export interface ApifyUsage {
+  month: string;
+  used: number;
+  free_cap: number;
+  remaining: number;
+  over_free_tier: boolean;
+  warn: boolean;
+}
+
+export interface ScrapeToPoolResult {
+  source_id: number;
+  niche: string;
+  scraped: number;
+  added: number;
+  duplicates: number;
+  no_account: number;
+  apify_usage: ApifyUsage;
 }
 
 export interface LibraryItem {
@@ -242,6 +274,11 @@ export interface PoolSource {
   newest_post_at: string | null;
 }
 
+export interface NicheAccount {
+  id: number;
+  name: string;
+}
+
 export interface PoolSourceClip {
   pool_item_id: number;
   shortcode: string | null;
@@ -250,7 +287,20 @@ export interface PoolSourceClip {
   like_count: number | null;
   published_at: string | null;
   download_status: string;
+  acceptance_status: string;
+  preview_url: string | null;
   distributed_to: string[];
+  // Engagement score (log-damped likes + recency) the pool list is ranked by.
+  score: number;
+}
+
+export interface DistributeNicheResult {
+  niche: string;
+  assigned: number;
+  max_per_account: number;
+  accounts: { account_id: number; account_name: string; count: number }[];
+  /** Only present when assigned === 0. Explains why nothing was distributed. */
+  reason?: "no_accounts" | "all_at_cap" | "pool_empty";
 }
 
 export interface DashboardPublishJob {
