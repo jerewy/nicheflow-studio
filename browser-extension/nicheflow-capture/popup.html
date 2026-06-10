@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>NicheFlow Capture</title>
+    <style>
+      * { box-sizing: border-box; }
+      body { width: 286px; margin: 0; padding: 12px; background: #111827; color: #f8fafc; font: 12px/1.35 system-ui, sans-serif; }
+      header, .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+      h1 { margin: 0; font-size: 15px; }
+      select, button { border-radius: 6px; font: inherit; padding: 7px 8px; }
+      select { width: 98px; border: 1px solid #475569; background: #1e293b; color: #f8fafc; }
+      button { border: 0; cursor: pointer; font-weight: 700; }
+      button:disabled { opacity: .55; cursor: wait; }
+      .primary { flex: 1; background: #22c55e; color: #052e16; }
+      .secondary { flex: 1; background: #2563eb; color: white; }
+      .stats { margin: 10px 0; padding: 8px; border: 1px solid #334155; border-radius: 7px; background: #1e293b; }
+      .value { font-weight: 750; color: #f8fafc; }
+      #result { margin-top: 9px; padding-top: 8px; border-top: 1px solid #334155; color: #cbd5e1; }
+      #result[data-tone="success"] { color: #86efac; }
+      #result[data-tone="error"] { color: #fca5a5; }
+      .muted { color: #94a3b8; }
+    </style>
+  </head>
+  <body>
+    <header><h1>NicheFlow Capture</h1><select id="niche"><option value="history">History</option><option value="movie">Movie</option></select></header>
+    <div class="stats">
+      <div class="row"><span>Queue</span><span class="value" id="queue-count">0</span></div>
+      <div class="row"><span id="pool-label">History pool</span><span class="value" id="pool-count">...</span></div>
+      <div class="row"><span>Apify estimate</span><span class="value" id="apify-cost">...</span></div>
+      <div class="row muted"><span>Monthly results</span><span id="apify-results">...</span></div>
+    </div>
+    <div class="row">
+      <button class="primary" id="queue">Queue Current</button>
+      <button class="secondary" id="process">Process Queue</button>
+    </div>
+    <div id="result" data-tone="neutral">Queue several Reels, then process them together.</div>
+    <script src="popup.js"></script>
+  </body>
+</html>

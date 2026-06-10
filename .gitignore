@@ -28,6 +28,7 @@ Desktop.ini
 build/
 dist/
 *.spec
+!NicheFlowCaptureHost.spec
 *.egg-info/
 
 # Node tooling / local Codex install artifacts
@@ -44,6 +45,7 @@ data/
 # Local diagnostics / screenshots
 *.log
 *.png
+!browser-extension/nicheflow-capture/icon128.png
 
 # Local agent / browser tooling
 .claude/
