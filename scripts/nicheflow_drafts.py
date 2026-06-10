@@ -10,10 +10,15 @@ Examples (PowerShell):
 
     .venv\\Scripts\\python.exe scripts\\nicheflow_drafts.py current
     .venv\\Scripts\\python.exe scripts\\nicheflow_drafts.py context --item-id 12
-    Get-Content draft.json | .venv\\Scripts\\python.exe scripts\\nicheflow_drafts.py save --item-id 12 --stdin
-    Get-Content one.json   | .venv\\Scripts\\python.exe scripts\\nicheflow_drafts.py revise --item-id 12 --option 2 --stdin
+    .venv\\Scripts\\python.exe scripts\\nicheflow_drafts.py save --item-id 12 --file draft.json
+    .venv\\Scripts\\python.exe scripts\\nicheflow_drafts.py revise --item-id 12 --option 2 --file one.json
     .venv\\Scripts\\python.exe scripts\\nicheflow_drafts.py apply --item-id 12 --option 2
     .venv\\Scripts\\python.exe scripts\\nicheflow_drafts.py history --item-id 12
+
+Prefer ``--file`` over piping into ``--stdin``: PowerShell's ``Get-Content``
+re-decodes BOM-less UTF-8 files as the ANSI codepage before the bytes reach
+Python, silently corrupting em dashes and emoji. ``--file`` opens the file
+directly as UTF-8 and is immune.
 
 ``save`` stdin JSON shape (only title_options + caption_options are required)::
 
@@ -63,6 +68,27 @@ def _emit(payload: object) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
+def _read_payload_json(args: argparse.Namespace) -> dict:
+    """Read the revision JSON from --file when given, else from stdin."""
+    file_path = getattr(args, "file", None)
+    if not file_path:
+        return _read_stdin_json()
+    path = pathlib.Path(file_path)
+    if not path.is_file():
+        raise svc.DraftRevisionError(f"--file not found: {path}")
+    # utf-8-sig tolerates a BOM from editors/PowerShell Out-File.
+    raw = path.read_text(encoding="utf-8-sig")
+    if not raw.strip():
+        raise svc.DraftRevisionError(f"--file is empty: {path}")
+    try:
+        parsed = json.loads(raw)
+    except ValueError as exc:
+        raise svc.DraftRevisionError(f"Invalid JSON in {path}: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise svc.DraftRevisionError("Top-level JSON must be an object.")
+    return parsed
+
+
 def _read_stdin_json() -> dict:
     # Read the raw byte buffer as utf-8-sig so we are immune to the Windows
     # console codepage (cp1252 can't decode emoji/em-dash) and to a UTF-8 BOM
@@ -95,7 +121,7 @@ def _cmd_context(args: argparse.Namespace) -> None:
 
 
 def _cmd_save(args: argparse.Namespace) -> None:
-    payload = _read_stdin_json()
+    payload = _read_payload_json(args)
     dto = svc.save_revision(
         args.item_id,
         title_options=payload.get("title_options") or [],
@@ -117,7 +143,7 @@ def _cmd_save(args: argparse.Namespace) -> None:
 
 
 def _cmd_revise(args: argparse.Namespace) -> None:
-    payload = _read_stdin_json()
+    payload = _read_payload_json(args)
     dto = svc.revise_option(
         args.item_id,
         args.option,
@@ -152,6 +178,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p_save = sub.add_parser("save", help="Save a new draft revision from stdin JSON.")
     p_save.add_argument("--item-id", type=int, required=True)
     p_save.add_argument("--stdin", action="store_true", help="Read revision JSON from stdin.")
+    p_save.add_argument(
+        "--file",
+        type=str,
+        default=None,
+        help="Read revision JSON from a UTF-8 file (preferred over piping into --stdin).",
+    )
     p_save.set_defaults(func=_cmd_save)
 
     p_revise = sub.add_parser("revise", help="Revise one option into a new revision.")
@@ -162,6 +194,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_revise.add_argument(
         "--stdin", action="store_true", help="Read {title,caption,note} from stdin."
+    )
+    p_revise.add_argument(
+        "--file",
+        type=str,
+        default=None,
+        help="Read {title,caption,note} JSON from a UTF-8 file (preferred over --stdin).",
     )
     p_revise.set_defaults(func=_cmd_revise)
 

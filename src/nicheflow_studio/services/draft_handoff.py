@@ -191,12 +191,17 @@ def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
             "",
             "Generate 3 meaningfully different on-screen title options and 3 caption options.",
             "Keep display titles plain text. Only use internal **keyword** emphasis when the Cinema Bold Keywords style requires it.",
+            "Never write em dashes or double hyphens ('--') in titles or captions; "
+            "use a comma, period, or colon instead. Long dashes read as AI-generated copy.",
             "Recommend the strongest title/caption pair and add one short selection note per option.",
             "Do not invent unsupported facts.",
             "",
             "Automatic NicheFlow handoff for Codex or Claude Code:",
-            f"- After generating, save the options directly to item {item_id} in SQLite by running:",
-            f"  Get-Content <draft-json-file> | .venv\\Scripts\\python.exe scripts\\nicheflow_drafts.py save --item-id {item_id} --stdin",
+            f"- After generating, save the options directly to item {item_id} in SQLite: "
+            "write the draft JSON to a UTF-8 file, then run:",
+            f"  .venv\\Scripts\\python.exe scripts\\nicheflow_drafts.py save --item-id {item_id} --file <draft-json-path>",
+            "- Do NOT pipe the JSON through Get-Content into --stdin: PowerShell re-decodes "
+            "the bytes and silently corrupts em dashes and emoji before Python sees them.",
             "- Use JSON fields title_options, caption_options, option_notes, recommended_title_index, recommended_caption_index, recommendation_reason, provider_label, and source.",
             "- Recommended indexes are 1-based. Set provider_label/source to Codex or Claude Code.",
             "- The running Processing screen automatically detects the saved revision. Do not ask the user to paste it manually.",

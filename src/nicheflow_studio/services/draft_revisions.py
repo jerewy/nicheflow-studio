@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 from dataclasses import asdict, dataclass
 
 from sqlalchemy import select
@@ -165,6 +166,28 @@ def _next_revision_number(session, item_id: int) -> int:
     return (max(rows) + 1) if rows else 1
 
 
+# Numeric ranges keep a plain hyphen (1974–1980 -> 1974-1980); every other
+# em/en dash or double hyphen becomes a comma pause.
+_NUMERIC_RANGE_DASH = re.compile(r"(?<=\d)[ \t]*[–—][ \t]*(?=\d)")
+# Spaces/tabs only around the dash: matching \n would silently merge the
+# caption's paragraph breaks.
+_DASH_AS_PAUSE = re.compile(r"[ \t]*(?:—|–|--+)[ \t]*")
+
+
+def _normalize_dashes(text: str | None) -> str | None:
+    """Strip the em-dash/double-hyphen tell from generated copy.
+
+    LLMs lean on em dashes heavily enough that they read as AI-generated, and
+    '--' additionally shows up when agents dodge the PowerShell pipe encoding
+    bug. Normalizing at this single choke point cleans every intake path
+    (Groq, clipboard paste, CLI save/revise) without touching manual edits.
+    """
+    if not text:
+        return text
+    text = _NUMERIC_RANGE_DASH.sub("-", text)
+    return _DASH_AS_PAUSE.sub(", ", text)
+
+
 def save_revision(
     item_id: int,
     *,
@@ -189,8 +212,8 @@ def save_revision(
     lists of strings. Other fields are optional. The new row gets the next
     ``revision_number`` for the item.
     """
-    titles = [str(t).strip() for t in (title_options or []) if str(t).strip()]
-    captions = [str(c) for c in (caption_options or []) if str(c).strip()]
+    titles = [_normalize_dashes(str(t).strip()) for t in (title_options or []) if str(t).strip()]
+    captions = [_normalize_dashes(str(c)) for c in (caption_options or []) if str(c).strip()]
     if not titles:
         raise DraftRevisionError("title_options must contain at least one non-empty title.")
     if not captions:

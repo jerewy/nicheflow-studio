@@ -62,6 +62,20 @@ def test_build_chat_prompt_guards_blind_chat_models() -> None:
     assert "never bold or markdown-formatted" in prompt
 
 
+def test_build_chat_prompt_bans_dashes_and_avoids_pipe_corruption() -> None:
+    # Dash ban: long dashes read as AI-generated copy. Handoff instruction:
+    # agents must save via --file, not the Get-Content pipe that corrupts
+    # em dashes/emoji before Python sees them.
+    item_id = _make_item()
+
+    prompt = draft_handoff.build_chat_prompt(item_id)
+
+    assert "Never write em dashes or double hyphens" in prompt
+    assert f"save --item-id {item_id} --file" in prompt
+    assert "Do NOT pipe the JSON through Get-Content" in prompt
+    assert "Get-Content <draft-json-file> |" not in prompt
+
+
 def test_build_chat_prompt_includes_stored_vision_payload() -> None:
     item_id = _make_item()
     with get_session() as session:

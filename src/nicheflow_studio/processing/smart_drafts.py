@@ -744,6 +744,9 @@ def _smart_draft_prompt(
                 if _is_meme_niche
                 else "- Emojis in captions. Write clean text only."
             ),
+            "- Em dashes ('—', '–') and double hyphens ('--') anywhere in titles or "
+            "captions. Use a comma, period, or colon instead; long dashes are a tell "
+            "of AI-generated copy.",
             "- Video-description phrases in captions: 'the clip shows', 'the video shows', "
             "'this video features', 'in this clip', 'the interview shows'. These read like "
             "YouTube descriptions, not Instagram captions.",

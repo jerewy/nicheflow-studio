@@ -299,3 +299,63 @@ def test_cli_save_invalid_json_returns_error(
 
     assert cli.main(["save", "--item-id", str(item_id), "--stdin"]) == 1
     assert "error:" in capsys.readouterr().err
+
+
+def test_cli_save_reads_utf8_file_without_pipe_corruption(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # --file must read the JSON directly as UTF-8, bypassing the PowerShell
+    # Get-Content pipe that corrupts em dashes and emoji. The em dash itself
+    # then gets normalized away by save_revision's dash rule.
+    cli = _load_cli()
+    item_id = _make_item()
+    payload = {
+        "title_options": ["Café title 🎬"],
+        "caption_options": ["A 1974–1980 era caption — still sharp."],
+    }
+    draft_file = tmp_path / "draft.json"
+    draft_file.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    assert cli.main(["save", "--item-id", str(item_id), "--file", str(draft_file)]) == 0
+    saved = json.loads(capsys.readouterr().out)
+    assert saved["title_options"] == ["Café title 🎬"]
+    assert saved["caption_options"] == ["A 1974-1980 era caption, still sharp."]
+
+
+def test_cli_save_missing_file_returns_error(capsys: pytest.CaptureFixture[str]) -> None:
+    cli = _load_cli()
+    item_id = _make_item()
+
+    assert cli.main(["save", "--item-id", str(item_id), "--file", "Z:/nope/missing.json"]) == 1
+    assert "error:" in capsys.readouterr().err
+
+
+def test_save_revision_normalizes_dashes_in_published_copy() -> None:
+    # Em/en dashes and '--' read as AI-generated copy; every intake path
+    # funnels through save_revision, so they must come out normalized.
+    item_id = _make_item()
+
+    saved = svc.save_revision(
+        item_id,
+        title_options=["Fosse danced -- then the world copied", "Plain title"],
+        caption_options=["He was precise — almost mechanical.\n\nThe 1974–1980 years proved it."],
+    )
+
+    assert saved.title_options[0] == "Fosse danced, then the world copied"
+    assert saved.title_options[1] == "Plain title"
+    assert saved.caption_options[0] == (
+        "He was precise, almost mechanical.\n\nThe 1974-1980 years proved it."
+    )
+
+
+def test_save_revision_keeps_hyphenated_words_intact() -> None:
+    item_id = _make_item()
+
+    saved = svc.save_revision(
+        item_id,
+        title_options=["A well-known never-before-told story"],
+        caption_options=["Self-taught, one-take performance."],
+    )
+
+    assert saved.title_options == ["A well-known never-before-told story"]
+    assert saved.caption_options == ["Self-taught, one-take performance."]
