@@ -18,6 +18,7 @@ from dataclasses import dataclass
 
 from sqlalchemy.orm import Session
 
+from nicheflow_studio.db.blocklist import is_blocked
 from nicheflow_studio.db.media_library import find_or_register_media_asset
 from nicheflow_studio.db.models import Account, PoolItem, ScrapeCandidate
 from nicheflow_studio.db.pools import (
@@ -53,6 +54,7 @@ class PoolIntakeResult:
     ``status`` is one of:
       * ``"added"``     — newly pooled.
       * ``"duplicate"`` — already in a pool (its ``niche`` is reported); skipped.
+      * ``"blocked"``   — footage on the global blocklist; skipped.
       * ``"no_account"`` — no account in the target niche to own the clip.
     """
 
@@ -70,6 +72,15 @@ def add_reel_to_pool(
     if value not in VALID_NICHES:
         raise ValueError(f"niche must be one of {sorted(VALID_NICHES)}, got {niche!r}.")
     niche = value
+
+    # Global blocklist: footage the user rejected must never re-pool.
+    if is_blocked(session, source_url=metadata.source_url, shortcode=metadata.shortcode):
+        return PoolIntakeResult(
+            status="blocked",
+            niche=niche,
+            shortcode=metadata.shortcode,
+            message="Globally rejected earlier — skipped.",
+        )
 
     # Stage 1 dedup: is this footage already pooled (any niche)?
     asset, _ = find_or_register_media_asset(
