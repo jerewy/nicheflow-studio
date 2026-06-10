@@ -38,8 +38,9 @@ def _iso(value: dt.datetime | None) -> str | None:
 def _parse_scheduled_at(value: str | None) -> dt.datetime | None:
     """Parse an ISO-8601 time to an aware UTC datetime.
 
-    A naive value (e.g. from an HTML datetime-local input) is interpreted in the
-    machine's local timezone then converted to UTC, matching the PyQt behavior.
+    The React UI now sends a UTC-offset string (e.g. ``"2026-06-09T05:05:00+00:00"``)
+    so timezone conversion is a no-op for normal callers.  A naive value (no offset)
+    is still accepted for backwards-compat and treated as the machine's local timezone.
     """
     if not value:
         return None
@@ -47,6 +48,7 @@ def _parse_scheduled_at(value: str | None) -> dt.datetime | None:
         parsed = dt.datetime.fromisoformat(value)
     except ValueError as exc:
         raise PublishError(f"Invalid scheduled time: {value!r}") from exc
+    # aware → convert to UTC; naive → assume local timezone (legacy path).
     return parsed.astimezone(dt.timezone.utc)
 
 

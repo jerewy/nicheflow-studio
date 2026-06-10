@@ -36,6 +36,7 @@ log = logging.getLogger(__name__)
 
 INSTAGRAM_URL = "https://www.instagram.com/"
 _IGNORED_CHROMIUM_DEFAULT_ARGS = ("--enable-automation",)
+_PUBLISH_CHROME_ARGS = ("--start-minimized",)
 
 # --- Selectors. Instagram relabels/restructures these periodically; keep each
 # step tolerant by listing several candidates. ----------------------------
@@ -383,17 +384,11 @@ async def _publish_reel_async(
             "headless": False,
             "viewport": {"width": 1280, "height": 900},
             # Stay non-headless (a real Chrome window is far less bot-like than
-            # headless) but: (1) start minimized so it doesn't steal focus, and
-            # (2) strip the obvious automation fingerprints Instagram can read —
-            # the "--enable-automation" switch (the "controlled by automated test
-            # software" banner) and the AutomationControlled blink flag that sets
-            # navigator.webdriver=true. NOTE: this only lowers the *technical*
-            # fingerprint; account safety still depends mostly on human-like
-            # pacing and not over-posting (handled by the publish scheduler/jitter).
-            "args": [
-                "--start-minimized",
-                "--disable-blink-features=AutomationControlled",
-            ],
+            # headless) and start minimized so it doesn't steal focus. We ignore
+            # Chrome's default "--enable-automation" switch below to avoid the
+            # automation banner, but do not add unsupported stealth flags because
+            # Chrome surfaces them as a security warning.
+            "args": list(_PUBLISH_CHROME_ARGS),
             # Playwright disables Chromium's sandbox by default. Explicitly keep
             # it enabled so headed publishing does not show Chrome's
             # unsupported --no-sandbox security warning.

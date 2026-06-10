@@ -3,6 +3,7 @@ from pathlib import Path
 
 from nicheflow_studio.publisher.instagram_publisher import (
     _IGNORED_CHROMIUM_DEFAULT_ARGS,
+    _PUBLISH_CHROME_ARGS,
     PublishResult,
     _capture_posted_url,
     publish_reel,
@@ -23,6 +24,11 @@ def test_publish_result_flags_checkpoint() -> None:
 
 def test_publish_browser_only_ignores_automation_default_arg() -> None:
     assert _IGNORED_CHROMIUM_DEFAULT_ARGS == ("--enable-automation",)
+
+
+def test_publish_browser_args_do_not_include_unsupported_stealth_flags() -> None:
+    assert _PUBLISH_CHROME_ARGS == ("--start-minimized",)
+    assert "--disable-blink-features=AutomationControlled" not in _PUBLISH_CHROME_ARGS
 
 
 def test_publish_reel_fails_fast_when_video_missing(tmp_path: Path) -> None:
