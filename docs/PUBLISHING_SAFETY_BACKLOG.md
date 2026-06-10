@@ -3,6 +3,24 @@
 Findings from the 2026-06-10 publishing-safety review (multi-account scale-up).
 Planned, not yet executed. Ordered by priority.
 
+## Remote-posting decision (2026-06-10)
+
+- **Interim (active now):** Instagram native scheduler, manual weekly batch via
+  web composer / Business Suite Planner. Meta's servers post; laptop can be off.
+  Works at current scale (~30-40 min/week for one account); does not scale to
+  10 accounts (~5-7 h/week of clicking).
+- **Destination (decided):** **Instagram Graph API publisher** — sanctioned,
+  no browser, no selector maintenance, fully automated and laptop-independent.
+  Requires Meta developer app + accounts linked to FB Pages + app review for
+  the Content Publishing permission. Build after the MVP branch lands and P0/P1
+  items below are done.
+- **Rejected:** Playwright driving Meta Business Suite ("poor man's Graph
+  API") — same account-correlation cost as the API, but unsanctioned and
+  selector-fragile; would be throwaway work.
+- **Open question to settle before the Graph API build:** account-correlation
+  tolerance — linking all network accounts into one Meta Business portfolio
+  tells Meta they are related. Decide grouping (one portfolio vs several) first.
+
 ## P0 — fix before scaling to 10 accounts
 
 1. **Failed jobs retry forever (retry hammer).**
