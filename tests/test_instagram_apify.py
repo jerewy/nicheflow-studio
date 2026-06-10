@@ -100,6 +100,13 @@ def test_scrape_instagram_urls_apify_reads_actor_dataset(monkeypatch) -> None:
 def test_scrape_instagram_source_apify_uses_since_and_rewrites_source_url(monkeypatch) -> None:
     captured_input: dict | None = None
 
+    # Timestamps must stay relative to now: max_age_days filters against the
+    # wall clock, so hardcoded dates silently age out of the window.
+    now = dt.datetime.now(dt.timezone.utc)
+    recent_ts = (now - dt.timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    old_ts = (now - dt.timedelta(days=40)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    since = now - dt.timedelta(days=3)
+
     class FakeActor:
         def call(self, *, run_input, timeout_secs):  # noqa: ANN001
             nonlocal captured_input
@@ -116,7 +123,7 @@ def test_scrape_instagram_source_apify_uses_since_and_rewrites_source_url(monkey
                         "url": "https://www.instagram.com/reel/SOURCE1/",
                         "caption": "Source candidate",
                         "ownerUsername": "source",
-                        "timestamp": "2026-05-25T00:00:00Z",
+                        "timestamp": recent_ts,
                         "videoViewCount": 1000,
                         "likesCount": 120,
                         "commentsCount": 12,
@@ -127,7 +134,7 @@ def test_scrape_instagram_source_apify_uses_since_and_rewrites_source_url(monkey
                         "url": "https://www.instagram.com/reel/OLD1/",
                         "caption": "Old candidate",
                         "ownerUsername": "source",
-                        "timestamp": "2026-04-01T00:00:00Z",
+                        "timestamp": old_ts,
                         "videoViewCount": 1000,
                         "likesCount": 120,
                         "commentsCount": 12,
@@ -152,7 +159,7 @@ def test_scrape_instagram_source_apify_uses_since_and_rewrites_source_url(monkey
         source_url=source_url,
         max_items=10,
         max_age_days=14,
-        since=dt.datetime(2026, 5, 24, 9, 30, tzinfo=dt.timezone.utc),
+        since=since,
     )
 
     assert captured_input == {
@@ -160,7 +167,7 @@ def test_scrape_instagram_source_apify_uses_since_and_rewrites_source_url(monkey
         "resultsType": "posts",
         "resultsLimit": 10,
         "addParentData": False,
-        "onlyPostsNewerThan": "2026-05-24",
+        "onlyPostsNewerThan": since.strftime("%Y-%m-%d"),
     }
     assert len(candidates) == 1
     assert candidates[0].scrape_source_url == source_url
