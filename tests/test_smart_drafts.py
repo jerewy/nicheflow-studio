@@ -1127,6 +1127,22 @@ def test_history_lost_archive_title_rules_are_not_meme_framing() -> None:
     assert "me when" in joined.lower()
 
 
+def test_history_lost_archive_title_rules_include_twist_and_comment_hooks() -> None:
+    rules = smart_drafts._caption_style_title_rules("history_lost_archive")
+    joined = "\n".join(rules)
+
+    # Two-beat twist shape: setup sentence + short punch ("He said no.").
+    assert "TWIST BEAT" in joined
+    assert "He said no." in joined
+    # Comment-bait question/observation shape requires a NAMED subject, so it
+    # cannot collide with the subject-hiding bans below it.
+    assert "COMMENT HOOK" in joined
+    assert "NAMES the subject" in joined
+    # The engagement goal is explicit: titles should provoke comments/shares.
+    assert "COMMENT TEST" in joined
+    assert "intrigue without controversy" in joined
+
+
 def test_history_lost_archive_title_rules_mandate_concrete_subject() -> None:
     rules = smart_drafts._caption_style_title_rules("history_lost_archive")
     joined = "\n".join(rules)

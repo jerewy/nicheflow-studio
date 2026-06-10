@@ -36,6 +36,45 @@ def test_build_chat_prompt_contains_selected_item_context() -> None:
     assert "Cinema Bold Keywords" in prompt
 
 
+def test_build_chat_prompt_carries_title_rules_and_hook_framing() -> None:
+    # The chat path must share the live prompt's title rules (history account
+    # with no explicit style auto-routes to the history hook rules) and the
+    # green/yellow/red hook framing, so chat models write to the same contract.
+    item_id = _make_item()
+
+    prompt = draft_handoff.build_chat_prompt(item_id)
+
+    assert "On-screen title rules" in prompt
+    assert "NAMES the concrete visible subject" in prompt
+    assert "COMMENT TEST" in prompt
+    assert "GREEN" in prompt and "YELLOW" in prompt and "RED" in prompt
+
+
+def test_build_chat_prompt_guards_blind_chat_models() -> None:
+    # A chat model without file access must be told to use only the provided
+    # signals and to ask the user rather than guess at an unidentified subject.
+    item_id = _make_item()
+
+    prompt = draft_handoff.build_chat_prompt(item_id)
+
+    assert "CANNOT open the local video" in prompt
+    assert "ask the user for a one-line description" in prompt
+    assert "never bold or markdown-formatted" in prompt
+
+
+def test_build_chat_prompt_includes_stored_vision_payload() -> None:
+    item_id = _make_item()
+    with get_session() as session:
+        item = session.get(DownloadItem, item_id)
+        item.smart_vision_payload = '{"on_screen_hook": "man rides scooter with tent"}'
+        session.commit()
+
+    prompt = draft_handoff.build_chat_prompt(item_id)
+
+    assert "man rides scooter with tent" in prompt
+    assert "Visual evidence JSON" in prompt
+
+
 def test_parse_pasted_draft_preserves_plain_title_and_recommendation() -> None:
     parsed = draft_handoff.parse_pasted_draft(
         """Title Option 1:

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from nicheflow_studio.db.models import Account, DownloadItem
 from nicheflow_studio.db.session import get_session
+from nicheflow_studio.processing import smart_drafts
 from nicheflow_studio.services import draft_revisions
 from nicheflow_studio.services.draft_revisions import DraftRevisionDTO, DraftRevisionError
 
@@ -131,9 +132,10 @@ def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
             raise DraftRevisionError(f"No download item with id {item_id}.")
         account = session.get(Account, item.account_id) if item.account_id else None
         path = Path(item.file_path or "").expanduser().resolve()
+        niche_label = account.niche_label if account and account.niche_label else None
         fields = [
             f"Account: {account.name if account else '(none)'}",
-            f"Niche: {account.niche_label if account and account.niche_label else '(none)'}",
+            f"Niche: {niche_label or '(none)'}",
             f"Tone: {account.writing_tone if account and account.writing_tone else '(none)'}",
             f"Target audience: {account.target_audience if account and account.target_audience else '(none)'}",
             f"Hook style: {account.hook_style if account and account.hook_style else '(none)'}",
@@ -145,6 +147,13 @@ def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
             f"Source description: {item.source_description or '(none)'}",
         ]
         transcript = (item.transcript_text or "").strip() or "(none; inspect the local video)"
+        vision_text = (item.smart_vision_payload or "").strip() or "(none)"
+    caption_style = settings.get("caption_style") or None
+    title_style = settings.get("title_style") or None
+    # Same rule source as the live Groq prompt (see effective_title_rules
+    # docstring) so the chat path and the API path never drift apart.
+    title_rules = smart_drafts.effective_title_rules(title_style, caption_style, niche_label)
+    hook_rules = smart_drafts._hook_drama_and_fact_safety_rules()
     return "\n".join(
         [
             "Please inspect this local NicheFlow video and generate Instagram-ready drafts.",
@@ -159,8 +168,26 @@ def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
             f"Title style: {settings.get('title_style') or 'Auto (match caption style)'}",
             f"Processing template: {settings.get('template') or '(none)'}",
             "",
+            "Visual evidence JSON (from an earlier vision pass; empty means no pass ran):",
+            vision_text[:4000],
+            "",
             "Existing transcript/context:",
             transcript[:6000],
+            "",
+            "If you can open local files (Codex, Claude Code): inspect the actual video "
+            "frames before writing anything.",
+            "If you CANNOT open the local video (chat assistants like ChatGPT or Claude "
+            "web): work ONLY from the signals above — source title, source description, "
+            "visual evidence JSON, and transcript. If those signals do not clearly "
+            "identify the subject of the clip, STOP and ask the user for a one-line "
+            "description of what is on screen instead of generating guesses. Never "
+            "invent names, dates, places, records, or events the signals do not state.",
+            "",
+            "On-screen title rules (follow these exactly):",
+            *title_rules,
+            "",
+            "Hook framing (drama is allowed, overclaiming is not):",
+            *hook_rules,
             "",
             "Generate 3 meaningfully different on-screen title options and 3 caption options.",
             "Keep display titles plain text. Only use internal **keyword** emphasis when the Cinema Bold Keywords style requires it.",
@@ -174,7 +201,8 @@ def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
             "- Recommended indexes are 1-based. Set provider_label/source to Codex or Claude Code.",
             "- The running Processing screen automatically detects the saved revision. Do not ask the user to paste it manually.",
             "",
-            "Return format:",
+            "Return format (write every section header exactly as shown, plain text — "
+            "never bold or markdown-formatted; '**Title Option 1:**' breaks the importer):",
             "Title Option 1:",
             "Caption Option 1:",
             "Title Option 2:",

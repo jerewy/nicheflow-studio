@@ -1377,13 +1377,34 @@ def _caption_style_title_rules(caption_style: str | None) -> list[str]:
             "[specific situation]', or 'The [ordinary moment] that became [specific "
             "legacy]'. Keep the emotional or situational context when it is the "
             "reason the moment matters.",
+            "- COMMENT TEST: a strong title makes the viewer want to reply, share "
+            "their take, or tag a friend — intrigue without controversy. Before "
+            "returning each title ask: 'would someone stop scrolling and comment "
+            "on this?' If it only informs, sharpen the surprise, contrast, or "
+            "withheld outcome until it provokes a reaction.",
+            "- TWIST BEAT shape (use for at most one option, only when the moment "
+            "has a genuine turn): a setup sentence with the concrete subject and "
+            "stakes, then a SHORT punch sentence of 2-6 words that lands the "
+            "twist. Example: 'After solving a math problem unsolved for 100 "
+            "years, Grigori Perelman was offered $1,000,000. He said no.' This "
+            "shape may run up to 20 words because the final beat is short. The "
+            "punch must state what actually happened — never a teaser like "
+            "'what happened next is shocking'.",
+            "- COMMENT HOOK shape (use for at most one option): a collective "
+            "observation or direct question that NAMES the subject and invites "
+            "the viewer to weigh in. Examples: 'Why is nobody talking about how "
+            "[named person] [specific action]?', 'Nobody expected [named "
+            "person/place] to [specific surprising action]'. These are allowed "
+            "ONLY with the concrete subject in the line — the subject-hiding "
+            "versions in the BANNED list below stay banned.",
             "- Rotate these shapes across the three options: "
             "'This [subject] [surprising action] in [era]', "
             "'People actually [did/used/built] [surprising detail] in [era]', "
             "'How people [ordinary activity] before [modern change]', "
             "'What [familiar subject] looked like in [era]', "
             "'When [ordinary thing] [unexpected condition]', "
-            "'The [place/event] where [person] [specific emotional action]'.",
+            "'The [place/event] where [person] [specific emotional action]', "
+            "the TWIST BEAT shape, the COMMENT HOOK shape.",
             "- Good: 'The ski lift ride where John Denver wrote Annie's Song for "
             "his wife'; 'People actually attached camping tents to scooters in the "
             "1950s'. Too flat: 'John Denver wrote Annie's Song on a ski lift'. "
