@@ -3,9 +3,12 @@ from pathlib import Path
 
 from nicheflow_studio.publisher.instagram_publisher import (
     _IGNORED_CHROMIUM_DEFAULT_ARGS,
+    _POST_MENU_SELECTORS,
     _PUBLISH_CHROME_ARGS,
+    _SELECT_FROM_COMPUTER_SELECTORS,
     PublishResult,
     _capture_posted_url,
+    _format_control_dump,
     publish_reel,
 )
 
@@ -103,6 +106,32 @@ class _FakePage:
         if selector == '[role="dialog"]':
             return _FakeDialogMatches(self._dialog_href, self._dialog_count)
         return _FakeLinkLocator("https://www.instagram.com/reel/stale/")
+
+
+def test_format_control_dump_dedupes_and_trims() -> None:
+    labels = [
+        "  Select   from computer ",  # whitespace collapses
+        "Post",
+        "Post",  # duplicate dropped
+        "",  # empty dropped
+        "x" * 70,  # over-long dropped
+        "Next",
+    ]
+
+    dump = _format_control_dump(labels)
+
+    assert dump == "Select from computer | Post | Next"
+
+
+def test_format_control_dump_empty_is_marked() -> None:
+    assert _format_control_dump([]) == "(none)"
+
+
+def test_post_menu_prefers_exact_post_over_substring() -> None:
+    # Exact-text match must come first so the Create dropdown's "Post" is picked
+    # and never "Reel"/"Story"; substring fallbacks come after.
+    assert _POST_MENU_SELECTORS[0] == '[role="menuitem"]:text-is("Post")'
+    assert any("Select from computer" in sel for sel in _SELECT_FROM_COMPUTER_SELECTORS)
 
 
 def test_capture_posted_url_ignores_page_wide_stale_links() -> None:

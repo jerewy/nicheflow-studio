@@ -17,6 +17,7 @@ Design notes:
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import logging
 import random
 import time
@@ -31,6 +32,7 @@ from nicheflow_studio.core.instagram_session import (
     DEFAULT_PROFILE_NAME,
     profile_dir as session_profile_dir,
 )
+from nicheflow_studio.core.paths import logs_dir
 
 log = logging.getLogger(__name__)
 
@@ -46,13 +48,23 @@ _NEW_POST_SELECTORS = (
     '[role="button"]:has-text("Create")',
     'a:has-text("Create")',
 )
+# The "+" Create button opens a dropdown (Post / Reel / Story / Live) on the
+# current web UI before the file-drop dialog; older layouts skip straight to it.
+# We must pick "Post" specifically and never "Reel"/"Story", so prefer exact-text
+# matches first. ``text-is`` is exact (avoids matching "Posts" etc.).
 _POST_MENU_SELECTORS = (
+    '[role="menuitem"]:text-is("Post")',
+    'svg[aria-label="Post"]',
     '[role="menuitem"]:has-text("Post")',
-    'span:has-text("Post")',
+    'div[role="button"]:text-is("Post")',
+    'a[role="link"]:has-text("Post")',
+    'span:text-is("Post")',
 )
 _SELECT_FROM_COMPUTER_SELECTORS = (
     'button:has-text("Select from computer")',
     '[role="button"]:has-text("Select from computer")',
+    'button:has-text("Select From Computer")',
+    'div[role="button"]:has-text("Select from computer")',
 )
 _NEXT_SELECTORS = (
     'div[role="button"]:has-text("Next")',
@@ -192,6 +204,86 @@ async def _click_first(page: Page, selectors: tuple[str, ...], *, timeout: float
     return False
 
 
+async def _any_visible(page: Page, selectors: tuple[str, ...]) -> bool:
+    """True if any selector has at least one visible match (no click)."""
+    for selector in selectors:
+        locator = page.locator(selector)
+        try:
+            count = await locator.count()
+        except PlaywrightError:
+            continue
+        for index in range(count):
+            try:
+                if await locator.nth(index).is_visible():
+                    return True
+            except PlaywrightError:
+                continue
+    return False
+
+
+def _format_control_dump(labels: list[str]) -> str:
+    """Compact, de-duplicated one-line summary of visible control labels.
+
+    Pure so it is unit-testable; the async dumper feeds it the page's visible
+    button/menuitem text when a composer step can't find its target.
+    """
+    seen: list[str] = []
+    for raw in labels:
+        text = " ".join(str(raw).split())
+        if not text or len(text) > 60:
+            continue
+        if text not in seen:
+            seen.append(text)
+    return " | ".join(seen[:40]) or "(none)"
+
+
+async def _dump_composer_state(page: Page, reason: str) -> None:
+    """Save a screenshot + visible control labels when a composer step fails.
+
+    This is the evidence trail for layout drift (e.g. the Create dropdown
+    changing): a failed run leaves a PNG in data/logs and logs what Instagram
+    actually rendered, so the exact selector fix can be made from ground truth.
+    Never fatal.
+    """
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    try:
+        out_dir = logs_dir()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        shot = out_dir / f"publish-{reason}-{stamp}.png"
+        await page.screenshot(path=str(shot))
+        log.warning("composer diagnostic screenshot saved: %s", shot)
+    except Exception:  # noqa: BLE001 - diagnostics must never break publishing
+        log.debug("could not capture composer screenshot", exc_info=True)
+    try:
+        labels = await page.eval_on_selector_all(
+            'button, [role="button"], [role="menuitem"], a[role="link"]',
+            "els => els.filter(e => e.offsetParent !== null)"
+            ".map(e => (e.innerText || e.getAttribute('aria-label') || '').trim())"
+            ".filter(Boolean)",
+        )
+        log.warning("composer visible controls (%s): %s", reason, _format_control_dump(labels))
+    except Exception:  # noqa: BLE001
+        log.debug("could not enumerate composer controls", exc_info=True)
+
+
+async def _ensure_file_drop_screen(page: Page) -> bool:
+    """Make the 'Select from computer' button reachable.
+
+    Handles both web layouts without branching on account type: if the upload
+    button isn't visible yet, the Create dropdown (Post / Reel / Story / Live)
+    is probably open, so click the 'Post' option and look again. Returns True
+    once the upload button is visible.
+    """
+    for _ in range(3):
+        if await _any_visible(page, _SELECT_FROM_COMPUTER_SELECTORS):
+            return True
+        # Pick "Post" from the Create dropdown (never Reel/Story). No-op if the
+        # dropdown isn't there — then the next loop re-checks the upload button.
+        await _click_first(page, _POST_MENU_SELECTORS, timeout=2500)
+        await _human_pause(0.4, 0.9)
+    return await _any_visible(page, _SELECT_FROM_COMPUTER_SELECTORS)
+
+
 async def _dismiss_interstitials(page: Page) -> None:
     """Best-effort close of cookie banners / 'not now' prompts; never fatal."""
     for selector in _DISMISS_SELECTORS:
@@ -216,19 +308,27 @@ async def _detect_checkpoint(page: Page) -> str | None:
 
 
 async def _open_composer_and_attach(page: Page, video: Path) -> None:
-    """Open the Create dialog and hand the video to the file chooser."""
+    """Open the Create dialog and hand the video to the file chooser.
+
+    Works for both personal and professional accounts: the difference between
+    layouts is whether a Create dropdown sits in front of the file-drop screen,
+    which :func:`_ensure_file_drop_screen` resolves. On failure we capture a
+    diagnostic screenshot so the cause is visible rather than guessed.
+    """
     if not await _click_first(page, _NEW_POST_SELECTORS):
+        await _dump_composer_state(page, "new-post-button-missing")
         raise RuntimeError("could not find the 'New post' / Create button")
     await _human_pause(0.3, 0.8)
-    # The Post/Reel submenu only appears on some IG layouts; modern "Create new
-    # post" goes straight to the file-drop screen. When it's absent this probe
-    # would otherwise burn its whole timeout doing nothing — keep it short so we
-    # don't sit on the composer for seconds. When present, it shows in <1s.
-    await _click_first(page, _POST_MENU_SELECTORS, timeout=1000)
-    await _human_pause(0.3, 0.8)
+    if not await _ensure_file_drop_screen(page):
+        await _dump_composer_state(page, "select-from-computer-missing")
+        raise RuntimeError(
+            "could not find 'Select from computer' (saved a diagnostic screenshot "
+            "in data/logs); the composer layout may have changed"
+        )
     async with page.expect_file_chooser() as fc_info:
         if not await _click_first(page, _SELECT_FROM_COMPUTER_SELECTORS):
-            raise RuntimeError("could not find 'Select from computer'")
+            await _dump_composer_state(page, "select-from-computer-click-failed")
+            raise RuntimeError("could not click 'Select from computer'")
     chooser = await fc_info.value
     await chooser.set_files(str(video))
     await _human_pause(0.5, 1.0)
