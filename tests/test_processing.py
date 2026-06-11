@@ -759,6 +759,75 @@ def test_detect_content_rectangle_finds_moving_footage(monkeypatch, tmp_path: Pa
     assert abs(rect.right - 40) <= 30
 
 
+@pytest.mark.parametrize(
+    ("canvas_color", "label"),
+    [
+        ("black", "black"),
+        ("white", "white"),
+        ("0xF5F5F5", "off-white"),
+    ],
+)
+def test_detect_content_rectangle_finds_crf28_footage_on_any_canvas(
+    tmp_path: Path, canvas_color: str, label: str
+) -> None:
+    ffmpeg = video.ffmpeg_binary()
+    if ffmpeg is None:
+        pytest.skip("ffmpeg is required for the content-rectangle fixture")
+
+    frame_width = 360
+    frame_height = 640
+    footage_left = 60
+    footage_top = 180
+    footage_width = 240
+    footage_height = 280
+    expected = CropSettings(
+        left=footage_left,
+        top=footage_top,
+        right=frame_width - footage_left - footage_width,
+        bottom=frame_height - footage_top - footage_height,
+    )
+    fixture = tmp_path / f"{label}.mp4"
+    canvas_filter = (
+        "[0:v]noise=alls=10:allf=u[canvas];[canvas][1:v]"
+        if canvas_color != "black"
+        else "[0:v][1:v]"
+    )
+    subprocess.run(
+        [
+            str(ffmpeg),
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c={canvas_color}:s={frame_width}x{frame_height}:r=24:d=4",
+            "-f",
+            "lavfi",
+            "-i",
+            f"testsrc2=s={footage_width}x{footage_height}:r=24:d=4",
+            "-filter_complex",
+            f"{canvas_filter}overlay={footage_left}:{footage_top}:shortest=1",
+            "-c:v",
+            "libx264",
+            "-crf",
+            "28",
+            "-pix_fmt",
+            "yuv420p",
+            str(fixture),
+        ],
+        check=True,
+        capture_output=True,
+        **video.subprocess_run_kwargs(),
+    )
+
+    rect = video.detect_content_rectangle(fixture, video.probe_video(fixture))
+
+    assert rect is not None
+    assert abs(rect.left - expected.left) <= frame_width * 0.02
+    assert abs(rect.right - expected.right) <= frame_width * 0.02
+    assert abs(rect.top - expected.top) <= frame_height * 0.02
+    assert abs(rect.bottom - expected.bottom) <= frame_height * 0.02
+
+
 def test_detect_content_rectangle_keeps_bottom_descender_padding(
     monkeypatch, tmp_path: Path
 ) -> None:

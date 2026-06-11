@@ -368,6 +368,9 @@ def _visual_content_top_margin(frame) -> int | None:  # noqa: ANN001
 # static title/caption text do not. Temporal variance separates the two.
 CONTENT_RECT_ACTIVITY_THRESHOLD = 7.0  # per-pixel std across sampled frames (0-255 luma)
 CONTENT_RECT_BRIGHTNESS_THRESHOLD = 46.0  # mean luma above which a pixel is non-canvas
+CONTENT_RECT_CANVAS_BORDER_RATIO = 0.02  # outer-frame sample used to estimate canvas luma
+CONTENT_RECT_CANVAS_LUMA_TOLERANCE = 12.0  # light-canvas pixels within this range are canvas
+CONTENT_RECT_LIGHT_CANVAS_MIN = 128.0  # preserve the tuned dark-canvas path byte-for-byte
 CONTENT_RECT_COVERAGE_THRESHOLD = 0.18  # fraction of a row/column that must be "footage"
 CONTENT_RECT_MIN_BAND_RATIO = 0.12  # shortest acceptable footage band per axis
 CONTENT_RECT_MIN_REMAINING_RATIO = 0.08  # reject crops that leave < 8% of a dimension
@@ -510,6 +513,20 @@ def detect_content_rectangle(input_path: Path, probe: VideoProbe) -> CropSetting
 
     temporal = grays.std(axis=0)  # motion map
     brightness = grays.mean(axis=0)  # average luma
+    border_size = max(1, int(min(min_h, min_w) * CONTENT_RECT_CANVAS_BORDER_RATIO))
+    border_pixels = np.concatenate(
+        [
+            grays[:, :border_size, :].reshape(-1),
+            grays[:, -border_size:, :].reshape(-1),
+            grays[:, border_size:-border_size, :border_size].reshape(-1),
+            grays[:, border_size:-border_size, -border_size:].reshape(-1),
+        ]
+    )
+    canvas_luma = float(np.median(border_pixels))
+    is_light_canvas = canvas_luma >= CONTENT_RECT_LIGHT_CANVAS_MIN
+    canvas_mask = (np.abs(brightness - canvas_luma) <= CONTENT_RECT_CANVAS_LUMA_TOLERANCE) & (
+        temporal < CONTENT_RECT_ACTIVITY_THRESHOLD
+    )
     # Active = MOVES (primary signal). Static graphics (title bars at top,
     # info captions at bottom) have zero motion and should NOT be treated
     # as footage to keep — they're overlays we want to crop away.
@@ -524,6 +541,8 @@ def detect_content_rectangle(input_path: Path, probe: VideoProbe) -> CropSetting
     has_any_motion = float(temporal.mean()) > 0.5
     if has_any_motion:
         active = temporal > CONTENT_RECT_ACTIVITY_THRESHOLD
+    elif is_light_canvas:
+        active = np.abs(brightness - canvas_luma) > CONTENT_RECT_CANVAS_LUMA_TOLERANCE
     else:
         active = brightness > CONTENT_RECT_BRIGHTNESS_THRESHOLD
     row_coverage = active.mean(axis=1)
@@ -541,6 +560,8 @@ def detect_content_rectangle(input_path: Path, probe: VideoProbe) -> CropSetting
         - brightness[1:-1, 2:]
     )
     sharp_pixel = np.abs(lap) > CONTENT_RECT_SHARP_PIXEL_THRESHOLD
+    if is_light_canvas:
+        sharp_pixel &= ~canvas_mask
     row_sharp_cov = sharp_pixel.mean(axis=1)
     col_sharp_cov = sharp_pixel.mean(axis=0)
     # A row is "blurred-background" if it moves heavily yet is almost flat
