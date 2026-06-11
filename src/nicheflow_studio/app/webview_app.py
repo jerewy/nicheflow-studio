@@ -30,6 +30,7 @@ from nicheflow_studio.core.env import load_dotenv
 from nicheflow_studio.core.logging import configure_logging
 from nicheflow_studio.core.paths import ensure_data_dirs
 from nicheflow_studio.db.session import init_db
+from nicheflow_studio.services.auto_publish_loop import AutoPublishLoop
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +76,16 @@ def run_webview() -> None:
     ensure_data_dirs()
     configure_logging()
     init_db()
+    auto_publish_loop = AutoPublishLoop()
+    auto_publish_loop.start()
 
+    try:
+        _run_started_webview()
+    finally:
+        auto_publish_loop.stop()
+
+
+def _run_started_webview() -> None:
     import webview  # lazy: keep GUI runtime out of plain imports/tests
 
     entry = resolve_entry()

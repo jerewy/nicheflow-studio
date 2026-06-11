@@ -11,7 +11,10 @@ from __future__ import annotations
 import random as _random
 from datetime import datetime, timedelta
 
-DEFAULT_JITTER_MINUTES = 7
+# Posts land 0..jitter after the round slot moment. Wide enough that a daily
+# slot doesn't produce a recognizable "always 09:0x" pattern, narrow enough
+# that multi-hour slot spacing never collides (collision guard = jitter + 5).
+DEFAULT_JITTER_MINUTES = 15
 
 
 def parse_slots(slots: str | None) -> list[tuple[int, int]]:

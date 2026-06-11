@@ -20,8 +20,6 @@ const JOB_POLL_INTERVAL_MS = 1000;
 const JOB_TIMEOUT_MS = 180000;
 // Publishing drives a real browser and can take several minutes.
 const PUBLISH_TIMEOUT_MS = 480000;
-// How often the opt-in auto-publish loop checks for due scheduled reels.
-const AUTO_PUBLISH_INTERVAL_MS = 60000;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -305,11 +303,6 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
 
   // --- Live publishing (Publish Now + opt-in auto-publish-due) --- //
 
-  const publishingRef = useRef(false);
-  useEffect(() => {
-    publishingRef.current = publishingNow;
-  }, [publishingNow]);
-
   const refreshDueCount = useCallback(async () => {
     try {
       setDueCount((await bridge.publishDueCount()).due);
@@ -356,18 +349,12 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
     }
   };
 
-  const publishDueNow = async (silent = false) => {
-    if (publishingRef.current) return;
-    if (
-      !silent &&
-      !window.confirm(`Post ${dueCount} due scheduled reel(s) to Instagram now? This publishes live.`)
-    )
+  const publishDueNow = async () => {
+    if (!window.confirm(`Post ${dueCount} due scheduled reel(s) to Instagram now? This publishes live.`))
       return;
     setPublishingNow(true);
-    if (!silent) {
-      setActionError(null);
-      setPublishMessage(null);
-    }
+    setActionError(null);
+    setPublishMessage(null);
     try {
       const { job_id } = await bridge.startPublishDue();
       const result = (await waitForJob(job_id, undefined, PUBLISH_TIMEOUT_MS)) as {
@@ -384,24 +371,17 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
       if (itemId !== null) refreshPublishJobs(itemId);
       bridge.listLibraryItems(activeAccountId).then(setItems).catch(() => undefined);
     } catch (err: unknown) {
-      if (!silent) setActionError(err instanceof Error ? err.message : String(err));
+      setActionError(err instanceof Error ? err.message : String(err));
     } finally {
       setPublishingNow(false);
     }
   };
 
-  // Let the auto-publish interval call the latest publishDueNow without
-  // resubscribing the timer on every render.
-  const publishDueNowRef = useRef(publishDueNow);
-  useEffect(() => {
-    publishDueNowRef.current = publishDueNow;
-  });
-
   const toggleAutoPublish = async (next: boolean) => {
     if (
       next &&
       !window.confirm(
-        "Turn on auto-publish? While this window is open, scheduled reels will post to Instagram automatically once their time passes.",
+        "Turn on auto-publish? While NicheFlow Studio is open, scheduled reels will post to Instagram automatically once their time passes. You can use any screen.",
       )
     )
       return;
@@ -424,16 +404,6 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
     }, 0);
     return () => window.clearTimeout(timer);
   }, [refreshDueCount]);
-
-  // Opt-in auto-publish loop: while on, post any due scheduled reels each minute.
-  useEffect(() => {
-    if (!autoPublish) return;
-    const timer = window.setInterval(() => {
-      if (publishingRef.current) return;
-      void publishDueNowRef.current(true);
-    }, AUTO_PUBLISH_INTERVAL_MS);
-    return () => window.clearInterval(timer);
-  }, [autoPublish]);
 
   // Poll for newer revisions (Codex writes, or another window's edits).
   useEffect(() => {
@@ -1408,7 +1378,7 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
               size="sm"
               variant="outline"
               disabled={publishingNow || dueCount === 0}
-              onClick={() => publishDueNow(false)}
+              onClick={() => publishDueNow()}
             >
               {publishingNow ? "Publishing…" : `Publish due now${dueCount > 0 ? ` (${dueCount})` : ""}`}
             </Button>

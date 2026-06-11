@@ -19,7 +19,9 @@ not require Playwright at import time, and tests can patch it cheaply.
 from __future__ import annotations
 
 import datetime as dt
+import random as _random
 import threading
+import time
 from typing import Callable
 
 from sqlalchemy import select
@@ -34,6 +36,19 @@ _PUBLISH_LOCK = threading.Lock()
 # Cap how many due reels one auto-publish pass posts, so an unattended loop can
 # never fire the whole backlog at once.
 _DUE_BATCH_LIMIT = 3
+# A transient failure gets exactly one delayed retry before the job is marked
+# failed — never an endless re-attempt loop on every auto-publish pass, which
+# escalates platform flags (especially after a checkpoint).
+_RETRY_DELAY_MINUTES = (10, 20)
+# Different accounts posting from the same IP within minutes of each other is a
+# correlation tell; keep a randomized human-ish gap between batch posts.
+_INTER_POST_GAP_SECONDS = (120, 360)
+# After Instagram shows a checkpoint, stop posting on that account entirely
+# until the cooldown passes (the user should re-login / check the account).
+_CHECKPOINT_COOLDOWN = dt.timedelta(hours=3)
+_account_cooldowns: dict[int, dt.datetime] = {}
+# Seam for tests: patch to avoid real sleeping in the batch loop.
+_sleep = time.sleep
 
 
 class PublishNowError(ServiceError):
@@ -42,6 +57,21 @@ class PublishNowError(ServiceError):
 
 def _iso(value: dt.datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
+
+
+def _account_on_cooldown(account_id: int, *, now: dt.datetime | None = None) -> bool:
+    until = _account_cooldowns.get(account_id)
+    if until is None:
+        return False
+    now = now or dt.datetime.now(dt.timezone.utc)
+    if now >= until:
+        _account_cooldowns.pop(account_id, None)
+        return False
+    return True
+
+
+def _start_account_cooldown(account_id: int) -> None:
+    _account_cooldowns[account_id] = dt.datetime.now(dt.timezone.utc) + _CHECKPOINT_COOLDOWN
 
 
 def _aware(value: dt.datetime) -> dt.datetime:
@@ -100,8 +130,23 @@ def _post_and_record(job_id: int) -> dict:
             if result.posted_url:
                 job.posted_url = result.posted_url
             job.error_message = None
+        elif result.status == "checkpoint":
+            # Instagram flagged the account — retrying makes it worse. Fail the
+            # job and pause the whole account until the cooldown passes.
+            job.status = "failed"
+            job.error_message = result.error_message or "checkpoint detected"
+            _start_account_cooldown(job.account_id)
         else:
+            # A scheduled job that already carries an error message has used its
+            # one retry; anything else gets a single delayed re-attempt so a
+            # transient hiccup recovers without hammering every loop pass.
+            already_retried = bool(job.error_message)
             job.error_message = result.error_message or result.status
+            if job.status == "scheduled" and not already_retried:
+                delay = _random.randint(*_RETRY_DELAY_MINUTES)
+                job.scheduled_at = dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=delay)
+            else:
+                job.status = "failed"
         session.commit()
     return {
         "status": result.status,
@@ -138,7 +183,11 @@ def publish_item_now(item_id: int) -> dict:
 
 
 def list_due_jobs() -> list[dict]:
-    """Scheduled jobs whose time has passed (status ``scheduled``, time <= now)."""
+    """Scheduled jobs whose time has passed (status ``scheduled``, time <= now).
+
+    Jobs on an account in checkpoint cooldown are excluded — nothing should
+    post on a flagged account until the cooldown expires.
+    """
     now = dt.datetime.now(dt.timezone.utc)
     with get_session() as session:
         rows = session.scalars(
@@ -149,9 +198,16 @@ def list_due_jobs() -> list[dict]:
             .order_by(UploadJob.scheduled_at.asc())
         ).all()
         return [
-            {"job_id": row.id, "title": row.title, "scheduled_at": _iso(_aware(row.scheduled_at))}
+            {
+                "job_id": row.id,
+                "account_id": row.account_id,
+                "title": row.title,
+                "scheduled_at": _iso(_aware(row.scheduled_at)),
+            }
             for row in rows
-            if row.scheduled_at is not None and _aware(row.scheduled_at) <= now
+            if row.scheduled_at is not None
+            and _aware(row.scheduled_at) <= now
+            and not _account_on_cooldown(row.account_id, now=now)
         ]
 
 
@@ -171,7 +227,15 @@ def publish_due_jobs(*, limit: int = _DUE_BATCH_LIMIT) -> dict:
     failed = 0
     results: list[dict] = []
     with _PUBLISH_LOCK:
+        attempted = False
         for entry in due:
+            if entry.get("account_id") is not None and _account_on_cooldown(entry["account_id"]):
+                continue  # a checkpoint earlier in this batch paused the account
+            if attempted:
+                # Randomized gap so consecutive posts (often different accounts
+                # on the same IP) don't land back-to-back like a bot.
+                _sleep(_random.randint(*_INTER_POST_GAP_SECONDS))
+            attempted = True
             try:
                 outcome = _post_and_record(entry["job_id"])
             except PublishNowError as exc:
