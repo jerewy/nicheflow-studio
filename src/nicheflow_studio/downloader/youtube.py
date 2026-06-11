@@ -6,6 +6,10 @@ from pathlib import Path
 from yt_dlp import YoutubeDL
 
 from nicheflow_studio.core.media_tools import ffmpeg_binary
+from nicheflow_studio.downloader.yt_dlp_sidecar import (
+    download_with_sidecar,
+    yt_dlp_sidecar_path,
+)
 
 
 @dataclass(frozen=True)
@@ -43,15 +47,25 @@ def _yt_dlp_options(output_dir: Path) -> dict[str, object]:
 def download_youtube_url(*, url: str, output_dir: Path) -> DownloadResult:
     output_dir.mkdir(parents=True, exist_ok=True)
     ydl_opts = _yt_dlp_options(output_dir)
+    sidecar = yt_dlp_sidecar_path()
 
-    with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        file_path = Path(ydl.prepare_filename(info))
+    if sidecar is not None:
+        info, file_path = download_with_sidecar(
+            sidecar=sidecar,
+            url=url,
+            output_dir=output_dir,
+            format_selector=str(ydl_opts["format"]),
+            merge_output_format=ydl_opts.get("merge_output_format"),
+        )
+    else:
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            file_path = Path(ydl.prepare_filename(info))
 
-        if not file_path.exists():
-            mp4_candidate = file_path.with_suffix(".mp4")
-            if mp4_candidate.exists():
-                file_path = mp4_candidate
+            if not file_path.exists():
+                mp4_candidate = file_path.with_suffix(".mp4")
+                if mp4_candidate.exists():
+                    file_path = mp4_candidate
 
     return DownloadResult(
         extractor=info.get("extractor"),

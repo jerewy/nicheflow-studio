@@ -6,6 +6,10 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from nicheflow_studio.downloader.youtube import _yt_dlp_options
+from nicheflow_studio.downloader.yt_dlp_sidecar import (
+    download_with_sidecar,
+    yt_dlp_sidecar_path,
+)
 
 from yt_dlp import YoutubeDL
 
@@ -56,16 +60,26 @@ def _download_with_yt_dlp(*, url: str, output_dir: Path) -> InstagramDownloadRes
 
     output_dir.mkdir(parents=True, exist_ok=True)
     ydl_opts = _yt_dlp_options(output_dir)
+    sidecar = yt_dlp_sidecar_path()
 
-    with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        if not isinstance(info, dict):
-            raise RuntimeError("Instagram download returned no metadata.")
-        file_path = Path(ydl.prepare_filename(info))
-        if not file_path.exists():
-            mp4_candidate = file_path.with_suffix(".mp4")
-            if mp4_candidate.exists():
-                file_path = mp4_candidate
+    if sidecar is not None:
+        info, file_path = download_with_sidecar(
+            sidecar=sidecar,
+            url=url,
+            output_dir=output_dir,
+            format_selector=str(ydl_opts["format"]),
+            merge_output_format=ydl_opts.get("merge_output_format"),
+        )
+    else:
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if not isinstance(info, dict):
+                raise RuntimeError("Instagram download returned no metadata.")
+            file_path = Path(ydl.prepare_filename(info))
+            if not file_path.exists():
+                mp4_candidate = file_path.with_suffix(".mp4")
+                if mp4_candidate.exists():
+                    file_path = mp4_candidate
 
     return InstagramDownloadResult(
         extractor="instagram",

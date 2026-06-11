@@ -32,6 +32,7 @@ from nicheflow_studio.core.paths import ensure_data_dirs
 from nicheflow_studio.db.session import init_db
 from nicheflow_studio.services.auto_publish_loop import AutoPublishLoop
 from nicheflow_studio.services.db_backup import run_startup_backup
+from nicheflow_studio.downloader.yt_dlp_sidecar import start_sidecar_update
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,7 @@ def run_webview() -> None:
     configure_logging()
     init_db()
     run_startup_backup()
+    start_sidecar_update()
     auto_publish_loop = AutoPublishLoop()
     auto_publish_loop.start()
 

@@ -14,6 +14,8 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 $py = ".\.venv\Scripts\python.exe"
+$sidecarDir = Join-Path $root "build\tools"
+$sidecar = Join-Path $sidecarDir "yt-dlp.exe"
 
 if (-not $SkipFrontend) {
     Write-Host "== Building frontend =="
@@ -30,6 +32,17 @@ if (-not (Test-Path "frontend\dist\index.html")) {
     throw "frontend\dist\index.html not found - build the frontend first (omit -SkipFrontend)."
 }
 
+New-Item -ItemType Directory -Force -Path $sidecarDir | Out-Null
+if (-not (Test-Path $sidecar)) {
+    Write-Host "== Downloading standalone yt-dlp sidecar =="
+    Invoke-WebRequest `
+        -Uri "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe" `
+        -OutFile $sidecar
+} else {
+    Write-Host "== Updating standalone yt-dlp sidecar =="
+    & $sidecar -U
+}
+
 Write-Host "== PyInstaller bundle =="
 & .\.venv\Scripts\pyinstaller.exe `
     --noconfirm --clean `
@@ -37,6 +50,7 @@ Write-Host "== PyInstaller bundle =="
     --paths src `
     --add-data "frontend\dist;frontend\dist" `
     --add-data "assets;assets" `
+    --add-binary "$sidecar;." `
     --collect-all webview `
     --collect-all clr_loader `
     --collect-all pythonnet `
