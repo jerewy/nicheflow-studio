@@ -755,7 +755,8 @@ def _smart_draft_prompt(
                 [
                     "- FOLLOW OUTRO (MANDATORY): every caption_options string must include "
                     f'this exact line, alone on its own line, directly BEFORE the hashtag line: "{caption_outro}". '
-                    "Do not reword it, do not merge it into a paragraph, and do not repeat it."
+                    "Put one blank line immediately BEFORE it and one blank line immediately "
+                    "AFTER it. Do not reword it, merge it into a paragraph, or repeat it."
                 ]
                 if caption_outro
                 else []
@@ -848,6 +849,13 @@ def _hook_drama_and_fact_safety_rules() -> list[str]:
         "the wrong person (e.g. calling another player 'Michael Jordan') and "
         "never invent cause-and-effect ('the routine that made him the greatest "
         "ever'). Frame the meaning instead of fabricating the fact.",
+        "- ACTOR ATTRIBUTION (RED when guessed): never state WHO performs an "
+        "on-screen action (screams, cries, faints, throws something) unless a "
+        "signal explicitly says who does it. A caption mentioning 'the birthday "
+        "screams' does NOT mean the named person screamed — the crowd may be "
+        "screaming AT them. When the actor is ambiguous, describe the action "
+        "without naming the doer ('screams erupt through the crowd') or anchor "
+        "on the named person's visible REACTION instead.",
     ]
 
 
@@ -1475,9 +1483,19 @@ def _caption_style_title_rules(
             "one CURIOSITY GAP, one COMMENT HOOK question/direct-address form, and "
             "one STORY-OPENER. A TWIST BEAT may be used only when it also fills one "
             "of those three roles. Do not return three factual summaries or three "
-            "versions of the same shape. Before returning, CHECK the three titles: "
-            "if none of them is a question or direct-address line, the response is "
-            "INVALID — rewrite one title as the COMMENT HOOK before answering.",
+            "versions of the same shape. SHUFFLE which option number carries which "
+            "role — the roles must NOT always sit in the same slots (e.g. the "
+            "comment hook must not always be Option 2). Before returning, CHECK "
+            "the three titles: if none of them is a question or direct-address "
+            "line, the response is INVALID — rewrite one title as the COMMENT "
+            "HOOK before answering.",
+            "- RECOMMENDED PICK (HARD RULE): choose the option whose hook best "
+            "fits THIS clip's strongest concrete signal — never default to the "
+            "question/comment-hook role. The question form is not automatically "
+            "the strongest: a clip with a jaw-dropping visible moment usually "
+            "wants the curiosity gap; a clip with a complete-arc story usually "
+            "wants the story opener. Justify the pick with a clip-specific "
+            "reason, not a restatement of these rules.",
             f"- {winner_label} (calibrate the voice and structure; never copy "
             "unsupported facts into another clip):\n- "
             + "\n- ".join(winners),
