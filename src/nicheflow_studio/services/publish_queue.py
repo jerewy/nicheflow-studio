@@ -29,7 +29,14 @@ class PublishQueueError(ServiceError):
 
 
 def _iso(value: dt.datetime | None) -> str | None:
-    return value.isoformat() if value is not None else None
+    """ISO-8601 with an explicit UTC offset. SQLite returns naive datetimes;
+    without the offset the frontend's Date() reads them as LOCAL time and
+    every displayed schedule shifts by the machine's UTC offset."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=dt.timezone.utc)
+    return value.isoformat()
 
 
 def _parse_iso_utc(value: str | None) -> dt.datetime | None:

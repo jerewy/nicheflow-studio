@@ -37,7 +37,13 @@ class PublishError(ServiceError):
 
 
 def _iso(value: dt.datetime | None) -> str | None:
-    return value.isoformat() if value is not None else None
+    """ISO-8601 with an explicit UTC offset (naive DB values are UTC).
+    A naive string would be parsed as LOCAL time by the frontend's Date()."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=dt.timezone.utc)
+    return value.isoformat()
 
 
 def _parse_scheduled_at(value: str | None) -> dt.datetime | None:

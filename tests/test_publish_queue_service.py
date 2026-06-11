@@ -111,3 +111,19 @@ def test_remove_job() -> None:
 def test_unknown_job_raises() -> None:
     with pytest.raises(PublishQueueError):
         publish_queue.mark_posted(99999, {})
+
+def test_iso_serialization_attaches_utc_offset_to_naive_db_datetimes() -> None:
+    """SQLite returns naive datetimes; the API must emit an explicit UTC
+    offset or the frontend parses the time as local and every displayed
+    schedule shifts by the machine's UTC offset (reported 2026-06-11:
+    a 10:11 UTC job rendered as 10:11 AM local in Multi-Account Publish)."""
+    import datetime as dt
+
+    from nicheflow_studio.services import publish_queue, publishing, publishing_dashboard
+
+    naive = dt.datetime(2026, 6, 11, 10, 11, 53)
+    for service in (publish_queue, publishing, publishing_dashboard):
+        rendered = service._iso(naive)
+        assert rendered is not None and rendered.endswith("+00:00"), (service.__name__, rendered)
+        parsed = dt.datetime.fromisoformat(rendered)
+        assert parsed.utcoffset() == dt.timedelta(0)
