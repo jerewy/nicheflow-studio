@@ -1,24 +1,40 @@
 from __future__ import annotations
 
+import datetime as dt
 from pathlib import Path
 
 import pytest
 
-from nicheflow_studio.db.models import DownloadItem
+from nicheflow_studio.db.models import Account, DownloadItem, UploadJob
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.processing import video
 from nicheflow_studio.services import export as export_svc
 from nicheflow_studio.services.export import ExportError
 
 
-def _make_item(*, file_path: str | None, title_draft: str | None = "Chosen title") -> int:
+def _make_item(
+    *,
+    file_path: str | None,
+    title_draft: str | None = "Chosen title",
+    auto_schedule_on_export: bool = False,
+    upload_schedule_slots: str | None = None,
+) -> int:
     with get_session() as session:
+        account = Account(
+            name="Export Account",
+            platform="instagram",
+            auto_schedule_on_export=auto_schedule_on_export,
+            upload_schedule_slots=upload_schedule_slots,
+        )
+        session.add(account)
+        session.flush()
         item = DownloadItem(
             source_url="https://instagram.com/reel/abc",
             title="Source title",
             title_draft=title_draft,
             file_path=file_path,
             status="completed",
+            account_id=account.id,
         )
         session.add(item)
         session.commit()
@@ -63,6 +79,74 @@ def test_export_sets_processed_path_and_reports_progress(
     # Progress was reported and reached completion.
     assert events[0][0] <= 0.1
     assert events[-1][0] == 1.0
+
+
+def test_export_auto_schedules_next_open_slot_when_flag_on(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake")
+    item_id = _make_item(
+        file_path=str(source),
+        auto_schedule_on_export=True,
+        upload_schedule_slots="09:00",
+    )
+    _mock_video(monkeypatch, {})
+    occupied = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=1)
+    occupied = occupied.replace(hour=2, minute=0, second=0, microsecond=0)
+    with get_session() as session:
+        item = session.get(DownloadItem, item_id)
+        session.add(
+            UploadJob(
+                account_id=item.account_id,
+                processed_path="C:/processed/already-booked.mp4",
+                scheduled_at=occupied,
+                status="scheduled",
+            )
+        )
+        session.commit()
+
+    result = export_svc.export_item(item_id)
+
+    assert "warning" not in result
+    with get_session() as session:
+        jobs = session.query(UploadJob).filter(UploadJob.download_item_id == item_id).all()
+        assert len(jobs) == 1
+        assert jobs[0].status == "scheduled"
+        scheduled = jobs[0].scheduled_at.replace(tzinfo=dt.timezone.utc)
+        assert scheduled > occupied
+        assert abs((scheduled - occupied).total_seconds()) > 20 * 60
+
+
+def test_export_does_not_schedule_when_flag_off(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake")
+    item_id = _make_item(file_path=str(source), upload_schedule_slots="09:00")
+    _mock_video(monkeypatch, {})
+
+    result = export_svc.export_item(item_id)
+
+    assert "warning" not in result
+    with get_session() as session:
+        assert session.query(UploadJob).count() == 0
+
+
+def test_export_with_auto_schedule_and_no_slots_returns_warning(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake")
+    item_id = _make_item(file_path=str(source), auto_schedule_on_export=True)
+    _mock_video(monkeypatch, {})
+
+    result = export_svc.export_item(item_id)
+
+    assert "schedule slots" in result["warning"].lower()
+    assert result["processed_path"]
+    with get_session() as session:
+        assert session.query(UploadJob).count() == 0
 
 
 def test_export_missing_file_path_raises() -> None:

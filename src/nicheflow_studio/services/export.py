@@ -19,9 +19,10 @@ from pathlib import Path
 from typing import Callable
 
 from nicheflow_studio.core.paths import processed_dir
-from nicheflow_studio.db.models import DownloadItem
+from nicheflow_studio.db.models import Account, DownloadItem
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.processing import video
+from nicheflow_studio.services import publishing
 from nicheflow_studio.services.errors import ServiceError
 from nicheflow_studio.services.processing_workflow import render_config
 
@@ -146,9 +147,10 @@ def clear_crop_override(item_id: int) -> dict:
 def export_item(item_id: int, *, progress: ProgressFn | None = None) -> dict:
     """Render the processed Reel for ``item_id`` and set ``processed_path``.
 
-    Returns ``{"item_id", "processed_path"}``. Raises :class:`ExportError` for
-    user-fixable problems (no source file, file missing) so the message reaches
-    the UI cleanly.
+    Returns ``{"item_id", "processed_path"}``, plus scheduling details or a
+    non-fatal scheduling warning when the account enables auto-scheduling.
+    Raises :class:`ExportError` for user-fixable export problems (no source
+    file, file missing) so the message reaches the UI cleanly.
     """
 
     def report(fraction: float, message: str = "") -> None:
@@ -199,11 +201,21 @@ def export_item(item_id: int, *, progress: ProgressFn | None = None) -> dict:
     )
 
     report(0.9, "Saving…")
+    auto_schedule_on_export = False
     with get_session() as session:
         item = session.get(DownloadItem, item_id)
         if item is not None:
             item.processed_path = str(result_path)
             session.commit()
+            account = session.get(Account, item.account_id) if item.account_id is not None else None
+            auto_schedule_on_export = bool(account and account.auto_schedule_on_export)
+
+    result = {"item_id": item_id, "processed_path": str(result_path)}
+    if auto_schedule_on_export:
+        try:
+            result["scheduled_publish"] = publishing.auto_schedule_for_publish(item_id)
+        except publishing.PublishError as exc:
+            result["warning"] = str(exc)
 
     report(1.0, "Done")
-    return {"item_id": item_id, "processed_path": str(result_path)}
+    return result

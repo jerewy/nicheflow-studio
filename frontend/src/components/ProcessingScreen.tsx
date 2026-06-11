@@ -653,6 +653,11 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
         setExportProgress({ value, message }),
       )) as ExportResult;
       setExportedPath(result.processed_path);
+      if (result.warning) {
+        setActionError(
+          `Exported successfully, but auto-scheduling needs attention: ${result.warning}`,
+        );
+      }
       // Refetch so the item's processed_path is reflected, and refresh queue/list.
       const ctx = await bridge.getContext(itemId);
       setContext(ctx);

@@ -88,6 +88,7 @@ export interface JobSnapshot {
 export interface ExportResult {
   item_id: number;
   processed_path: string;
+  warning?: string;
 }
 
 export interface ItemSummary {
@@ -156,6 +157,7 @@ export interface AccountDetail extends AccountSummary {
   upload_timezone: string | null;
   upload_default_privacy: string | null;
   upload_schedule_slots: string | null;
+  auto_schedule_on_export: boolean;
   download_item_count: number;
   upload_job_count: number;
 }

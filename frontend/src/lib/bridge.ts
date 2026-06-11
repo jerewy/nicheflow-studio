@@ -1019,6 +1019,7 @@ const mock = {
       upload_timezone: "Asia/Jakarta",
       upload_default_privacy: "private",
       upload_schedule_slots: null,
+      auto_schedule_on_export: false,
       download_item_count: 0,
       upload_job_count: 0,
     };

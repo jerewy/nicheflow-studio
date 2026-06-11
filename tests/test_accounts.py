@@ -49,6 +49,16 @@ def test_update_is_partial_and_preserves_other_fields() -> None:
     assert updated["credential_blob"] == "secret-notes"
 
 
+def test_auto_schedule_on_export_round_trips() -> None:
+    created = accounts_svc.create_account(
+        {"name": "Auto Schedule", "auto_schedule_on_export": True}
+    )
+    assert created["auto_schedule_on_export"] is True
+
+    updated = accounts_svc.update_account(created["id"], {"auto_schedule_on_export": False})
+    assert updated["auto_schedule_on_export"] is False
+
+
 def test_update_unknown_raises() -> None:
     with pytest.raises(AccountError):
         accounts_svc.update_account(99999, {"name": "x"})

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -60,6 +60,7 @@ class Account(Base):
     upload_timezone: Mapped[str | None] = mapped_column(String(64), nullable=True)
     upload_default_privacy: Mapped[str | None] = mapped_column(String(32), nullable=True)
     upload_schedule_slots: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    auto_schedule_on_export: Mapped[bool] = mapped_column(Boolean, default=False)
     upload_made_for_kids: Mapped[int] = mapped_column(Integer, default=0)
     upload_contains_synthetic_media: Mapped[int] = mapped_column(Integer, default=0)
     # JSON snapshot of the user's last-used Processing settings for this

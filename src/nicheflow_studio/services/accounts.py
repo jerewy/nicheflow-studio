@@ -48,6 +48,7 @@ _TEXT_FIELDS = (
     "upload_default_privacy",
     "upload_schedule_slots",
 )
+_BOOL_FIELDS = ("auto_schedule_on_export",)
 
 
 class AccountError(ServiceError):
@@ -88,6 +89,7 @@ def _account_detail(session, account: Account) -> dict:
             "upload_timezone": account.upload_timezone,
             "upload_default_privacy": account.upload_default_privacy,
             "upload_schedule_slots": account.upload_schedule_slots,
+            "auto_schedule_on_export": bool(account.auto_schedule_on_export),
             "download_item_count": session.scalar(
                 select(func.count(DownloadItem.id)).where(DownloadItem.account_id == account.id)
             )
@@ -120,6 +122,12 @@ def _apply_payload(account: Account, payload: dict, *, partial: bool) -> None:
     for field in _TEXT_FIELDS:
         if field in payload or not partial:
             setattr(account, field, _clean(payload.get(field)))
+    for field in _BOOL_FIELDS:
+        if field in payload or not partial:
+            value = payload.get(field, False)
+            if isinstance(value, str):
+                value = value.strip().lower() in {"1", "true", "yes", "on"}
+            setattr(account, field, bool(value))
 
 
 def list_accounts() -> list[dict]:

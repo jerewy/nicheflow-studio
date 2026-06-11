@@ -263,6 +263,13 @@ def _ensure_compatibility() -> None:
             connection.execute(
                 text("ALTER TABLE accounts ADD COLUMN upload_schedule_slots VARCHAR(512)")
             )
+        if "auto_schedule_on_export" not in account_columns:
+            connection.execute(
+                text(
+                    "ALTER TABLE accounts ADD COLUMN auto_schedule_on_export "
+                    "BOOLEAN DEFAULT 0"
+                )
+            )
         if "upload_made_for_kids" not in account_columns:
             connection.execute(
                 text("ALTER TABLE accounts ADD COLUMN upload_made_for_kids INTEGER DEFAULT 0")

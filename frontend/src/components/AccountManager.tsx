@@ -61,6 +61,7 @@ export function AccountManager({ activeId, onAccountsChanged, onUseAccount }: Ac
   const [creating, setCreating] = useState(false);
   const [form, setForm] = useState<FormState>(EMPTY_FORM);
   const [detail, setDetail] = useState<AccountDetail | null>(null);
+  const [autoScheduleOnExport, setAutoScheduleOnExport] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -86,6 +87,7 @@ export function AccountManager({ activeId, onAccountsChanged, onUseAccount }: Ac
       const d = await bridge.getAccount(id);
       setDetail(d);
       setForm(detailToForm(d));
+      setAutoScheduleOnExport(d.auto_schedule_on_export);
       setSelectedId(id);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
@@ -108,6 +110,7 @@ export function AccountManager({ activeId, onAccountsChanged, onUseAccount }: Ac
     setSelectedId(null);
     setDetail(null);
     setForm({ ...EMPTY_FORM, platform: "instagram" });
+    setAutoScheduleOnExport(false);
   };
 
   const setField = (key: string, value: string) =>
@@ -118,7 +121,10 @@ export function AccountManager({ activeId, onAccountsChanged, onUseAccount }: Ac
     setError(null);
     setMessage(null);
     try {
-      const payload: Record<string, unknown> = { ...form };
+      const payload: Record<string, unknown> = {
+        ...form,
+        auto_schedule_on_export: autoScheduleOnExport,
+      };
       if (creating) {
         const created = await bridge.createAccount(payload);
         await refreshList();
@@ -128,6 +134,7 @@ export function AccountManager({ activeId, onAccountsChanged, onUseAccount }: Ac
         const updated = await bridge.updateAccount(selectedId, payload);
         setDetail(updated);
         setForm(detailToForm(updated));
+        setAutoScheduleOnExport(updated.auto_schedule_on_export);
         await refreshList();
         setMessage("Account saved.");
       }
@@ -266,6 +273,14 @@ export function AccountManager({ activeId, onAccountsChanged, onUseAccount }: Ac
                   </div>
                 ))}
               </div>
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={autoScheduleOnExport}
+                  onChange={(event) => setAutoScheduleOnExport(event.target.checked)}
+                />
+                Auto-schedule each reel after export
+              </label>
               <div className="flex items-center gap-2">
                 <Button onClick={save} disabled={busy}>
                   {creating ? "Create account" : "Save changes"}
