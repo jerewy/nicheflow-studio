@@ -9,7 +9,7 @@ from pathlib import Path
 from nicheflow_studio.db.models import Account, DownloadItem
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.processing import smart_drafts
-from nicheflow_studio.services import draft_revisions
+from nicheflow_studio.services import draft_revisions, publishing_dashboard
 from nicheflow_studio.services.draft_revisions import DraftRevisionDTO, DraftRevisionError
 
 
@@ -133,6 +133,9 @@ def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
         account = session.get(Account, item.account_id) if item.account_id else None
         path = Path(item.file_path or "").expanduser().resolve()
         niche_label = account.niche_label if account and account.niche_label else None
+        few_shot_winners = (
+            publishing_dashboard.top_post_titles(account.id) if account is not None else []
+        )
         fields = [
             f"Account: {account.name if account else '(none)'}",
             f"Niche: {niche_label or '(none)'}",
@@ -152,7 +155,12 @@ def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
     title_style = settings.get("title_style") or None
     # Same rule source as the live Groq prompt (see effective_title_rules
     # docstring) so the chat path and the API path never drift apart.
-    title_rules = smart_drafts.effective_title_rules(title_style, caption_style, niche_label)
+    title_rules = smart_drafts.effective_title_rules(
+        title_style,
+        caption_style,
+        niche_label,
+        few_shot_winners=few_shot_winners,
+    )
     hook_rules = smart_drafts._hook_drama_and_fact_safety_rules()
     return "\n".join(
         [

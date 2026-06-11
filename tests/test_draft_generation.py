@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from nicheflow_studio.db.models import Account, DownloadItem
+from nicheflow_studio.db.models import Account, DownloadItem, UploadJob
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.processing import smart_drafts
 from nicheflow_studio.services import draft_generation
@@ -73,6 +73,44 @@ def test_generate_saves_revision_and_maps_recommended_index(
     # Account voice was assembled from Account columns and passed through.
     assert captured["account_voice"]["tone"] == "cinematic"
     assert captured["niche_label"] == "movie"
+
+
+def test_generate_passes_accounts_measured_top_titles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    item_id = _make_item()
+    with get_session() as session:
+        item = session.get(DownloadItem, item_id)
+        session.add_all(
+            [
+                UploadJob(
+                    account_id=item.account_id,
+                    processed_path="C:/winner-one.mp4",
+                    title="Measured winner one",
+                    status="posted",
+                    posted_likes=300,
+                ),
+                UploadJob(
+                    account_id=item.account_id,
+                    processed_path="C:/winner-two.mp4",
+                    title="Measured winner two",
+                    status="posted",
+                    posted_likes=200,
+                ),
+            ]
+        )
+        session.commit()
+    captured: dict = {}
+
+    def fake_generate(**kwargs):
+        captured.update(kwargs)
+        return _fake_drafts()
+
+    monkeypatch.setattr(smart_drafts, "generate_smart_drafts", fake_generate)
+
+    draft_generation.generate_revision_for_item(item_id)
+
+    assert captured["few_shot_winners"] == ["Measured winner one", "Measured winner two"]
 
 
 def test_generate_without_transcript_succeeds_via_vision(

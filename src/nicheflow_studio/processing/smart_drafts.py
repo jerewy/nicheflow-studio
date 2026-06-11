@@ -143,6 +143,7 @@ def generate_smart_drafts(
     title_style: str | None = None,
     recent_titles: list[str] | None = None,
     recent_captions: list[str] | None = None,
+    few_shot_winners: list[str] | None = None,
     require_vision: bool = False,
 ) -> SmartDrafts:
     cleaned_transcript = _normalize_whitespace(transcript_text)
@@ -195,6 +196,7 @@ def generate_smart_drafts(
                     title_style=title_style,
                     recent_titles=recent_titles,
                     recent_captions=recent_captions,
+                    few_shot_winners=few_shot_winners,
                     low_context=low_context,
                 )
             else:
@@ -211,6 +213,7 @@ def generate_smart_drafts(
                     title_style=title_style,
                     recent_titles=recent_titles,
                     recent_captions=recent_captions,
+                    few_shot_winners=few_shot_winners,
                     low_context=low_context,
                 )
             _enforce_require_vision(result, require_vision=require_vision)
@@ -296,6 +299,7 @@ def _generate_ollama_smart_drafts(
     caption_style: str | None,
     recent_titles: list[str] | None,
     recent_captions: list[str] | None,
+    few_shot_winners: list[str] | None = None,
     low_context: bool = False,
     title_style: str | None = None,
 ) -> SmartDrafts:
@@ -320,6 +324,7 @@ def _generate_ollama_smart_drafts(
             title_style=title_style,
             recent_titles=recent_titles,
             recent_captions=recent_captions,
+            few_shot_winners=few_shot_winners,
         ),
         provider_name=f"Ollama model {model}",
     )
@@ -372,6 +377,7 @@ def _generate_groq_smart_drafts(
     caption_style: str | None,
     recent_titles: list[str] | None,
     recent_captions: list[str] | None,
+    few_shot_winners: list[str] | None = None,
     low_context: bool = False,
     title_style: str | None = None,
 ) -> SmartDrafts:
@@ -465,6 +471,7 @@ def _generate_groq_smart_drafts(
             title_style=title_style,
             recent_titles=recent_titles,
             recent_captions=recent_captions,
+            few_shot_winners=few_shot_winners,
         ),
         provider_name=f"Groq reasoning model {reasoning_model}",
     )
@@ -599,6 +606,7 @@ def _smart_draft_prompt(
     title_style: str | None = None,
     recent_titles: list[str] | None = None,
     recent_captions: list[str] | None = None,
+    few_shot_winners: list[str] | None = None,
 ) -> str:
     source_title_text = source_title or "(none)"
     source_description_text = _normalize_whitespace(source_description or "")
@@ -704,7 +712,13 @@ def _smart_draft_prompt(
                 if _has_specific_title_style(title_style, niche_label, prompt_profile)
                 else [f"- {style['title']}"]
             ),
-            *effective_title_rules(title_style, caption_style, niche_label, prompt_profile),
+            *effective_title_rules(
+                title_style,
+                caption_style,
+                niche_label,
+                prompt_profile,
+                few_shot_winners=few_shot_winners,
+            ),
             "",
             "HOOK FRAMING (drama is allowed, overclaiming is not)",
             *_hook_drama_and_fact_safety_rules(),
@@ -1188,6 +1202,7 @@ def effective_title_rules(
     caption_style: str | None,
     niche_label: str | None,
     prompt_profile: str | None = None,
+    few_shot_winners: list[str] | tuple[str, ...] | None = None,
 ) -> list[str]:
     """Pick the on-screen title rules, niche-aware.
 
@@ -1203,12 +1218,14 @@ def effective_title_rules(
     Used by BOTH the live generation prompt and the Copy Chat Prompt contract so
     the two never drift.
     """
-    explicit = _title_style_rules(title_style)
+    explicit = _title_style_rules(title_style, few_shot_winners=few_shot_winners)
     if explicit is not None:
         return explicit
     if _history_should_auto_route(niche_label, prompt_profile):
-        return _caption_style_title_rules("history_lost_archive")
-    return _caption_style_title_rules(caption_style)
+        return _caption_style_title_rules(
+            "history_lost_archive", few_shot_winners=few_shot_winners
+        )
+    return _caption_style_title_rules(caption_style, few_shot_winners=few_shot_winners)
 
 
 def _has_specific_title_style(
@@ -1224,7 +1241,11 @@ def _has_specific_title_style(
     )
 
 
-def _title_style_rules(title_style: str | None) -> list[str] | None:
+def _title_style_rules(
+    title_style: str | None,
+    *,
+    few_shot_winners: list[str] | tuple[str, ...] | None = None,
+) -> list[str] | None:
     """Return on-screen title rules when the caller picked an explicit
     title_style, decoupling title format from caption_style.
 
@@ -1323,7 +1344,7 @@ def _title_style_rules(title_style: str | None) -> list[str] | None:
         "history_lost_archive",
         *_MEME_CAMPAIGN_STYLES,
     }:
-        return _caption_style_title_rules(style)
+        return _caption_style_title_rules(style, few_shot_winners=few_shot_winners)
     # Unknown title_style: return None so the caller falls back to the
     # caption-derived rules instead of shipping an empty rule list.
     return None
@@ -1369,7 +1390,11 @@ def _cinema_bold_keyword_mode_rules() -> list[str]:
     ]
 
 
-def _caption_style_title_rules(caption_style: str | None) -> list[str]:
+def _caption_style_title_rules(
+    caption_style: str | None,
+    *,
+    few_shot_winners: list[str] | tuple[str, ...] | None = None,
+) -> list[str]:
     """Return per-style on-screen title rules to inject into the prompt.
 
     These are extra bullets stacked on top of the base prompt_profile title
@@ -1380,6 +1405,17 @@ def _caption_style_title_rules(caption_style: str | None) -> list[str]:
     if style in _MEME_CAMPAIGN_STYLES:
         return _meme_campaign_title_rules(style)
     if style == "history_lost_archive":
+        measured_winners = tuple(
+            cleaned
+            for value in (few_shot_winners or ())
+            if (cleaned := _normalize_whitespace(str(value)))
+        )
+        winners = measured_winners or _HISTORY_LOST_ARCHIVE_FEW_SHOT_WINNERS
+        winner_label = (
+            "MEASURED ACCOUNT WINNER EXAMPLES"
+            if measured_winners
+            else "STATIC WINNER EXAMPLES"
+        )
         return [
             "- HARD RULE: each title stays concrete about the visible action, era, "
             "and stakes, and pairs them with ONE clear surprise, contrast, emotional "
@@ -1425,9 +1461,9 @@ def _caption_style_title_rules(caption_style: str | None) -> list[str]:
             "versions of the same shape. Before returning, CHECK the three titles: "
             "if none of them is a question or direct-address line, the response is "
             "INVALID — rewrite one title as the COMMENT HOOK before answering.",
-            "- STATIC WINNER EXAMPLES (calibrate the voice and structure; never copy "
+            f"- {winner_label} (calibrate the voice and structure; never copy "
             "unsupported facts into another clip):\n- "
-            + "\n- ".join(_HISTORY_LOST_ARCHIVE_FEW_SHOT_WINNERS),
+            + "\n- ".join(winners),
             "- Good: 'The ski lift ride where John Denver wrote Annie's Song for "
             "his wife'; 'People actually attached camping tents to scooters in the "
             "1950s'. Too flat: 'John Denver wrote Annie's Song on a ski lift'. "
@@ -2188,6 +2224,7 @@ def _build_groq_payload(
     title_style: str | None,
     recent_titles: list[str] | None,
     recent_captions: list[str] | None,
+    few_shot_winners: list[str] | None = None,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "model": model,
@@ -2225,6 +2262,7 @@ def _build_groq_payload(
                     title_style=title_style,
                     recent_titles=recent_titles,
                     recent_captions=recent_captions,
+                    few_shot_winners=few_shot_winners,
                 ),
             },
         ],
@@ -2248,6 +2286,7 @@ def _build_ollama_payload(
     title_style: str | None,
     recent_titles: list[str] | None,
     recent_captions: list[str] | None,
+    few_shot_winners: list[str] | None = None,
 ) -> dict[str, object]:
     return {
         "model": model,
@@ -2272,6 +2311,7 @@ def _build_ollama_payload(
                     title_style=title_style,
                     recent_titles=recent_titles,
                     recent_captions=recent_captions,
+                    few_shot_winners=few_shot_winners,
                 ),
             },
         ],

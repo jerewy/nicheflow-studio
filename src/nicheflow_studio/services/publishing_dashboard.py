@@ -23,6 +23,8 @@ from nicheflow_studio.db.session import get_session
 from nicheflow_studio.publisher.instagram_web import launch_instagram_login
 from nicheflow_studio.services.errors import ServiceError
 
+_TOP_POSTS_LIMIT = 5
+
 HEALTH_LABELS = {
     HealthState.OK: "OK",
     HealthState.WARN: "Aging",
@@ -104,6 +106,67 @@ def list_global_publish_jobs() -> dict:
             )
     counts = {key: sum(1 for row in visible if row["status"] == key) for key in ("draft", "ready", "scheduled")}
     return {"jobs": visible, "due_count": sum(1 for row in visible if row["is_due"]), **counts}
+
+
+def top_posts(account_id: int, *, limit: int = _TOP_POSTS_LIMIT) -> list[dict]:
+    """Highest-engagement measured posts for exactly one account.
+
+    V1 uses total interactions; learning account-specific ranking weights is
+    deliberately deferred until an account has roughly 50 measured posts.
+    """
+    with get_session() as session:
+        jobs = (
+            session.query(UploadJob)
+            .filter(
+                UploadJob.account_id == account_id,
+                (UploadJob.posted_at.is_not(None)) | (UploadJob.status == "posted"),
+                (UploadJob.posted_views.is_not(None))
+                | (UploadJob.posted_likes.is_not(None))
+                | (UploadJob.posted_comments.is_not(None))
+                | (UploadJob.posted_shares.is_not(None)),
+            )
+            .all()
+        )
+    ranked = sorted(
+        jobs,
+        key=lambda job: (
+            int(job.posted_likes or 0)
+            + int(job.posted_comments or 0)
+            + int(job.posted_shares or 0),
+            int(job.posted_views or 0),
+            job.id,
+        ),
+        reverse=True,
+    )
+    return [
+        {
+            "id": job.id,
+            "account_id": job.account_id,
+            "title": job.title,
+            "posted_views": job.posted_views,
+            "posted_likes": job.posted_likes,
+            "posted_comments": job.posted_comments,
+            "posted_shares": job.posted_shares,
+            "engagement": (
+                int(job.posted_likes or 0)
+                + int(job.posted_comments or 0)
+                + int(job.posted_shares or 0)
+            ),
+        }
+        for job in ranked[: max(0, limit)]
+    ]
+
+
+def top_post_titles(account_id: int, *, limit: int = _TOP_POSTS_LIMIT) -> list[str]:
+    """Measured winner titles for few-shot prompting, strongest first."""
+    titles: list[str] = []
+    for row in top_posts(account_id, limit=max(limit * 20, limit)):
+        title = str(row["title"] or "").strip()
+        if title:
+            titles.append(title)
+        if len(titles) >= limit:
+            break
+    return titles
 
 
 def mark_ready(job_ids: list[int]) -> dict:

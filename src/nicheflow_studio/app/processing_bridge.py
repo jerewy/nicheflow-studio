@@ -169,6 +169,10 @@ class ProcessingBridge:
         return publish_queue.mark_posted(job_id, payload or {})
 
     @_guard
+    def update_job_metrics(self, job_id: int, payload: dict | None = None) -> dict:
+        return publish_queue.update_metrics(job_id, payload or {})
+
+    @_guard
     def reschedule_job(self, job_id: int, scheduled_at: str) -> dict:
         return publish_queue.reschedule(job_id, scheduled_at)
 

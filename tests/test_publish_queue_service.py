@@ -53,6 +53,34 @@ def test_mark_posted_bad_metric_raises() -> None:
         publish_queue.mark_posted(job_id, {"posted_views": "lots"})
 
 
+def test_update_metrics_edits_existing_post_without_changing_post_state() -> None:
+    job_id = _make_job(status="posted")
+
+    result = publish_queue.update_metrics(
+        job_id,
+        {
+            "posted_views": "1,200",
+            "posted_likes": "90",
+            "posted_comments": 12,
+            "posted_shares": 7,
+        },
+    )
+
+    assert result["status"] == "posted"
+    assert result["posted_at"] is None
+    assert result["posted_views"] == 1200
+    assert result["posted_likes"] == 90
+    assert result["posted_comments"] == 12
+    assert result["posted_shares"] == 7
+
+
+def test_update_metrics_requires_posted_job() -> None:
+    job_id = _make_job()
+
+    with pytest.raises(PublishQueueError, match="posted"):
+        publish_queue.update_metrics(job_id, {"posted_views": 1200})
+
+
 def test_reschedule_then_unschedule() -> None:
     job_id = _make_job()
 

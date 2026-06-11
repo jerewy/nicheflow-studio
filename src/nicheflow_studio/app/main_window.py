@@ -175,6 +175,8 @@ from nicheflow_studio.processing.smart_drafts import (
     effective_title_rules,
     generate_smart_drafts,
 )
+from nicheflow_studio.services import publish_queue as publish_queue_service
+from nicheflow_studio.services import publishing_dashboard as publishing_dashboard_service
 from nicheflow_studio.queue import QueueManager, download_assigned_pending
 from nicheflow_studio.scraper.youtube import (
     DiscoveryWeights,
@@ -1097,6 +1099,7 @@ class SmartDraftJobConfig:
     title_style: str | None = None
     recent_titles: list[str] | None = None
     recent_captions: list[str] | None = None
+    few_shot_winners: list[str] | None = None
 
 
 # Auto-publish safety limits. Per-account daily cap keeps an accidental
@@ -1779,6 +1782,7 @@ class SmartDraftWorker(QObject):
                 title_style=self._job.title_style,
                 recent_titles=self._job.recent_titles,
                 recent_captions=self._job.recent_captions,
+                few_shot_winners=self._job.few_shot_winners,
             )
             self.completed.emit(
                 {
@@ -6661,6 +6665,29 @@ class MainWindow(QWidget):
         schedule_detail_row.addWidget(self._schedule_auto_time_button)
         schedule_detail_row.addStretch(1)
 
+        self._schedule_metric_inputs: dict[str, QLineEdit] = {}
+        metrics_row = QHBoxLayout()
+        metrics_row.setSpacing(10)
+        metrics_row.addWidget(QLabel("IG Insights"))
+        for label, field in (
+            ("Views", "posted_views"),
+            ("Likes", "posted_likes"),
+            ("Comments", "posted_comments"),
+            ("Shares", "posted_shares"),
+        ):
+            field_input = QLineEdit()
+            field_input.setPlaceholderText(label)
+            field_input.setMaximumWidth(100)
+            field_input.setEnabled(False)
+            self._schedule_metric_inputs[field] = field_input
+            metrics_row.addWidget(field_input)
+        self._schedule_save_metrics_button = QPushButton("Save Insights")
+        self._schedule_save_metrics_button.setObjectName("downloadToolbarButton")
+        self._schedule_save_metrics_button.setEnabled(False)
+        self._schedule_save_metrics_button.clicked.connect(self._on_save_schedule_metrics_clicked)
+        metrics_row.addWidget(self._schedule_save_metrics_button)
+        metrics_row.addStretch(1)
+
         self._schedule_table = TableFocusScrollWidget()
         self._schedule_table.setObjectName("downloadQueueTable")
         self._schedule_table.setColumnCount(7)
@@ -6711,6 +6738,7 @@ class MainWindow(QWidget):
         panel_layout.addWidget(self._schedule_summary_label)
         schedule_action_row.removeWidget(self._schedule_copy_caption_button)
         panel_layout.addLayout(schedule_detail_row)
+        panel_layout.addLayout(metrics_row)
         panel_layout.addWidget(self._schedule_caption_preview)
         panel_layout.addLayout(schedule_action_row)
         panel_layout.addWidget(self._schedule_table, stretch=1)
@@ -7712,7 +7740,17 @@ class MainWindow(QWidget):
         # would do — history accounts auto-route to the history title rules.
         account = self._active_account()
         niche_label = account.niche_label if account else None
-        title_rules = effective_title_rules(title_style, caption_style, niche_label, prompt_profile)
+        title_rules = effective_title_rules(
+            title_style,
+            caption_style,
+            niche_label,
+            prompt_profile,
+            few_shot_winners=(
+                publishing_dashboard_service.top_post_titles(account.id)
+                if account is not None
+                else None
+            ),
+        )
         title_rule_text = "\n".join(title_rules)
 
         return "\n".join(
@@ -8926,6 +8964,11 @@ class MainWindow(QWidget):
                 title_style=self._processing_title_style(),
                 recent_titles=recent_titles,
                 recent_captions=recent_captions,
+                few_shot_winners=(
+                    publishing_dashboard_service.top_post_titles(account.id)
+                    if account is not None
+                    else None
+                ),
             )
         )
 
@@ -9114,6 +9157,11 @@ class MainWindow(QWidget):
                 title_style=self._processing_title_style(),
                 recent_titles=recent_titles,
                 recent_captions=recent_captions,
+                few_shot_winners=(
+                    publishing_dashboard_service.top_post_titles(account.id)
+                    if account is not None
+                    else None
+                ),
             )
         )
         return True
@@ -10960,6 +11008,11 @@ class MainWindow(QWidget):
 
     def _on_schedule_selection_changed(self) -> None:
         has_selection = self._selected_schedule_job_id() is not None
+        selected_job = self._selected_schedule_job() if has_selection else None
+        metrics_enabled = bool(
+            selected_job
+            and (selected_job.posted_at is not None or selected_job.status == "posted")
+        )
         self._schedule_copy_caption_button.setEnabled(has_selection)
         self._schedule_open_output_button.setEnabled(has_selection)
         self._schedule_copy_path_button.setEnabled(has_selection)
@@ -10973,9 +11026,38 @@ class MainWindow(QWidget):
         self._schedule_time_edit.setEnabled(has_selection)
         self._schedule_save_time_button.setEnabled(has_selection)
         self._schedule_clear_time_button.setEnabled(has_selection)
+        for field_input in self._schedule_metric_inputs.values():
+            field_input.setEnabled(metrics_enabled)
+        self._schedule_save_metrics_button.setEnabled(metrics_enabled)
         self._refresh_schedule_caption_preview()
         self._refresh_schedule_status_combo()
         self._refresh_schedule_time_editor()
+        self._refresh_schedule_metrics_editor(selected_job)
+
+    def _refresh_schedule_metrics_editor(self, job: UploadJob | None = None) -> None:
+        if not hasattr(self, "_schedule_metric_inputs"):
+            return
+        job = job or self._selected_schedule_job()
+        for field, field_input in self._schedule_metric_inputs.items():
+            value = getattr(job, field, None) if job is not None else None
+            field_input.setText("" if value is None else str(value))
+
+    def _on_save_schedule_metrics_clicked(self) -> None:
+        job_id = self._selected_schedule_job_id()
+        if job_id is None:
+            self._notify("Select a posted publish job first.", Tone.WARNING)
+            return
+        payload = {
+            field: field_input.text().strip()
+            for field, field_input in self._schedule_metric_inputs.items()
+        }
+        try:
+            publish_queue_service.update_metrics(job_id, payload)
+        except Exception as exc:  # noqa: BLE001
+            self._notify(str(exc), Tone.ERROR)
+            return
+        self._refresh_schedule_page()
+        self._notify("Saved Instagram Insights metrics.", Tone.SUCCESS)
 
     def _selected_schedule_job(self) -> UploadJob | None:
         job_id = self._selected_schedule_job_id()

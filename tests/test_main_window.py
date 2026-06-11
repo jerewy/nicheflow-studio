@@ -4123,6 +4123,56 @@ def test_publish_queue_has_manual_instagram_actions(qt_app, tmp_path: Path) -> N
         window.close()
 
 
+def test_publish_queue_saves_manual_insights_for_posted_job(qt_app, tmp_path: Path) -> None:
+    init_db()
+    output_path = tmp_path / "posted-reel.mp4"
+    output_path.write_bytes(b"processed")
+
+    with get_session() as session:
+        account = Account(name="RespawnReels", platform="instagram")
+        session.add(account)
+        session.flush()
+        job = UploadJob(
+            account_id=account.id,
+            processed_path=str(output_path),
+            title="Measured title",
+            status="posted",
+        )
+        session.add(job)
+        session.commit()
+        job_id = job.id
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._current_account_combo.setCurrentIndex(1)
+        window._set_current_page("uploads")
+        qt_app.processEvents()
+        window._schedule_table.selectRow(0)
+        qt_app.processEvents()
+
+        assert window._schedule_save_metrics_button.isEnabled() is True
+        window._schedule_metric_inputs["posted_views"].setText("1200")
+        window._schedule_metric_inputs["posted_likes"].setText("90")
+        window._schedule_metric_inputs["posted_comments"].setText("12")
+        window._schedule_metric_inputs["posted_shares"].setText("7")
+        window._schedule_save_metrics_button.click()
+        qt_app.processEvents()
+
+        with get_session() as session:
+            saved = session.get(UploadJob, job_id)
+            assert saved.posted_views == 1200
+            assert saved.posted_likes == 90
+            assert saved.posted_comments == 12
+            assert saved.posted_shares == 7
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
 def test_publish_queue_assisted_instagram_upload_opens_profile_and_copies_caption(
     qt_app,
     tmp_path: Path,

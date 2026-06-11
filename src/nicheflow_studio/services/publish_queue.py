@@ -44,7 +44,7 @@ def _coerce_int(value: object) -> int | None:
     if value is None or value == "":
         return None
     try:
-        return int(value)
+        return int(str(value).replace(",", "").strip())
     except (TypeError, ValueError) as exc:
         raise PublishQueueError(f"Expected a number, got {value!r}.") from exc
 
@@ -117,6 +117,25 @@ def mark_posted(job_id: int, payload: dict | None = None) -> dict:
         for field in _METRIC_FIELDS:
             if field in payload:
                 setattr(job, field, _coerce_int(payload[field]))
+        name = _account_name(session, job.account_id)
+        session.commit()
+        return _job_view(job, name)
+
+
+def update_metrics(job_id: int, payload: dict | None = None) -> dict:
+    """Update manually-entered IG Insights metrics for an already-posted job."""
+    payload = payload or {}
+    with get_session() as session:
+        job = _require_job(session, job_id)
+        if job.posted_at is None and job.status != "posted":
+            raise PublishQueueError("Metrics can only be entered for a posted job.")
+        for field in _METRIC_FIELDS:
+            if field not in payload:
+                continue
+            value = _coerce_int(payload[field])
+            if value is not None and value < 0:
+                raise PublishQueueError("Metrics cannot be negative.")
+            setattr(job, field, value)
         name = _account_name(session, job.account_id)
         session.commit()
         return _job_view(job, name)

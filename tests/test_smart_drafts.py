@@ -1220,6 +1220,47 @@ def test_effective_title_rules_auto_routes_history_without_explicit_style() -> N
     assert "10-16 words" in joined
 
 
+def test_effective_title_rules_renders_measured_winners_instead_of_static_examples() -> None:
+    winners = ["Measured winner one", "Measured winner two", "Measured winner three"]
+
+    rules = smart_drafts.effective_title_rules(
+        title_style="history_lost_archive",
+        caption_style=None,
+        niche_label="history archive",
+        few_shot_winners=winners,
+    )
+    rendered = "\n".join(rules)
+
+    assert all(winner in rendered for winner in winners)
+    assert "MEASURED ACCOUNT WINNER EXAMPLES" in rendered
+    assert smart_drafts._HISTORY_LOST_ARCHIVE_FEW_SHOT_WINNERS[0] not in rendered
+
+
+def test_effective_title_rules_falls_back_to_static_winners_without_metrics() -> None:
+    rules = smart_drafts.effective_title_rules(
+        title_style="history_lost_archive",
+        caption_style=None,
+        niche_label="history archive",
+        few_shot_winners=[],
+    )
+    rendered = "\n".join(rules)
+
+    assert smart_drafts._HISTORY_LOST_ARCHIVE_FEW_SHOT_WINNERS[0] in rendered
+
+
+def test_live_prompt_renders_measured_winners() -> None:
+    prompt = smart_drafts._smart_draft_prompt(
+        transcript_text="A narrator explains the archive footage.",
+        source_title="Archive footage",
+        niche_label="history archive",
+        title_style="history_lost_archive",
+        few_shot_winners=["Measured winner one", "Measured winner two"],
+    )
+
+    assert "Measured winner one" in prompt
+    assert "Measured winner two" in prompt
+
+
 def test_effective_title_rules_respects_explicit_title_style_for_history() -> None:
     # An explicit pick always wins, even for a history account.
     rules = smart_drafts.effective_title_rules(

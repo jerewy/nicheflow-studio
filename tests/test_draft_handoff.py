@@ -1,4 +1,4 @@
-from nicheflow_studio.db.models import Account, DownloadItem
+from nicheflow_studio.db.models import Account, DownloadItem, UploadJob
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.services import draft_handoff, draft_revisions
 
@@ -50,6 +50,36 @@ def test_build_chat_prompt_carries_title_rules_and_hook_framing() -> None:
     assert "STATIC WINNER EXAMPLES" in prompt
     assert "COMMENT TEST" in prompt
     assert "GREEN" in prompt and "YELLOW" in prompt and "RED" in prompt
+
+
+def test_build_chat_prompt_uses_accounts_measured_top_titles() -> None:
+    item_id = _make_item()
+    with get_session() as session:
+        item = session.get(DownloadItem, item_id)
+        session.add_all(
+            [
+                UploadJob(
+                    account_id=item.account_id,
+                    processed_path="C:/winner-one.mp4",
+                    title="Measured winner one",
+                    status="posted",
+                    posted_likes=300,
+                ),
+                UploadJob(
+                    account_id=item.account_id,
+                    processed_path="C:/winner-two.mp4",
+                    title="Measured winner two",
+                    status="posted",
+                    posted_likes=200,
+                ),
+            ]
+        )
+        session.commit()
+
+    prompt = draft_handoff.build_chat_prompt(item_id)
+
+    assert "Measured winner one" in prompt
+    assert "Measured winner two" in prompt
 
 
 def test_build_chat_prompt_guards_blind_chat_models() -> None:

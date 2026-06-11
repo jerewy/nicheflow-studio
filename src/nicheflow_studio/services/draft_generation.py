@@ -18,7 +18,7 @@ from sqlalchemy import select
 from nicheflow_studio.db.models import Account, DownloadItem
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.processing import smart_drafts
-from nicheflow_studio.services import draft_revisions
+from nicheflow_studio.services import draft_revisions, publishing_dashboard
 from nicheflow_studio.services.draft_revisions import DraftRevisionDTO, DraftRevisionError
 
 # Number of recent same-account drafts fed to the generator so it can avoid
@@ -114,6 +114,9 @@ def generate_revision_for_item(
             )
         voice = _account_voice(account, clip_premise)
         recent_titles, recent_captions = _recent_drafts(session, item.account_id, item.id)
+        few_shot_winners = (
+            publishing_dashboard.top_post_titles(account.id) if account is not None else []
+        )
         gen_kwargs = {
             "transcript_text": item.transcript_text or "",
             "source_title": item.title,
@@ -126,6 +129,7 @@ def generate_revision_for_item(
             "title_style": title_style,
             "recent_titles": recent_titles or None,
             "recent_captions": recent_captions or None,
+            "few_shot_winners": few_shot_winners or None,
         }
 
     # The provider call is slow and must run outside the DB session.
