@@ -22,6 +22,7 @@ const SINGLE_LINE: { key: string; label: string; placeholder?: string }[] = [
   { key: "upload_timezone", label: "Upload timezone", placeholder: "Asia/Jakarta" },
   { key: "upload_default_privacy", label: "Default privacy", placeholder: "private" },
   { key: "upload_schedule_slots", label: "Schedule slots", placeholder: "09:00, 18:00" },
+  { key: "daily_posts_target", label: "Daily posts target", placeholder: "Default: 4" },
 ];
 
 const MULTI_LINE: { key: string; label: string }[] = [

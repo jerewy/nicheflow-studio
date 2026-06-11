@@ -31,7 +31,7 @@ DEFAULT_PLANNING_WINDOW_DAYS = 7
 
 
 def target_backlog(
-    daily_posts_per_account: int = DEFAULT_DAILY_POSTS_PER_ACCOUNT,
+    daily_posts_per_account: int | None = None,
     planning_window_days: int = DEFAULT_PLANNING_WINDOW_DAYS,
 ) -> int:
     """Per-account backlog target = daily posts × planning window (in days).
@@ -40,11 +40,16 @@ def target_backlog(
     is driven by how fast it posts and how far ahead we plan. MVP default is
     4 × 7 = 28. See docs/SOURCING_POOLING_PLAN.md §4.
     """
-    if daily_posts_per_account < 1:
+    daily_posts = (
+        DEFAULT_DAILY_POSTS_PER_ACCOUNT
+        if daily_posts_per_account is None
+        else daily_posts_per_account
+    )
+    if daily_posts < 1:
         raise ValueError("daily_posts_per_account must be at least 1.")
     if planning_window_days < 1:
         raise ValueError("planning_window_days must be at least 1.")
-    return daily_posts_per_account * planning_window_days
+    return daily_posts * planning_window_days
 
 
 @dataclass(frozen=True)
@@ -149,6 +154,7 @@ def plan_first_cycle(
     *,
     rng: _random.Random | None = None,
     max_per_account: int | None = None,
+    targets_by_account: dict[int, int] | None = None,
     existing_counts: dict[int, int] | None = None,
     shuffle_items: bool = True,
 ) -> list[PlannedAssignment]:
@@ -185,6 +191,8 @@ def plan_first_cycle(
         return []
     if max_per_account is not None and max_per_account < 1:
         raise ValueError("max_per_account must be at least 1 when set.")
+    if targets_by_account is not None and any(target < 1 for target in targets_by_account.values()):
+        raise ValueError("targets_by_account values must be at least 1.")
 
     rng = rng or _random.Random()
     items = list(pool_item_ids)
@@ -202,7 +210,12 @@ def plan_first_cycle(
     per_account: Counter[int] = Counter({acct: int(base.get(acct, 0)) for acct in accounts})
 
     def _has_room(account_id: int) -> bool:
-        return max_per_account is None or per_account[account_id] < max_per_account
+        target = (
+            targets_by_account.get(account_id)
+            if targets_by_account is not None
+            else max_per_account
+        )
+        return target is None or per_account[account_id] < target
 
     assignments: list[PlannedAssignment] = []
     for pool_item_id in items:

@@ -129,6 +129,7 @@ def distribute_niche(
     *,
     rng: _random.Random | None = None,
     max_per_account: int | None = None,
+    targets_by_account: dict[int, int] | None = None,
 ) -> list[Assignment]:
     """Distribute the niche's unassigned accepted pool across its accounts.
 
@@ -169,6 +170,7 @@ def distribute_niche(
         account_ids,
         rng=rng,
         max_per_account=max_per_account,
+        targets_by_account=targets_by_account,
         existing_counts=existing_counts,
         shuffle_items=False,
     )

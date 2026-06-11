@@ -344,6 +344,7 @@ def test_init_db_adds_scrape_columns_and_creates_candidates_table() -> None:
     assert "upload_default_privacy" in account_columns
     assert "upload_schedule_slots" in account_columns
     assert "auto_schedule_on_export" in account_columns
+    assert "daily_posts_target" in account_columns
     assert "upload_made_for_kids" in account_columns
     assert "upload_contains_synthetic_media" in account_columns
     assert "scrape_candidates" in tables

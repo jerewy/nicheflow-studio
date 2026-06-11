@@ -194,19 +194,33 @@ def distribute_niche(niche: str, max_per_account: int | None = None) -> dict:
     Ranks the unassigned pool by intrinsic engagement (likes + recency), spreads
     the strongest clips one-per-account (volume-balanced, jittered within score
     tiers so accounts don't all get the same top clip), and tops each account up
-    to ``max_per_account`` TOTAL (default :func:`target_backlog`, 28). Idempotent:
+    to each account's cadence-based total target. An explicit
+    ``max_per_account`` remains a uniform override. Idempotent:
     re-running only places clips for accounts still under target and never
     double-books a clip. Returns how many assignments were created, a per-account
     breakdown, and a ``reason`` string when assigned is 0 so the caller can show
     a specific message instead of a generic one:
     - ``"no_accounts"``  — no accounts are in this niche yet.
-    - ``"all_at_cap"``   — every account already holds ``max_per_account`` clips.
+    - ``"all_at_cap"``   — every account already holds its target clips.
     - ``"pool_empty"``   — all accepted clips are already assigned.
     """
-    cap = max_per_account if max_per_account is not None else target_backlog()
     with get_session() as session:
+        accounts = session.query(Account).filter(Account.niche == niche).all()
+        targets = {
+            account.id: (
+                max_per_account
+                if max_per_account is not None
+                else target_backlog(account.daily_posts_target)
+            )
+            for account in accounts
+        }
         try:
-            created = assignments_db.distribute_niche(session, niche, max_per_account=cap)
+            created = assignments_db.distribute_niche(
+                session,
+                niche,
+                max_per_account=max_per_account,
+                targets_by_account=None if max_per_account is not None else targets,
+            )
         except ValueError as exc:  # unknown niche from _validate_niche
             raise PoolingError(str(exc)) from exc
 
@@ -219,7 +233,7 @@ def distribute_niche(niche: str, max_per_account: int | None = None) -> dict:
                 existing = assignments_db.assignment_counts_by_account(session, niche)
                 reason = (
                     "all_at_cap"
-                    if all(existing.get(a, 0) >= cap for a in acct_ids)
+                    if all(existing.get(a, 0) >= targets[a] for a in acct_ids)
                     else "pool_empty"
                 )
 
@@ -235,15 +249,26 @@ def distribute_niche(niche: str, max_per_account: int | None = None) -> dict:
             else {}
         )
         session.commit()
+        unique_targets = set(targets.values())
+        response_cap = (
+            max_per_account
+            if max_per_account is not None
+            else next(iter(unique_targets))
+            if len(unique_targets) == 1
+            else target_backlog()
+            if not unique_targets
+            else None
+        )
         result: dict = {
             "niche": niche,
             "assigned": len(created),
-            "max_per_account": cap,
+            "max_per_account": response_cap,
             "accounts": [
                 {
                     "account_id": account_id,
                     "account_name": names.get(account_id, f"#{account_id}"),
                     "count": count,
+                    "target": targets[account_id],
                 }
                 for account_id, count in sorted(per_account.items(), key=lambda kv: -kv[1])
             ],

@@ -146,13 +146,13 @@ export function PoolingScreen() {
       if (result.assigned === 0) {
         const reasonMessages: Record<string, string> = {
           no_accounts: `No accounts are set to the "${niche}" niche — assign accounts first in Account settings.`,
-          all_at_cap: `All accounts are already at the ${result.max_per_account}-clip target. Add more accounts to this niche, or wait for the backlog to drain before redistributing.`,
+          all_at_cap: "All accounts are already at their daily-cadence backlog targets. Add more accounts to this niche, or wait for the backlog to drain before redistributing.",
           pool_empty: "Pool is fully distributed — no unused clips remain.",
         };
         setMessage(reasonMessages[result.reason ?? ""] ?? "Nothing to distribute.");
       } else {
         const breakdown = result.accounts
-          .map((account) => `${account.account_name} (${account.count})`)
+          .map((account) => `${account.account_name} (${account.count}/${account.target})`)
           .join(", ");
         setMessage(`Distributed ${result.assigned} clip(s) — ${breakdown}.`);
       }

@@ -17,6 +17,7 @@ from nicheflow_studio.core.distribution import (
 def test_target_backlog_mvp_default_is_28() -> None:
     """MVP cadence: 4 posts/day over a 7-day window = 28 clips/account."""
     assert target_backlog() == 28
+    assert target_backlog(None, 7) == 28
 
 
 def test_target_backlog_scales_with_cadence_and_window() -> None:
@@ -111,6 +112,17 @@ def test_existing_counts_make_max_per_account_a_total_target() -> None:
     assert counts.get(1, 0) == 0  # already full -> no new assignments
     assert counts[2] == 28  # topped up to the target
     assert len(plan) == 28
+
+
+def test_per_account_targets_fill_different_backlogs() -> None:
+    plan = plan_first_cycle(
+        list(range(1, 101)),
+        [1, 2, 3],
+        rng=random.Random(5),
+        targets_by_account={1: 21, 2: 35, 3: 28},
+    )
+
+    assert distribution_counts(plan) == {1: 21, 2: 35, 3: 28}
 
 
 def test_top_up_levels_underfilled_accounts_evenly() -> None:

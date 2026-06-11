@@ -157,6 +157,7 @@ export interface AccountDetail extends AccountSummary {
   upload_timezone: string | null;
   upload_default_privacy: string | null;
   upload_schedule_slots: string | null;
+  daily_posts_target: number | null;
   auto_schedule_on_export: boolean;
   download_item_count: number;
   upload_job_count: number;
@@ -299,8 +300,8 @@ export interface PoolSourceClip {
 export interface DistributeNicheResult {
   niche: string;
   assigned: number;
-  max_per_account: number;
-  accounts: { account_id: number; account_name: string; count: number }[];
+  max_per_account: number | null;
+  accounts: { account_id: number; account_name: string; count: number; target: number }[];
   /** Only present when assigned === 0. Explains why nothing was distributed. */
   reason?: "no_accounts" | "all_at_cap" | "pool_empty";
 }

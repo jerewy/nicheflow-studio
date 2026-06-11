@@ -208,8 +208,59 @@ def test_distribute_niche_service_defaults_to_target_backlog() -> None:
 
     result = pooling.distribute_niche("history")
 
-    assert result["max_per_account"] == 28  # target_backlog() MVP default
+    assert result["max_per_account"] == 28
     assert result["assigned"] == 2  # only two clips available to place
+
+
+def test_distribute_niche_uses_each_accounts_daily_posts_target() -> None:
+    with get_session() as session:
+        session.add_all(
+            [
+                Account(
+                    name="Three Daily",
+                    platform="instagram",
+                    niche="history",
+                    daily_posts_target=3,
+                ),
+                Account(
+                    name="Five Daily",
+                    platform="instagram",
+                    niche="history",
+                    daily_posts_target=5,
+                ),
+                Account(
+                    name="Default Daily",
+                    platform="instagram",
+                    niche="history",
+                    daily_posts_target=None,
+                ),
+            ]
+        )
+        for index in range(100):
+            asset = MediaAsset(
+                platform="instagram",
+                canonical_source_url=f"https://instagram.com/reel/cadence{index}",
+                source_shortcode=f"cadence{index}",
+                download_status="downloaded",
+            )
+            session.add(asset)
+            session.flush()
+            session.add(
+                PoolItem(
+                    media_asset_id=asset.id,
+                    niche="history",
+                    acceptance_status="accepted",
+                )
+            )
+        session.commit()
+
+    result = pooling.distribute_niche("history")
+
+    counts = {row["account_name"]: row["count"] for row in result["accounts"]}
+    targets = {row["account_name"]: row["target"] for row in result["accounts"]}
+    assert result["max_per_account"] is None
+    assert counts == {"Three Daily": 21, "Five Daily": 35, "Default Daily": 28}
+    assert targets == {"Three Daily": 21, "Five Daily": 35, "Default Daily": 28}
 
 
 def test_distribute_niche_service_rejects_unknown_niche() -> None:

@@ -60,6 +60,7 @@ class Account(Base):
     upload_timezone: Mapped[str | None] = mapped_column(String(64), nullable=True)
     upload_default_privacy: Mapped[str | None] = mapped_column(String(32), nullable=True)
     upload_schedule_slots: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    daily_posts_target: Mapped[int | None] = mapped_column(Integer, nullable=True)
     auto_schedule_on_export: Mapped[bool] = mapped_column(Boolean, default=False)
     upload_made_for_kids: Mapped[int] = mapped_column(Integer, default=0)
     upload_contains_synthetic_media: Mapped[int] = mapped_column(Integer, default=0)

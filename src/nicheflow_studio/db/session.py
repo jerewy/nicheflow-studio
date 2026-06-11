@@ -263,6 +263,8 @@ def _ensure_compatibility() -> None:
             connection.execute(
                 text("ALTER TABLE accounts ADD COLUMN upload_schedule_slots VARCHAR(512)")
             )
+        if "daily_posts_target" not in account_columns:
+            connection.execute(text("ALTER TABLE accounts ADD COLUMN daily_posts_target INTEGER"))
         if "auto_schedule_on_export" not in account_columns:
             connection.execute(
                 text(

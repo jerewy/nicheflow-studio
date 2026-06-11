@@ -49,6 +49,7 @@ _TEXT_FIELDS = (
     "upload_schedule_slots",
 )
 _BOOL_FIELDS = ("auto_schedule_on_export",)
+_OPTIONAL_POSITIVE_INT_FIELDS = ("daily_posts_target",)
 
 
 class AccountError(ServiceError):
@@ -89,6 +90,7 @@ def _account_detail(session, account: Account) -> dict:
             "upload_timezone": account.upload_timezone,
             "upload_default_privacy": account.upload_default_privacy,
             "upload_schedule_slots": account.upload_schedule_slots,
+            "daily_posts_target": account.daily_posts_target,
             "auto_schedule_on_export": bool(account.auto_schedule_on_export),
             "download_item_count": session.scalar(
                 select(func.count(DownloadItem.id)).where(DownloadItem.account_id == account.id)
@@ -128,6 +130,19 @@ def _apply_payload(account: Account, payload: dict, *, partial: bool) -> None:
             if isinstance(value, str):
                 value = value.strip().lower() in {"1", "true", "yes", "on"}
             setattr(account, field, bool(value))
+    for field in _OPTIONAL_POSITIVE_INT_FIELDS:
+        if field in payload or not partial:
+            raw = payload.get(field)
+            if raw is None or str(raw).strip() == "":
+                setattr(account, field, None)
+                continue
+            try:
+                value = int(raw)
+            except (TypeError, ValueError) as exc:
+                raise AccountError(f"{field} must be a whole number.") from exc
+            if value < 1:
+                raise AccountError(f"{field} must be at least 1.")
+            setattr(account, field, value)
 
 
 def list_accounts() -> list[dict]:

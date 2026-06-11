@@ -4866,8 +4866,22 @@ class MainWindow(QWidget):
             # nothing more) thanks to the existing-count seeding in
             # distribute_niche — see docs/SOURCING_POOLING_PLAN.md §4-§6.
             spin = self._pooling_distribute_count.get(niche)
-            target = spin.value() if spin is not None else target_backlog()
-            created_count = len(distribute_niche(session, niche, max_per_account=target))
+            selected_target = spin.value() if spin is not None else target_backlog()
+            uniform_override = (
+                selected_target if selected_target != target_backlog() else None
+            )
+            targets = {
+                account.id: target_backlog(account.daily_posts_target)
+                for account in session.query(Account).filter(Account.niche == niche).all()
+            }
+            created_count = len(
+                distribute_niche(
+                    session,
+                    niche,
+                    max_per_account=uniform_override,
+                    targets_by_account=None if uniform_override is not None else targets,
+                )
+            )
             session.commit()
             counts = assignment_counts_by_account(session, niche)
             names = {
@@ -4876,7 +4890,7 @@ class MainWindow(QWidget):
         if created_count == 0:
             self._notify(
                 f"Nothing new to distribute for {niche} — every account is already "
-                f"at its target of {target} clip(s), or the pool is empty.",
+                "at its backlog target, or the pool is empty.",
                 Tone.INFO,
             )
             self._refresh_pooling_page()
@@ -4885,9 +4899,13 @@ class MainWindow(QWidget):
             f"{names.get(account_id, account_id)}: {count}"
             for account_id, count in sorted(counts.items())
         )
+        target_label = (
+            f"target {uniform_override}/account"
+            if uniform_override is not None
+            else "per-account cadence targets"
+        )
         self._notify(
-            f"Distributed {created_count} clip(s) across {niche} accounts "
-            f"(target {target}/account).",
+            f"Distributed {created_count} clip(s) across {niche} accounts ({target_label}).",
             Tone.SUCCESS,
         )
         self._pooling_status_label.setText(f"Latest {niche} distribution → {summary}")
@@ -4969,7 +4987,7 @@ class MainWindow(QWidget):
         )
         with get_session() as session:
             accounts = [
-                (a.id, a.name, a.niche)
+                (a.id, a.name, a.niche, a.daily_posts_target)
                 for a in session.query(Account).order_by(Account.name.asc()).all()
             ]
             pool_sizes = {n: pool_size(session, n) for n in self._POOLING_NICHES}
@@ -4985,7 +5003,9 @@ class MainWindow(QWidget):
             # Distinct source labels feeding the selected niche's accounts.
             niche_sources: list[str] = []
             if selected_niche in self._POOLING_NICHES:
-                niche_account_ids = [aid for aid, _n, n in accounts if (n or "") == selected_niche]
+                niche_account_ids = [
+                    aid for aid, _n, n, _target in accounts if (n or "") == selected_niche
+                ]
                 if niche_account_ids:
                     niche_sources = sorted(
                         {
@@ -4996,10 +5016,9 @@ class MainWindow(QWidget):
                         }
                     )
 
-        target = target_backlog()
         self._pooling_table.blockSignals(True)
         self._pooling_table.setRowCount(0)
-        for account_id, name, niche in accounts:
+        for account_id, name, niche, daily_posts_target in accounts:
             # Niche filter: "all" shows everything; otherwise only that niche.
             if selected_niche in self._POOLING_NICHES and (niche or "") != selected_niche:
                 continue
@@ -5007,6 +5026,7 @@ class MainWindow(QWidget):
             # Target/Need only make sense for accounts in a pool niche; others
             # (no niche set) show "—" so the columns stay meaningful.
             is_pool_niche = (niche or "") in self._POOLING_NICHES
+            target = target_backlog(daily_posts_target)
             target_text = str(target) if is_pool_niche else "—"
             need_text = str(max(0, target - assigned)) if is_pool_niche else "—"
             row = self._pooling_table.rowCount()

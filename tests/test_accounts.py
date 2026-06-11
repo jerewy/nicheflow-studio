@@ -59,6 +59,14 @@ def test_auto_schedule_on_export_round_trips() -> None:
     assert updated["auto_schedule_on_export"] is False
 
 
+def test_daily_posts_target_round_trips_and_can_clear() -> None:
+    created = accounts_svc.create_account({"name": "Cadence", "daily_posts_target": 5})
+    assert created["daily_posts_target"] == 5
+
+    updated = accounts_svc.update_account(created["id"], {"daily_posts_target": None})
+    assert updated["daily_posts_target"] is None
+
+
 def test_update_unknown_raises() -> None:
     with pytest.raises(AccountError):
         accounts_svc.update_account(99999, {"name": "x"})
