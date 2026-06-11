@@ -828,6 +828,70 @@ def test_detect_content_rectangle_finds_crf28_footage_on_any_canvas(
     assert abs(rect.bottom - expected.bottom) <= frame_height * 0.02
 
 
+def test_detect_content_rectangle_trims_white_card_matte_on_dark_canvas(
+    tmp_path: Path,
+) -> None:
+    """pastmomentsdaily #212 composition: white card framing the footage on a
+    BLACK canvas. The outer border is dark, so the light-canvas path doesn't
+    engage — the flat white matte strips must be trimmed by the margin pass."""
+    ffmpeg = video.ffmpeg_binary()
+    if ffmpeg is None:
+        pytest.skip("ffmpeg is required for the content-rectangle fixture")
+
+    frame_width = 360
+    frame_height = 640
+    card_left, card_top, card_width, card_height = 40, 160, 280, 320
+    footage_left, footage_top, footage_width, footage_height = 60, 180, 240, 280
+    expected = CropSettings(
+        left=footage_left,
+        top=footage_top,
+        right=frame_width - footage_left - footage_width,
+        bottom=frame_height - footage_top - footage_height,
+    )
+    fixture = tmp_path / "white-card.mp4"
+    subprocess.run(
+        [
+            str(ffmpeg),
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c=black:s={frame_width}x{frame_height}:r=24:d=4",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c=white:s={card_width}x{card_height}:r=24:d=4",
+            "-f",
+            "lavfi",
+            "-i",
+            f"testsrc2=s={footage_width}x{footage_height}:r=24:d=4",
+            "-filter_complex",
+            f"[0:v][1:v]overlay={card_left}:{card_top}[base];"
+            f"[base][2:v]overlay={footage_left}:{footage_top}:shortest=1",
+            "-c:v",
+            "libx264",
+            "-crf",
+            "28",
+            "-pix_fmt",
+            "yuv420p",
+            str(fixture),
+        ],
+        check=True,
+        capture_output=True,
+        **video.subprocess_run_kwargs(),
+    )
+
+    rect = video.detect_content_rectangle(fixture, video.probe_video(fixture))
+
+    assert rect is not None
+    assert abs(rect.left - expected.left) <= frame_width * 0.02
+    assert abs(rect.right - expected.right) <= frame_width * 0.02
+    assert abs(rect.top - expected.top) <= frame_height * 0.02
+    # Bottom keeps the deliberate descender padding, so allow it below expected.
+    assert expected.bottom - rect.bottom <= frame_height * 0.03
+    assert rect.bottom >= expected.bottom - frame_height * 0.03
+
+
 def test_detect_content_rectangle_keeps_bottom_descender_padding(
     monkeypatch, tmp_path: Path
 ) -> None:

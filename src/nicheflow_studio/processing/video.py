@@ -426,6 +426,20 @@ CONTENT_RECT_OVERLAY_BAR_MOTION_MAX = 1.5
 # The bottom edge often lands on the subtitle ink bbox. Keep a small guard so
 # descenders/antialias pixels in baked-in captions ("g", "p", "y") survive.
 CONTENT_RECT_BOTTOM_DESCENDER_PADDING_RATIO = 0.006
+# Card-matte margins. Some reels frame the footage in a flat "card" border
+# (e.g. a white matte on a black canvas — pastmomentsdaily #212). The matte's
+# inner boundary carries sharp pixels, so band detection keeps thin matte
+# strips at the rect edges. A matte row/column is UNIFORM (flat color) and
+# STATIC (no motion) across the whole band — real footage edges are not.
+# Trimming is capped per side so a flat-but-real footage edge (clear sky)
+# can only ever lose a sliver.
+# Measured fingerprints (pastmomentsdaily #212 + fixtures): true matte rows/
+# cols have spatial std <= 1.7 and motion <= 0.9; flat-ish REAL footage edges
+# (testsrc2 gradient) run std ~3.5 but motion ~6 — so the motion gate must be
+# far stricter than CONTENT_RECT_ACTIVITY_THRESHOLD or footage gets trimmed.
+CONTENT_RECT_MARGIN_UNIFORM_STD = 4.0  # spatial std ceiling for a "flat" row/col
+CONTENT_RECT_MARGIN_MOTION_MAX = 2.0  # matte is motionless; footage edges are not
+CONTENT_RECT_MARGIN_TRIM_RATIO = 0.05  # max fraction of the rect trimmed per side
 
 
 def _downscale_frame(frame, target_width: int):  # noqa: ANN001
@@ -479,6 +493,55 @@ def _largest_coverage_band(
     if best is None or best_len < min_len:
         return None
     return best
+
+
+def _trim_uniform_static_margins(
+    brightness,  # noqa: ANN001
+    temporal,  # noqa: ANN001
+    *,
+    top: int,
+    bottom: int,
+    left: int,
+    right: int,
+) -> tuple[int, int, int, int]:
+    """Walk inward from each rect edge and trim flat, motionless matte strips.
+
+    Columns are trimmed first against the full row band, then rows against the
+    trimmed columns, so a matte corner can't shield an adjacent edge. Returns
+    the refined ``(top, bottom, left, right)`` indices (downscaled space).
+    """
+    col_cap = max(1, int((right - left + 1) * CONTENT_RECT_MARGIN_TRIM_RATIO))
+    row_cap = max(1, int((bottom - top + 1) * CONTENT_RECT_MARGIN_TRIM_RATIO))
+
+    def _col_is_matte(x: int) -> bool:
+        return (
+            float(brightness[top : bottom + 1, x].std()) < CONTENT_RECT_MARGIN_UNIFORM_STD
+            and float(temporal[top : bottom + 1, x].mean()) < CONTENT_RECT_MARGIN_MOTION_MAX
+        )
+
+    def _row_is_matte(y: int) -> bool:
+        return (
+            float(brightness[y, left : right + 1].std()) < CONTENT_RECT_MARGIN_UNIFORM_STD
+            and float(temporal[y, left : right + 1].mean()) < CONTENT_RECT_MARGIN_MOTION_MAX
+        )
+
+    for _ in range(col_cap):
+        if left >= right or not _col_is_matte(left):
+            break
+        left += 1
+    for _ in range(col_cap):
+        if right <= left or not _col_is_matte(right):
+            break
+        right -= 1
+    for _ in range(row_cap):
+        if top >= bottom or not _row_is_matte(top):
+            break
+        top += 1
+    for _ in range(row_cap):
+        if bottom <= top or not _row_is_matte(bottom):
+            break
+        bottom -= 1
+    return top, bottom, left, right
 
 
 def detect_content_rectangle(input_path: Path, probe: VideoProbe) -> CropSettings | None:
@@ -711,12 +774,23 @@ def detect_content_rectangle(input_path: Path, probe: VideoProbe) -> CropSetting
         buffer = max(4, int(min_h * 0.008))
         top_band_index = min(last_text_y + 1 + buffer, scan_end)
 
+    # Trim flat, motionless card-matte strips (white card on dark canvas etc.)
+    # that band detection keeps because their inner boundary has sharp pixels.
+    trim_top, trim_bottom, trim_left, trim_right = _trim_uniform_static_margins(
+        brightness,
+        temporal,
+        top=top_band_index,
+        bottom=row_band[1],
+        left=col_band[0],
+        right=col_band[1],
+    )
+
     bottom_padding = max(4, int(probe.height * CONTENT_RECT_BOTTOM_DESCENDER_PADDING_RATIO))
     crop = CropSettings(
-        left=int((col_band[0] / min_w) * probe.width),
-        top=int((top_band_index / min_h) * probe.height),
-        right=int(((min_w - 1 - col_band[1]) / min_w) * probe.width),
-        bottom=max(0, int(((min_h - 1 - row_band[1]) / min_h) * probe.height) - bottom_padding),
+        left=int((trim_left / min_w) * probe.width),
+        top=int((trim_top / min_h) * probe.height),
+        right=int(((min_w - 1 - trim_right) / min_w) * probe.width),
+        bottom=max(0, int(((min_h - 1 - trim_bottom) / min_h) * probe.height) - bottom_padding),
     )
     remaining_w = probe.width - crop.left - crop.right
     remaining_h = probe.height - crop.top - crop.bottom
