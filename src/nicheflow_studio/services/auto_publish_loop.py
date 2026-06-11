@@ -11,6 +11,18 @@ from nicheflow_studio.services.publish_now import auto_publish_enabled, publish_
 logger = logging.getLogger(__name__)
 
 _DEFAULT_INTERVAL_SECONDS = 60.0
+# Top-up the niche pools' distribution once at startup and then hourly: the
+# assignment lifecycle frees backlog slots as posts go out, and this is what
+# refills them without a manual "Auto-distribute" click.
+_DEFAULT_TOP_UP_EVERY_TICKS = 60
+
+
+def _default_top_up() -> list[dict]:
+    # Lazy import: pooling pulls in the distribution stack, which the loop
+    # shouldn't pay for at import time (mirrors the publish_reel seam).
+    from nicheflow_studio.services.pooling import auto_top_up
+
+    return auto_top_up()
 
 
 class AutoPublishLoop:
@@ -22,10 +34,15 @@ class AutoPublishLoop:
         interval_seconds: float = _DEFAULT_INTERVAL_SECONDS,
         enabled: Callable[[], bool] = auto_publish_enabled,
         publish: Callable[[], dict] = publish_due_jobs,
+        top_up: Callable[[], list[dict]] = _default_top_up,
+        top_up_every_ticks: int = _DEFAULT_TOP_UP_EVERY_TICKS,
     ) -> None:
         self._interval_seconds = interval_seconds
         self._enabled = enabled
         self._publish = publish
+        self._top_up = top_up
+        self._top_up_every_ticks = max(1, top_up_every_ticks)
+        self._ticks_since_top_up: int | None = None  # None -> top-up on first tick
         self._stop_event = threading.Event()
         self._tick_lock = threading.Lock()
         self._thread: threading.Thread | None = None
@@ -54,6 +71,7 @@ class AutoPublishLoop:
             logger.info("Skipping auto-publish tick because the previous tick is still running.")
             return False
         try:
+            self._maybe_top_up()
             if not self._enabled():
                 return True
             summary = self._publish()
@@ -65,6 +83,25 @@ class AutoPublishLoop:
             return True
         finally:
             self._tick_lock.release()
+
+    def _maybe_top_up(self) -> None:
+        """Refill under-stocked niche distributions at startup and then hourly.
+
+        Independent of the auto-publish toggle: topping up only creates
+        pending-review items (no downloads, no posting), so it is always safe.
+        """
+        if self._ticks_since_top_up is not None:
+            self._ticks_since_top_up += 1
+            if self._ticks_since_top_up < self._top_up_every_ticks:
+                return
+        self._ticks_since_top_up = 0
+        try:
+            refilled = self._top_up()
+            for result in refilled:
+                if result.get("assigned", 0) > 0:
+                    logger.info("Auto top-up distributed: %s", result)
+        except Exception:
+            logger.exception("Auto top-up failed; will retry on the next interval.")
 
     def _run(self) -> None:
         while not self._stop_event.is_set():

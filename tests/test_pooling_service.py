@@ -353,3 +353,39 @@ def test_distribute_never_fetches_media(monkeypatch: pytest.MonkeyPatch) -> None
     result = pooling.distribute_clip(pool_item_id, [account_id])
 
     assert result["assigned"] == 1
+
+def test_auto_top_up_refills_only_below_low_water(monkeypatch) -> None:
+    from nicheflow_studio.db import assignments as assignments_db
+    from nicheflow_studio.services import pooling
+
+    with get_session() as session:
+        account = Account(name="Hist", platform="instagram", niche="history", daily_posts_target=5)
+        session.add(account)
+        session.commit()
+        account_id = account.id
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        pooling, "distribute_niche", lambda niche: calls.append(niche) or {"niche": niche, "assigned": 0}
+    )
+
+    # Backlog at the low-water mark (5/day x 3d = 15): no refill.
+    monkeypatch.setattr(
+        assignments_db, "assignment_counts_by_account", lambda session, niche: {account_id: 15}
+    )
+    assert pooling.auto_top_up(("history",)) == []
+    assert calls == []
+
+    # One below low water: the niche is refilled via the ranked distribution.
+    monkeypatch.setattr(
+        assignments_db, "assignment_counts_by_account", lambda session, niche: {account_id: 14}
+    )
+    results = pooling.auto_top_up(("history",))
+    assert calls == ["history"]
+    assert results and results[0]["niche"] == "history"
+
+
+def test_auto_top_up_skips_niches_without_accounts() -> None:
+    from nicheflow_studio.services import pooling
+
+    assert pooling.auto_top_up(("movie",)) == []

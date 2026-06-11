@@ -14,7 +14,10 @@ from __future__ import annotations
 import datetime as dt
 from collections import Counter
 
-from nicheflow_studio.core.distribution import target_backlog
+from nicheflow_studio.core.distribution import (
+    DEFAULT_DAILY_POSTS_PER_ACCOUNT,
+    target_backlog,
+)
 from nicheflow_studio.db import assignments as assignments_db, pools
 from nicheflow_studio.db.models import Account, Assignment
 from nicheflow_studio.db.session import get_session
@@ -294,6 +297,42 @@ def distribute_niche(niche: str, max_per_account: int | None = None) -> dict:
         if reason is not None:
             result["reason"] = reason
         return result
+
+
+# Auto top-up hysteresis: refill a niche only once SOME account drops below
+# this many days of backlog, then fill every account to its full target.
+# Refilling in multi-day batches (instead of one clip per posted reel) keeps
+# the ranked, tier-shuffled batching meaningful and the assignment pattern
+# unmetronomic.
+AUTO_TOP_UP_LOW_WATER_DAYS = 3
+
+
+def auto_top_up(niches: tuple[str, ...] | None = None) -> list[dict]:
+    """Refill under-stocked niches; the background-loop entry point.
+
+    For each niche with accounts: when any account's pending backlog has
+    fallen below ``daily target x AUTO_TOP_UP_LOW_WATER_DAYS``, run the normal
+    ranked distribution (which tops every account up to its full cadence
+    target). Niches where everyone still has runway are left untouched, so
+    this is cheap to call on a timer. Returns one distribute result per niche
+    that was refilled.
+    """
+    results: list[dict] = []
+    for niche in niches or NICHES:
+        with get_session() as session:
+            accounts = session.query(Account).filter(Account.niche == niche).all()
+            if not accounts:
+                continue
+            counts = assignments_db.assignment_counts_by_account(session, niche)
+            below_low_water = any(
+                counts.get(account.id, 0)
+                < (account.daily_posts_target or DEFAULT_DAILY_POSTS_PER_ACCOUNT)
+                * AUTO_TOP_UP_LOW_WATER_DAYS
+                for account in accounts
+            )
+        if below_low_water:
+            results.append(distribute_niche(niche))
+    return results
 
 
 def distribute_niche_explicit(niche: str, targets_by_account: dict[int, int]) -> dict:

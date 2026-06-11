@@ -94,3 +94,38 @@ def test_webview_app_owns_loop_lifetime(monkeypatch: pytest.MonkeyPatch) -> None
     webview_app.run_webview()
 
     assert calls == ["db", "backup", "update", "start", "webview", "stop"]
+
+def test_loop_tops_up_on_first_tick_and_then_every_interval() -> None:
+    from nicheflow_studio.services.auto_publish_loop import AutoPublishLoop
+
+    top_ups: list[int] = []
+    loop = AutoPublishLoop(
+        enabled=lambda: False,
+        publish=lambda: {},
+        top_up=lambda: top_ups.append(1) or [],
+        top_up_every_ticks=3,
+    )
+
+    for _ in range(7):
+        loop.tick()
+
+    # First tick + every 3rd tick after: ticks 1, 4 and 7.
+    assert len(top_ups) == 3
+
+
+def test_loop_survives_top_up_failure() -> None:
+    from nicheflow_studio.services.auto_publish_loop import AutoPublishLoop
+
+    def boom() -> list[dict]:
+        raise RuntimeError("pool exploded")
+
+    published: list[int] = []
+    loop = AutoPublishLoop(
+        enabled=lambda: True,
+        publish=lambda: published.append(1) or {"posted": 0, "failed": 0},
+        top_up=boom,
+        top_up_every_ticks=1,
+    )
+
+    assert loop.tick() is True
+    assert published == [1]  # publishing still ran despite the top-up failure
