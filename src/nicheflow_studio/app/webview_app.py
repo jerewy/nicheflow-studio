@@ -31,6 +31,7 @@ from nicheflow_studio.core.logging import configure_logging
 from nicheflow_studio.core.paths import ensure_data_dirs
 from nicheflow_studio.db.session import init_db
 from nicheflow_studio.services.auto_publish_loop import AutoPublishLoop
+from nicheflow_studio.services.db_backup import run_startup_backup
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,7 @@ def run_webview() -> None:
     ensure_data_dirs()
     configure_logging()
     init_db()
+    run_startup_backup()
     auto_publish_loop = AutoPublishLoop()
     auto_publish_loop.start()
 

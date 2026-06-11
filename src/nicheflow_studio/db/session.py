@@ -96,7 +96,8 @@ def _backfill_account_niche() -> None:
         session.close()
 
 
-def _db_path() -> Path:
+def database_path() -> Path:
+    """Return the resolved runtime SQLite database path."""
     return data_dir() / "nicheflow.db"
 
 
@@ -361,7 +362,7 @@ def init_db() -> None:
     if _ENGINE is not None:
         return
 
-    db_path = _db_path()
+    db_path = database_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
     _ENGINE = create_engine(f"sqlite:///{db_path}", future=True)
     _SESSION_FACTORY = sessionmaker(bind=_ENGINE, autoflush=False, autocommit=False, future=True)

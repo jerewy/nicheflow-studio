@@ -86,9 +86,10 @@ def test_webview_app_owns_loop_lifetime(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(webview_app, "ensure_data_dirs", lambda: None)
     monkeypatch.setattr(webview_app, "configure_logging", lambda: None)
     monkeypatch.setattr(webview_app, "init_db", lambda: calls.append("db"))
+    monkeypatch.setattr(webview_app, "run_startup_backup", lambda: calls.append("backup"))
     monkeypatch.setattr(webview_app, "AutoPublishLoop", FakeLoop)
     monkeypatch.setattr(webview_app, "_run_started_webview", lambda: calls.append("webview"))
 
     webview_app.run_webview()
 
-    assert calls == ["db", "start", "webview", "stop"]
+    assert calls == ["db", "backup", "start", "webview", "stop"]
