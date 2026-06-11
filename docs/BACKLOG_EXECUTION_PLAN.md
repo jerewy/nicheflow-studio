@@ -284,7 +284,10 @@ wasn't enough.
 
 ## WO-7 — Writer model swap (DeepSeek V3 / Kimi K2 writer tier)
 
-**Priority: 7.** Do AFTER WO-2; measure prompt gains before paying for a model.
+**SHELVED (owner decision 2026-06-11): no paid model APIs — budget already
+committed to ChatGPT/Claude subscriptions.** Premium drafts go through the
+existing Copy Chat Prompt → Paste workflow on those subscriptions ($0
+marginal). Revisit only if the network's revenue justifies API automation.
 
 - **What:** Add an OpenAI-compatible writer provider (DeepSeek API,
   ~$0.27/M in $1.10/M out) selectable ahead of Groq in the writer fallback
