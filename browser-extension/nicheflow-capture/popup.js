@@ -1,5 +1,6 @@
 const HOST_NAME = "com.nicheflow.capture";
 const niche = document.querySelector("#niche");
+const pinnedAccount = document.querySelector("#pinned-account");
 const queueButton = document.querySelector("#queue");
 const processButton = document.querySelector("#process");
 const queueCount = document.querySelector("#queue-count");
@@ -22,6 +23,14 @@ function renderDashboard(dashboard) {
   apifyCost.textContent =
     typeof usage?.estimated_cost_usd === "number" ? `$${usage.estimated_cost_usd.toFixed(4)}` : "Unavailable";
   apifyResults.textContent = usage ? `${usage.used} / ${usage.free_cap}` : "Unavailable";
+  const previousPin = pinnedAccount.value;
+  pinnedAccount.replaceChildren(new Option("No pin", ""));
+  for (const account of selected?.accounts ?? []) {
+    pinnedAccount.add(new Option(account.name, String(account.id)));
+  }
+  pinnedAccount.value = [...pinnedAccount.options].some((option) => option.value === previousPin)
+    ? previousPin
+    : "";
 }
 
 function loadDashboard() {
@@ -59,11 +68,21 @@ async function queueCurrent() {
     show("error", "This Reel is already queued.");
     return;
   }
-  stored.captureQueue.push({ url: tab.url, niche: niche.value, queuedAt: new Date().toISOString() });
+  stored.captureQueue.push({
+    url: tab.url,
+    niche: niche.value,
+    pinned_account_id: pinnedAccount.value ? Number(pinnedAccount.value) : null,
+    queuedAt: new Date().toISOString(),
+  });
   await chrome.storage.local.set({ captureQueue: stored.captureQueue, lastBatch: null });
   await chrome.storage.sync.set({ niche: niche.value });
   chrome.runtime.sendMessage({ action: "refresh_badge" });
-  show("success", `Queued for the ${niche.value} pool.`);
+  show(
+    "success",
+    pinnedAccount.value
+      ? `Queued for the ${niche.value} pool, pinned to ${pinnedAccount.selectedOptions[0].textContent}.`
+      : `Queued for the ${niche.value} pool.`,
+  );
   await renderQueueState();
 }
 

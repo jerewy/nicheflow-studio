@@ -289,6 +289,15 @@ def _ensure_compatibility() -> None:
         if "niche" not in account_columns:
             connection.execute(text("ALTER TABLE accounts ADD COLUMN niche VARCHAR(16)"))
 
+        if "pool_items" in inspect(connection).get_table_names():
+            pool_item_columns = {
+                column["name"] for column in inspect(connection).get_columns("pool_items")
+            }
+            if "pinned_account_id" not in pool_item_columns:
+                connection.execute(
+                    text("ALTER TABLE pool_items ADD COLUMN pinned_account_id INTEGER")
+                )
+
         upload_job_columns = {
             column["name"] for column in inspect(connection).get_columns("upload_jobs")
         }

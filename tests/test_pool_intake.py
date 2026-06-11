@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 
-from nicheflow_studio.db.models import Account, ScrapeCandidate
+from nicheflow_studio.db.models import Account, PoolItem, ScrapeCandidate
 from nicheflow_studio.db.pool_intake import ReelMetadata, add_reel_to_pool
 from nicheflow_studio.db.pools import pool_size
 from nicheflow_studio.db.session import get_session, init_db
@@ -54,6 +54,33 @@ def test_adding_same_reel_twice_is_deduped():
         assert result.status == "duplicate"
         assert "skipped" in result.message.lower()
         assert pool_size(session, "history") == 1  # not double-pooled
+
+
+def test_duplicate_capture_keeps_first_pin():
+    init_db()
+    with get_session() as session:
+        first = _history_account(session)
+        second = Account(name="Another History", platform="instagram", niche="history")
+        session.add(second)
+        session.flush()
+
+        add_reel_to_pool(
+            session,
+            niche="history",
+            metadata=_meta("PINNED01"),
+            pinned_account_id=first.id,
+        )
+        session.commit()
+        result = add_reel_to_pool(
+            session,
+            niche="history",
+            metadata=_meta("PINNED01"),
+            pinned_account_id=second.id,
+        )
+        session.commit()
+
+        assert result.status == "duplicate"
+        assert session.query(PoolItem).one().pinned_account_id == first.id
 
 
 def test_reel_already_in_other_niche_is_reported_duplicate():

@@ -153,7 +153,11 @@ export function PoolingScreen() {
         setMessage(reasonMessages[result.reason ?? ""] ?? "Nothing to distribute.");
       } else {
         const breakdown = result.accounts
-          .map((account) => `${account.account_name} (${account.count}/${account.target})`)
+          .map(
+            (account) =>
+              `${account.account_name} (${account.count}/${account.target}` +
+              `${account.pinned ? `, ${account.pinned} pinned` : ""})`,
+          )
           .join(", ");
         setMessage(`Distributed ${result.assigned} clip(s) — ${breakdown}.`);
       }
@@ -178,7 +182,11 @@ export function PoolingScreen() {
     try {
       const result = await bridge.distributeNicheExplicit(niche, targets);
       const breakdown = result.accounts
-        .map((account) => `${account.account_name} (${account.count}/${account.target})`)
+        .map(
+          (account) =>
+            `${account.account_name} (${account.count}/${account.target}` +
+            `${account.pinned ? `, ${account.pinned} pinned` : ""})`,
+        )
         .join(", ");
       setMessage(`Manually distributed ${result.assigned} clip(s) â€” ${breakdown}.`);
       await load();

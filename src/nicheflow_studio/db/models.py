@@ -351,6 +351,10 @@ class PoolItem(Base):
     rights_confidence: Mapped[str | None] = mapped_column(String(32), nullable=True)
     # Strong evergreen clips may later be reused across more same-niche accounts.
     is_evergreen_candidate: Mapped[int] = mapped_column(Integer, default=0)
+    # Explicit capture intent; the clip remains in the shared niche pool.
+    pinned_account_id: Mapped[int | None] = mapped_column(
+        ForeignKey("accounts.id"), nullable=True
+    )
 
     media_asset: Mapped[MediaAsset] = relationship(back_populates="pool_items")
     assignments: Mapped[list["Assignment"]] = relationship(back_populates="pool_item")

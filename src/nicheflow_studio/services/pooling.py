@@ -249,6 +249,11 @@ def distribute_niche(niche: str, max_per_account: int | None = None) -> dict:
                 )
 
         per_account = Counter(assignment.account_id for assignment in created)
+        pinned_per_account = Counter(
+            assignment.account_id
+            for assignment in created
+            if getattr(assignment, "distribution_reason", None) == "pinned"
+        )
         names = (
             {
                 account_id: name
@@ -273,12 +278,14 @@ def distribute_niche(niche: str, max_per_account: int | None = None) -> dict:
         result: dict = {
             "niche": niche,
             "assigned": len(created),
+            "pinned": sum(pinned_per_account.values()),
             "max_per_account": response_cap,
             "accounts": [
                 {
                     "account_id": account_id,
                     "account_name": names.get(account_id, f"#{account_id}"),
                     "count": count,
+                    "pinned": pinned_per_account.get(account_id, 0),
                     "target": targets[account_id],
                 }
                 for account_id, count in sorted(per_account.items(), key=lambda kv: -kv[1])
@@ -308,6 +315,11 @@ def distribute_niche_explicit(niche: str, targets_by_account: dict[int, int]) ->
         except ValueError as exc:
             raise PoolingError(str(exc)) from exc
         assigned = Counter(row.account_id for row in created)
+        pinned = Counter(
+            row.account_id
+            for row in created
+            if getattr(row, "distribution_reason", None) == "pinned"
+        )
         names = {
             account.id: account.name
             for account in session.query(Account).filter(Account.id.in_(list(requested))).all()
@@ -316,12 +328,14 @@ def distribute_niche_explicit(niche: str, targets_by_account: dict[int, int]) ->
         return {
             "niche": niche,
             "assigned": len(created),
+            "pinned": sum(pinned.values()),
             "max_per_account": None,
             "accounts": [
                 {
                     "account_id": account_id,
                     "account_name": names.get(account_id, f"#{account_id}"),
                     "count": assigned.get(account_id, 0),
+                    "pinned": pinned.get(account_id, 0),
                     "target": target,
                 }
                 for account_id, target in requested.items()

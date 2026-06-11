@@ -186,13 +186,44 @@ def distribute_niche(
         return []
 
     already = assigned_pool_item_ids(session, niche)
-    unassigned_ids = [
-        item.id for item in pool_items_for_niche(session, niche) if item.id not in already
+    unassigned_items = [
+        item for item in pool_items_for_niche(session, niche) if item.id not in already
     ]
+    unassigned_ids = [item.id for item in unassigned_items]
     if not unassigned_ids:
         return []
 
     rng = rng or _random.Random()
+    created: list[Assignment] = []
+    valid_niche_accounts = set(account_ids_for_niche(session, niche))
+    selected_accounts = set(account_ids)
+    for item in unassigned_items:
+        if item.pinned_account_id not in selected_accounts:
+            continue
+        assignment = Assignment(
+            pool_item_id=item.id,
+            account_id=item.pinned_account_id,
+            niche=niche,
+            status=ASSIGNMENT_STATUS_ASSIGNED,
+            reuse_iteration=0,
+        )
+        # Transient response metadata; lifecycle status remains "assigned".
+        assignment.distribution_reason = "pinned"
+        session.add(assignment)
+        _create_pending_review_item(
+            session, pool_item_id=item.id, account_id=item.pinned_account_id
+        )
+        created.append(assignment)
+    pinned_item_ids = {
+        item.id
+        for item in unassigned_items
+        if item.pinned_account_id in valid_niche_accounts
+    }
+    unassigned_ids = [item_id for item_id in unassigned_ids if item_id not in pinned_item_ids]
+    if not unassigned_ids:
+        session.flush()
+        return created
+
     # Rank the undistributed pool by intrinsic engagement (likes + recency) so the
     # strongest clips go out first, jittered within tiers so the network doesn't
     # funnel the same top clip onto every account. plan_first_cycle then places
@@ -217,7 +248,6 @@ def distribute_niche(
         shuffle_items=False,
     )
 
-    created: list[Assignment] = []
     for planned in plan:
         assignment = Assignment(
             pool_item_id=planned.pool_item_id,
@@ -227,6 +257,7 @@ def distribute_niche(
             reuse_iteration=0,
         )
         session.add(assignment)
+        assignment.distribution_reason = "ranked"
         _create_pending_review_item(
             session, pool_item_id=planned.pool_item_id, account_id=planned.account_id
         )

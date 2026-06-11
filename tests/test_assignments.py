@@ -162,6 +162,32 @@ def test_max_per_account_caps_distribution(tmp_path) -> None:
         assert all(v == 5 for v in counts.values())
 
 
+def test_pinned_item_assigns_first_to_its_account_even_at_cap(tmp_path) -> None:
+    init_db()
+    with get_session() as session:
+        (account_id,) = _make_accounts(session, "history", 1)
+        _fill_pool(session, "history", 2)
+        session.commit()
+
+        first = distribute_niche(session, "history", rng=random.Random(1), max_per_account=1)
+        assert len(first) == 1
+        pinned_asset, _ = find_or_register_media_asset(
+            session, source_url="https://www.instagram.com/reel/explicit-pin/"
+        )
+        pinned_item = accept_into_pool(session, media_asset=pinned_asset, niche="history")
+        pinned_item.pinned_account_id = account_id
+        session.commit()
+
+        created = distribute_niche(session, "history", rng=random.Random(1), max_per_account=1)
+        session.commit()
+
+        assert len(created) == 1
+        assert created[0].pool_item_id == pinned_item.id
+        assert created[0].account_id == account_id
+        assert created[0].distribution_reason == "pinned"
+        assert assignment_counts_by_account(session, "history") == {account_id: 2}
+
+
 def test_assignments_for_account_returns_that_accounts_clips(tmp_path) -> None:
     init_db()
     with get_session() as session:

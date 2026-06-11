@@ -30,6 +30,7 @@ import type {
   PublishJob,
   PublishQueueJob,
   AccountReadiness,
+  DashboardAccountStats,
   QueueResult,
   ScrapeCandidate,
   SourceProfile,
@@ -153,6 +154,10 @@ interface PywebviewApi {
     jobId: number,
     payload: Record<string, unknown>,
   ): Promise<Envelope<PublishQueueJob>>;
+  update_job_metrics(
+    jobId: number,
+    payload: Record<string, unknown>,
+  ): Promise<Envelope<PublishQueueJob>>;
   reschedule_job(jobId: number, scheduledAt: string): Promise<Envelope<PublishQueueJob>>;
   unschedule_job(jobId: number): Promise<Envelope<PublishQueueJob>>;
   remove_publish_job(jobId: number): Promise<Envelope<{ removed_job_id: number }>>;
@@ -185,6 +190,7 @@ interface PywebviewApi {
     targets: Record<number, number>,
   ): Promise<Envelope<DistributeNicheResult>>;
   dashboard_publish_jobs(): Promise<Envelope<DashboardPublishQueue>>;
+  dashboard_account_stats(activeAccountId: number): Promise<Envelope<DashboardAccountStats>>;
   dashboard_mark_ready(jobIds: number[]): Promise<Envelope<{ updated: number }>>;
   dashboard_open_output(jobId: number): Promise<Envelope<{ opened: string }>>;
   dashboard_account_readiness(): Promise<Envelope<AccountReadiness>>;
@@ -557,6 +563,11 @@ export const bridge = {
     return unwrap(window.pywebview!.api.mark_job_posted(jobId, payload));
   },
 
+  updateJobMetrics(jobId: number, payload: Record<string, unknown>): Promise<PublishQueueJob> {
+    if (!hasBridge()) return mock.publishQueueJob();
+    return unwrap(window.pywebview!.api.update_job_metrics(jobId, payload));
+  },
+
   rescheduleJob(jobId: number, scheduledAt: string): Promise<PublishQueueJob> {
     if (!hasBridge()) return mock.publishQueueJob();
     return unwrap(window.pywebview!.api.reschedule_job(jobId, scheduledAt));
@@ -631,18 +642,23 @@ export const bridge = {
 
   distributeNiche(niche: string, maxPerAccount?: number | null): Promise<DistributeNicheResult> {
     if (!hasBridge())
-      return Promise.resolve({ niche, assigned: 0, max_per_account: maxPerAccount ?? 28, accounts: [], reason: "no_accounts" as const });
+      return Promise.resolve({ niche, assigned: 0, pinned: 0, max_per_account: maxPerAccount ?? 28, accounts: [], reason: "no_accounts" as const });
     return unwrap(window.pywebview!.api.distribute_niche(niche, maxPerAccount ?? null));
   },
 
   distributeNicheExplicit(niche: string, targets: Record<number, number>): Promise<DistributeNicheResult> {
-    if (!hasBridge()) return Promise.resolve({ niche, assigned: 0, max_per_account: null, accounts: [] });
+    if (!hasBridge()) return Promise.resolve({ niche, assigned: 0, pinned: 0, max_per_account: null, accounts: [] });
     return unwrap(window.pywebview!.api.distribute_niche_explicit(niche, targets));
   },
 
   dashboardPublishJobs(): Promise<DashboardPublishQueue> {
     if (!hasBridge()) return Promise.resolve({ jobs: [], due_count: 0, draft: 0, ready: 0, scheduled: 0 });
     return unwrap(window.pywebview!.api.dashboard_publish_jobs());
+  },
+
+  dashboardAccountStats(activeAccountId: number): Promise<DashboardAccountStats> {
+    if (!hasBridge()) return Promise.resolve({ niche: "history", accounts: [] });
+    return unwrap(window.pywebview!.api.dashboard_account_stats(activeAccountId));
   },
 
   dashboardMarkReady(jobIds: number[]): Promise<{ updated: number }> {

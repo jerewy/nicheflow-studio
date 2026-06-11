@@ -300,8 +300,15 @@ export interface PoolSourceClip {
 export interface DistributeNicheResult {
   niche: string;
   assigned: number;
+  pinned: number;
   max_per_account: number | null;
-  accounts: { account_id: number; account_name: string; count: number; target: number }[];
+  accounts: {
+    account_id: number;
+    account_name: string;
+    count: number;
+    pinned: number;
+    target: number;
+  }[];
   /** Only present when assigned === 0. Explains why nothing was distributed. */
   reason?: "no_accounts" | "all_at_cap" | "pool_empty";
 }
@@ -325,6 +332,25 @@ export interface DashboardPublishQueue {
   draft: number;
   ready: number;
   scheduled: number;
+}
+
+export interface DashboardAccountStatsRow {
+  account_id: number;
+  account_name: string;
+  today: number;
+  daily_target: number;
+  week: number;
+  all_time: number;
+  in_queue: number;
+  scheduled: number;
+  runway_days: number;
+  runway_status: "green" | "amber" | "red";
+  next_post_at: string | null;
+}
+
+export interface DashboardAccountStats {
+  niche: string;
+  accounts: DashboardAccountStatsRow[];
 }
 
 export interface ReadinessRow {

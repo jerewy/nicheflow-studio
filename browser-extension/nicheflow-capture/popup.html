@@ -6,11 +6,13 @@
     <title>NicheFlow Capture</title>
     <style>
       * { box-sizing: border-box; }
-      body { width: 286px; margin: 0; padding: 12px; background: #111827; color: #f8fafc; font: 12px/1.35 system-ui, sans-serif; }
+      body { width: 320px; margin: 0; padding: 12px; background: #111827; color: #f8fafc; font: 12px/1.35 system-ui, sans-serif; }
       header, .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
       h1 { margin: 0; font-size: 15px; }
       select, button { border-radius: 6px; font: inherit; padding: 7px 8px; }
-      select { width: 98px; border: 1px solid #475569; background: #1e293b; color: #f8fafc; }
+      select { width: 112px; border: 1px solid #475569; background: #1e293b; color: #f8fafc; }
+      .pin { margin-top: 8px; }
+      .pin select { width: 190px; }
       button { border: 0; cursor: pointer; font-weight: 700; }
       button:disabled { opacity: .55; cursor: wait; }
       .primary { flex: 1; background: #22c55e; color: #052e16; }
@@ -25,6 +27,7 @@
   </head>
   <body>
     <header><h1>NicheFlow Capture</h1><select id="niche"><option value="history">History</option><option value="movie">Movie</option></select></header>
+    <div class="row pin"><label for="pinned-account">Pin to account</label><select id="pinned-account"><option value="">No pin</option></select></div>
     <div class="stats">
       <div class="row"><span>Queue</span><span class="value" id="queue-count">0</span></div>
       <div class="row"><span id="pool-label">History pool</span><span class="value" id="pool-count">...</span></div>

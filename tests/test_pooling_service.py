@@ -204,6 +204,41 @@ def test_distribute_niche_service_assigns_and_summarizes() -> None:
     assert all(account["account_name"] for account in result["accounts"])
 
 
+def test_distribute_niche_flags_pinned_assignment_even_at_cap() -> None:
+    with get_session() as session:
+        account = Account(name="Pinned Hist", platform="instagram", niche="history")
+        session.add(account)
+        session.flush()
+        asset = MediaAsset(canonical_source_url="https://instagram.com/reel/regular/")
+        session.add(asset)
+        session.flush()
+        session.add(PoolItem(media_asset_id=asset.id, niche="history", acceptance_status="accepted"))
+        session.commit()
+        account_id = account.id
+
+    first = pooling.distribute_niche("history", max_per_account=1)
+    with get_session() as session:
+        asset = MediaAsset(canonical_source_url="https://instagram.com/reel/pinned/")
+        session.add(asset)
+        session.flush()
+        session.add(
+            PoolItem(
+                media_asset_id=asset.id,
+                niche="history",
+                acceptance_status="accepted",
+                pinned_account_id=account_id,
+            )
+        )
+        session.commit()
+    second = pooling.distribute_niche("history", max_per_account=1)
+
+    assert first["assigned"] == 1
+    assert first["pinned"] == 0
+    assert second["assigned"] == 1
+    assert second["pinned"] == 1
+    assert second["accounts"][0]["pinned"] == 1
+
+
 def test_distribute_niche_service_defaults_to_target_backlog() -> None:
     _seed_history_network(accounts=1, clips=2)
 

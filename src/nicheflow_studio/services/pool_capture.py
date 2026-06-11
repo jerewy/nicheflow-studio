@@ -10,7 +10,7 @@ from nicheflow_studio.core.apify_usage import (
     record_apify_results,
 )  # noqa: E501
 from nicheflow_studio.db.media_library import find_media_asset
-from nicheflow_studio.db.models import PoolItem
+from nicheflow_studio.db.models import Account, PoolItem
 from nicheflow_studio.db.pool_intake import (
     ReelMetadata,
     add_reel_to_pool,
@@ -29,10 +29,18 @@ class PoolCaptureError(RuntimeError):
 def capture_dashboard() -> dict:
     """Return compact pool and Apify usage stats for the extension popup."""
     with get_session() as session:
-        pools = {
-            niche: {"video_count": pool_size(session, niche)}  # noqa: E501
-            for niche in sorted(VALID_NICHES)
-        }
+        pools = {}
+        for niche in sorted(VALID_NICHES):
+            accounts = (
+                session.query(Account)
+                .filter(Account.niche == niche)
+                .order_by(Account.name.asc(), Account.id.asc())
+                .all()
+            )
+            pools[niche] = {
+                "video_count": pool_size(session, niche),
+                "accounts": [{"id": account.id, "name": account.name} for account in accounts],
+            }
     return {"pools": pools, "apify_usage": monthly_apify_usage()}
 
 
@@ -121,13 +129,15 @@ def capture_instagram_reels_to_pool(items: list[dict]) -> dict:
     for item in items:
         url = item.get("url") if isinstance(item, dict) else None
         niche = item.get("niche", "history") if isinstance(item, dict) else "history"  # noqa: E501
+        pinned_account_id = item.get("pinned_account_id") if isinstance(item, dict) else None
         if not isinstance(url, str):
             results.append({"status": "failed", "message": "Queued item has no URL."})  # noqa: E501
             continue
         try:
             normalized_url = normalize_instagram_media_url(url)
             normalized_niche = _normalize_niche(str(niche))
-        except PoolCaptureError as exc:
+            normalized_pin = int(pinned_account_id) if pinned_account_id not in (None, "") else None
+        except (PoolCaptureError, TypeError, ValueError) as exc:
             results.append(
                 {"status": "failed", "source_url": url, "message": str(exc)}
             )  # noqa: E501
@@ -157,6 +167,7 @@ def capture_instagram_reels_to_pool(items: list[dict]) -> dict:
                 "source_url": normalized_url,
                 "shortcode": shortcode,
                 "niche": normalized_niche,
+                "pinned_account_id": normalized_pin,
             }
         )
 
@@ -188,7 +199,12 @@ def capture_instagram_reels_to_pool(items: list[dict]) -> dict:
                 )
                 continue
             metadata = _metadata_from_candidate(candidate)
-            result = add_reel_to_pool(session, niche=item["niche"], metadata=metadata)  # noqa: E501
+            result = add_reel_to_pool(
+                session,
+                niche=item["niche"],
+                metadata=metadata,
+                pinned_account_id=item["pinned_account_id"],
+            )
             payload = asdict(result)
             payload["source_url"] = metadata.source_url
             payload["channel_name"] = metadata.channel_name
@@ -206,9 +222,13 @@ def capture_instagram_reels_to_pool(items: list[dict]) -> dict:
     return {"summary": summary, "results": results, "dashboard": capture_dashboard()}  # noqa: E501
 
 
-def capture_instagram_reel_to_pool(url: str, *, niche: str = "history") -> dict:  # noqa: E501
+def capture_instagram_reel_to_pool(
+    url: str, *, niche: str = "history", pinned_account_id: int | None = None
+) -> dict:
     """Fetch one Reel's metadata and add it to a shared niche pool."""
-    batch = capture_instagram_reels_to_pool([{"url": url, "niche": niche}])
+    batch = capture_instagram_reels_to_pool(
+        [{"url": url, "niche": niche, "pinned_account_id": pinned_account_id}]
+    )
     result = batch["results"][0]
     if result["status"] == "failed":
         raise PoolCaptureError(result["message"])

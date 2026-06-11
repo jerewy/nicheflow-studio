@@ -65,7 +65,11 @@ class PoolIntakeResult:
 
 
 def add_reel_to_pool(
-    session: Session, *, niche: str, metadata: ReelMetadata
+    session: Session,
+    *,
+    niche: str,
+    metadata: ReelMetadata,
+    pinned_account_id: int | None = None,
 ) -> PoolIntakeResult:
     """Add a single reel to the ``niche`` pool, pool-first deduped. Does not commit."""
     value = (niche or "").strip().lower()
@@ -118,9 +122,15 @@ def add_reel_to_pool(
             ),
         )
 
+    pinned_account: Account | None = None
+    if pinned_account_id is not None:
+        pinned_account = session.get(Account, pinned_account_id)
+        if pinned_account is None or pinned_account.niche != niche:
+            raise ValueError("Pinned account must belong to the selected pool niche.")
+
     candidate = _upsert_candidate(session, account_id=account.id, metadata=metadata)
     try:
-        accept_candidate_into_pool(
+        pool_item = accept_candidate_into_pool(
             session, candidate=candidate, niche=niche, accepted_reason="manual URL add"
         )
     except CrossNicheError:
@@ -138,6 +148,7 @@ def add_reel_to_pool(
             shortcode=metadata.shortcode,
             message="The same footage is already in this pool — skipped.",
         )
+    pool_item.pinned_account_id = pinned_account.id if pinned_account is not None else None
     return PoolIntakeResult(
         status="added",
         niche=niche,

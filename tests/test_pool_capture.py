@@ -4,7 +4,7 @@ import datetime as dt
 
 import pytest
 
-from nicheflow_studio.db.models import Account
+from nicheflow_studio.db.models import Account, PoolItem
 from nicheflow_studio.db.pools import pool_size
 from nicheflow_studio.db.session import get_session, init_db
 from nicheflow_studio.scraper.youtube import ScrapedVideoCandidate
@@ -73,6 +73,30 @@ def test_capture_instagram_reel_to_pool_fetches_metadata_and_pools(
     assert captured_urls == ["https://www.instagram.com/reel/ABC123/"]
     with get_session() as session:
         assert pool_size(session, "history") == 1
+
+
+def test_capture_stores_optional_account_pin(monkeypatch) -> None:
+    init_db()
+    with get_session() as session:
+        account = Account(name="Pinned History", platform="instagram", niche="history")
+        session.add(account)
+        session.commit()
+        account_id = account.id
+
+    monkeypatch.setattr(
+        pool_capture,
+        "scrape_instagram_urls_apify",
+        lambda urls, *, results_limit: [_candidate(urls[0])],
+    )
+
+    result = pool_capture.capture_instagram_reel_to_pool(
+        "https://www.instagram.com/reel/ABC123/",
+        pinned_account_id=account_id,
+    )
+
+    assert result["status"] == "added"
+    with get_session() as session:
+        assert session.query(PoolItem).one().pinned_account_id == account_id
 
 
 def test_duplicate_capture_skips_metadata_fetch(monkeypatch) -> None:

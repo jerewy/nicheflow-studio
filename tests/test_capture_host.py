@@ -49,3 +49,23 @@ def test_batch_action(monkeypatch) -> None:
 
     assert response["ok"] is True
     assert response["batch"]["summary"]["queued"] == 1
+
+
+def test_capture_action_without_pin_remains_backward_compatible(monkeypatch) -> None:
+    captured = {}
+
+    def fake_capture(url, *, niche, pinned_account_id=None):
+        captured.update(url=url, niche=niche, pinned_account_id=pinned_account_id)
+        return {"status": "added"}
+
+    monkeypatch.setattr(
+        "nicheflow_studio.services.pool_capture.capture_instagram_reel_to_pool",
+        fake_capture,
+    )
+
+    response = nicheflow_capture_host.handle_message(
+        {"action": "capture_to_pool", "url": "https://instagram.com/reel/X/"}
+    )
+
+    assert response["ok"] is True
+    assert captured["pinned_account_id"] is None

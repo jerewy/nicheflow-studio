@@ -306,6 +306,10 @@ class ProcessingBridge:
         return publishing_dashboard.list_global_publish_jobs()
 
     @_guard
+    def dashboard_account_stats(self, active_account_id: int) -> dict:
+        return publishing_dashboard.account_stats(active_account_id)
+
+    @_guard
     def dashboard_mark_ready(self, job_ids: list[int] | None = None) -> dict:
         return publishing_dashboard.mark_ready(job_ids or [])
 

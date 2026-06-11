@@ -83,6 +83,7 @@ def handle_message(message: dict) -> dict:
         return {"ok": False, "error": "Unsupported capture action."}
     url = message.get("url")
     niche = message.get("niche", "history")
+    pinned_account_id = message.get("pinned_account_id")
     if not isinstance(url, str) or not url.strip():
         return {
             "ok": False,
@@ -96,7 +97,9 @@ def handle_message(message: dict) -> dict:
             capture_instagram_reel_to_pool,
         )
 
-        result = capture_instagram_reel_to_pool(url, niche=niche)
+        result = capture_instagram_reel_to_pool(
+            url, niche=niche, pinned_account_id=pinned_account_id
+        )
     except Exception as exc:  # noqa: BLE001,E501 - extension needs a clean error response
         return {"ok": False, "error": str(exc)}
     return {"ok": True, "result": result}

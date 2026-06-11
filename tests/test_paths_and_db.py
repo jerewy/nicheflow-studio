@@ -204,6 +204,34 @@ def test_init_db_creates_accounts_table() -> None:
     assert "upload_jobs" in tables
 
 
+def test_init_db_adds_pinned_account_to_existing_pool_items() -> None:
+    db_dir = Path.cwd() / "data"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    db_path = db_dir / "nicheflow.db"
+
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE pool_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                media_asset_id INTEGER NOT NULL,
+                niche VARCHAR(16) NOT NULL
+            )
+            """
+        )
+        connection.commit()
+
+    init_db()
+
+    with sqlite3.connect(db_path) as connection:
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(pool_items)").fetchall()
+        }
+
+    assert "pinned_account_id" in columns
+
+
 def test_init_db_adds_manual_publish_columns_for_existing_upload_jobs() -> None:
     db_dir = Path.cwd() / "data"
     db_dir.mkdir(parents=True, exist_ok=True)

@@ -8,22 +8,27 @@ import random
 import time
 from pathlib import Path
 from typing import Callable
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from sqlalchemy import func, select
 from sqlalchemy.orm import joinedload
 
 from nicheflow_studio.core.account_health import HealthState, live_health, local_health
+from nicheflow_studio.core.distribution import DEFAULT_DAILY_POSTS_PER_ACCOUNT
 from nicheflow_studio.core.instagram_profile_pool import ProfilePool
 from nicheflow_studio.core.publishing_dashboard import (
     PublishJobView,
     build_dashboard_row,
     summarize_dashboard,
 )
-from nicheflow_studio.db.models import Account, UploadJob
+from nicheflow_studio.db.assignments import ASSIGNMENT_STATUS_ASSIGNED
+from nicheflow_studio.db.models import Account, Assignment, UploadJob
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.publisher.instagram_web import launch_instagram_login
 from nicheflow_studio.services.errors import ServiceError
 
 _TOP_POSTS_LIMIT = 5
+_DEFAULT_TIMEZONE = "Asia/Bangkok"
 
 HEALTH_LABELS = {
     HealthState.OK: "OK",
@@ -58,6 +63,115 @@ def _due(job: UploadJob, now: dt.datetime) -> bool:
         return False
     scheduled_at = _aware(job.scheduled_at)
     return scheduled_at is None or scheduled_at <= now
+
+
+def _timezone(name: str | None) -> dt.tzinfo:
+    timezone_name = (name or "").strip() or _DEFAULT_TIMEZONE
+    try:
+        return ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        # Windows does not ship the IANA database and the packaged MVP does not
+        # depend on tzdata. These are the account timezones used by the product.
+        fixed_offsets = {
+            "UTC": dt.timezone.utc,
+            "Asia/Bangkok": dt.timezone(dt.timedelta(hours=7), "Asia/Bangkok"),
+            "Asia/Jakarta": dt.timezone(dt.timedelta(hours=7), "Asia/Jakarta"),
+        }
+        return fixed_offsets.get(timezone_name, dt.timezone.utc)
+
+
+def _runway_status(days: float) -> str:
+    if days < 1:
+        return "red"
+    if days < 3:
+        return "amber"
+    return "green"
+
+
+def account_stats(active_account_id: int, *, now: dt.datetime | None = None) -> dict:
+    """Stats for every account in the active account's niche, without N+1 queries."""
+    now = _aware(now) or dt.datetime.now(dt.timezone.utc)
+    week_start = now - dt.timedelta(days=7)
+    with get_session() as session:
+        active_niche = (
+            select(Account.niche).where(Account.id == active_account_id).scalar_subquery()
+        )
+        accounts = (
+            session.query(Account)
+            .filter(Account.niche == active_niche)
+            .order_by(Account.name.asc(), Account.id.asc())
+            .all()
+        )
+        if not accounts:
+            raise PublishingDashboardError(
+                f"No active niche account with id {active_account_id}."
+            )
+        account_ids = [account.id for account in accounts]
+        jobs = (
+            session.query(
+                UploadJob.account_id,
+                UploadJob.status,
+                UploadJob.posted_at,
+                UploadJob.scheduled_at,
+            )
+            .filter(UploadJob.account_id.in_(account_ids))
+            .all()
+        )
+        queue_counts = dict(
+            session.query(Assignment.account_id, func.count(Assignment.id))
+            .filter(
+                Assignment.account_id.in_(account_ids),
+                Assignment.status == ASSIGNMENT_STATUS_ASSIGNED,
+            )
+            .group_by(Assignment.account_id)
+            .all()
+        )
+
+    jobs_by_account: dict[int, list[tuple[str, dt.datetime | None, dt.datetime | None]]] = {}
+    for account_id, status, posted_at, scheduled_at in jobs:
+        jobs_by_account.setdefault(account_id, []).append((status, posted_at, scheduled_at))
+
+    rows = []
+    for account in accounts:
+        timezone = _timezone(account.upload_timezone)
+        local_today = now.astimezone(timezone).date()
+        account_jobs = jobs_by_account.get(account.id, [])
+        posted_times = [
+            _aware(posted_at)
+            for _status, posted_at, _scheduled_at in account_jobs
+            if posted_at is not None
+        ]
+        future_scheduled = [
+            _aware(scheduled_at)
+            for status, posted_at, scheduled_at in account_jobs
+            if posted_at is None
+            and status != "posted"
+            and scheduled_at is not None
+            and _aware(scheduled_at) > now
+        ]
+        daily_target = account.daily_posts_target or DEFAULT_DAILY_POSTS_PER_ACCOUNT
+        in_queue = int(queue_counts.get(account.id, 0))
+        runway_days = round(in_queue / daily_target, 2)
+        next_post = min(future_scheduled, default=None)
+        rows.append(
+            {
+                "account_id": account.id,
+                "account_name": account.name,
+                "today": sum(
+                    posted_at.astimezone(timezone).date() == local_today
+                    for posted_at in posted_times
+                ),
+                "daily_target": daily_target,
+                "week": sum(posted_at >= week_start for posted_at in posted_times),
+                "all_time": len(posted_times),
+                "in_queue": in_queue,
+                "scheduled": len(future_scheduled),
+                "runway_days": runway_days,
+                "runway_status": _runway_status(runway_days),
+                "next_post_at": next_post.astimezone(timezone).isoformat() if next_post else None,
+            }
+        )
+    return {"niche": accounts[0].niche, "accounts": rows}
 
 
 def list_global_publish_jobs() -> dict:

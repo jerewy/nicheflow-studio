@@ -116,7 +116,9 @@ function App() {
         (activeId !== null ? (
           <ProcessingScreen activeAccountId={activeId} activeAccountName={activeName} />
         ) : null)}
-      {effectiveTab === "dashboard" && activeId !== null ? <Dashboard /> : null}
+      {effectiveTab === "dashboard" && activeId !== null ? (
+        <Dashboard activeAccountId={activeId} />
+      ) : null}
       {effectiveTab === "scraping" && activeId !== null ? (
         <ScrapingScreen activeAccountId={activeId} activeAccountName={activeName} />
       ) : null}
