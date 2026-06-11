@@ -684,6 +684,41 @@ WO-15/WO-6.** Auto-distribute returned zero candidates for pastmomentsdaily.
 
 ---
 
+## WO-18 — Dashboard account stats card (posted counters + runway)
+
+**Priority: right after WO-16 (runway needs WO-16's truthful backlog
+counts; the posted counters are independent).** Owner ask 2026-06-11:
+a visible posts-done counter, multi-account.
+
+- **What:** a stats card at the TOP of the React Dashboard (above the
+  Pool & Distribute tabs), one row per account in the active niche:
+  1. **Today:** posts with `posted_at` today (account-local day) vs
+     `daily_posts_target` (fallback 4) — rendered as "3 / 5".
+  2. **This week / All-time:** posted_at counts (rolling 7 days; total).
+  3. **In queue:** pending backlog — post-WO-16 this is assignments with
+     status "assigned"; jobs already exported+scheduled shown as a
+     separate small "scheduled" count.
+  4. **Runway:** in-queue ÷ daily target, shown as days, color-coded:
+     green >= 3d, amber < 3d, red < 1d.
+  5. **Next post:** earliest future scheduled_at for the account, local
+     time, or "—".
+- **Where:** new service function in
+  `services/publishing_dashboard.py` (e.g. `account_stats(niche)` —
+  single query set, no N+1), bridge method, React Dashboard component
+  (`frontend/src/components/Dashboard.tsx` area). Follow existing
+  bridge/typing patterns (`frontend/src/lib/bridge.ts`, `types.ts`).
+- **How to test (pass criteria):**
+  1. *Automated:* service tests with seeded jobs/assignments — today
+     count respects the local-day boundary; week boundary; in-queue
+     excludes posted/rejected assignments (WO-16 statuses); runway math
+     and color thresholds; next-post picks the earliest FUTURE job;
+     accounts with no data render zeros (no crash).
+  2. *Manual:* dashboard shows one row per active-niche account with
+     plausible numbers; counters update after marking a job posted
+     (refresh); tsc + vite build green.
+
+---
+
 ## Later / explicitly sequenced
 
 - **Assisted discovery (extension scoring)** — after WO-5; passive collection
