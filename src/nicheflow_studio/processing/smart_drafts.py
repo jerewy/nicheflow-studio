@@ -1422,7 +1422,9 @@ def _caption_style_title_rules(caption_style: str | None) -> list[str]:
             "one CURIOSITY GAP, one COMMENT HOOK question/direct-address form, and "
             "one STORY-OPENER. A TWIST BEAT may be used only when it also fills one "
             "of those three roles. Do not return three factual summaries or three "
-            "versions of the same shape.",
+            "versions of the same shape. Before returning, CHECK the three titles: "
+            "if none of them is a question or direct-address line, the response is "
+            "INVALID — rewrite one title as the COMMENT HOOK before answering.",
             "- STATIC WINNER EXAMPLES (calibrate the voice and structure; never copy "
             "unsupported facts into another clip):\n- "
             + "\n- ".join(_HISTORY_LOST_ARCHIVE_FEW_SHOT_WINNERS),
