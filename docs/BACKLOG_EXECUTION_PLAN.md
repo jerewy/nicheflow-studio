@@ -692,6 +692,11 @@ WO-15/WO-6.** Auto-distribute returned zero candidates for pastmomentsdaily.
 - **Pipeline stages 1→3 (auto-prepare → auto-schedule → auto-publish)** —
   after WO-1/2/3/6; owner approval of video+title+caption stays the gate
   until explicitly lifted per account.
+- **React metrics-entry UI (WO-6 follow-up, small)** — the
+  `update_job_metrics` bridge method exists but no React component calls
+  it; add Views/Likes/Comments/Shares inputs + save to the React publish
+  surface (MultiAccountPublish or Dashboard queue row) for posted jobs.
+  Until then metrics entry only exists on the legacy PyQt schedule page.
 - **Legacy cookie-scraping deletion (P3)** — verify no UI path reaches
   `scraper/instagram.py`, then delete; any time, low risk.
 - **PyQt retirement sweep (decision 2026-06-11: React/webview is THE app)** —
