@@ -25,6 +25,29 @@ def _make_item() -> int:
         return item.id
 
 
+def test_build_chat_prompt_includes_follow_outro_for_handle_account() -> None:
+    item_id = _make_item()
+    with get_session() as session:
+        item = session.get(DownloadItem, item_id)
+        account = session.get(Account, item.account_id)
+        account.instagram_handle = "pastmomentsdaily"
+        account.niche = "history"
+        session.commit()
+
+    prompt = draft_handoff.build_chat_prompt(item_id)
+
+    assert "Caption follow outro (MANDATORY)" in prompt
+    assert "Lost moments from history, every day → @pastmomentsdaily" in prompt
+
+
+def test_build_chat_prompt_omits_follow_outro_without_handle() -> None:
+    item_id = _make_item()  # account has no instagram_handle
+
+    prompt = draft_handoff.build_chat_prompt(item_id)
+
+    assert "Caption follow outro" not in prompt
+
+
 def test_build_chat_prompt_contains_selected_item_context() -> None:
     item_id = _make_item()
 

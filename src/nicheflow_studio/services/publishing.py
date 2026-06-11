@@ -232,6 +232,27 @@ def auto_schedule_for_publish(
         jobs = session.scalars(
             select(UploadJob).where(UploadJob.account_id == account.id)
         ).all()
+        # Re-export of an already-scheduled item must KEEP its slot: the job's
+        # own time would otherwise read as "occupied" and silently push the
+        # post to the next open slot on every re-export. Refresh the job's
+        # content (title/caption) at the existing time instead.
+        existing_scheduled = next(
+            (
+                row
+                for row in jobs
+                if row.posted_at is None
+                and row.status != "posted"
+                and row.scheduled_at is not None
+                and row.processed_path == item.processed_path
+            ),
+            None,
+        )
+        if existing_scheduled is not None:
+            kept_time = _aware(existing_scheduled.scheduled_at)
+            result = queue_for_publish(item_id, scheduled_at=kept_time.isoformat())
+            result["schedule_path"] = "kept_existing"
+            result["message"] = f"Kept existing schedule for {kept_time.astimezone():%H:%M}"
+            return result
         forward_occupied = [
             _aware(row.scheduled_at)
             for row in jobs

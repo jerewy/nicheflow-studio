@@ -144,6 +144,7 @@ def generate_smart_drafts(
     recent_titles: list[str] | None = None,
     recent_captions: list[str] | None = None,
     few_shot_winners: list[str] | None = None,
+    caption_outro: str | None = None,
     require_vision: bool = False,
 ) -> SmartDrafts:
     cleaned_transcript = _normalize_whitespace(transcript_text)
@@ -197,6 +198,7 @@ def generate_smart_drafts(
                     recent_titles=recent_titles,
                     recent_captions=recent_captions,
                     few_shot_winners=few_shot_winners,
+                    caption_outro=caption_outro,
                     low_context=low_context,
                 )
             else:
@@ -214,6 +216,7 @@ def generate_smart_drafts(
                     recent_titles=recent_titles,
                     recent_captions=recent_captions,
                     few_shot_winners=few_shot_winners,
+                    caption_outro=caption_outro,
                     low_context=low_context,
                 )
             _enforce_require_vision(result, require_vision=require_vision)
@@ -300,6 +303,7 @@ def _generate_ollama_smart_drafts(
     recent_titles: list[str] | None,
     recent_captions: list[str] | None,
     few_shot_winners: list[str] | None = None,
+    caption_outro: str | None = None,
     low_context: bool = False,
     title_style: str | None = None,
 ) -> SmartDrafts:
@@ -325,6 +329,7 @@ def _generate_ollama_smart_drafts(
             recent_titles=recent_titles,
             recent_captions=recent_captions,
             few_shot_winners=few_shot_winners,
+                    caption_outro=caption_outro,
         ),
         provider_name=f"Ollama model {model}",
     )
@@ -378,6 +383,7 @@ def _generate_groq_smart_drafts(
     recent_titles: list[str] | None,
     recent_captions: list[str] | None,
     few_shot_winners: list[str] | None = None,
+    caption_outro: str | None = None,
     low_context: bool = False,
     title_style: str | None = None,
 ) -> SmartDrafts:
@@ -472,6 +478,7 @@ def _generate_groq_smart_drafts(
             recent_titles=recent_titles,
             recent_captions=recent_captions,
             few_shot_winners=few_shot_winners,
+                    caption_outro=caption_outro,
         ),
         provider_name=f"Groq reasoning model {reasoning_model}",
     )
@@ -607,6 +614,7 @@ def _smart_draft_prompt(
     recent_titles: list[str] | None = None,
     recent_captions: list[str] | None = None,
     few_shot_winners: list[str] | None = None,
+    caption_outro: str | None = None,
 ) -> str:
     source_title_text = source_title or "(none)"
     source_description_text = _normalize_whitespace(source_description or "")
@@ -743,6 +751,15 @@ def _smart_draft_prompt(
             "Lead with the feeling, situation, or moment first.",
             f"- End with a final separate line of {_caption_hashtag_target(caption_style)} "
             "specific hashtags. Prefer niche tags over generic spam tags. Do not exceed 5 hashtags.",
+            *(
+                [
+                    "- FOLLOW OUTRO (MANDATORY): every caption_options string must include "
+                    f'this exact line, alone on its own line, directly BEFORE the hashtag line: "{caption_outro}". '
+                    "Do not reword it, do not merge it into a paragraph, and do not repeat it."
+                ]
+                if caption_outro
+                else []
+            ),
             "",
             "OUTPUT OPTIONS",
             f"- title_options: exactly {SMART_DRAFT_OPTION_COUNT} distinct on-screen titles, "
@@ -2225,6 +2242,7 @@ def _build_groq_payload(
     recent_titles: list[str] | None,
     recent_captions: list[str] | None,
     few_shot_winners: list[str] | None = None,
+    caption_outro: str | None = None,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "model": model,
@@ -2263,6 +2281,7 @@ def _build_groq_payload(
                     recent_titles=recent_titles,
                     recent_captions=recent_captions,
                     few_shot_winners=few_shot_winners,
+                    caption_outro=caption_outro,
                 ),
             },
         ],
@@ -2287,6 +2306,7 @@ def _build_ollama_payload(
     recent_titles: list[str] | None,
     recent_captions: list[str] | None,
     few_shot_winners: list[str] | None = None,
+    caption_outro: str | None = None,
 ) -> dict[str, object]:
     return {
         "model": model,
@@ -2312,6 +2332,7 @@ def _build_ollama_payload(
                     recent_titles=recent_titles,
                     recent_captions=recent_captions,
                     few_shot_winners=few_shot_winners,
+                    caption_outro=caption_outro,
                 ),
             },
         ],

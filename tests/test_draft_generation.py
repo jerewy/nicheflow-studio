@@ -153,3 +153,57 @@ def test_generate_without_any_grounding_raises() -> None:
 def test_generate_unknown_item_raises() -> None:
     with pytest.raises(DraftRevisionError):
         draft_generation.generate_revision_for_item(99999)
+
+def test_caption_outro_for_account_by_niche_and_handle() -> None:
+    from types import SimpleNamespace
+
+    history = SimpleNamespace(instagram_handle="pastmomentsdaily", niche="history")
+    movie = SimpleNamespace(instagram_handle="@cinemafilesdaily", niche="movie")
+    unknown = SimpleNamespace(instagram_handle="someacct", niche=None)
+    no_handle = SimpleNamespace(instagram_handle=None, niche="history")
+
+    assert (
+        draft_generation.caption_outro_for_account(history)
+        == "Lost moments from history, every day → @pastmomentsdaily"
+    )
+    # Leading @ in the stored handle must not double up.
+    assert (
+        draft_generation.caption_outro_for_account(movie)
+        == "One unforgettable scene a day → @cinemafilesdaily"
+    )
+    assert (
+        draft_generation.caption_outro_for_account(unknown)
+        == "More every day → @someacct"
+    )
+    assert draft_generation.caption_outro_for_account(no_handle) is None
+    assert draft_generation.caption_outro_for_account(None) is None
+
+
+def test_smart_draft_prompt_injects_caption_outro() -> None:
+    prompt = smart_drafts._smart_draft_prompt(
+        transcript_text="",
+        source_title="T",
+        source_description=None,
+        niche_label="history",
+        vision_payload=None,
+        account_voice=None,
+        prompt_profile=None,
+        caption_style="history_lost_archive",
+        caption_outro="Lost moments from history, every day → @pastmomentsdaily",
+    )
+
+    assert "FOLLOW OUTRO (MANDATORY)" in prompt
+    assert "@pastmomentsdaily" in prompt
+
+    without = smart_drafts._smart_draft_prompt(
+        transcript_text="",
+        source_title="T",
+        source_description=None,
+        niche_label="history",
+        vision_payload=None,
+        account_voice=None,
+        prompt_profile=None,
+        caption_style="history_lost_archive",
+    )
+
+    assert "FOLLOW OUTRO" not in without

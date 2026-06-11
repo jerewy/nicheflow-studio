@@ -9,7 +9,7 @@ from pathlib import Path
 from nicheflow_studio.db.models import Account, DownloadItem
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.processing import smart_drafts
-from nicheflow_studio.services import draft_revisions, publishing_dashboard
+from nicheflow_studio.services import draft_generation, draft_revisions, publishing_dashboard
 from nicheflow_studio.services.draft_revisions import DraftRevisionDTO, DraftRevisionError
 
 
@@ -136,6 +136,7 @@ def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
         few_shot_winners = (
             publishing_dashboard.top_post_titles(account.id) if account is not None else []
         )
+        caption_outro = draft_generation.caption_outro_for_account(account)
         fields = [
             f"Account: {account.name if account else '(none)'}",
             f"Niche: {niche_label or '(none)'}",
@@ -197,6 +198,16 @@ def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
             "Hook framing (drama is allowed, overclaiming is not):",
             *hook_rules,
             "",
+            *(
+                [
+                    "",
+                    "Caption follow outro (MANDATORY): every caption option must include "
+                    f'this exact line, alone on its own line, directly before the hashtag line: "{caption_outro}". '
+                    "Do not reword it or merge it into a paragraph.",
+                ]
+                if caption_outro
+                else []
+            ),
             "Generate 3 meaningfully different on-screen title options and 3 caption options.",
             "Keep display titles plain text. Only use internal **keyword** emphasis when the Cinema Bold Keywords style requires it.",
             "Never write em dashes or double hyphens ('--') in titles or captions; "

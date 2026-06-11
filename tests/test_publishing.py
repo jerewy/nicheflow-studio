@@ -86,6 +86,34 @@ def test_auto_schedule_uses_next_open_account_slot() -> None:
     assert scheduled > dt.datetime.now(dt.timezone.utc)
 
 
+def test_auto_schedule_keeps_existing_schedule_on_reexport() -> None:
+    """Re-running auto-schedule (e.g. after a re-export) must keep the job's
+    slot and refresh its content — never silently move the post later."""
+    item_id = _make_item()
+    with get_session() as session:
+        item = session.get(DownloadItem, item_id)
+        account = session.get(Account, item.account_id)
+        account.upload_schedule_slots = "09:00, 18:00"
+        session.commit()
+
+    first = publishing.auto_schedule_for_publish(item_id)
+    first_time = dt.datetime.fromisoformat(first["scheduled_at"])
+
+    # New draft text lands on the item, then the item is re-exported.
+    with get_session() as session:
+        item = session.get(DownloadItem, item_id)
+        item.title_draft = "Better title"
+        session.commit()
+
+    second = publishing.auto_schedule_for_publish(item_id)
+
+    assert second["schedule_path"] == "kept_existing"
+    assert dt.datetime.fromisoformat(second["scheduled_at"]) == first_time
+    jobs = publishing.list_publish_jobs(item_id)
+    assert len(jobs) == 1  # updated in place, never duplicated
+    assert jobs[0]["title"] == "Better title"
+
+
 def test_auto_schedule_requires_account_slots() -> None:
     item_id = _make_item()
 

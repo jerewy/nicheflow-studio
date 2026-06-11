@@ -31,6 +31,30 @@ def can_generate() -> bool:
     return smart_drafts.can_generate_smart_drafts()
 
 
+# Per-niche follow outro appended to every generated caption (before hashtags).
+# The promise ("every day") is the reason to follow; the @handle is there
+# because most Reels viewers never notice the corner username. Niches without
+# an entry fall back to the generic line; accounts without a handle get none.
+_CAPTION_OUTROS_BY_NICHE = {
+    "history": "Lost moments from history, every day → @{handle}",
+    "movie": "One unforgettable scene a day → @{handle}",
+}
+_CAPTION_OUTRO_DEFAULT = "More every day → @{handle}"
+
+
+def caption_outro_for_account(account: Account | None) -> str | None:
+    """The account's follow-outro caption line, or None without a handle."""
+    if account is None:
+        return None
+    handle = (account.instagram_handle or "").strip().lstrip("@")
+    if not handle:
+        return None
+    template = _CAPTION_OUTROS_BY_NICHE.get(
+        (account.niche or "").strip().lower(), _CAPTION_OUTRO_DEFAULT
+    )
+    return template.format(handle=handle)
+
+
 def _account_voice(account: Account | None, clip_premise: str | None) -> dict[str, str] | None:
     """Build the account "voice" config from Account columns (UI-free mirror of
     MainWindow._account_voice_config) plus an optional clip premise."""
@@ -139,6 +163,7 @@ def generate_revision_for_item(
             "recent_titles": recent_titles or None,
             "recent_captions": recent_captions or None,
             "few_shot_winners": few_shot_winners or None,
+            "caption_outro": caption_outro_for_account(account),
         }
 
     # The provider call is slow and must run outside the DB session.
