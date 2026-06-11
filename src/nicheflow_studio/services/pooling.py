@@ -16,7 +16,7 @@ from collections import Counter
 
 from nicheflow_studio.core.distribution import target_backlog
 from nicheflow_studio.db import assignments as assignments_db, pools
-from nicheflow_studio.db.models import Account
+from nicheflow_studio.db.models import Account, Assignment
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.services.errors import ServiceError
 
@@ -142,8 +142,19 @@ def remove_pool_item(pool_item_id: int, reason: str = "manual removal") -> dict:
     with get_session() as session:
         if not pools.remove_pool_item(session, pool_item_id=pool_item_id, reason=reason):
             raise PoolingError(f"No pool item with id {pool_item_id}.")
+        released = 0
+        for assignment in session.query(Assignment).filter(
+            Assignment.pool_item_id == pool_item_id,
+            Assignment.status == assignments_db.ASSIGNMENT_STATUS_ASSIGNED,
+        ).all():
+            assignment.status = assignments_db.ASSIGNMENT_STATUS_REJECTED
+            released += 1
         session.commit()
-        return {"pool_item_id": pool_item_id, "acceptance_status": "removed"}
+        return {
+            "pool_item_id": pool_item_id,
+            "acceptance_status": "removed",
+            "released_assignments": released,
+        }
 
 
 def restore_pool_item(pool_item_id: int) -> dict:
@@ -276,3 +287,43 @@ def distribute_niche(niche: str, max_per_account: int | None = None) -> dict:
         if reason is not None:
             result["reason"] = reason
         return result
+
+
+def distribute_niche_explicit(niche: str, targets_by_account: dict[int, int]) -> dict:
+    """Add explicit clip counts to selected accounts, ignoring cadence targets."""
+    requested = {
+        int(account_id): max(0, int(target))
+        for account_id, target in (targets_by_account or {}).items()
+    }
+    with get_session() as session:
+        existing = assignments_db.assignment_counts_by_account(session, niche)
+        total_targets = {
+            account_id: existing.get(account_id, 0) + count
+            for account_id, count in requested.items()
+        }
+        try:
+            created = assignments_db.distribute_niche(
+                session, niche, targets_by_account=total_targets
+            )
+        except ValueError as exc:
+            raise PoolingError(str(exc)) from exc
+        assigned = Counter(row.account_id for row in created)
+        names = {
+            account.id: account.name
+            for account in session.query(Account).filter(Account.id.in_(list(requested))).all()
+        }
+        session.commit()
+        return {
+            "niche": niche,
+            "assigned": len(created),
+            "max_per_account": None,
+            "accounts": [
+                {
+                    "account_id": account_id,
+                    "account_name": names.get(account_id, f"#{account_id}"),
+                    "count": assigned.get(account_id, 0),
+                    "target": target,
+                }
+                for account_id, target in requested.items()
+            ],
+        }

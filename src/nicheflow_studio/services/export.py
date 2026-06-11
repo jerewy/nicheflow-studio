@@ -22,7 +22,7 @@ from nicheflow_studio.core.paths import processed_dir
 from nicheflow_studio.db.models import Account, DownloadItem
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.processing import video
-from nicheflow_studio.services import publishing
+from nicheflow_studio.services import publishing, library
 from nicheflow_studio.services.errors import ServiceError
 from nicheflow_studio.services.processing_workflow import render_config
 
@@ -152,6 +152,14 @@ def export_item(item_id: int, *, progress: ProgressFn | None = None) -> dict:
     Raises :class:`ExportError` for user-fixable export problems (no source
     file, file missing) so the message reaches the UI cleanly.
     """
+
+    with get_session() as session:
+        pending_item = session.get(DownloadItem, item_id)
+        should_download = bool(
+            pending_item and pending_item.status == "pending_review" and not pending_item.file_path
+        )
+    if should_download:
+        library.ensure_item_downloaded(item_id)
 
     def report(fraction: float, message: str = "") -> None:
         if progress is not None:

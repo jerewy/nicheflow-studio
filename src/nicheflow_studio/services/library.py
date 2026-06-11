@@ -13,11 +13,16 @@ at the new draft-revision foreign key.
 from __future__ import annotations
 
 import datetime as dt
+from pathlib import Path
 
 from sqlalchemy import or_, select
 
 from nicheflow_studio.db.blocklist import block_asset
-from nicheflow_studio.db.media_library import find_media_asset
+from nicheflow_studio.db.media_library import (
+    find_media_asset,
+    find_or_register_media_asset,
+    mark_media_asset_downloaded,
+)
 from nicheflow_studio.db.models import (
     Account,
     Assignment,
@@ -29,8 +34,11 @@ from nicheflow_studio.db.models import (
 )
 from nicheflow_studio.db.pools import REJECT_REASONS, remove_pool_items_for_asset
 from nicheflow_studio.db.pools import reject_candidate as _reject_candidate_db
+from nicheflow_studio.db.assignments import reject_assignments_for_item
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.services.errors import ServiceError
+from nicheflow_studio.downloader.instagram import download_instagram_url
+from nicheflow_studio.core.paths import downloads_dir
 
 _LIST_LIMIT = 100
 # How recently an item must have been added to still read as "New".
@@ -52,6 +60,8 @@ def _derive_status(item: DownloadItem, posted_item_ids: set[int]) -> str:
     draft > new."""
     if item.id in posted_item_ids:
         return "posted"
+    if item.status == "pending_review":
+        return "pending_review"
     if (item.review_state or "").lower() in _SKIPPED_REVIEW_STATES:
         return "skipped"
     if item.processed_path:
@@ -202,6 +212,38 @@ def mark_seen(item_id: int) -> None:
             session.commit()
 
 
+def ensure_item_downloaded(item_id: int, *, downloader=None) -> dict:
+    """Materialize a pending-review item on first real use, globally deduped."""
+    with get_session() as session:
+        item = _require_item(session, item_id)
+        if item.file_path and Path(item.file_path).exists():
+            return {"item_id": item.id, "file_path": item.file_path, "downloaded": False}
+        asset = find_media_asset(session, source_url=item.source_url, shortcode=item.video_id)
+        if asset is not None and asset.original_download_path and Path(asset.original_download_path).exists():
+            item.file_path = asset.original_download_path
+            item.status = "completed"
+            session.commit()
+            return {"item_id": item.id, "file_path": item.file_path, "downloaded": False}
+        source_url = item.source_url
+        shortcode = item.video_id
+        account_id = item.account_id
+
+    fetch = downloader or download_instagram_url
+    result = fetch(url=source_url, output_dir=downloads_dir() / f"acc_{account_id}")
+    file_path = str(result.file_path)
+    with get_session() as session:
+        asset, _ = find_or_register_media_asset(
+            session, source_url=source_url, shortcode=shortcode, platform="instagram"
+        )
+        mark_media_asset_downloaded(asset, original_download_path=file_path)
+        for row in session.scalars(select(DownloadItem).where(DownloadItem.source_url == source_url)).all():
+            if row.file_path is None:
+                row.file_path = file_path
+                row.status = "completed"
+        session.commit()
+    return {"item_id": item_id, "file_path": file_path, "downloaded": True}
+
+
 def remove_item_from_pool(item_id: int, reason: str = "manual removal") -> dict:
     """Reversibly pull this clip's footage out of every niche pool it reached.
 
@@ -252,12 +294,14 @@ def reject_item(item_id: int, reason: str = "low_quality") -> dict:
         # Surface the decision on the item: 'rejected' reads as 'skipped' in the
         # Processing list (see _derive_status / _SKIPPED_REVIEW_STATES).
         item.review_state = "rejected"
+        released_assignments = reject_assignments_for_item(session, item)
         session.commit()
         return {
             "item_id": item_id,
             "rejected_candidates": len(candidates),
             "removed_pool_items": removed,
             "review_state": item.review_state,
+            "released_assignments": released_assignments,
         }
 
 

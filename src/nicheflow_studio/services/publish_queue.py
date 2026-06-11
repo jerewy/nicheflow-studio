@@ -16,6 +16,7 @@ import datetime as dt
 from sqlalchemy import select
 
 from nicheflow_studio.db.models import Account, UploadJob
+from nicheflow_studio.db.assignments import mark_assignment_posted_for_job
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.services.errors import ServiceError
 
@@ -110,6 +111,7 @@ def mark_posted(job_id: int, payload: dict | None = None) -> dict:
         job.status = "posted"
         if job.posted_at is None:
             job.posted_at = dt.datetime.now(dt.timezone.utc)
+        mark_assignment_posted_for_job(session, job)
         if "posted_url" in payload:
             job.posted_url = _clean_opt(payload["posted_url"])
         if "content_type" in payload:

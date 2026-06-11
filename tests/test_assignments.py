@@ -205,6 +205,21 @@ def test_account_assignment_backlog_empty_for_account_without_assignments(tmp_pa
         assert account_assignment_backlog(session, account_ids[0]) == []
 
 
+def test_assignment_counts_only_include_pending_assigned_status() -> None:
+    init_db()
+    with get_session() as session:
+        (account_id,) = _make_accounts(session, "history", 1)
+        _fill_pool(session, "history", 4)
+        session.commit()
+        rows = distribute_niche(session, "history", rng=random.Random(1))
+        rows[1].status = "posted"
+        rows[2].status = "rejected"
+        rows[3].status = "skipped_duplicate"
+        session.commit()
+
+        assert assignment_counts_by_account(session, "history") == {account_id: 1}
+
+
 def test_top_up_adds_new_accounts_without_touching_existing(tmp_path) -> None:
     """The plan's headline scenario: distribute to a target, add more accounts
     later, re-distribute — new accounts fill to target, existing ones unchanged,

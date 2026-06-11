@@ -18,7 +18,7 @@ from sqlalchemy import select
 from nicheflow_studio.db.models import Account, DownloadItem
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.processing import smart_drafts
-from nicheflow_studio.services import draft_revisions, publishing_dashboard
+from nicheflow_studio.services import draft_revisions, publishing_dashboard, library
 from nicheflow_studio.services.draft_revisions import DraftRevisionDTO, DraftRevisionError
 
 # Number of recent same-account drafts fed to the generator so it can avoid
@@ -90,6 +90,15 @@ def generate_revision_for_item(
     to vision over the video frames plus the source caption (smart_drafts'
     "No-transcript mode"), which is the normal path for speechless reels.
     """
+    with get_session() as session:
+        pending_item = session.get(DownloadItem, item_id)
+        should_download = bool(
+            pending_item
+            and pending_item.status == "pending_review"
+            and not pending_item.file_path
+        )
+    if should_download:
+        library.ensure_item_downloaded(item_id)
     with get_session() as session:
         item = session.get(DownloadItem, item_id)
         if item is None:

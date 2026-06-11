@@ -180,6 +180,10 @@ interface PywebviewApi {
     niche: string,
     maxPerAccount?: number | null,
   ): Promise<Envelope<DistributeNicheResult>>;
+  distribute_niche_explicit(
+    niche: string,
+    targets: Record<number, number>,
+  ): Promise<Envelope<DistributeNicheResult>>;
   dashboard_publish_jobs(): Promise<Envelope<DashboardPublishQueue>>;
   dashboard_mark_ready(jobIds: number[]): Promise<Envelope<{ updated: number }>>;
   dashboard_open_output(jobId: number): Promise<Envelope<{ opened: string }>>;
@@ -629,6 +633,11 @@ export const bridge = {
     if (!hasBridge())
       return Promise.resolve({ niche, assigned: 0, max_per_account: maxPerAccount ?? 28, accounts: [], reason: "no_accounts" as const });
     return unwrap(window.pywebview!.api.distribute_niche(niche, maxPerAccount ?? null));
+  },
+
+  distributeNicheExplicit(niche: string, targets: Record<number, number>): Promise<DistributeNicheResult> {
+    if (!hasBridge()) return Promise.resolve({ niche, assigned: 0, max_per_account: null, accounts: [] });
+    return unwrap(window.pywebview!.api.distribute_niche_explicit(niche, targets));
   },
 
   dashboardPublishJobs(): Promise<DashboardPublishQueue> {

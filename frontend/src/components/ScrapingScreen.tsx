@@ -286,7 +286,8 @@ export function ScrapingScreen({ activeAccountId, activeAccountName }: ScrapingS
       <div>
         <h1 className="text-2xl font-semibold tracking-tight">Scraping</h1>
         <p className="text-sm text-muted-foreground">
-          Sources and candidates for {activeAccountName ?? "this account"}. Adding or scraping a
+          Source intake for {activeAccountName ?? "this account"}. Distributed clips are reviewed
+          once in Processing; this screen keeps source and Apify intake history.
           source pulls its recent posts into this account's niche pool via Apify (deduplicated).
         </p>
       </div>
@@ -404,7 +405,7 @@ export function ScrapingScreen({ activeAccountId, activeAccountName }: ScrapingS
 
       <Card>
         <CardHeader className="flex-row items-center justify-between space-y-0">
-          <CardTitle className="text-base">Candidates</CardTitle>
+          <CardTitle className="text-base">Intake history</CardTitle>
           <select
             className="h-9 rounded-md border border-input bg-transparent px-2 text-sm"
             value={filter}

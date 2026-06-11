@@ -1,15 +1,22 @@
 from __future__ import annotations
 
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 from sqlalchemy import select
 
 from nicheflow_studio.db.models import (
     Account,
+    Assignment,
     DownloadItem,
     DraftRevision,
+    MediaAsset,
+    PoolItem,
     ScrapeCandidate,
     UploadJob,
 )
+from nicheflow_studio.db.assignments import assignment_counts_by_account, distribute_niche
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.services import library
 from nicheflow_studio.services.library import LibraryError
@@ -219,6 +226,92 @@ def test_reject_item_unknown_reason_raises() -> None:
     item_id = _make_item(account_id=account_id)
     with pytest.raises(LibraryError):
         library.reject_item(item_id, "nope")
+
+
+def test_pending_review_reject_releases_assignment_without_download(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with get_session() as session:
+        account = Account(name="History", platform="instagram", niche="history")
+        asset = MediaAsset(canonical_source_url="https://instagram.com/reel/reject/", source_shortcode="reject")
+        session.add_all([account, asset])
+        session.flush()
+        pool_item = PoolItem(media_asset_id=asset.id, niche="history", acceptance_status="accepted")
+        session.add(pool_item)
+        session.flush()
+        replacement_asset = MediaAsset(
+            canonical_source_url="https://instagram.com/reel/replacement/",
+            source_shortcode="replacement",
+        )
+        session.add(replacement_asset)
+        session.flush()
+        session.add(
+            PoolItem(
+                media_asset_id=replacement_asset.id,
+                niche="history",
+                acceptance_status="accepted",
+            )
+        )
+        assignment = Assignment(pool_item_id=pool_item.id, account_id=account.id, niche="history")
+        item = DownloadItem(
+            source_url=asset.canonical_source_url,
+            video_id=asset.source_shortcode,
+            account_id=account.id,
+            status="pending_review",
+            review_state="pending_review",
+        )
+        session.add_all([assignment, item])
+        session.commit()
+        item_id = item.id
+        assignment_id = assignment.id
+        account_id = account.id
+    monkeypatch.setattr(
+        "nicheflow_studio.services.library.download_instagram_url",
+        lambda **_kwargs: pytest.fail("reject must not download"),
+    )
+
+    result = library.reject_item(item_id, "low_quality")
+
+    assert result["released_assignments"] == 1
+    with get_session() as session:
+        assert session.get(Assignment, assignment_id).status == "rejected"
+        assert session.get(DownloadItem, item_id).file_path is None
+        assert assignment_counts_by_account(session, "history").get(account_id, 0) == 0
+        assert len(distribute_niche(session, "history", max_per_account=1)) == 1
+
+
+def test_pending_review_first_use_downloads_once_and_reuses_globally(tmp_path: Path) -> None:
+    source_url = "https://instagram.com/reel/lazy/"
+    with get_session() as session:
+        accounts = [Account(name="A", niche="history"), Account(name="B", niche="history")]
+        session.add_all(accounts)
+        session.flush()
+        for account in accounts:
+            session.add(
+                DownloadItem(
+                    source_url=source_url,
+                    video_id="lazy",
+                    account_id=account.id,
+                    status="pending_review",
+                    review_state="pending_review",
+                )
+            )
+        session.commit()
+        item_ids = [row.id for row in session.query(DownloadItem).all()]
+    calls: list[str] = []
+
+    def fake_download(*, url, output_dir):
+        calls.append(url)
+        path = tmp_path / "lazy.mp4"
+        path.write_bytes(b"video")
+        return SimpleNamespace(file_path=path)
+
+    first = library.ensure_item_downloaded(item_ids[0], downloader=fake_download)
+    second = library.ensure_item_downloaded(item_ids[1], downloader=fake_download)
+
+    assert first["downloaded"] is True
+    assert second["downloaded"] is False
+    assert calls == [source_url]
 
 
 def _row_for(account_id: int, item_id: int):

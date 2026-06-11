@@ -27,6 +27,7 @@ from typing import Callable
 from sqlalchemy import select
 
 from nicheflow_studio.db.models import Account, DownloadItem, UploadJob
+from nicheflow_studio.db.assignments import mark_assignment_posted_for_job
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.services.errors import ServiceError
 from nicheflow_studio.services.publishing import queue_for_publish
@@ -130,6 +131,7 @@ def _post_and_record(job_id: int) -> dict:
             if result.posted_url:
                 job.posted_url = result.posted_url
             job.error_message = None
+            mark_assignment_posted_for_job(session, job)
         elif result.status == "checkpoint":
             # Instagram flagged the account — retrying makes it worse. Fail the
             # job and pause the whole account until the cooldown passes.

@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from nicheflow_studio.db.models import Account, Assignment, MediaAsset, PoolItem
+from nicheflow_studio.db import assignments as assignments_db
+from nicheflow_studio.db.models import Account, Assignment, DownloadItem, MediaAsset, PoolItem
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.services import pooling
 from nicheflow_studio.services.pooling import PoolingError
@@ -266,3 +267,54 @@ def test_distribute_niche_uses_each_accounts_daily_posts_target() -> None:
 def test_distribute_niche_service_rejects_unknown_niche() -> None:
     with pytest.raises(PoolingError):
         pooling.distribute_niche("not-a-niche")
+
+
+def test_manual_distribute_selected_accounts_only_and_ignores_cadence_targets() -> None:
+    with get_session() as session:
+        accounts = [
+            Account(name=f"A{i}", platform="instagram", niche="history", daily_posts_target=1)
+            for i in range(3)
+        ]
+        session.add_all(accounts)
+        session.flush()
+        selected = {accounts[0].id: 2, accounts[2].id: 3}
+        for i in range(10):
+            asset = MediaAsset(
+                canonical_source_url=f"https://instagram.com/reel/manual{i}/",
+                source_shortcode=f"manual{i}",
+            )
+            session.add(asset)
+            session.flush()
+            session.add(PoolItem(media_asset_id=asset.id, niche="history", acceptance_status="accepted"))
+        session.commit()
+
+    result = pooling.distribute_niche_explicit("history", selected)
+
+    assert result["assigned"] == 5
+    assert {row["account_id"]: row["count"] for row in result["accounts"]} == selected
+    with get_session() as session:
+        counts = assignments_db.assignment_counts_by_account(session, "history")
+        assert counts == selected
+        pending = session.query(DownloadItem).filter(DownloadItem.status == "pending_review").all()
+        assert len(pending) == 5
+        assert all(item.file_path is None for item in pending)
+
+
+def test_distribute_never_fetches_media(monkeypatch: pytest.MonkeyPatch) -> None:
+    with get_session() as session:
+        account = Account(name="History", platform="instagram", niche="history")
+        asset = MediaAsset(canonical_source_url="https://instagram.com/reel/no-fetch/")
+        session.add_all([account, asset])
+        session.flush()
+        pool_item = PoolItem(media_asset_id=asset.id, niche="history", acceptance_status="accepted")
+        session.add(pool_item)
+        session.commit()
+        pool_item_id, account_id = pool_item.id, account.id
+    monkeypatch.setattr(
+        "nicheflow_studio.downloader.instagram.download_instagram_url",
+        lambda **_kwargs: pytest.fail("distribution must not fetch media"),
+    )
+
+    result = pooling.distribute_clip(pool_item_id, [account_id])
+
+    assert result["assigned"] == 1

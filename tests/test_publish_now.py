@@ -6,7 +6,10 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy import select
 
-from nicheflow_studio.db.models import Account, DownloadItem, UploadJob
+from nicheflow_studio.db.assignments import assignment_counts_by_account, distribute_niche
+from nicheflow_studio.db.media_library import find_or_register_media_asset
+from nicheflow_studio.db.models import Account, Assignment, DownloadItem, PoolItem, UploadJob
+from nicheflow_studio.db.pools import accept_into_pool
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.services import publish_now
 from nicheflow_studio.services.errors import ServiceError
@@ -69,6 +72,58 @@ def test_publish_item_now_marks_posted(monkeypatch: pytest.MonkeyPatch) -> None:
         assert job.status == "posted"
         assert job.posted_at is not None
         assert job.posted_url == "https://instagram.com/p/XYZ/"
+
+
+def test_posted_job_releases_assignment_and_next_distribute_backfills(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account_id = _make_account()
+    with get_session() as session:
+        assets = []
+        for code in ("abc", "next"):
+            asset, _ = find_or_register_media_asset(
+                session,
+                source_url=f"https://instagram.com/reel/{code}",
+                shortcode=code,
+            )
+            accept_into_pool(session, media_asset=asset, niche="history")
+            assets.append(asset)
+        session.commit()
+        first = distribute_niche(session, "history", max_per_account=1)
+        session.commit()
+        assert len(first) == 1
+        assigned_pool = session.get(PoolItem, first[0].pool_item_id)
+        assigned_asset = assigned_pool.media_asset
+        assigned_url = assigned_asset.canonical_source_url
+        assigned_shortcode = assigned_asset.source_shortcode
+    item_id = _make_exported_item(account_id)
+    with get_session() as session:
+        item = session.get(DownloadItem, item_id)
+        item.source_url = assigned_url
+        item.video_id = assigned_shortcode
+        session.commit()
+    monkeypatch.setattr(
+        publish_now,
+        "_do_publish_reel",
+        lambda *_args: _fake_result("posted", posted_url="https://instagram.com/p/posted/"),
+    )
+
+    publish_now.publish_item_now(item_id)
+
+    with get_session() as session:
+        assignment = session.query(Assignment).one()
+        assert assignment.status == "posted"
+        assert assignment_counts_by_account(session, "history").get(account_id, 0) == 0
+        assert len(distribute_niche(session, "history", max_per_account=1)) == 1
+        session.commit()
+        assert assignment_counts_by_account(session, "history")[account_id] == 1
+
+    # Re-post lifecycle sync is idempotent.
+    with get_session() as session:
+        job = session.query(UploadJob).filter(UploadJob.download_item_id == item_id).one()
+        from nicheflow_studio.db.assignments import mark_assignment_posted_for_job
+
+        assert mark_assignment_posted_for_job(session, job) == 0
 
 
 def test_publish_item_now_records_failure(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -358,9 +358,8 @@ def niche_pool_stats(session: Session, niche: str) -> NichePoolStats:
         row[0]
         for row in session.query(Assignment.pool_item_id)
         .filter(Assignment.niche == niche)
-        # "skipped_duplicate" assignments don't hold a real slot (literal here to
-        # avoid a pools<->assignments import cycle).
-        .filter(Assignment.status != "skipped_duplicate")
+        # Only pending assignments hold active backlog slots.
+        .filter(Assignment.status == "assigned")
         .all()
     }
     assigned = len(assigned_item_ids)

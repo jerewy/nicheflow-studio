@@ -17,6 +17,7 @@ export function PoolingScreen() {
   const [selectedClip, setSelectedClip] = useState<PoolSourceClip | null>(null);
   const [nicheAccounts, setNicheAccounts] = useState<NicheAccount[]>([]);
   const [distributeSel, setDistributeSel] = useState<Set<number>>(new Set());
+  const [manualTargets, setManualTargets] = useState<Record<number, number>>({});
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
@@ -164,6 +165,30 @@ export function PoolingScreen() {
     }
   };
 
+  const manualDistribute = async () => {
+    const targets = Object.fromEntries(
+      Object.entries(manualTargets).filter(([, count]) => count > 0),
+    );
+    if (Object.keys(targets).length === 0) {
+      setError("Select at least one account and enter a count.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await bridge.distributeNicheExplicit(niche, targets);
+      const breakdown = result.accounts
+        .map((account) => `${account.account_name} (${account.count}/${account.target})`)
+        .join(", ");
+      setMessage(`Manually distributed ${result.assigned} clip(s) â€” ${breakdown}.`);
+      await load();
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const stats = overview?.niches.find((row) => row.niche === niche);
 
   return (
@@ -192,6 +217,44 @@ export function PoolingScreen() {
           title="Rank the undistributed pool by engagement (likes + recency) and spread the strongest clips across this niche's accounts"
         >
           Auto-distribute (ranked)
+        </Button>
+      </div>
+      <div className="space-y-2 rounded-md border border-border p-3">
+        <div>
+          <p className="text-sm font-medium">Distribute now</p>
+          <p className="text-xs text-muted-foreground">Explicit counts bypass cadence targets. Distribution creates pending-review items only; it never downloads media.</p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          {nicheAccounts.map((account) => (
+            <label key={account.id} className="flex items-center gap-2 rounded-md border border-border px-2 py-1 text-xs">
+              <input
+                type="checkbox"
+                checked={(manualTargets[account.id] ?? 0) > 0}
+                onChange={(event) =>
+                  setManualTargets((current) => ({
+                    ...current,
+                    [account.id]: event.target.checked ? Math.max(current[account.id] ?? 1, 1) : 0,
+                  }))
+                }
+              />
+              {account.name}
+              <input
+                type="number"
+                min={0}
+                className="h-7 w-16 rounded border border-input px-1"
+                value={manualTargets[account.id] ?? 0}
+                onChange={(event) =>
+                  setManualTargets((current) => ({
+                    ...current,
+                    [account.id]: Math.max(0, Number(event.target.value) || 0),
+                  }))
+                }
+              />
+            </label>
+          ))}
+        </div>
+        <Button size="sm" variant="outline" disabled={busy} onClick={manualDistribute}>
+          Distribute now
         </Button>
       </div>
       <DashboardTable headers={["Source", "Clips", "Newest post"]}>

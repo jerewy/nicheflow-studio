@@ -25,6 +25,7 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Workflow status -> label + colored dot (Tailwind bg class) for the videos table.
 const STATUS_META: Record<string, { label: string; dot: string }> = {
+  pending_review: { label: "Pending review", dot: "bg-sky-500" },
   new: { label: "New", dot: "bg-sky-500" },
   draft: { label: "Draft", dot: "bg-amber-500" },
   exported: { label: "Exported", dot: "bg-violet-500" },
@@ -796,6 +797,7 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
               >
                 <option value="all">All</option>
                 <option value="new">New</option>
+                <option value="pending_review">Pending review</option>
                 <option value="draft">Draft</option>
                 <option value="exported">Exported</option>
                 <option value="posted">Posted</option>

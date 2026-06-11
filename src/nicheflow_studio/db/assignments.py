@@ -22,10 +22,13 @@ from nicheflow_studio.core.distribution import (
 from nicheflow_studio.db.models import (
     Account,
     Assignment,
+    DownloadItem,
     MediaAsset,
     PoolItem,
     ScrapeCandidate,
+    UploadJob,
 )
+from nicheflow_studio.db.media_library import find_media_asset
 from nicheflow_studio.db.pools import VALID_NICHES, pool_items_for_niche
 
 import random as _random
@@ -36,6 +39,9 @@ _SCORE_IN_CHUNK = 500
 # An assignment whose clip turned out to be duplicate footage at download time.
 # Excluded from per-account counts so the next Distribute refills the slot.
 ASSIGNMENT_STATUS_SKIPPED_DUPLICATE = "skipped_duplicate"
+ASSIGNMENT_STATUS_ASSIGNED = "assigned"
+ASSIGNMENT_STATUS_POSTED = "posted"
+ASSIGNMENT_STATUS_REJECTED = "rejected"
 
 
 def _validate_niche(niche: str) -> str:
@@ -123,6 +129,40 @@ def _engagement_scores_for_pool_items(
     return scores
 
 
+def _create_pending_review_item(
+    session: Session, *, pool_item_id: int, account_id: int
+) -> None:
+    """Expose a new assignment in Processing without downloading its media."""
+    pool_item = session.get(PoolItem, pool_item_id)
+    asset = session.get(MediaAsset, pool_item.media_asset_id) if pool_item is not None else None
+    if asset is None:
+        return
+    if session.query(DownloadItem.id).filter(
+        DownloadItem.account_id == account_id,
+        DownloadItem.source_url == asset.canonical_source_url,
+    ).first() is not None:
+        return
+    candidate = (
+        session.query(ScrapeCandidate)
+        .filter(ScrapeCandidate.video_id == asset.source_shortcode)
+        .first()
+        if asset.source_shortcode
+        else None
+    )
+    session.add(
+        DownloadItem(
+            source_url=asset.canonical_source_url,
+            extractor=asset.platform,
+            video_id=asset.source_shortcode,
+            title=candidate.title if candidate is not None else asset.source_shortcode,
+            source_description=candidate.description if candidate is not None else None,
+            status="pending_review",
+            review_state="pending_review",
+            account_id=account_id,
+        )
+    )
+
+
 def distribute_niche(
     session: Session,
     niche: str,
@@ -140,6 +180,8 @@ def distribute_niche(
     """
     niche = _validate_niche(niche)
     account_ids = account_ids_for_niche(session, niche)
+    if targets_by_account is not None:
+        account_ids = [account_id for account_id in account_ids if account_id in targets_by_account]
     if not account_ids:
         return []
 
@@ -185,6 +227,9 @@ def distribute_niche(
             reuse_iteration=0,
         )
         session.add(assignment)
+        _create_pending_review_item(
+            session, pool_item_id=planned.pool_item_id, account_id=planned.account_id
+        )
         created.append(assignment)
     session.flush()
     return created
@@ -224,6 +269,9 @@ def assign_pool_item_to_accounts(
             reuse_iteration=0,
         )
         session.add(assignment)
+        _create_pending_review_item(
+            session, pool_item_id=pool_item_id, account_id=account_id
+        )
         already.add(account_id)
         created.append(assignment)
     session.flush()
@@ -242,11 +290,53 @@ def assignment_counts_by_account(session: Session, niche: str) -> dict[int, int]
     for (account_id,) in (
         session.query(Assignment.account_id)
         .filter(Assignment.niche == niche)
-        .filter(Assignment.status != ASSIGNMENT_STATUS_SKIPPED_DUPLICATE)
+        .filter(Assignment.status == ASSIGNMENT_STATUS_ASSIGNED)
         .all()
     ):
         counts[account_id] = counts.get(account_id, 0) + 1
     return counts
+
+
+def _active_assignments_for_item(session: Session, item: DownloadItem) -> list[Assignment]:
+    asset = find_media_asset(session, source_url=item.source_url, shortcode=item.video_id)
+    if asset is None or item.account_id is None:
+        return []
+    pool_item_ids = [
+        row[0]
+        for row in session.query(PoolItem.id).filter(PoolItem.media_asset_id == asset.id).all()
+    ]
+    if not pool_item_ids:
+        return []
+    return session.query(Assignment).filter(
+        Assignment.account_id == item.account_id,
+        Assignment.pool_item_id.in_(pool_item_ids),
+        Assignment.status == ASSIGNMENT_STATUS_ASSIGNED,
+    ).all()
+
+
+def mark_assignment_posted_for_job(session: Session, job: UploadJob) -> int:
+    """Mark the originating active assignment posted; repeated calls are no-ops."""
+    rows = session.query(Assignment).filter(
+        Assignment.upload_job_id == job.id,
+        Assignment.status == ASSIGNMENT_STATUS_ASSIGNED,
+    ).all()
+    if not rows and job.download_item_id is not None:
+        item = session.get(DownloadItem, job.download_item_id)
+        rows = _active_assignments_for_item(session, item) if item is not None else []
+    for assignment in rows:
+        assignment.status = ASSIGNMENT_STATUS_POSTED
+        assignment.upload_job_id = job.id
+    session.flush()
+    return len(rows)
+
+
+def reject_assignments_for_item(session: Session, item: DownloadItem) -> int:
+    """Release this distributed item's active assignment after review reject."""
+    rows = _active_assignments_for_item(session, item)
+    for assignment in rows:
+        assignment.status = ASSIGNMENT_STATUS_REJECTED
+    session.flush()
+    return len(rows)
 
 
 def assignments_for_account(session: Session, account_id: int) -> list[Assignment]:
@@ -318,7 +408,7 @@ def pending_download_assignments(
         .join(PoolItem, PoolItem.id == Assignment.pool_item_id)
         .join(MediaAsset, MediaAsset.id == PoolItem.media_asset_id)
         .filter(MediaAsset.download_status != "downloaded")
-        .filter(Assignment.status != ASSIGNMENT_STATUS_SKIPPED_DUPLICATE)
+        .filter(Assignment.status == ASSIGNMENT_STATUS_ASSIGNED)
     )
     if niche is not None:
         query = query.filter(Assignment.niche == _validate_niche(niche))

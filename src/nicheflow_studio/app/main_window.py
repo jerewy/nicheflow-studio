@@ -82,6 +82,7 @@ from nicheflow_studio.db.assignments import (
     account_assignment_backlog,
     assignment_counts_by_account,
     distribute_niche,
+    mark_assignment_posted_for_job,
     pending_download_assignments,
 )
 from nicheflow_studio.db.media_library import (
@@ -12040,6 +12041,7 @@ class MainWindow(QWidget):
                     job.posted_at = posted_at
                     job.posted_url = posted_url
                     job.error_message = None
+                    mark_assignment_posted_for_job(session, job)
                     duplicate_jobs = (
                         session.query(UploadJob)
                         .filter(UploadJob.id != job.id)
@@ -12054,6 +12056,7 @@ class MainWindow(QWidget):
                         duplicate_job.posted_at = posted_at
                         duplicate_job.posted_url = posted_url
                         duplicate_job.error_message = None
+                        mark_assignment_posted_for_job(session, duplicate_job)
                     session.commit()
             self._notify("Reel published.", Tone.SUCCESS)
         elif status == "dry_run":

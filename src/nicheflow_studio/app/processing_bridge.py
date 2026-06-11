@@ -25,6 +25,8 @@ from pathlib import Path
 
 from nicheflow_studio.app.local_media import media_url
 from nicheflow_studio.core.ui_prefs import set_ui_pref
+from nicheflow_studio.db.models import DownloadItem
+from nicheflow_studio.db.session import get_session
 from nicheflow_studio.services import (
     accounts as accounts_svc,
     draft_generation,
@@ -296,6 +298,10 @@ class ProcessingBridge:
         return pooling.distribute_niche(niche, max_per_account)
 
     @_guard
+    def distribute_niche_explicit(self, niche: str, targets: dict | None = None) -> dict:
+        return pooling.distribute_niche_explicit(niche, targets or {})
+
+    @_guard
     def dashboard_publish_jobs(self) -> dict:
         return publishing_dashboard.list_global_publish_jobs()
 
@@ -322,6 +328,14 @@ class ProcessingBridge:
     @_guard
     def get_context(self, item_id: int | None = None) -> dict:
         """Active Processing context for ``item_id`` (or the resolved current item)."""
+        if item_id is not None:
+            with get_session() as session:
+                pending = session.get(DownloadItem, item_id)
+                should_download = bool(
+                    pending and pending.status == "pending_review" and not pending.file_path
+                )
+            if should_download:
+                library_svc.ensure_item_downloaded(item_id)
         context = svc.active_context(item_id)
         item = context["item"]
         mapping_ready = self._media_ready is None or self._media_ready.wait(timeout=5)
