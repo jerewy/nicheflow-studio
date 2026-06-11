@@ -113,9 +113,11 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
   const [busy, setBusy] = useState(false);
   const [generating, setGenerating] = useState(false);
   const [canGenerate, setCanGenerate] = useState(false);
-  const [exporting, setExporting] = useState(false);
-  const [exportProgress, setExportProgress] = useState<{ value: number; message: string } | null>(
-    null,
+  // Export progress keyed by item id so exports run in the background: the
+  // user can switch items mid-export, and a finishing export only updates the
+  // screen if its item is still the one being viewed.
+  const [exportJobs, setExportJobs] = useState<Record<number, { value: number; message: string }>>(
+    {},
   );
   const [exportedPath, setExportedPath] = useState<string | null>(null);
   const [items, setItems] = useState<LibraryItem[]>([]);
@@ -150,6 +152,12 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
   const [pendingRevision, setPendingRevision] = useState<DraftRevision | null>(null);
 
   const itemId = context?.item.id ?? null;
+  // Ref mirror so async export completions can tell whether the user is still
+  // viewing the item they exported (state writes are gated on this).
+  const itemIdRef = useRef<number | null>(itemId);
+  itemIdRef.current = itemId;
+  const exporting = itemId !== null && exportJobs[itemId] !== undefined;
+  const exportProgress = itemId !== null ? exportJobs[itemId] ?? null : null;
   const dirty = useMemo(
     () => loadedRevision !== null && !sameOptions(edits, loadedRevision),
     [edits, loadedRevision],
@@ -643,32 +651,43 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
 
   const exportReel = async () => {
     if (itemId === null) return;
-    setExporting(true);
+    // Pin the id: the user may select another item while this export runs in
+    // the background, and every completion write below must target THIS item
+    // (or be skipped when the user has moved on) — never the current selection.
+    const exportItemId = itemId;
     setActionError(null);
     setExportedPath(null);
     setExportPreviewError(null);
-    setExportProgress({ value: 0, message: "Starting…" });
+    setExportJobs((jobs) => ({ ...jobs, [exportItemId]: { value: 0, message: "Starting…" } }));
     try {
-      const { job_id } = await bridge.startExport(itemId);
+      const { job_id } = await bridge.startExport(exportItemId);
       const result = (await waitForJob(job_id, (value, message) =>
-        setExportProgress({ value, message }),
+        setExportJobs((jobs) => ({ ...jobs, [exportItemId]: { value, message } })),
       )) as ExportResult;
-      setExportedPath(result.processed_path);
-      if (result.warning) {
-        setActionError(
-          `Exported successfully, but auto-scheduling needs attention: ${result.warning}`,
-        );
+      if (itemIdRef.current === exportItemId) {
+        setExportedPath(result.processed_path);
+        if (result.warning) {
+          setActionError(
+            `Exported successfully, but auto-scheduling needs attention: ${result.warning}`,
+          );
+        }
+        // Refetch so the item's processed_path is reflected, and refresh the queue.
+        const ctx = await bridge.getContext(exportItemId);
+        if (itemIdRef.current === exportItemId) {
+          setContext(ctx);
+          refreshPublishJobs(exportItemId);
+        }
       }
-      // Refetch so the item's processed_path is reflected, and refresh queue/list.
-      const ctx = await bridge.getContext(itemId);
-      setContext(ctx);
-      refreshPublishJobs(itemId);
       bridge.listLibraryItems(activeAccountId).then(setItems).catch(() => undefined);
     } catch (err: unknown) {
-      setActionError(err instanceof Error ? err.message : String(err));
+      if (itemIdRef.current === exportItemId) {
+        setActionError(err instanceof Error ? err.message : String(err));
+      }
     } finally {
-      setExporting(false);
-      setExportProgress(null);
+      setExportJobs((jobs) => {
+        const { [exportItemId]: _done, ...rest } = jobs;
+        return rest;
+      });
     }
   };
 
