@@ -2,6 +2,7 @@ import random
 from datetime import datetime, timedelta, timezone
 
 from nicheflow_studio.core.scheduling import (
+    catch_up_slot_time,
     next_open_slot_time,
     parse_slots,
     upcoming_slot_times,
@@ -85,3 +86,96 @@ def test_next_open_slot_time_applies_jitter_within_window() -> None:
     slot = datetime(2026, 5, 30, 9, 0, tzinfo=timezone.utc)
     assert slot <= when <= slot + timedelta(minutes=7)
     assert (when - slot).total_seconds() > 0
+
+
+def test_catch_up_returns_random_delay_for_recent_unused_slot() -> None:
+    now = datetime(2026, 6, 11, 9, 23, tzinfo=timezone.utc)
+
+    when = catch_up_slot_time(
+        "09:00, 13:00",
+        now=now,
+        occupied=(),
+        last_posted_at=datetime(2026, 6, 10, 21, 0, tzinfo=timezone.utc),
+        rng=random.Random(7),
+    )
+
+    assert now + timedelta(minutes=5) <= when <= now + timedelta(minutes=20)
+
+
+def test_catch_up_rejects_recent_actual_post() -> None:
+    now = datetime(2026, 6, 11, 9, 23, tzinfo=timezone.utc)
+
+    when = catch_up_slot_time(
+        "09:00, 13:00",
+        now=now,
+        occupied=(),
+        last_posted_at=datetime(2026, 6, 11, 8, 30, tzinfo=timezone.utc),
+        rng=random.Random(7),
+    )
+
+    assert when is None
+
+
+def test_catch_up_rejects_used_missed_slot() -> None:
+    now = datetime(2026, 6, 11, 9, 23, tzinfo=timezone.utc)
+
+    when = catch_up_slot_time(
+        "09:00, 13:00",
+        now=now,
+        occupied=[datetime(2026, 6, 11, 9, 5, tzinfo=timezone.utc)],
+        last_posted_at=datetime(2026, 6, 10, 21, 0, tzinfo=timezone.utc),
+        rng=random.Random(7),
+    )
+
+    assert when is None
+
+
+def test_catch_up_uses_latest_slot_within_grace_window() -> None:
+    now = datetime(2026, 6, 11, 14, 0, tzinfo=timezone.utc)
+
+    expired = catch_up_slot_time(
+        "09:00",
+        now=now,
+        occupied=(),
+        last_posted_at=datetime(2026, 6, 10, 21, 0, tzinfo=timezone.utc),
+        rng=random.Random(7),
+    )
+    recent = catch_up_slot_time(
+        "09:00, 13:00",
+        now=now,
+        occupied=(),
+        last_posted_at=datetime(2026, 6, 10, 21, 0, tzinfo=timezone.utc),
+        rng=random.Random(7),
+    )
+
+    assert expired is None
+    assert now + timedelta(minutes=5) <= recent <= now + timedelta(minutes=20)
+
+
+def test_catch_up_rejects_job_before_next_forward_slot() -> None:
+    now = datetime(2026, 6, 11, 9, 23, tzinfo=timezone.utc)
+
+    when = catch_up_slot_time(
+        "09:00, 13:00",
+        now=now,
+        occupied=[datetime(2026, 6, 11, 10, 0, tzinfo=timezone.utc)],
+        last_posted_at=datetime(2026, 6, 10, 21, 0, tzinfo=timezone.utc),
+        rng=random.Random(7),
+    )
+
+    assert when is None
+
+
+def test_catch_up_rejects_checkpoint_cooldown() -> None:
+    now = datetime(2026, 6, 11, 9, 23, tzinfo=timezone.utc)
+
+    when = catch_up_slot_time(
+        "09:00, 13:00",
+        now=now,
+        occupied=(),
+        last_posted_at=datetime(2026, 6, 10, 21, 0, tzinfo=timezone.utc),
+        checkpoint_cooldown=True,
+        rng=random.Random(7),
+    )
+
+    assert when is None

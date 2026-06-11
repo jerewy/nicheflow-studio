@@ -14,10 +14,15 @@ be one click away in an early migration slice.
 from __future__ import annotations
 
 import datetime as dt
+import random as _random
 
 from sqlalchemy import select
 
-from nicheflow_studio.core.scheduling import next_open_slot_time
+from nicheflow_studio.core.scheduling import (
+    catch_up_slot_time,
+    most_recent_passed_slot_time,
+    next_open_slot_time,
+)
 from nicheflow_studio.db.models import Account, DownloadItem, UploadJob
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.services.errors import ServiceError
@@ -50,6 +55,17 @@ def _parse_scheduled_at(value: str | None) -> dt.datetime | None:
         raise PublishError(f"Invalid scheduled time: {value!r}") from exc
     # aware → convert to UTC; naive → assume local timezone (legacy path).
     return parsed.astimezone(dt.timezone.utc)
+
+
+def _aware(value: dt.datetime) -> dt.datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=dt.timezone.utc)
+
+
+def _account_in_checkpoint_cooldown(account_id: int, *, now: dt.datetime) -> bool:
+    # Lazy import avoids the publish_now -> publishing module dependency cycle.
+    from nicheflow_studio.services.publish_now import _account_on_cooldown
+
+    return _account_on_cooldown(account_id, now=now.astimezone(dt.timezone.utc))
 
 
 def list_items() -> list[dict]:
@@ -192,9 +208,14 @@ def queue_for_publish(item_id: int, *, scheduled_at: str | None = None) -> dict:
         }
 
 
-def auto_schedule_for_publish(item_id: int) -> dict:
-    """Queue an exported item in its account's next open posting slot."""
-    now_local = dt.datetime.now().astimezone()
+def auto_schedule_for_publish(
+    item_id: int,
+    *,
+    now: dt.datetime | None = None,
+    rng: _random.Random | None = None,
+) -> dict:
+    """Queue an exported item in a safe catch-up or next open posting slot."""
+    now_local = now or dt.datetime.now().astimezone()
     with get_session() as session:
         item = session.get(DownloadItem, item_id)
         if item is None:
@@ -208,27 +229,58 @@ def auto_schedule_for_publish(item_id: int) -> dict:
         if account is None:
             raise PublishError("The item's account no longer exists.")
 
-        occupied = [
-            row.scheduled_at.replace(tzinfo=dt.timezone.utc)
-            if row.scheduled_at.tzinfo is None
-            else row.scheduled_at
-            for row in session.scalars(
-                select(UploadJob)
-                .where(UploadJob.account_id == account.id)
-                .where(UploadJob.posted_at.is_(None))
-                .where(UploadJob.scheduled_at.is_not(None))
-            ).all()
-            if row.scheduled_at is not None
+        jobs = session.scalars(
+            select(UploadJob).where(UploadJob.account_id == account.id)
+        ).all()
+        forward_occupied = [
+            _aware(row.scheduled_at)
+            for row in jobs
+            if row.posted_at is None and row.scheduled_at is not None
         ]
-        scheduled_local = next_open_slot_time(
+        catch_up_occupied = [
+            _aware(value)
+            for row in jobs
+            for value in (row.scheduled_at, row.posted_at)
+            if value is not None
+        ]
+        posted_times = [_aware(row.posted_at) for row in jobs if row.posted_at is not None]
+        last_posted_at = max(posted_times, default=None)
+        checkpoint_cooldown = _account_in_checkpoint_cooldown(account.id, now=now_local)
+
+        scheduled_local = catch_up_slot_time(
             account.upload_schedule_slots,
-            after=now_local,
-            occupied=occupied,
+            now=now_local,
+            occupied=catch_up_occupied,
+            last_posted_at=last_posted_at,
+            checkpoint_cooldown=checkpoint_cooldown,
+            rng=rng,
         )
+        missed_slot = (
+            most_recent_passed_slot_time(account.upload_schedule_slots, now=now_local)
+            if scheduled_local is not None
+            else None
+        )
+        schedule_path = "catch_up" if scheduled_local is not None else "next_open_slot"
+        if scheduled_local is None:
+            scheduled_local = next_open_slot_time(
+                account.upload_schedule_slots,
+                after=now_local,
+                occupied=forward_occupied,
+                rng=rng,
+            )
 
     if scheduled_local is None:
         raise PublishError(
             "Set this account's schedule slots first (e.g. 09:00, 18:00) "
             "in account settings."
         )
-    return queue_for_publish(item_id, scheduled_at=scheduled_local.isoformat())
+    result = queue_for_publish(item_id, scheduled_at=scheduled_local.isoformat())
+    result["schedule_path"] = schedule_path
+    if schedule_path == "catch_up" and missed_slot is not None:
+        result["message"] = (
+            f"Catch-up: scheduled for {scheduled_local:%H:%M} "
+            f"(missed {missed_slot:%H:%M} slot)"
+        )
+    else:
+        result["message"] = f"Scheduled for {scheduled_local:%H:%M}"
+    return result

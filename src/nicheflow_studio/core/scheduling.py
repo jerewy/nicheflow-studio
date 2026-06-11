@@ -15,6 +15,9 @@ from datetime import datetime, timedelta
 # slot doesn't produce a recognizable "always 09:0x" pattern, narrow enough
 # that multi-hour slot spacing never collides (collision guard = jitter + 5).
 DEFAULT_JITTER_MINUTES = 15
+DEFAULT_CATCH_UP_GRACE_HOURS = 3
+DEFAULT_CATCH_UP_MIN_GAP_HOURS = 2
+_CATCH_UP_DELAY_MINUTES = (5, 20)
 
 
 def parse_slots(slots: str | None) -> list[tuple[int, int]]:
@@ -124,3 +127,60 @@ def next_open_slot_time(
         day = day + timedelta(days=1)
         days_checked += 1
     return None
+
+
+def most_recent_passed_slot_time(slots: str | None, *, now: datetime) -> datetime | None:
+    """Return today's latest configured slot at or before ``now``."""
+    passed = [
+        datetime(now.year, now.month, now.day, hour, minute, tzinfo=now.tzinfo)
+        for hour, minute in parse_slots(slots)
+        if (hour, minute) <= (now.hour, now.minute)
+    ]
+    return max(passed, default=None)
+
+
+def catch_up_slot_time(
+    slots: str | None,
+    *,
+    now: datetime,
+    occupied: list[datetime] | tuple[datetime, ...],
+    last_posted_at: datetime | None,
+    grace_hours: float = DEFAULT_CATCH_UP_GRACE_HOURS,
+    min_gap_hours: float = DEFAULT_CATCH_UP_MIN_GAP_HOURS,
+    checkpoint_cooldown: bool = False,
+    rng: _random.Random | None = None,
+    collision_minutes: int = DEFAULT_JITTER_MINUTES + 5,
+) -> datetime | None:
+    """Return a delayed catch-up time when a recent missed slot is safe to recover.
+
+    ``occupied`` includes both scheduled and actually-posted job timestamps.
+    This helper makes no persistence decisions; callers still queue the returned
+    time through the normal scheduler.
+    """
+    if checkpoint_cooldown:
+        return None
+
+    missed_slot = most_recent_passed_slot_time(slots, now=now)
+    if missed_slot is None or now - missed_slot > timedelta(hours=max(0, grace_hours)):
+        return None
+
+    collision = timedelta(minutes=max(0, collision_minutes))
+    if any(abs(taken - missed_slot) <= collision for taken in occupied):
+        return None
+
+    if (
+        last_posted_at is not None
+        and now - last_posted_at < timedelta(hours=max(0, min_gap_hours))
+    ):
+        return None
+
+    forward_slots = upcoming_slot_times(slots, 1, after=now, jitter_minutes=0)
+    if not forward_slots:
+        return None
+    next_forward_slot = forward_slots[0]
+    if any(now < taken < next_forward_slot for taken in occupied):
+        return None
+
+    rng = rng or _random
+    delay_minutes = rng.randint(*_CATCH_UP_DELAY_MINUTES)
+    return now + timedelta(minutes=delay_minutes)
