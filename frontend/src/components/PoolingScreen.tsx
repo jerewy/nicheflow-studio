@@ -188,7 +188,9 @@ export function PoolingScreen() {
             `${account.pinned ? `, ${account.pinned} pinned` : ""})`,
         )
         .join(", ");
-      setMessage(`Manually distributed ${result.assigned} clip(s) â€” ${breakdown}.`);
+      setMessage(
+        `Distributed ${result.assigned} clip(s): ${breakdown}. Review them in the Processing screen (pending review).`,
+      );
       await load();
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
@@ -230,7 +232,11 @@ export function PoolingScreen() {
       <div className="space-y-2 rounded-md border border-border p-3">
         <div>
           <p className="text-sm font-medium">Distribute now</p>
-          <p className="text-xs text-muted-foreground">Explicit counts bypass cadence targets. Distribution creates pending-review items only; it never downloads media.</p>
+          <p className="text-xs text-muted-foreground">
+            Counts are ADDITIONAL clips per account (on top of what it already holds), bypassing
+            cadence targets. New clips appear in the Processing screen as pending review — nothing
+            is downloaded until you open one.
+          </p>
         </div>
         <div className="flex flex-wrap gap-2">
           {nicheAccounts.map((account) => (

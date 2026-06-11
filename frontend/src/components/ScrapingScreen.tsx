@@ -545,8 +545,9 @@ export function ScrapingScreen({ activeAccountId, activeAccountName }: ScrapingS
             </div>
           )}
           <p className="mt-2 text-xs text-muted-foreground">
-            Scraping pools clips automatically. Add to Processing downloads (or reuses) a clip for
-            editing; Reject removes it from the pool. Distribute pooled clips from Pool &amp; Distribute.
+            Scraping pools clips automatically. Distributed clips no longer appear here — they go
+            straight to the Processing screen as pending-review items (review and reject them
+            there). Distribute pooled clips from Pool &amp; Distribute.
           </p>
         </CardContent>
       </Card>
