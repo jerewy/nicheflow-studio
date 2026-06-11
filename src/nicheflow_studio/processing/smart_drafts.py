@@ -47,6 +47,19 @@ GROQ_REQUESTS_PER_FULL_VIDEO = 2
 # clearing Groq's free-tier 30K TPM window on the next attempt.
 LOW_CONTEXT_RETRY_FRAME_COUNT = 2
 
+# Initial history-hook few-shot set: the account's REAL top performers from
+# IG Insights (2026-06-10 review, ranked by accounts engaged) plus one
+# curiosity-gap calibration line in the strongest competitor's voice. WO-6
+# replaces this static block with measured per-account winners once post
+# metrics are available.
+_HISTORY_LOST_ARCHIVE_FEW_SHOT_WINNERS = (
+    "Janet Jackson turned grief into a VMA tribute",
+    "Princess Diana met Rowan Atkinson before Mr Bean changed everything",
+    "The 1996 awards moment that made Michael Jackson look shy",
+    "The moment John Denver wrote Annie's Song while riding a ski lift",
+    "She performed what would become one of the hardest rap openings ever...",
+)
+
 
 @dataclass(frozen=True)
 class SmartDrafts:
@@ -1368,11 +1381,12 @@ def _caption_style_title_rules(caption_style: str | None) -> list[str]:
         return _meme_campaign_title_rules(style)
     if style == "history_lost_archive":
         return [
-            "- HARD RULE: each title NAMES the concrete visible subject (object, "
-            "person, activity, vehicle, place, technology) and pairs it with ONE "
-            "clear surprise, contrast, emotional meaning, or historical context. "
-            "Preferred 10-16 words, acceptable 8-18, must fit two centered overlay "
-            "lines. Explain WHY the footage is worth watching — never just label it.",
+            "- HARD RULE: each title stays concrete about the visible action, era, "
+            "and stakes, and pairs them with ONE clear surprise, contrast, emotional "
+            "meaning, or historical context. Preferred 10-16 words, acceptable 8-18, "
+            "must fit two centered overlay lines. Explain WHY the footage is worth "
+            "watching — never just label it. Name the concrete visible subject unless "
+            "the single CURIOSITY GAP option deliberately withholds the subject.",
             "- STORY-OPENER RULE: write each title like the first sentence of a "
             "short historical story, not a compressed label or news headline. "
             "Prefer natural story shapes such as 'The [place/event] where [person] "
@@ -1393,27 +1407,33 @@ def _caption_style_title_rules(caption_style: str | None) -> list[str]:
             "shape may run up to 20 words because the final beat is short. The "
             "punch must state what actually happened — never a teaser like "
             "'what happened next is shocking'.",
-            "- COMMENT HOOK shape (use for at most one option): a collective "
-            "observation or direct question that NAMES the subject and invites "
-            "the viewer to weigh in. Examples: 'Why is nobody talking about how "
-            "[named person] [specific action]?', 'Nobody expected [named "
-            "person/place] to [specific surprising action]'. These are allowed "
-            "ONLY with the concrete subject in the line — the subject-hiding "
-            "versions in the BANNED list below stay banned.",
-            "- Rotate these shapes across the three options: "
-            "'This [subject] [surprising action] in [era]', "
-            "'People actually [did/used/built] [surprising detail] in [era]', "
-            "'How people [ordinary activity] before [modern change]', "
-            "'What [familiar subject] looked like in [era]', "
-            "'When [ordinary thing] [unexpected condition]', "
-            "'The [place/event] where [person] [specific emotional action]', "
-            "the TWIST BEAT shape, the COMMENT HOOK shape.",
+            "- CURIOSITY GAP shape (use for EXACTLY one of the three options): "
+            "withhold exactly ONE element — the subject ('She...', 'This 12-year-old...') "
+            "OR the outcome — while everything else stays concrete (era, action, "
+            "stakes). The withheld element must be delivered by the clip in the first "
+            "seconds. A trailing ellipsis is allowed. Example: 'She performed what "
+            "would become one of the hardest rap openings ever...'.",
+            "- COMMENT HOOK shape (AT LEAST one of the three options must use a "
+            "question or direct-address form): invite the viewer to weigh in using "
+            "concrete action and stakes. It may be the curiosity-gap option only if "
+            "it withholds exactly one element. Examples: 'Would you have turned down "
+            "the million dollars?', 'Why did her 1990 VMA performance become unforgettable?'.",
+            "- OPTION ROTATION (HARD RULE): assign one primary role to each option: "
+            "one CURIOSITY GAP, one COMMENT HOOK question/direct-address form, and "
+            "one STORY-OPENER. A TWIST BEAT may be used only when it also fills one "
+            "of those three roles. Do not return three factual summaries or three "
+            "versions of the same shape.",
+            "- STATIC WINNER EXAMPLES (calibrate the voice and structure; never copy "
+            "unsupported facts into another clip):\n- "
+            + "\n- ".join(_HISTORY_LOST_ARCHIVE_FEW_SHOT_WINNERS),
             "- Good: 'The ski lift ride where John Denver wrote Annie's Song for "
             "his wife'; 'People actually attached camping tents to scooters in the "
             "1950s'. Too flat: 'John Denver wrote Annie's Song on a ski lift'. "
-            "Weak (BANNED — hides the subject): 'The accessory that disappeared', "
-            "'The lost story behind this scene', 'Nobody expected this to matter', "
-            "'This old footage aged strangely'.",
+            "Weak (BANNED — double-withholding hides BOTH subject AND outcome): "
+            "'The accessory that disappeared', 'The lost story behind this scene', "
+            "'Nobody expected this to matter', 'This old footage aged strangely'. "
+            "Withholding one element is allowed only for the single controlled "
+            "CURIOSITY GAP option; hiding both is vague mystery bait.",
             "- FACT DISCIPLINE: name an exact year/decade only when provided or "
             "verified; otherwise use 'decades ago' / 'before modern [X]'. Never "
             "invent rarity, disappearance, first-ever status, popularity, "

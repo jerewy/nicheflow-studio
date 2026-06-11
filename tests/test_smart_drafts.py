@@ -1134,31 +1134,50 @@ def test_history_lost_archive_title_rules_include_twist_and_comment_hooks() -> N
     # Two-beat twist shape: setup sentence + short punch ("He said no.").
     assert "TWIST BEAT" in joined
     assert "He said no." in joined
-    # Comment-bait question/observation shape requires a NAMED subject, so it
-    # cannot collide with the subject-hiding bans below it.
+    # Comment bait is mandatory in at least one option.
     assert "COMMENT HOOK" in joined
-    assert "NAMES the subject" in joined
+    assert "AT LEAST one of the three options" in joined
+    assert "question or direct-address form" in joined
+    assert "assign one primary role to each option" in joined
     # The engagement goal is explicit: titles should provoke comments/shares.
     assert "COMMENT TEST" in joined
     assert "intrigue without controversy" in joined
 
 
-def test_history_lost_archive_title_rules_mandate_concrete_subject() -> None:
+def test_history_lost_archive_title_rules_allow_one_controlled_curiosity_gap() -> None:
     rules = smart_drafts._caption_style_title_rules("history_lost_archive")
     joined = "\n".join(rules)
 
-    # Core upgrade: name the visible subject + one surprise, not vague bait.
-    assert "NAMES the concrete visible subject" in joined
+    assert "CURIOSITY GAP shape" in joined
+    assert "EXACTLY one of the three options" in joined
+    assert "withhold exactly ONE element" in joined
+    assert "subject ('She...'" in joined
+    assert "OR the outcome" in joined
+    assert "delivered by the clip in the first seconds" in joined
     assert "never just label it" in joined.lower()
     # The strong calibration example is present as the "good" anchor.
     assert "camping tents to scooters" in joined
     assert "The ski lift ride where John Denver wrote Annie's Song for his wife" in joined
     assert "Too flat" in joined
-    # Vague subject-hiding bait is explicitly banned, not recommended.
-    assert "hides the subject" in joined.lower()
+    # Only double-withholding remains banned as vague mystery bait.
+    assert "double-withholding hides BOTH subject AND outcome" in joined
+    assert "hiding both is vague mystery bait" in joined
     # Fact discipline: no invented rarity / disappearance / first-ever.
     assert "FACT DISCIPLINE" in joined
     assert "first-ever status" in joined
+
+
+def test_history_lost_archive_title_rules_include_static_winner_examples() -> None:
+    joined = "\n".join(smart_drafts._caption_style_title_rules("history_lost_archive"))
+
+    assert "STATIC WINNER EXAMPLES" in joined
+    # The block must hold the account's REAL Insights winners, not recycled
+    # rule examples — Janet Jackson is the 17.1K top performer.
+    assert "Janet Jackson turned grief into a VMA tribute" in joined
+    assert "Princess Diana met Rowan Atkinson" in joined
+    assert "made Michael Jackson look shy" in joined
+    # Plus the curiosity-gap calibration line in the competitor's voice.
+    assert "hardest rap openings ever" in joined
 
 
 def test_niche_profile_history_names_subject_and_avoids_podcast_misroute() -> None:
@@ -1197,7 +1216,7 @@ def test_effective_title_rules_auto_routes_history_without_explicit_style() -> N
     )
     joined = "\n".join(rules)
 
-    assert "NAMES the concrete visible subject" in joined
+    assert "CURIOSITY GAP shape" in joined
     assert "10-16 words" in joined
 
 
@@ -1254,8 +1273,36 @@ def test_history_prompt_auto_applies_history_title_rules_end_to_end() -> None:
         title_style=None,
     )
 
-    assert "NAMES the concrete visible subject" in prompt
+    assert "CURIOSITY GAP shape" in prompt
+    assert "AT LEAST one of the three options" in prompt
+    assert "STATIC WINNER EXAMPLES" in prompt
     assert "camping tents to scooters" in prompt
+
+
+def test_live_groq_history_prompt_emits_wo2_rules(monkeypatch) -> None:
+    monkeypatch.setenv("GROQ_API_KEY", "groq-key")
+    monkeypatch.setattr(smart_drafts, "sample_video_frame_data_urls", lambda path, max_frames=5: [])
+    captured_prompts: list[str] = []
+
+    def fake_urlopen(request, timeout=90):  # noqa: ANN001
+        payload = smart_drafts.json.loads(request.data.decode("utf-8"))
+        captured_prompts.append(payload["messages"][1]["content"])
+        return _FakeJsonResponse(_WRITER_OK_BODY)
+
+    monkeypatch.setattr(smart_drafts.urllib.request, "urlopen", fake_urlopen)
+
+    smart_drafts.generate_smart_drafts(
+        transcript_text="A detailed transcript about a known historical performance.",
+        source_title="A specific historical performance",
+        niche_label=HISTORY_NICHE,
+        prompt_profile="broad_short_form",
+        caption_style="history_lost_archive",
+    )
+
+    writer_prompt = captured_prompts[-1]
+    assert "CURIOSITY GAP shape" in writer_prompt
+    assert "AT LEAST one of the three options" in writer_prompt
+    assert "STATIC WINNER EXAMPLES" in writer_prompt
 
 
 def test_meme_factual_system_prompt_enforces_emoji_plus_wikipedia() -> None:

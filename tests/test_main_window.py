@@ -4893,11 +4893,13 @@ def test_processing_copy_chat_prompt_includes_local_file_and_niche_context(
         assert "Style contract copied from NicheFlow smart drafts" in prompt
         assert "Caption word target: 90-150" in prompt
         assert "PAST MOMENTS DAILY" in prompt
-        # History hooks now use story-opener 10-16 word rules with a concrete
-        # subject mandate (the Copy Chat Prompt must mirror live generation).
+        # The legacy Copy Chat Prompt still mirrors the shared live-generation
+        # history rules while PyQt remains frozen.
         assert "10-16 words" in prompt
         assert "STORY-OPENER RULE" in prompt
-        assert "NAMES the concrete visible subject" in prompt
+        assert "CURIOSITY GAP shape" in prompt
+        assert "AT LEAST one of the three options" in prompt
+        assert "STATIC WINNER EXAMPLES" in prompt
         assert "Do not use generic filler hashtags like #fyp" in prompt
         assert "Generate 3 on-screen title options and 3 caption options" in prompt
         assert "recommend the strongest title/caption pair" in prompt

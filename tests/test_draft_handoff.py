@@ -45,7 +45,9 @@ def test_build_chat_prompt_carries_title_rules_and_hook_framing() -> None:
     prompt = draft_handoff.build_chat_prompt(item_id)
 
     assert "On-screen title rules" in prompt
-    assert "NAMES the concrete visible subject" in prompt
+    assert "CURIOSITY GAP shape" in prompt
+    assert "AT LEAST one of the three options" in prompt
+    assert "STATIC WINNER EXAMPLES" in prompt
     assert "COMMENT TEST" in prompt
     assert "GREEN" in prompt and "YELLOW" in prompt and "RED" in prompt
 

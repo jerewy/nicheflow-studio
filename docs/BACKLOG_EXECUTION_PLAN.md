@@ -21,10 +21,12 @@ Safety rails landed 2026-06-10; the remaining result-movers, in order:
 2. **WO-1** backend publish loop + **WO-11** backup — consistency: posts fire
    without babysitting, and the data that runs the business can't be lost.
 3. **WO-12** packaged validation — locks 1+2 in as a real product.
-4. **WO-3 + WO-4 + WO-13** auto-schedule on export, per-account cadence,
+4. **WO-14** white-canvas crop fix — first quality item after the hooks;
+   every white-canvas export currently ships with a white halo.
+5. **WO-3 + WO-4 + WO-13** auto-schedule on export, per-account cadence,
    missed-slot catch-up — removes the last per-post clicks, stops losing
    posts to skipped slots, enables the 4→5 ramp.
-5. **WO-6** metrics feedback — makes quality compound over time.
+6. **WO-6** metrics feedback — makes quality compound over time.
 
 Everything else (WO-5 side panel, WO-7 model swap, WO-8/9/10, discovery,
 pipeline stages) waits until the five above are live — they are conveniences
@@ -421,6 +423,14 @@ not twice).** Packaging is MVP, not post-MVP (`.claude/CLAUDE.md`).
   paths, missing data files) — so validate right after they land.
 - **Where:** the build scripts above + whatever they surface. Fix root
   causes in `src/`, not by patching the dist output.
+- **yt-dlp staleness (found 2026-06-11):** IG downloads fail with "Instagram
+  sent an empty media response" when yt-dlp ages (extractor broke at ~3
+  months stale). Dev runs now auto-upgrade via `scripts/dev_webview.ps1`,
+  but a PyInstaller-frozen lib CANNOT pip-update itself — the packaged build
+  must either (a) ship yt-dlp as a sidecar `yt-dlp.exe` invoked by
+  subprocess with its own `-U` self-update, or (b) check PyPI at startup and
+  tell the user to update the app. Decide during this WO; (a) is the
+  standard solution and also future-proofs the YouTube path.
 - **How to test (pass criteria — the packaged smoke checklist):**
   1. `scripts/build_webview.ps1` completes clean.
   2. `scripts/run_fresh_packaged.ps1` (fresh `data/` dir): app launches,
@@ -480,6 +490,63 @@ the unused 09:00 slot and booked 13:02, silently turning a 4-post day into 3.
      passed unused → UI shows "Auto-scheduled for ~now+5–20 min" instead of
      the afternoon slot; export a second item immediately → it goes to the
      next forward slot (rule 4 prevents double catch-up).
+
+---
+
+## WO-14 — White-canvas crop accuracy (owner-reported 2026-06-11)
+
+**Priority: high — first quality item after WO-2's hook work; it degrades every
+white-canvas export (visible white margins around the footage).** Black-canvas
+reels crop tight; white-canvas reels keep a white halo.
+
+- **What:** `processing/video.py::detect_content_rectangle` under-crops when
+  the surrounding canvas is white/light. Root cause is a dark-canvas
+  assumption in two places:
+  1. `CONTENT_RECT_SHARP_PIXEL_THRESHOLD = 1.0` (|Laplacian| on 0–255 luma)
+     is far below white-canvas compression noise. Encoders write black canvas
+     as flat zeros, but white canvas carries banding/shimmer (±1–3 luma), so
+     canvas pixels register as "sharp". The row band extension
+     (`motion OR sharp`, ~line 620) and the column signal
+     (`slab_sharp_cov`, ~line 651) then absorb white margins as content.
+     The stride-based `_downscale_frame` preserves that noise (no averaging).
+  2. The no-motion fallback `brightness > CONTENT_RECT_BRIGHTNESS_THRESHOLD
+     (46)` literally defines canvas as "dark" — a white canvas is all
+     "content" on that path.
+- **Why:** Crop quality is output quality — a white halo looks like a lazy
+  repost and wastes vertical pixels that the title band needs. Memory note:
+  `detect_content_rectangle` is the single crop authority at export
+  (see decisions memory / Crop authority) — fixing it fixes every export.
+- **Where:** `processing/video.py` only — constants block (~line 366) and
+  `detect_content_rectangle`. Do NOT touch the vision `content_box` path
+  (metadata-only by decision) or `suggest_title_replacement_crop`'s contract.
+- **How (canvas-aware, not threshold-whack-a-mole):**
+  1. Estimate the CANVAS COLOR from the frame's outer border pixels
+     (e.g. 2% frame margin, median luma across sampled frames) instead of
+     assuming dark.
+  2. Build a canvas mask: pixels within a tolerance (~8–12 luma) of the
+     canvas color AND below the motion threshold. Exclude canvas-mask pixels
+     from `sharp_pixel` before any row/column coverage is computed — this
+     kills the white-shimmer false positives without raising the global
+     sharp threshold (which would regress dark-banner detection like the
+     COURTROOM case documented in the comments).
+  3. Make the no-motion fallback canvas-relative: content = |luma − canvas|
+     > threshold, not brightness > 46.
+  4. Keep every existing special path (blurred-bg, overlay-bar, text-top
+     scan, descender padding) byte-identical for dark canvases — the
+     regression risk here is the carefully-tuned dark cases in the comments.
+- **How to test (pass criteria):**
+  1. *Automated fixtures (ffmpeg-generated in the test, like existing video
+     tests):* embed a moving noise/testsrc rectangle at a KNOWN position
+     into (a) black canvas, (b) white canvas, (c) off-white #F5F5F5 canvas,
+     encoded libx264 CRF 28 (realistic shimmer). Assert the detected
+     rectangle is within ~2% of the known footage rect for ALL three.
+     Today (a) passes and (b)/(c) fail — that asymmetry IS the bug.
+  2. *Regression:* full suite green; any existing crop/export golden tests
+     unchanged for dark-canvas inputs.
+  3. *Manual:* re-run "Adjust crop"/re-export on the white-canvas reel from
+     the 2026-06-11 report (Princess Diana / Prince William clip) → exported
+     reel shows footage edge-to-edge with no white margin; spot-check 2
+     known-good black-canvas reels still crop identically.
 
 ---
 

@@ -21,6 +21,12 @@ if (-not (Test-Path (Join-Path $frontend "node_modules"))) {
     try { npm install } finally { Pop-Location }
 }
 
+# Instagram breaks yt-dlp's extractor regularly; a stale version shows up as
+# "Instagram sent an empty media response" on downloads. Best-effort upgrade —
+# offline/registry failures must never block launching the app.
+Write-Host "Checking yt-dlp is current..."
+try { & $py -m pip install -U yt-dlp --quiet --disable-pip-version-check 2>$null | Out-Null } catch {}
+
 if ($Dev) {
     Write-Host "Starting Vite dev server (hot reload)..."
     $vite = Start-Process -FilePath "npm.cmd" -ArgumentList "run", "dev" `
