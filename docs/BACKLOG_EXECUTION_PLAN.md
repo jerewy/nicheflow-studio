@@ -26,7 +26,11 @@ Safety rails landed 2026-06-10; the remaining result-movers, in order:
 5. **WO-3 + WO-4 + WO-13** auto-schedule on export, per-account cadence,
    missed-slot catch-up — removes the last per-post clicks, stops losing
    posts to skipped slots, enables the 4→5 ramp.
-6. **WO-6** metrics feedback — makes quality compound over time.
+6. **WO-16** assignment lifecycle + single-review flow — unblocks
+   distribution starvation (posted clips never freed their backlog slot)
+   and collapses the double candidate/processing review.
+7. **WO-6** metrics feedback — makes quality compound over time.
+   (WO-15 crop UX and WO-17 extension pin slot in anywhere after WO-16.)
 
 Everything else (WO-5 side panel, WO-7 model swap, WO-8/9/10, discovery,
 pipeline stages) waits until the five above are live — they are conveniences
@@ -596,6 +600,87 @@ and the fit-to-view scale makes 1 screen px ≈ 3–4 video px — too coarse.
      green; no backend test changes except the new bridge method's test.
   3. *Regression:* saved override JSON shape unchanged — re-export of an
      item with an existing override behaves identically.
+
+---
+
+## WO-16 — Assignment lifecycle + single-review distribution flow
+
+**Priority: TOP operational item (owner blocked 2026-06-11) — run before
+WO-15/WO-6.** Auto-distribute returned zero candidates for pastmomentsdaily.
+
+- **Root cause (verified):** `Assignment.status` never transitions past
+  `"assigned"` (only `skipped_duplicate` exists).
+  `db/assignments.py::assignment_counts_by_account` therefore counts
+  LIFETIME assignments against the backlog target — account 7 held 30 vs
+  target 28 with most already posted, so distribution starves forever once
+  an account has ever received `target` clips. Interim band-aid applied
+  2026-06-11: one-off `distribute_niche('history', max_per_account=40)`.
+- **What to build:**
+  1. **Release on post (the fix):** when a clip's UploadJob is marked
+     posted, transition the originating assignment to `"posted"`. Trace the
+     linkage (Assignment → pool_item → media_asset → DownloadItem →
+     UploadJob) and write the transition in BOTH posting paths
+     (`services/publish_now.py::_post_and_record` and the legacy PyQt
+     handler — display-correctness sync only). `assignment_counts_by_account`
+     counts only statuses representing pending backlog (`"assigned"`).
+     Idempotent: re-marking posted is a no-op.
+  2. **Release on reject:** rejecting a distributed clip (Processing reject
+     or pool reject of an assigned item) transitions the assignment to a
+     freed status so the next distribute backfills — mirror the
+     `skipped_duplicate` replace behavior.
+  3. **Manual distribute section:** in Pool & Distribute, a "Distribute
+     now" control: multi-select accounts + count per account; calls the
+     existing service with explicit per-account targets (bypasses cadence
+     targets). Show per-account assigned/target results.
+  4. **Single review surface:** distributed clips appear DIRECTLY in the
+     account's Processing list in a `pending_review` state with NO
+     download — preview uses the pool thumbnail/metadata; Reject from
+     there (= step 2 release). The download fires lazily on first real
+     action (open item / generate / export) via the existing media-asset
+     dedup (no clip is ever downloaded twice). The Scraping screen's
+     Candidates section is then removed/reduced to source management +
+     Apify triggers.
+- **Storage constraint (owner requirement):** bulk distribution must NEVER
+  trigger bulk downloads. Pool intake stays metadata-only; one download per
+  clip at first use, deduped globally.
+- **How to test (pass criteria):**
+  1. *Automated:* assignment transitions — posted job marks its assignment
+     `"posted"` and frees a slot (counts drop by 1; next distribute assigns
+     1 more); reject frees + backfills; counts exclude posted/rejected;
+     re-posting idempotent. Manual-distribute service: selected accounts
+     only, explicit counts, ignores cadence targets. Pending-review items:
+     created without a media download (no file path), reject without
+     download, first-open triggers exactly one download.
+  2. *Manual:* with the account at cap, post one scheduled reel → run
+     Auto-distribute → exactly one new candidate arrives. Reject it →
+     next distribute backfills a different clip. Manual section: select
+     pastmomentsdaily + 5 → exactly 5 arrive regardless of cap.
+  3. *Regression:* full suite green; distribution math tests (WO-4)
+     unchanged; no bulk download in any new path (assert no media fetch on
+     distribute).
+
+---
+
+## WO-17 — Capture extension: pin a clip to an account
+
+**Priority: small, after WO-16 (builds on its distribute changes).**
+
+- **What:** optional "Pin to account" dropdown in the capture extension
+  (populated with the selected pool's niche accounts). The clip still
+  enters the SHARED pool (dedup/one-source-of-truth intact) but carries
+  `pool_items.pinned_account_id`. Distribution assigns pinned items to
+  their account FIRST, flagged in the result; a pin is explicit owner
+  intent, so it assigns even when the account is at target (counts toward
+  the backlog like any assignment).
+- **Where:** `browser-extension/nicheflow-capture` UI + native-host message
+  (additive field, backward compatible), `db/pool_intake.py` (accept +
+  store the pin), `db/models.py` pool item column + migration,
+  `db/assignments.py`/`services/pooling.py` (pinned-first pass before
+  ranked distribution).
+- **How to test:** unit — pinned item assigned to its account on next
+  distribute even at cap, unpinned flow unchanged, duplicate capture of a
+  pinned URL keeps the first pin; manual — pin one reel from the extension,
+  run distribute, it lands on the chosen account flagged "pinned".
 
 ---
 
