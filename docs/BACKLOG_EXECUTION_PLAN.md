@@ -553,6 +553,52 @@ reels crop tight; white-canvas reels keep a white halo.
 
 ---
 
+## WO-15 — Crop editor UX: edge handles, zoom, precision tools
+
+**Priority: independent, frontend-only — slot after WO-13 (or any time).**
+Owner-reported 2026-06-12: the Adjust-crop box can only be resized from the
+four corner handles, so trimming ONE side (the most common fix — e.g. a
+white matte strip) forces a two-sides-at-once corner drag on a small target,
+and the fit-to-view scale makes 1 screen px ≈ 3–4 video px — too coarse.
+
+- **What/Where:** `frontend/src/components/CropEditor.tsx` only (drag math
+  in `applyDrag` extends from 4 corner modes to 8; container/zoom layer
+  around the frame). Saved override format `{x, y, w, h}` is UNCHANGED.
+  Item 5 needs one read-only bridge method returning the auto-detected rect.
+- **How (priority order within the WO):**
+  1. **Edge handles + grabbable edge lines:** four mid-edge handles
+     (n/s/e/w) AND the full edge line as a drag target, with directional
+     cursors (`ns-resize`/`ew-resize`). One side moves independently.
+  2. **Hit areas:** ~20px invisible hit zone around every handle/edge;
+     visible size unchanged.
+  3. **Zoom + pan:** Ctrl+wheel zoom toward cursor (1x–4x) + a small
+     −/100%/+ control; pan via drag outside the box or scrollbars; handles
+     keep constant SCREEN size. Note: existing drag math normalizes by the
+     rendered box size, so precision scales with zoom for free.
+  4. **Keyboard nudge:** focused edge/box moves 0.5% per arrow press,
+     2% with Shift.
+  5. **Editable numbers:** the "Keeping x|y|w|h %" readout becomes four
+     inputs (validated, clamped).
+  6. **Per-edge snap-to-auto:** double-click an edge to snap just that edge
+     to the auto-detected content boundary (new bridge call exposing
+     `detect_content_rectangle`'s rect for the item; cache it per item).
+- **How to test (pass criteria):**
+  1. *Manual checklist:* drag the left edge line only → x/w change, y/h
+     identical. Zoom to 4x on the right edge of a white-card reel (e.g.
+     item #212 source) → place the edge within ~2 video px of the matte
+     boundary; pan works while zoomed; handles stay screen-sized. Arrow
+     keys nudge 0.5%/2%. Typing w=96 updates the box. Double-click left
+     edge → snaps to the auto rect edge. Reset to auto / Save crop / Select
+     all unchanged.
+  2. *Automated:* unit-test the extended `applyDrag` (8 modes: each edge
+     changes only its own side; corners unchanged from today) and the
+     percent-clamping of numeric inputs. Frontend `tsc` + `vite build`
+     green; no backend test changes except the new bridge method's test.
+  3. *Regression:* saved override JSON shape unchanged — re-export of an
+     item with an existing override behaves identically.
+
+---
+
 ## Later / explicitly sequenced
 
 - **Assisted discovery (extension scoring)** — after WO-5; passive collection
