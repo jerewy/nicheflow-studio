@@ -1,6 +1,9 @@
 import asyncio
 from pathlib import Path
 
+import pytest
+
+from nicheflow_studio.publisher import instagram_publisher
 from nicheflow_studio.publisher.instagram_publisher import (
     _IGNORED_CHROMIUM_DEFAULT_ARGS,
     _POST_MENU_SELECTORS,
@@ -106,6 +109,52 @@ class _FakePage:
         if selector == '[role="dialog"]':
             return _FakeDialogMatches(self._dialog_href, self._dialog_count)
         return _FakeLinkLocator("https://www.instagram.com/reel/stale/")
+
+
+def test_click_first_dismissing_sweeps_then_clicks(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The first-post dialog ("Video posts are now shared as reels") blocks the
+    # first click attempt; the sweep between attempts must clear it so the
+    # second attempt lands.
+    calls: list[str] = []
+
+    async def fake_dismiss(page) -> None:  # noqa: ANN001
+        calls.append("dismiss")
+
+    async def fake_click(page, selectors, *, timeout) -> bool:  # noqa: ANN001
+        calls.append("click")
+        return calls.count("click") >= 2
+
+    monkeypatch.setattr(instagram_publisher, "_dismiss_interstitials", fake_dismiss)
+    monkeypatch.setattr(instagram_publisher, "_click_first", fake_click)
+
+    clicked = asyncio.run(
+        instagram_publisher._click_first_dismissing(object(), ("sel",), timeout=30000)
+    )
+
+    assert clicked is True
+    assert calls == ["dismiss", "click", "dismiss", "click"]
+
+
+def test_click_first_dismissing_gives_up_at_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+
+    async def fake_dismiss(page) -> None:  # noqa: ANN001
+        calls.append("dismiss")
+
+    async def fake_click(page, selectors, *, timeout) -> bool:  # noqa: ANN001
+        calls.append("click")
+        await asyncio.sleep(0.05)  # consume the budget so the deadline passes
+        return False
+
+    monkeypatch.setattr(instagram_publisher, "_dismiss_interstitials", fake_dismiss)
+    monkeypatch.setattr(instagram_publisher, "_click_first", fake_click)
+
+    clicked = asyncio.run(
+        instagram_publisher._click_first_dismissing(object(), ("sel",), timeout=40)
+    )
+
+    assert clicked is False
+    assert "click" in calls  # it tried before giving up
 
 
 def test_format_control_dump_dedupes_and_trims() -> None:

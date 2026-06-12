@@ -196,7 +196,10 @@ async def _click_first(page: Page, selectors: tuple[str, ...], *, timeout: float
                 try:
                     if await element.is_visible():
                         await _human_pause(0.3, 0.9)
-                        await element.click()
+                        # Bounded click: the outer loop owns the deadline. The
+                        # default 30s actionability wait can hang here when a
+                        # modal overlay (first-post dialog) blocks the control.
+                        await element.click(timeout=2500)
                         return True
                 except PlaywrightError:
                     continue
@@ -296,6 +299,28 @@ async def _dismiss_interstitials(page: Page) -> None:
             continue
 
 
+async def _click_first_dismissing(
+    page: Page, selectors: tuple[str, ...], *, timeout: float = 45000
+) -> bool:
+    """:func:`_click_first` with interstitial sweeps between attempts.
+
+    First-post dialogs ("Video posts are now shared as reels") can appear
+    seconds AFTER the post-attach dismissal pass — Instagram reads the video
+    before showing the dialog — and then sit over the composer while a plain
+    ``_click_first`` burns its whole budget against a blocked control.
+    Sweeping before each attempt clears the dialog whenever it shows up.
+    """
+    slice_ms = 5000.0
+    deadline = time.monotonic() + timeout / 1000
+    while True:
+        await _dismiss_interstitials(page)
+        remaining_ms = (deadline - time.monotonic()) * 1000
+        if remaining_ms <= 0:
+            return False
+        if await _click_first(page, selectors, timeout=min(slice_ms, remaining_ms)):
+            return True
+
+
 async def _detect_checkpoint(page: Page) -> str | None:
     """Return the matched marker text if Instagram is showing a challenge/restriction."""
     for marker in _CHECKPOINT_MARKERS:
@@ -342,7 +367,7 @@ async def _select_9_16_aspect(page: Page) -> None:
     before the crop screen appears — use a generous timeout so we don't give up
     while the upload is still in progress.
     """
-    if not await _click_first(page, _CROP_BUTTON_SELECTORS, timeout=45000):
+    if not await _click_first_dismissing(page, _CROP_BUTTON_SELECTORS, timeout=45000):
         log.warning("could not find crop control; leaving aspect as-is")
         return
     await _human_pause(0.3, 0.7)
@@ -364,7 +389,7 @@ async def _advance_through_edit_steps(page: Page) -> None:
     await _select_9_16_aspect(page)
     timeouts = [60000, 15000]  # crop-screen Next can be slow; filter-screen Next is fast
     for timeout_ms in timeouts:
-        if not await _click_first(page, _NEXT_SELECTORS, timeout=timeout_ms):
+        if not await _click_first_dismissing(page, _NEXT_SELECTORS, timeout=timeout_ms):
             raise RuntimeError("could not advance with 'Next' during edit steps")
         await _human_pause(0.6, 1.4)
 
