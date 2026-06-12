@@ -45,6 +45,42 @@ def test_global_publish_jobs_and_mark_ready(tmp_path: Path) -> None:
     assert next(row for row in updated["jobs"] if row["id"] == job_id)["status"] == "ready"
 
 
+def test_global_publish_jobs_orders_nearest_schedule_first(tmp_path: Path) -> None:
+    with get_session() as session:
+        account = Account(name="History Daily", platform="instagram")
+        session.add(account)
+        session.flush()
+        jobs = [
+            UploadJob(
+                account_id=account.id,
+                processed_path=str(tmp_path / "latest.mp4"),
+                status="scheduled",
+                scheduled_at=dt.datetime(2026, 6, 12, 18, 0),
+            ),
+            UploadJob(
+                account_id=account.id,
+                processed_path=str(tmp_path / "unscheduled.mp4"),
+                status="ready",
+            ),
+            UploadJob(
+                account_id=account.id,
+                processed_path=str(tmp_path / "nearest.mp4"),
+                status="scheduled",
+                scheduled_at=dt.datetime(2026, 6, 12, 12, 0),
+            ),
+        ]
+        session.add_all(jobs)
+        session.commit()
+        expected_ids = [jobs[2].id, jobs[0].id, jobs[1].id]
+
+    for name in ("latest.mp4", "unscheduled.mp4", "nearest.mp4"):
+        (tmp_path / name).write_bytes(b"video")
+
+    result = publishing_dashboard.list_global_publish_jobs()
+
+    assert [row["id"] for row in result["jobs"]] == expected_ids
+
+
 def test_account_readiness_lists_accounts_and_due_work(tmp_path: Path) -> None:
     _seed_job(tmp_path, status="ready")
 

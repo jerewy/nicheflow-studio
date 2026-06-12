@@ -189,7 +189,11 @@ def list_global_publish_jobs() -> dict:
             session.query(UploadJob)
             .options(joinedload(UploadJob.account), joinedload(UploadJob.download_item))
             .filter(UploadJob.posted_at.is_(None), UploadJob.status != "posted")
-            .order_by(UploadJob.created_at.desc())
+            .order_by(
+                UploadJob.scheduled_at.is_(None),
+                UploadJob.scheduled_at.asc(),
+                UploadJob.created_at.desc(),
+            )
             .all()
         )
         visible = []

@@ -72,6 +72,9 @@ class SmartDrafts:
     recommendation_reason: str | None = None
     option_notes: list[str] | None = None
     option_tiers: list[str] | None = None
+    # Per-title supporting quote for the option's concrete claim ("none needed"
+    # for green options) — feeds the deterministic grounding guard downstream.
+    claim_supports: list[str] | None = None
     used_fallback: bool = False
     vision_payload: dict[str, object] | None = None
     generation_meta: dict[str, object] | None = None
@@ -344,6 +347,7 @@ def _generate_ollama_smart_drafts(
         recommendation_reason=parsed.recommendation_reason,
         option_notes=parsed.option_notes,
         option_tiers=parsed.option_tiers,
+        claim_supports=parsed.claim_supports,
         vision_payload=visual_payload,
         generation_meta={
             "writer_model": model,
@@ -497,6 +501,7 @@ def _generate_groq_smart_drafts(
         recommendation_reason=parsed.recommendation_reason,
         option_notes=parsed.option_notes,
         option_tiers=parsed.option_tiers,
+        claim_supports=parsed.claim_supports,
         vision_payload=vision_payload,
         generation_meta={
             "writer_model": reasoning_model,
@@ -781,6 +786,12 @@ def _smart_draft_prompt(
             "tiers above. 'green' = no checkable claim (safe to auto-post); 'yellow' = "
             "states a concrete fact grounded in the signals; 'red' = an unverifiable "
             "overclaim (you should not have written it — fix the title instead of tagging it red).",
+            f"- claim_support: exactly {SMART_DRAFT_OPTION_COUNT} strings, one per title in "
+            "the same order. For every yellow title, copy the EXACT phrase from the "
+            "transcript, source caption, or visual evidence JSON that backs its concrete "
+            "claim. For green titles write 'none needed'. If you cannot quote a supporting "
+            "phrase, the claim is unsupported: rewrite the title without it instead of "
+            "writing 'none'.",
             "",
             "AVOID",
             (
@@ -834,11 +845,14 @@ def _hook_drama_and_fact_safety_rules() -> list[str]:
         "effortless', 'This moment still feels unreal'. The clip itself is "
         "enough support; no extra proof needed.",
         "- YELLOW (allowed only when the signals support it): any concrete claim "
-        "such as a name, age, height, date, place, record, cause, quote, or a "
-        "'first / shortest / biggest' superlative. Use these ONLY when the "
+        "such as a name, age, height, date, place, record, cause, quote, a "
+        "precise duration ('36 hours before'), or a 'first / last / final / "
+        "shortest / biggest / only time' superlative. Use these ONLY when the "
         "transcript, source caption, niche, or visual evidence actually backs "
         "them. If a number, record, or identity is not in the signals, do not "
-        "state it as fact.",
+        "state it as fact. Timeline finality ('his final rehearsal', 'never "
+        "again') counts as a claim: keep the source's own framing and never "
+        "upgrade it to 'last/final' yourself.",
         "- RED (never write): unverifiable rarity, secrecy, or world-changing "
         "claims. Banned phrasings include 'never-before-seen', 'rare footage "
         "nobody has seen', 'the last video ever of him', 'they tried to hide "
@@ -1177,7 +1191,7 @@ def _smart_draft_system_prompt(caption_style: str | None) -> str:
     return (
         "You create short-form video hooks and captions. "
         "Return only valid JSON with keys final_summary, title_options, caption_options, "
-        "recommended_pick, option_notes, option_tiers. "
+        "recommended_pick, option_notes, option_tiers, claim_support. "
         f"title_options must contain exactly {SMART_DRAFT_OPTION_COUNT} strings. "
         f"caption_options must contain exactly {SMART_CAPTION_OPTION_COUNT} strings. "
         f"Each caption_options string must be {word_target} words. "
@@ -1186,6 +1200,8 @@ def _smart_draft_system_prompt(caption_style: str | None) -> str:
         f"option_notes must contain exactly {SMART_DRAFT_OPTION_COUNT} short strings explaining each option's angle. "
         f"option_tiers must contain exactly {SMART_DRAFT_OPTION_COUNT} strings, one per title_options "
         "entry, each exactly 'green', 'yellow', or 'red' per the HOOK FRAMING tiers. "
+        f"claim_support must contain exactly {SMART_DRAFT_OPTION_COUNT} strings, one per title: "
+        "the exact signal phrase backing that title's concrete claim, or 'none needed'. "
         f"{paragraph_rule}"
     )
 
@@ -2627,6 +2643,7 @@ class _ParsedDraftResponse:
     recommendation_reason: str | None = None
     option_notes: list[str] | None = None
     option_tiers: list[str] | None = None
+    claim_supports: list[str] | None = None
 
 
 # The model occasionally decorates a tier ("green ✅", "Tier: yellow") — match
@@ -2653,6 +2670,20 @@ def _clean_option_tiers(value: object) -> list[str] | None:
         if len(tiers) >= SMART_DRAFT_OPTION_COUNT:
             break
     return tiers or None
+
+
+def _clean_claim_supports(value: object) -> list[str] | None:
+    """Position-preserving cleanup for claim_support entries.
+
+    Unlike ``_clean_options`` this keeps empty strings: entry i must stay
+    aligned with title_options[i], so a missing quote may not shift the rest.
+    """
+    if not isinstance(value, (list, tuple)):
+        return None
+    supports = [
+        _normalize_whitespace(str(item)) if item is not None else "" for item in value
+    ]
+    return supports[:SMART_DRAFT_OPTION_COUNT] or None
 
 
 def _parse_final_drafts(
@@ -2685,6 +2716,7 @@ def _parse_final_drafts(
         recommendation_reason=recommendation["recommendation_reason"],
         option_notes=recommendation["option_notes"],
         option_tiers=recommendation["option_tiers"],
+        claim_supports=recommendation["claim_supports"],
     )
 
 
@@ -2723,12 +2755,18 @@ def _parse_recommendation_fields(parsed: dict[str, object]) -> dict[str, object]
         preserve_paragraphs=False,
     )[:SMART_DRAFT_OPTION_COUNT]
     option_tiers = _clean_option_tiers(raw_pick.get("option_tiers") or parsed.get("option_tiers"))
+    claim_supports = _clean_claim_supports(
+        raw_pick.get("claim_support")
+        or parsed.get("claim_support")
+        or parsed.get("claim_supports")
+    )
     return {
         "recommended_title_index": title_index if title_index is not None else shared_index,
         "recommended_caption_index": caption_index if caption_index is not None else shared_index,
         "recommendation_reason": reason[:320] or None,
         "option_notes": option_notes or None,
         "option_tiers": option_tiers,
+        "claim_supports": claim_supports,
     }
 
 

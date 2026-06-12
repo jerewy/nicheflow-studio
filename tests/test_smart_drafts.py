@@ -1477,6 +1477,46 @@ def test_system_and_user_prompts_request_option_tiers() -> None:
     assert "option_tiers" in user_prompt
 
 
+def test_system_and_user_prompts_request_claim_support() -> None:
+    # Layer 1 of the grounding plan: every yellow title must carry the exact
+    # signal phrase that backs its claim, so the guard can verify the quote.
+    system_prompt = smart_drafts._smart_draft_system_prompt("contextual_info")
+    assert "claim_support" in system_prompt
+    user_prompt = smart_drafts._smart_draft_prompt(
+        transcript_text="",
+        source_title="Old clip",
+        niche_label="history archive",
+    )
+    assert "claim_support" in user_prompt
+    assert "EXACT phrase" in user_prompt
+
+
+def test_clean_claim_supports_preserves_positions() -> None:
+    """Empty/missing quotes must stay in place — entry i belongs to title i."""
+    assert smart_drafts._clean_claim_supports(
+        ["none needed", None, "weighed over 30kg"]
+    ) == ["none needed", "", "weighed over 30kg"]
+    assert smart_drafts._clean_claim_supports(None) is None
+    assert smart_drafts._clean_claim_supports("none") is None
+
+
+def test_parse_final_drafts_extracts_claim_supports() -> None:
+    import json
+
+    content = json.dumps(
+        {
+            "final_summary": "An old basketball clip",
+            "title_options": ["At 5'3 he made the NBA", "Defying the odds", "Too short, they said"],
+            "caption_options": ["First caption.", "Second caption.", "Third caption."],
+            "option_tiers": ["yellow", "green", "green"],
+            "claim_support": ["listed at 5 foot 3", "none needed", "none needed"],
+        }
+    )
+    payload = {"choices": [{"message": {"content": content}}]}
+    parsed = smart_drafts._parse_final_drafts(payload, provider_name="Test")
+    assert parsed.claim_supports == ["listed at 5 foot 3", "none needed", "none needed"]
+
+
 # ---------------------------------------------------------------------------
 # Narrative caption style (theanomalists pattern)
 # ---------------------------------------------------------------------------

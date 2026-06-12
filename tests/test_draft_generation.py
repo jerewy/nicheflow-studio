@@ -113,6 +113,75 @@ def test_generate_passes_accounts_measured_top_titles(
     assert captured["few_shot_winners"] == ["Measured winner one", "Measured winner two"]
 
 
+def test_generate_flags_unsupported_claim_and_moves_recommendation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The "heavy pram" case: the model writes a concrete claim no signal
+    # supports and even rates it green. The deterministic guard downgrades the
+    # option to red and moves the recommendation (title+caption together) to
+    # the first clean option.
+    item_id = _make_item()
+    flagged_drafts = smart_drafts.SmartDrafts(
+        summary="Vintage prams.",
+        title_options=[
+            "Would you push one of these today?",
+            "These prams were insanely heavy",
+            "A stroll through old London",
+        ],
+        caption_options=["Cap one", "Cap two", "Cap three"],
+        provider_label="Groq (test)",
+        recommended_title_index=1,
+        recommended_caption_index=1,
+        recommendation_reason="boldest hook",
+        option_notes=["n1", "n2", "n3"],
+        option_tiers=["green", "green", "green"],
+        claim_supports=["none needed", "none", "none needed"],
+    )
+    monkeypatch.setattr(smart_drafts, "generate_smart_drafts", lambda **_: flagged_drafts)
+
+    dto = draft_generation.generate_revision_for_item(item_id)
+
+    assert dto.option_tiers == ["green", "red", "green"]
+    assert dto.recommended_title_index == 1
+    assert dto.recommended_caption_index == 1
+    assert "no support in the clip signals" in dto.recommendation_reason
+    assert "'heavy'" in dto.option_notes[1]
+
+
+def test_generate_keeps_supported_claim_and_recommendation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # When the transcript actually backs the claim, the guard must not touch
+    # the tier or the recommendation — grounded facts are good hooks.
+    item_id = _make_item(
+        transcript="Narrator: each of these prams weighed more than a modern bicycle."
+    )
+    drafts = smart_drafts.SmartDrafts(
+        summary="Vintage prams.",
+        title_options=[
+            "Would you push one of these today?",
+            "These prams were insanely heavy",
+            "A stroll through old London",
+        ],
+        caption_options=["Cap one", "Cap two", "Cap three"],
+        provider_label="Groq (test)",
+        recommended_title_index=1,
+        recommended_caption_index=1,
+        recommendation_reason="boldest hook",
+        option_notes=["n1", "n2", "n3"],
+        option_tiers=["green", "yellow", "green"],
+        claim_supports=["none needed", "weighed more than a modern bicycle", "none needed"],
+    )
+    monkeypatch.setattr(smart_drafts, "generate_smart_drafts", lambda **_: drafts)
+
+    dto = draft_generation.generate_revision_for_item(item_id)
+
+    assert dto.option_tiers == ["green", "yellow", "green"]
+    assert dto.recommended_title_index == 2
+    assert dto.recommendation_reason == "boldest hook"
+    assert dto.option_notes == ["n1", "n2", "n3"]
+
+
 def test_generate_without_transcript_succeeds_via_vision(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -194,6 +263,8 @@ def test_smart_draft_prompt_injects_caption_outro() -> None:
 
     assert "FOLLOW OUTRO (MANDATORY)" in prompt
     assert "@pastmomentsdaily" in prompt
+    assert "one blank line immediately BEFORE it" in prompt
+    assert "one blank line immediately AFTER it" in prompt
 
     without = smart_drafts._smart_draft_prompt(
         transcript_text="",
@@ -207,3 +278,19 @@ def test_smart_draft_prompt_injects_caption_outro() -> None:
     )
 
     assert "FOLLOW OUTRO" not in without
+
+
+def test_space_caption_outro_adds_blank_lines_above_and_below() -> None:
+    outro = "Lost moments from history, every day → @pastmomentsdaily"
+    caption = f"Context paragraph.\n{outro}\n#history #royalfamily"
+
+    assert draft_generation._space_caption_outro(caption, outro) == (
+        f"Context paragraph.\n\n{outro}\n\n#history #royalfamily"
+    )
+
+
+def test_space_caption_outro_keeps_existing_readable_spacing() -> None:
+    outro = "Lost moments from history, every day → @pastmomentsdaily"
+    caption = f"Context paragraph.\n\n{outro}\n\n#history"
+
+    assert draft_generation._space_caption_outro(caption, outro) == caption

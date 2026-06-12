@@ -8,7 +8,7 @@ from pathlib import Path
 
 from nicheflow_studio.db.models import Account, DownloadItem
 from nicheflow_studio.db.session import get_session
-from nicheflow_studio.processing import smart_drafts
+from nicheflow_studio.processing import draft_guard, smart_drafts
 from nicheflow_studio.services import draft_generation, draft_revisions, publishing_dashboard
 from nicheflow_studio.services.draft_revisions import DraftRevisionDTO, DraftRevisionError
 
@@ -225,8 +225,10 @@ def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
             "- Do NOT pipe the JSON through Get-Content into --stdin: PowerShell re-decodes "
             "the bytes and silently corrupts em dashes and emoji before Python sees them.",
             "- Use JSON fields title_options, caption_options, option_notes (a LIST of "
-            "strings, one per option, NOT an object), recommended_title_index, "
-            "recommended_caption_index, recommendation_reason, provider_label, and source.",
+            "strings, one per option, NOT an object), option_tiers (a LIST of "
+            "'green'/'yellow'/'red' strings, one per title, from the HOOK FRAMING tiers "
+            "above), recommended_title_index, recommended_caption_index, "
+            "recommendation_reason, provider_label, and source.",
             "- Recommended indexes are 1-based and MUST be equal to each other. Set "
             "provider_label to 'Codex' or 'Claude Code' and source to 'codex' or "
             "'claude-code' (a short label, never a file path).",
@@ -256,13 +258,43 @@ def import_pasted_draft(item_id: int, text: str) -> DraftRevisionDTO:
         raise DraftRevisionError(
             "No 'Title Option' or 'Caption Option' sections found in the clipboard text."
         )
+    # Chat assistants can't rate their own output into the paste format, so
+    # pasted drafts arrive untiered: the deterministic guard assigns tiers
+    # from the stored clip signals and moves the recommended pick off any
+    # title whose claim nothing supports. The paste format itself stays
+    # untouched — no new headers for a chat model to get wrong.
+    with get_session() as session:
+        item = session.get(DownloadItem, item_id)
+        account = session.get(Account, item.account_id) if item and item.account_id else None
+        signals_text = draft_guard.build_signals_text(
+            item.transcript_text if item else None,
+            item.title if item else None,
+            item.source_description if item else None,
+            account.niche_label if account else None,
+            item.smart_vision_payload if item else None,
+        )
+    guarded = draft_guard.guard_options(
+        title_options=parsed.title_options,
+        signals_text=signals_text,
+        option_notes=parsed.option_notes,
+        recommended_index=(
+            parsed.recommended_title_index - 1 if parsed.recommended_title_index else None
+        ),
+        recommendation_reason=parsed.reason,
+    )
+    if guarded.recommendation_shifted and guarded.recommended_index is not None:
+        recommended_title_index = recommended_caption_index = guarded.recommended_index + 1
+    else:
+        recommended_title_index = parsed.recommended_title_index
+        recommended_caption_index = parsed.recommended_caption_index
     return draft_revisions.save_revision(
         item_id,
         title_options=parsed.title_options,
         caption_options=parsed.caption_options,
-        option_notes=parsed.option_notes,
-        recommended_title_index=parsed.recommended_title_index,
-        recommended_caption_index=parsed.recommended_caption_index,
-        recommendation_reason=parsed.reason,
+        option_notes=guarded.option_notes,
+        option_tiers=guarded.option_tiers,
+        recommended_title_index=recommended_title_index,
+        recommended_caption_index=recommended_caption_index,
+        recommendation_reason=guarded.recommendation_reason,
         source="clipboard",
     )

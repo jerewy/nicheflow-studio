@@ -191,3 +191,77 @@ def test_import_pasted_draft_saves_revision() -> None:
 
     assert saved.source == "clipboard"
     assert draft_revisions.latest_revision(item_id).title_options == ["A title"]
+
+
+def test_build_chat_prompt_asks_cli_agents_for_option_tiers() -> None:
+    # Codex/Claude Code can inspect the actual video, so their self-rated
+    # tiers are genuinely informed — the CLI contract must request them.
+    item_id = _make_item()
+
+    prompt = draft_handoff.build_chat_prompt(item_id)
+
+    assert "option_tiers" in prompt
+    assert "'green'/'yellow'/'red'" in prompt
+
+
+def test_import_pasted_draft_grades_titles_and_moves_flagged_pick() -> None:
+    # ChatGPT pastes arrive untiered; the deterministic guard grades them from
+    # the stored clip signals and never lets an unsupported claim ("heavy"
+    # with no weight evidence anywhere) stay the recommended pick.
+    item_id = _make_item()
+    with get_session() as session:
+        item = session.get(DownloadItem, item_id)
+        item.source_description = "Vintage prams on the streets of London, 1950s."
+        session.commit()
+
+    saved = draft_handoff.import_pasted_draft(
+        item_id,
+        """Title Option 1:
+Would you push one of these today?
+Caption Option 1:
+Cap one.
+
+Title Option 2:
+These prams were insanely heavy
+Caption Option 2:
+Cap two.
+
+Recommended Pick: Title Option 2 + Caption Option 2
+Why: Boldest hook.
+Selection Notes:
+Option 1: Safe curiosity angle.
+Option 2: Boldest claim.
+""",
+    )
+
+    assert saved.option_tiers == ["green", "red"]
+    assert saved.recommended_title_index == 1
+    assert saved.recommended_caption_index == 1
+    assert "Auto-moved from Option 2" in saved.recommendation_reason
+    assert "'heavy'" in saved.option_notes[1]
+
+
+def test_import_pasted_draft_keeps_supported_claims_yellow() -> None:
+    # A claim the source caption actually backs ("1950s") grades yellow and
+    # the recommendation stays where the chat model put it.
+    item_id = _make_item()
+    with get_session() as session:
+        item = session.get(DownloadItem, item_id)
+        item.source_description = "Vintage prams on the streets of London, 1950s."
+        session.commit()
+
+    saved = draft_handoff.import_pasted_draft(
+        item_id,
+        """Title Option 1:
+Pram fashion in the 1950s
+Caption Option 1:
+Cap one.
+
+Recommended Pick: Title Option 1 + Caption Option 1
+Why: Dated and grounded.
+""",
+    )
+
+    assert saved.option_tiers == ["yellow"]
+    assert saved.recommended_title_index == 1
+    assert saved.recommendation_reason == "Dated and grounded."

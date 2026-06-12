@@ -17,7 +17,7 @@ from sqlalchemy import select
 
 from nicheflow_studio.db.models import Account, DownloadItem
 from nicheflow_studio.db.session import get_session
-from nicheflow_studio.processing import smart_drafts
+from nicheflow_studio.processing import draft_guard, smart_drafts
 from nicheflow_studio.services import draft_revisions, publishing_dashboard, library
 from nicheflow_studio.services.draft_revisions import DraftRevisionDTO, DraftRevisionError
 
@@ -53,6 +53,20 @@ def caption_outro_for_account(account: Account | None) -> str | None:
         (account.niche or "").strip().lower(), _CAPTION_OUTRO_DEFAULT
     )
     return template.format(handle=handle)
+
+
+def _space_caption_outro(caption: str, outro: str | None) -> str:
+    """Keep the follow outro readable even when the model ignores paragraph rules."""
+    if not outro:
+        return caption
+    lines = caption.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    try:
+        index = next(i for i, line in enumerate(lines) if line.strip() == outro)
+    except StopIteration:
+        return caption
+    before = "\n".join(lines[:index]).rstrip()
+    after = "\n".join(lines[index + 1 :]).lstrip()
+    return "\n\n".join(part for part in (before, outro, after) if part)
 
 
 def _account_voice(account: Account | None, clip_premise: str | None) -> dict[str, str] | None:
@@ -168,21 +182,62 @@ def generate_revision_for_item(
 
     # The provider call is slow and must run outside the DB session.
     drafts = smart_drafts.generate_smart_drafts(**gen_kwargs)
+    caption_outro = gen_kwargs["caption_outro"]
+    caption_options = [
+        _space_caption_outro(caption, caption_outro) for caption in drafts.caption_options
+    ]
+
+    # Deterministic grounding check: the model self-rates option_tiers, but a
+    # claim word with no signal support still slips through ("heavy" prams).
+    # The guard downgrades such options to red and moves the recommendation
+    # off them; title+caption indexes always shift together (the Apply button
+    # applies one option number as a unit).
+    account_voice = gen_kwargs["account_voice"] or {}
+    guarded = draft_guard.guard_options(
+        title_options=drafts.title_options,
+        signals_text=draft_guard.build_signals_text(
+            gen_kwargs["transcript_text"],
+            gen_kwargs["source_title"],
+            gen_kwargs["source_description"],
+            gen_kwargs["niche_label"],
+            account_voice.get("clip_context"),
+            drafts.vision_payload,
+        ),
+        option_tiers=drafts.option_tiers,
+        option_notes=drafts.option_notes,
+        claim_supports=drafts.claim_supports,
+        recommended_index=drafts.recommended_title_index,
+        recommendation_reason=drafts.recommendation_reason,
+    )
+    if guarded.recommendation_shifted:
+        recommended_title_index = recommended_caption_index = guarded.recommended_index
+    else:
+        recommended_title_index = drafts.recommended_title_index
+        recommended_caption_index = drafts.recommended_caption_index
+    generation_meta = drafts.generation_meta
+    if guarded.flagged_terms or guarded.recommendation_shifted:
+        generation_meta = dict(generation_meta or {})
+        generation_meta["grounding_guard"] = {
+            "flagged_options": {
+                str(index + 1): terms for index, terms in sorted(guarded.flagged_terms.items())
+            },
+            "recommendation_shifted": guarded.recommendation_shifted,
+        }
 
     return draft_revisions.save_revision(
         item_id,
         title_options=drafts.title_options,
-        caption_options=drafts.caption_options,
+        caption_options=caption_options,
         summary=drafts.summary,
-        option_notes=drafts.option_notes,
-        option_tiers=drafts.option_tiers,
-        recommended_title_index=_one_based(drafts.recommended_title_index),
-        recommended_caption_index=_one_based(drafts.recommended_caption_index),
-        recommendation_reason=drafts.recommendation_reason,
+        option_notes=guarded.option_notes,
+        option_tiers=guarded.option_tiers,
+        recommended_title_index=_one_based(recommended_title_index),
+        recommended_caption_index=_one_based(recommended_caption_index),
+        recommendation_reason=guarded.recommendation_reason,
         title_style_preset=title_style,
         caption_style_preset=caption_style,
         provider_label=drafts.provider_label,
-        generation_meta=drafts.generation_meta,
+        generation_meta=generation_meta,
         vision_payload=drafts.vision_payload,
         source=source,
     )
