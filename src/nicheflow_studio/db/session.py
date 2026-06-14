@@ -265,6 +265,10 @@ def _ensure_compatibility() -> None:
             )
         if "daily_posts_target" not in account_columns:
             connection.execute(text("ALTER TABLE accounts ADD COLUMN daily_posts_target INTEGER"))
+        if "distribute_daily_target" not in account_columns:
+            connection.execute(
+                text("ALTER TABLE accounts ADD COLUMN distribute_daily_target INTEGER")
+            )
         if "auto_schedule_on_export" not in account_columns:
             connection.execute(
                 text(

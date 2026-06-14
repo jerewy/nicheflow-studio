@@ -133,11 +133,25 @@ def test_duplicate_capture_skips_metadata_fetch(monkeypatch) -> None:
 
 def test_capture_dashboard_reports_each_pool() -> None:
     init_db()
+    with get_session() as session:
+        session.add_all(
+            [
+                Account(name="History Account", platform="instagram", niche="history"),
+                Account(name="Movie Account", platform="instagram", niche="movie"),
+            ]
+        )
+        session.commit()
 
     dashboard = pool_capture.capture_dashboard()
 
     assert dashboard["pools"]["history"]["video_count"] == 0
     assert dashboard["pools"]["movie"]["video_count"] == 0
+    assert dashboard["pools"]["history"]["accounts"] == [
+        {"id": dashboard["pools"]["history"]["accounts"][0]["id"], "name": "History Account"}
+    ]
+    assert dashboard["pools"]["movie"]["accounts"] == [
+        {"id": dashboard["pools"]["movie"]["accounts"][0]["id"], "name": "Movie Account"}
+    ]
     assert dashboard["apify_usage"]["estimated_cost_usd"] == 0
 
 

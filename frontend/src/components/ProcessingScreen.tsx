@@ -2,16 +2,22 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { CropEditor } from "@/components/CropEditor";
 import { OptionCard } from "@/components/OptionCard";
+import { PublishDueDialog } from "@/components/PublishDueDialog";
+import { PublishNowDialog } from "@/components/PublishNowDialog";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { useToast } from "@/components/ui/Toast";
 import { bridge, whenBridgeReady } from "@/lib/bridge";
+import { formatDate } from "@/lib/format";
 import type {
   DraftRevision,
+  DueRecencyWarning,
   ExportResult,
   LibraryItem,
   ProcessingContext,
   PublishJob,
+  PublishRecency,
   WorkflowSettings,
 } from "@/types";
 
@@ -31,6 +37,7 @@ const STATUS_META: Record<string, { label: string; dot: string }> = {
   exported: { label: "Exported", dot: "bg-violet-500" },
   posted: { label: "Posted", dot: "bg-emerald-500" },
   skipped: { label: "Skipped", dot: "bg-zinc-500" },
+  failed: { label: "Failed", dot: "bg-red-500" },
 };
 
 const REVIEW_REASON_LABELS: Record<string, string> = {
@@ -106,6 +113,7 @@ function sameOptions(a: EditableOptions, revision: DraftRevision | null): boolea
 }
 
 export function ProcessingScreen({ activeAccountId, activeAccountName }: ProcessingScreenProps) {
+  const { pushToast } = useToast();
   const [context, setContext] = useState<ProcessingContext | null>(null);
   const [itemsLoaded, setItemsLoaded] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -124,11 +132,21 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
   const [publishJobs, setPublishJobs] = useState<PublishJob[]>([]);
   const [scheduleAt, setScheduleAt] = useState("");
   const [publishMessage, setPublishMessage] = useState<string | null>(null);
-  // Live-posting state: a post running now, the opt-in auto-publish toggle, and
-  // how many scheduled reels are currently past due.
-  const [publishingNow, setPublishingNow] = useState(false);
+  // Live-posting state: the opt-in auto-publish toggle and how many scheduled
+  // reels are currently past due.
+  //
+  // Manual posts are tracked per item id (message keyed by item) so a post runs
+  // in the BACKGROUND: the user can switch item/niche and keep working while it
+  // posts, and ONLY the posting item has its conflicting actions disabled.
+  const [publishingItems, setPublishingItems] = useState<Record<number, string>>({});
+  // The "Publish due now" batch flow (not tied to a single item).
+  const [publishingDue, setPublishingDue] = useState(false);
   const [autoPublish, setAutoPublish] = useState(false);
   const [dueCount, setDueCount] = useState(0);
+  // Open recent-post confirmation for "Publish due now" (null = closed).
+  const [dueDialog, setDueDialog] = useState<DueRecencyWarning[] | null>(null);
+  // Open recent-post confirmation for "Publish Now" on this item (null = closed).
+  const [nowDialog, setNowDialog] = useState<PublishRecency | null>(null);
   const [isDesktop, setIsDesktop] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [itemSearch, setItemSearch] = useState("");
@@ -158,6 +176,11 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
   itemIdRef.current = itemId;
   const exporting = itemId !== null && exportJobs[itemId] !== undefined;
   const exportProgress = itemId !== null ? exportJobs[itemId] ?? null : null;
+  // The viewed item's in-flight post message (undefined = not posting). Only the
+  // posting item is gated; other items stay fully editable.
+  const thisItemPublishMessage =
+    itemId !== null ? publishingItems[itemId] : undefined;
+  const isThisItemPublishing = thisItemPublishMessage !== undefined;
   const dirty = useMemo(
     () => loadedRevision !== null && !sameOptions(edits, loadedRevision),
     [edits, loadedRevision],
@@ -322,58 +345,130 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
 
   const publishNow = async () => {
     if (itemId === null) return;
+    // Gate on the same-account recency window: if the account posted too
+    // recently, open the confirmation dialog (reschedule / post anyway) instead
+    // of posting. Otherwise a plain confirm is enough.
+    const recency = await bridge
+      .itemPublishRecency(itemId)
+      .catch(() => ({ on_cooldown: false }) as PublishRecency);
+    if (recency.on_cooldown) {
+      setNowDialog(recency);
+      return;
+    }
     if (
       !window.confirm(
         "Post this reel to your Instagram account now? This logs in and publishes live — it can't be undone.",
       )
     )
       return;
-    setPublishingNow(true);
-    setBusy(true);
+    await doPublishNow(false);
+  };
+
+  // The actual live post. `allowRecent` true is the explicit "post anyway"
+  // override from the recency dialog; false posts only when not on cooldown
+  // (the backend also refuses and returns "on_cooldown" as a backstop).
+  //
+  // Runs in the BACKGROUND keyed by item id: the user can switch item/niche and
+  // keep working while it posts. On completion we DON'T snap the view back to the
+  // posted item — a toast reports the result, and the screen only refreshes if
+  // the user is still viewing that item.
+  const doPublishNow = async (allowRecent: boolean) => {
+    if (itemId === null) return;
+    // Pin id + account name at call time; the user may move on before this
+    // multi-minute post finishes.
+    const publishItemId = itemId;
+    const accountLabel = activeAccountName ?? "Account";
+    setNowDialog(null);
+    setPublishingItems((m) => ({ ...m, [publishItemId]: "Publishing…" }));
     setActionError(null);
     setPublishMessage(null);
     try {
-      const { job_id } = await bridge.startPublishNow(itemId);
-      const result = (await waitForJob(job_id, undefined, PUBLISH_TIMEOUT_MS)) as {
+      const { job_id } = await bridge.startPublishNow(publishItemId, allowRecent);
+      const result = (await waitForJob(
+        job_id,
+        (_value, message) => {
+          if (!message) return;
+          setPublishingItems((m) =>
+            publishItemId in m ? { ...m, [publishItemId]: message } : m,
+          );
+        },
+        PUBLISH_TIMEOUT_MS,
+      )) as {
         status: string;
         posted_url?: string | null;
         error?: string | null;
+        account_name?: string | null;
+        minutes_since?: number;
+        recommended_next_at?: string | null;
       };
       if (result.status === "posted") {
-        setPublishMessage(
-          `Posted to Instagram${result.posted_url ? ` — ${result.posted_url}` : ""}.`,
-        );
+        const when = new Date().toLocaleTimeString([], {
+          hour: "numeric",
+          minute: "2-digit",
+        });
+        pushToast(`✅ ${accountLabel} — posted #${publishItemId} at ${when}`, "success");
+      } else if (result.status === "on_cooldown") {
+        // Backend backstop tripped (shouldn't normally happen since the UI
+        // pre-checks). Re-open the dialog only if still on this item, else toast.
+        if (itemIdRef.current === publishItemId) {
+          setNowDialog({ on_cooldown: true, ...result });
+        } else {
+          pushToast(
+            `⏳ ${accountLabel} — #${publishItemId} not posted (posted too recently).`,
+            "info",
+          );
+        }
+        return;
       } else {
-        setActionError(`Publish ${result.status}${result.error ? `: ${result.error}` : ""}.`);
+        pushToast(
+          `⚠️ ${accountLabel} — #${publishItemId} publish ${result.status}${result.error ? `: ${result.error}` : ""}.`,
+          "error",
+        );
       }
-      refreshPublishJobs(itemId);
-      bridge.listLibraryItems(activeAccountId).then(setItems).catch(() => undefined);
-      const ctx = await bridge.getContext(itemId);
-      setContext(ctx);
+      // Only refresh THIS screen if the user is still viewing the posted item
+      // (refreshing the list with a now-stale active account would clobber the
+      // niche they switched to). Otherwise the toast is the only feedback.
+      if (itemIdRef.current === publishItemId) {
+        refreshPublishJobs(publishItemId);
+        bridge.listLibraryItems(activeAccountId).then(setItems).catch(() => undefined);
+        const ctx = await bridge.getContext(publishItemId);
+        if (itemIdRef.current === publishItemId) setContext(ctx);
+      }
     } catch (err: unknown) {
-      setActionError(err instanceof Error ? err.message : String(err));
+      const message = err instanceof Error ? err.message : String(err);
+      if (itemIdRef.current === publishItemId) {
+        setActionError(message);
+      } else {
+        pushToast(`⚠️ ${accountLabel} — #${publishItemId} publish failed: ${message}`, "error");
+      }
     } finally {
-      setPublishingNow(false);
-      setBusy(false);
+      setPublishingItems((m) => {
+        const { [publishItemId]: _done, ...rest } = m;
+        return rest;
+      });
     }
   };
 
-  const publishDueNow = async () => {
-    if (!window.confirm(`Post ${dueCount} due scheduled reel(s) to Instagram now? This publishes live.`))
-      return;
-    setPublishingNow(true);
+  // Run the due-publish job. `allowRecent` false defers reels whose account
+  // posted too recently; true is the explicit "publish anyway" path.
+  const runPublishDue = async (allowRecent: boolean) => {
+    setDueDialog(null);
+    setPublishingDue(true);
     setActionError(null);
     setPublishMessage(null);
     try {
-      const { job_id } = await bridge.startPublishDue();
+      const { job_id } = await bridge.startPublishDue(allowRecent);
       const result = (await waitForJob(job_id, undefined, PUBLISH_TIMEOUT_MS)) as {
         due: number;
         posted: number;
         failed: number;
+        deferred: number;
       };
       if (result.due > 0) {
-        setPublishMessage(
-          `Auto-publish: posted ${result.posted}, failed ${result.failed} of ${result.due} due.`,
+        const rescheduled = result.deferred ? `, rescheduled ${result.deferred}` : "";
+        pushToast(
+          `Publish due: posted ${result.posted}, failed ${result.failed}${rescheduled} of ${result.due} due.`,
+          result.failed > 0 ? "error" : "success",
         );
       }
       await refreshDueCount();
@@ -382,8 +477,28 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
     } catch (err: unknown) {
       setActionError(err instanceof Error ? err.message : String(err));
     } finally {
-      setPublishingNow(false);
+      setPublishingDue(false);
     }
+  };
+
+  const publishDueNow = async () => {
+    // If any due reel would post too soon after its account's last post, let the
+    // user choose (reschedule / publish anyway / cancel) instead of silently
+    // posting. With no such conflict, a plain confirm is enough.
+    const warnings = await bridge
+      .duePublishRecency()
+      .catch(() => [] as DueRecencyWarning[]);
+    if (warnings.length > 0) {
+      setDueDialog(warnings);
+      return;
+    }
+    if (
+      !window.confirm(
+        `Post ${dueCount} due scheduled reel(s) to Instagram now? This publishes live.`,
+      )
+    )
+      return;
+    await runPublishDue(false);
   };
 
   const toggleAutoPublish = async (next: boolean) => {
@@ -770,6 +885,7 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
     const search = itemSearch.trim().toLowerCase();
     const matchesSearch =
       !search ||
+      (candidate.account_seq != null && String(candidate.account_seq).includes(search)) ||
       String(candidate.id).includes(search) ||
       (candidate.title ?? "").toLowerCase().includes(search) ||
       candidate.source_url.toLowerCase().includes(search);
@@ -820,6 +936,7 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
                 <option value="draft">Draft</option>
                 <option value="exported">Exported</option>
                 <option value="posted">Posted</option>
+                <option value="failed">Failed</option>
                 <option value="skipped">Skipped</option>
               </select>
               <select
@@ -875,7 +992,8 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
                             </Badge>
                           )}
                           <span className="truncate">
-                            #{candidate.id} {candidate.title ?? candidate.source_url}
+                            #{candidate.account_seq ?? candidate.id}{" "}
+                            {candidate.title ?? candidate.source_url}
                           </span>
                         </span>
                       </td>
@@ -1219,7 +1337,11 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
             </Button>
           )}
           <div className="grow" />
-          <Button variant="secondary" onClick={exportReel} disabled={exporting || dirty}>
+          <Button
+            variant="secondary"
+            onClick={exportReel}
+            disabled={exporting || dirty || isThisItemPublishing}
+          >
             {exporting ? "Exporting…" : "Export Reel"}
           </Button>
         </footer>
@@ -1269,7 +1391,7 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
                   size="sm"
                   variant="outline"
                   onClick={() => setCropOpen((open) => !open)}
-                  disabled={!item.original_preview_url}
+                  disabled={!item.original_preview_url || isThisItemPublishing}
                   title="Adjust the source crop used for the exported reel"
                 >
                   {cropOpen ? "Close crop editor" : "Adjust crop"}
@@ -1357,14 +1479,14 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
           <div className="flex flex-wrap items-center gap-2">
             <Button
               variant="secondary"
-              disabled={!item.processed_path || busy}
+              disabled={!item.processed_path || busy || isThisItemPublishing}
               onClick={() => queueForPublish(null)}
             >
               Add to Publish Queue
             </Button>
             <Button
               variant="secondary"
-              disabled={!item.processed_path || busy}
+              disabled={!item.processed_path || busy || isThisItemPublishing}
               onClick={autoScheduleForPublish}
             >
               Auto Schedule
@@ -1376,16 +1498,16 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
               onChange={(e) => setScheduleAt(e.target.value)}
             />
             <Button
-              disabled={!item.processed_path || !scheduleAt || busy}
+              disabled={!item.processed_path || !scheduleAt || busy || isThisItemPublishing}
               onClick={() => queueForPublish(scheduleAt)}
             >
               Schedule
             </Button>
             <Button
-              disabled={!item.processed_path || busy || publishingNow}
+              disabled={!item.processed_path || busy || isThisItemPublishing}
               onClick={publishNow}
             >
-              {publishingNow ? "Publishing…" : "Publish Now"}
+              {thisItemPublishMessage ?? "Publish Now"}
             </Button>
           </div>
           <div className="flex flex-wrap items-center gap-3 border-t border-border pt-3 text-sm">
@@ -1403,28 +1525,67 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
             <Button
               size="sm"
               variant="outline"
-              disabled={publishingNow || dueCount === 0}
+              disabled={publishingDue || dueCount === 0}
               onClick={() => publishDueNow()}
             >
-              {publishingNow ? "Publishing…" : `Publish due now${dueCount > 0 ? ` (${dueCount})` : ""}`}
+              {publishingDue ? "Publishing…" : `Publish due now${dueCount > 0 ? ` (${dueCount})` : ""}`}
             </Button>
             <span className="text-xs text-muted-foreground">
               Live posts run only while this window is open.
             </span>
           </div>
           {publishMessage && <p className="text-sm text-emerald-600">{publishMessage}</p>}
+          {dueDialog && (
+            <PublishDueDialog
+              warnings={dueDialog}
+              dueCount={dueCount}
+              busy={publishingDue}
+              onRescheduleSafely={() => runPublishDue(false)}
+              onPublishAnyway={() => runPublishDue(true)}
+              onCancel={() => setDueDialog(null)}
+            />
+          )}
+          {nowDialog && (
+            <PublishNowDialog
+              recency={nowDialog}
+              busy={isThisItemPublishing || busy}
+              onSchedule={() => {
+                setNowDialog(null);
+                void autoScheduleForPublish();
+              }}
+              onPublishAnyway={() => void doPublishNow(true)}
+              onCancel={() => setNowDialog(null)}
+            />
+          )}
           {publishJobs.length > 0 ? (
-            <ul className="space-y-1 text-sm">
-              {publishJobs.map((job) => (
-                <li key={job.id} className="flex items-center gap-2">
-                  <Badge variant={job.posted_at ? "default" : "secondary"}>{job.status}</Badge>
-                  <span className="text-muted-foreground">
-                    {job.title ?? "(untitled)"}
-                    {job.scheduled_at ? ` — scheduled ${job.scheduled_at}` : ""}
-                    {job.posted_at ? ` — posted ${job.posted_at}` : ""}
-                  </span>
-                </li>
-              ))}
+            <ul className="space-y-1.5 text-sm">
+              {publishJobs.map((job) => {
+                const failed = job.status === "failed";
+                return (
+                  <li key={job.id} className="space-y-0.5">
+                    <span className="flex items-center gap-2">
+                      <Badge
+                        variant={failed ? "destructive" : job.posted_at ? "default" : "secondary"}
+                      >
+                        {job.status}
+                      </Badge>
+                      <span className="text-muted-foreground">
+                        {job.title ?? "(untitled)"}
+                        {job.scheduled_at
+                          ? ` — ${failed ? "last attempt" : "scheduled"} ${formatDate(job.scheduled_at)}`
+                          : ""}
+                        {job.posted_at ? ` — posted ${formatDate(job.posted_at)}` : ""}
+                      </span>
+                    </span>
+                    {failed && (
+                      <p className="text-xs text-red-500">
+                        {job.error_message ?? "Publish failed."} — republish with Publish Now,
+                        or Schedule/Auto Schedule to retry later.
+                      </p>
+                    )}
+                  </li>
+                );
+              })}
             </ul>
           ) : (
             <p className="text-xs text-muted-foreground">

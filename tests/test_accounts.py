@@ -2,7 +2,15 @@ from __future__ import annotations
 
 import pytest
 
-from nicheflow_studio.db.models import Account, DownloadItem, UploadJob
+from nicheflow_studio.db.assignments import assigned_pool_item_ids
+from nicheflow_studio.db.models import (
+    Account,
+    Assignment,
+    DownloadItem,
+    MediaAsset,
+    PoolItem,
+    UploadJob,
+)
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.services import accounts as accounts_svc
 from nicheflow_studio.services.accounts import AccountError
@@ -67,6 +75,14 @@ def test_daily_posts_target_round_trips_and_can_clear() -> None:
     assert updated["daily_posts_target"] is None
 
 
+def test_distribute_daily_target_round_trips_and_can_clear() -> None:
+    created = accounts_svc.create_account({"name": "Backlog", "distribute_daily_target": 8})
+    assert created["distribute_daily_target"] == 8
+
+    updated = accounts_svc.update_account(created["id"], {"distribute_daily_target": None})
+    assert updated["distribute_daily_target"] is None
+
+
 def test_update_unknown_raises() -> None:
     with pytest.raises(AccountError):
         accounts_svc.update_account(99999, {"name": "x"})
@@ -122,3 +138,36 @@ def test_delete_unassigns_items_and_removes_jobs() -> None:
         survived = session.get(DownloadItem, item_id)
         assert survived is not None
         assert survived.account_id is None
+
+
+def test_delete_removes_assignments_and_frees_pool_items() -> None:
+    created = accounts_svc.create_account({"name": "Acc", "niche": "history"})
+    account_id = created["id"]
+    with get_session() as session:
+        asset = MediaAsset(
+            canonical_source_url="https://instagram.com/reel/orphan/",
+            source_shortcode="orphan",
+        )
+        session.add(asset)
+        session.flush()
+        pool_item = PoolItem(
+            media_asset_id=asset.id, niche="history", acceptance_status="accepted"
+        )
+        session.add(pool_item)
+        session.flush()
+        session.add(
+            Assignment(pool_item_id=pool_item.id, account_id=account_id, niche="history")
+        )
+        session.commit()
+        pool_item_id = pool_item.id
+
+    result = accounts_svc.delete_account(account_id)
+
+    assert result["removed_assignments"] == 1
+    with get_session() as session:
+        # No assignment rows may keep pointing at the deleted account.
+        assert (
+            session.query(Assignment).filter(Assignment.account_id == account_id).count() == 0
+        )
+        # The clip no longer counts as booked, so Distribute can hand it out again.
+        assert pool_item_id not in assigned_pool_item_ids(session, "history")

@@ -4,6 +4,7 @@ import { AccountManager } from "@/components/AccountManager";
 import { Dashboard } from "@/components/Dashboard";
 import { ProcessingScreen } from "@/components/ProcessingScreen";
 import { ScrapingScreen } from "@/components/ScrapingScreen";
+import { ToastProvider } from "@/components/ui/Toast";
 import { bridge, whenBridgeReady } from "@/lib/bridge";
 import { cn } from "@/lib/utils";
 import type { AccountSummary } from "@/types";
@@ -61,6 +62,7 @@ function App() {
 
   return (
     <main className="dark min-h-screen bg-background text-foreground">
+      <ToastProvider>
       <nav className="flex items-center justify-between gap-3 border-b border-border px-4 py-2">
         <div className="flex items-center gap-1">
           {TABS.map((t) => {
@@ -129,6 +131,7 @@ function App() {
           Processing and the Dashboard.
         </p>
       )}
+      </ToastProvider>
     </main>
   );
 }

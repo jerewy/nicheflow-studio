@@ -17,6 +17,7 @@ import type {
   DeleteAccountResult,
   DistributeNicheResult,
   DraftRevision,
+  DueRecencyWarning,
   DashboardPublishQueue,
   ItemSummary,
   JobSnapshot,
@@ -29,6 +30,7 @@ import type {
   ProcessingContext,
   PublishJob,
   PublishQueueJob,
+  PublishRecency,
   AccountReadiness,
   DashboardAccountStats,
   QueueResult,
@@ -97,9 +99,11 @@ interface PywebviewApi {
     scheduledAt?: string | null,
   ): Promise<Envelope<QueueResult>>;
   auto_schedule_for_publish(itemId: number): Promise<Envelope<QueueResult>>;
-  start_publish_now(itemId: number): Promise<Envelope<{ job_id: string }>>;
+  start_publish_now(itemId: number, allowRecent?: boolean): Promise<Envelope<{ job_id: string }>>;
   publish_due_count(): Promise<Envelope<{ due: number }>>;
-  start_publish_due(): Promise<Envelope<{ job_id: string }>>;
+  item_publish_recency(itemId: number): Promise<Envelope<PublishRecency>>;
+  due_publish_recency(): Promise<Envelope<DueRecencyWarning[]>>;
+  start_publish_due(allowRecent?: boolean): Promise<Envelope<{ job_id: string }>>;
   get_auto_publish(): Promise<Envelope<{ enabled: boolean }>>;
   set_auto_publish(enabled: boolean): Promise<Envelope<{ enabled: boolean }>>;
   list_accounts(): Promise<Envelope<AccountSummary[]>>;
@@ -307,9 +311,9 @@ export const bridge = {
     return unwrap(window.pywebview!.api.auto_schedule_for_publish(itemId));
   },
 
-  startPublishNow(itemId: number): Promise<{ job_id: string }> {
+  startPublishNow(itemId: number, allowRecent = false): Promise<{ job_id: string }> {
     if (!hasBridge()) return Promise.resolve({ job_id: "mock-publish" });
-    return unwrap(window.pywebview!.api.start_publish_now(itemId));
+    return unwrap(window.pywebview!.api.start_publish_now(itemId, allowRecent));
   },
 
   publishDueCount(): Promise<{ due: number }> {
@@ -317,9 +321,19 @@ export const bridge = {
     return unwrap(window.pywebview!.api.publish_due_count());
   },
 
-  startPublishDue(): Promise<{ job_id: string }> {
+  itemPublishRecency(itemId: number): Promise<PublishRecency> {
+    if (!hasBridge()) return Promise.resolve({ on_cooldown: false });
+    return unwrap(window.pywebview!.api.item_publish_recency(itemId));
+  },
+
+  duePublishRecency(): Promise<DueRecencyWarning[]> {
+    if (!hasBridge()) return Promise.resolve([]);
+    return unwrap(window.pywebview!.api.due_publish_recency());
+  },
+
+  startPublishDue(allowRecent = false): Promise<{ job_id: string }> {
     if (!hasBridge()) return Promise.resolve({ job_id: "mock-publish-due" });
-    return unwrap(window.pywebview!.api.start_publish_due());
+    return unwrap(window.pywebview!.api.start_publish_due(allowRecent));
   },
 
   getAutoPublish(): Promise<{ enabled: boolean }> {
@@ -475,6 +489,7 @@ export const bridge = {
         deleted_account_id: accountId,
         unassigned_download_items: 0,
         removed_upload_jobs: 0,
+        removed_assignments: 0,
       });
     return unwrap(window.pywebview!.api.delete_account(accountId));
   },
@@ -642,17 +657,18 @@ export const bridge = {
 
   distributeNiche(niche: string, maxPerAccount?: number | null): Promise<DistributeNicheResult> {
     if (!hasBridge())
-      return Promise.resolve({ niche, assigned: 0, pinned: 0, max_per_account: maxPerAccount ?? 28, accounts: [], reason: "no_accounts" as const });
+      return Promise.resolve({ niche, assigned: 0, pinned: 0, download_failures: 0, max_per_account: maxPerAccount ?? 28, accounts: [], reason: "no_accounts" as const });
     return unwrap(window.pywebview!.api.distribute_niche(niche, maxPerAccount ?? null));
   },
 
   distributeNicheExplicit(niche: string, targets: Record<number, number>): Promise<DistributeNicheResult> {
-    if (!hasBridge()) return Promise.resolve({ niche, assigned: 0, pinned: 0, max_per_account: null, accounts: [] });
+    if (!hasBridge()) return Promise.resolve({ niche, assigned: 0, pinned: 0, download_failures: 0, max_per_account: null, accounts: [] });
     return unwrap(window.pywebview!.api.distribute_niche_explicit(niche, targets));
   },
 
   dashboardPublishJobs(): Promise<DashboardPublishQueue> {
-    if (!hasBridge()) return Promise.resolve({ jobs: [], due_count: 0, draft: 0, ready: 0, scheduled: 0 });
+    if (!hasBridge())
+      return Promise.resolve({ jobs: [], due_count: 0, draft: 0, ready: 0, scheduled: 0, failed: 0 });
     return unwrap(window.pywebview!.api.dashboard_publish_jobs());
   },
 
@@ -1008,6 +1024,7 @@ const mock = {
     return [
       {
         id: 1,
+        account_seq: 1,
         title: "Mock clip (browser dev)",
         source_url: "https://instagram.com/reel/mock",
         status: "draft",
@@ -1045,6 +1062,7 @@ const mock = {
       upload_default_privacy: "private",
       upload_schedule_slots: null,
       daily_posts_target: null,
+      distribute_daily_target: null,
       auto_schedule_on_export: false,
       download_item_count: 0,
       upload_job_count: 0,

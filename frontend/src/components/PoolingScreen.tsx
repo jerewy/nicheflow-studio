@@ -52,6 +52,15 @@ export function PoolingScreen() {
     return () => window.clearTimeout(timer);
   }, [load]);
 
+  // Success banners read as transient alerts: clear them after a few seconds so
+  // an old "distributed N" doesn't linger as if it just happened. Errors stay
+  // until the next action so they aren't missed.
+  useEffect(() => {
+    if (!message) return;
+    const timer = window.setTimeout(() => setMessage(null), 8000);
+    return () => window.clearTimeout(timer);
+  }, [message]);
+
   const fetchClips = async (label: string, withRemoved: boolean) => {
     setClips(await bridge.listPoolSourceClips(niche, label, withRemoved));
   };
@@ -144,10 +153,14 @@ export function PoolingScreen() {
     setMessage(null);
     try {
       const result = await bridge.distributeNiche(niche);
+      // Refresh the pool/overview first — load() clears banners, so the
+      // confirmation must be set afterwards or it would be wiped immediately.
+      await load();
       if (result.assigned === 0) {
         const reasonMessages: Record<string, string> = {
           no_accounts: `No accounts are set to the "${niche}" niche — assign accounts first in Account settings.`,
-          all_at_cap: "All accounts are already at their daily-cadence backlog targets. Add more accounts to this niche, or wait for the backlog to drain before redistributing.",
+          no_ready_accounts: `No "${niche}" accounts are currently ready to publish.`,
+          all_at_cap: "All accounts already hold their daily backlog target. They'll auto-top-up as posts drain the backlog — or use Distribute now to add more on top.",
           pool_empty: "Pool is fully distributed — no unused clips remain.",
         };
         setMessage(reasonMessages[result.reason ?? ""] ?? "Nothing to distribute.");
@@ -159,9 +172,11 @@ export function PoolingScreen() {
               `${account.pinned ? `, ${account.pinned} pinned` : ""})`,
           )
           .join(", ");
-        setMessage(`Distributed ${result.assigned} clip(s) — ${breakdown}.`);
+        setMessage(
+          `✓ Distributed ${result.assigned} clip(s) — ${breakdown}. ` +
+            "Footage downloads in the background.",
+        );
       }
-      await load();
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -174,24 +189,32 @@ export function PoolingScreen() {
       Object.entries(manualTargets).filter(([, count]) => count > 0),
     );
     if (Object.keys(targets).length === 0) {
-      setError("Select at least one account and enter a count.");
+      setError("Enter a count for at least one account first.");
       return;
     }
     setBusy(true);
     setError(null);
+    setMessage(null);
     try {
       const result = await bridge.distributeNicheExplicit(niche, targets);
-      const breakdown = result.accounts
-        .map(
-          (account) =>
-            `${account.account_name} (${account.count}/${account.target}` +
-            `${account.pinned ? `, ${account.pinned} pinned` : ""})`,
-        )
-        .join(", ");
-      setMessage(
-        `Distributed ${result.assigned} clip(s): ${breakdown}. Review them in the Processing screen (pending review).`,
-      );
+      // Refresh first — load() clears banners — then reset the inputs and show
+      // the confirmation so success is unmistakable.
       await load();
+      setManualTargets({});
+      if (result.assigned === 0) {
+        setMessage(
+          "No clips were distributed — this niche's pool has no unused clips left to add.",
+        );
+      } else {
+        const breakdown = result.accounts
+          .filter((account) => account.count > 0)
+          .map((account) => `${account.account_name} (${account.count})`)
+          .join(", ");
+        setMessage(
+          `✓ Distributed ${result.assigned} clip(s)${breakdown ? ` — ${breakdown}` : ""}. ` +
+            "Find them in Processing (pending review); footage downloads in the background.",
+        );
+      }
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -200,6 +223,13 @@ export function PoolingScreen() {
   };
 
   const stats = overview?.niches.find((row) => row.niche === niche);
+  // Total clips the "Distribute now" click would add — drives the button label
+  // and disabled state so a zero-count click reads as intentionally inert
+  // instead of a silent no-op.
+  const manualTotal = Object.values(manualTargets).reduce(
+    (sum, count) => sum + (count > 0 ? count : 0),
+    0,
+  );
 
   return (
     <section className="space-y-4 rounded-xl border bg-card p-5">
@@ -210,8 +240,38 @@ export function PoolingScreen() {
         </div>
         <Button size="sm" variant="secondary" onClick={load}>Refresh</Button>
       </div>
-      {error && <p className="text-sm text-destructive">{error}</p>}
-      {message && <p className="text-sm text-emerald-600">{message}</p>}
+      {error && (
+        <div
+          role="alert"
+          className="flex items-start gap-2 rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+        >
+          <span className="grow">{error}</span>
+          <button
+            type="button"
+            aria-label="Dismiss"
+            className="shrink-0 leading-none text-destructive/70 hover:text-destructive"
+            onClick={() => setError(null)}
+          >
+            ×
+          </button>
+        </div>
+      )}
+      {message && (
+        <div
+          role="status"
+          className="flex items-start gap-2 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-600"
+        >
+          <span className="grow">{message}</span>
+          <button
+            type="button"
+            aria-label="Dismiss"
+            className="shrink-0 leading-none text-emerald-600/70 hover:text-emerald-600"
+            onClick={() => setMessage(null)}
+          >
+            ×
+          </button>
+        </div>
+      )}
       <div className="flex flex-wrap items-center gap-3">
         <label className="text-sm text-muted-foreground">Niche</label>
         <select className="h-9 rounded-md border border-input px-3 text-sm" value={niche} onChange={(e) => setNiche(e.target.value)}>
@@ -234,8 +294,8 @@ export function PoolingScreen() {
           <p className="text-sm font-medium">Distribute now</p>
           <p className="text-xs text-muted-foreground">
             Counts are ADDITIONAL clips per account (on top of what it already holds), bypassing
-            cadence targets. New clips appear in the Processing screen as pending review — nothing
-            is downloaded until you open one.
+            the daily target. New clips appear in the Processing screen as pending review and their
+            footage downloads in the background.
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
@@ -267,8 +327,14 @@ export function PoolingScreen() {
             </label>
           ))}
         </div>
-        <Button size="sm" variant="outline" disabled={busy} onClick={manualDistribute}>
-          Distribute now
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={busy || manualTotal === 0}
+          title={manualTotal === 0 ? "Enter a count for at least one account first" : undefined}
+          onClick={manualDistribute}
+        >
+          {manualTotal > 0 ? `Distribute now (${manualTotal})` : "Distribute now"}
         </Button>
       </div>
       <DashboardTable headers={["Source", "Clips", "Newest post"]}>

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
+from nicheflow_studio.core.instagram_session import instagram_yt_dlp_cookie_status
 from nicheflow_studio.downloader.youtube import _yt_dlp_options
 from nicheflow_studio.downloader.yt_dlp_sidecar import (
     download_with_sidecar,
@@ -60,6 +61,13 @@ def _download_with_yt_dlp(*, url: str, output_dir: Path) -> InstagramDownloadRes
 
     output_dir.mkdir(parents=True, exist_ok=True)
     ydl_opts = _yt_dlp_options(output_dir)
+    # Instagram now refuses anonymous downloads ("empty media response"), so reuse
+    # the same saved sourcing cookies the Apify/instaloader scrape path already
+    # uses. Without this the download fails even though scraping works.
+    cookie_status = instagram_yt_dlp_cookie_status()
+    cookiefile = cookie_status.cookiefile
+    if cookiefile:
+        ydl_opts["cookiefile"] = cookiefile
     sidecar = yt_dlp_sidecar_path()
 
     if sidecar is not None:
@@ -69,6 +77,7 @@ def _download_with_yt_dlp(*, url: str, output_dir: Path) -> InstagramDownloadRes
             output_dir=output_dir,
             format_selector=str(ydl_opts["format"]),
             merge_output_format=ydl_opts.get("merge_output_format"),
+            cookiefile=cookiefile,
         )
     else:
         with YoutubeDL(ydl_opts) as ydl:

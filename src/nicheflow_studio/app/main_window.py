@@ -93,6 +93,7 @@ from nicheflow_studio.db.media_library import (
 )
 from nicheflow_studio.db.models import (
     Account,
+    Assignment,
     DownloadItem,
     PoolItem,
     ScrapeCandidate,
@@ -13226,6 +13227,12 @@ class MainWindow(QWidget):
                 session.delete(run)
             for source in session.query(Source).filter(Source.account_id == selected.id).all():
                 session.delete(source)
+            # Assignment rows must go too: assigned_pool_item_ids() filters by
+            # niche only, so any leftover row keeps its pool clip looking booked.
+            for assignment in (
+                session.query(Assignment).filter(Assignment.account_id == selected.id).all()
+            ):
+                session.delete(assignment)
             session.delete(account)
             session.commit()
 

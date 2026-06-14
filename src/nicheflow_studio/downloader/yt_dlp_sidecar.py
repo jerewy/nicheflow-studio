@@ -69,6 +69,7 @@ def download_with_sidecar(
     output_dir: Path,
     format_selector: str,
     merge_output_format: str | None = None,
+    cookiefile: str | None = None,
 ) -> tuple[dict[str, object], Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     output_template = output_dir / "%(extractor)s_%(id)s_%(title).80s.%(ext)s"
@@ -100,6 +101,8 @@ def download_with_sidecar(
     ]
     if merge_output_format is not None:
         command.extend(["--merge-output-format", merge_output_format])
+    if cookiefile:
+        command.extend(["--cookies", cookiefile])
     command.append(url)
 
     try:

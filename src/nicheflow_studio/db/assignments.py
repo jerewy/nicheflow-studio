@@ -132,7 +132,7 @@ def _engagement_scores_for_pool_items(
 def _create_pending_review_item(
     session: Session, *, pool_item_id: int, account_id: int
 ) -> None:
-    """Expose a new assignment in Processing without downloading its media."""
+    """Expose a new assignment in Processing using the shared downloaded media."""
     pool_item = session.get(PoolItem, pool_item_id)
     asset = session.get(MediaAsset, pool_item.media_asset_id) if pool_item is not None else None
     if asset is None:
@@ -156,6 +156,7 @@ def _create_pending_review_item(
             video_id=asset.source_shortcode,
             title=candidate.title if candidate is not None else asset.source_shortcode,
             source_description=candidate.description if candidate is not None else None,
+            file_path=asset.original_download_path,
             status="pending_review",
             review_state="pending_review",
             account_id=account_id,
@@ -170,6 +171,7 @@ def distribute_niche(
     rng: _random.Random | None = None,
     max_per_account: int | None = None,
     targets_by_account: dict[int, int] | None = None,
+    eligible_pool_item_ids: set[int] | None = None,
 ) -> list[Assignment]:
     """Distribute the niche's unassigned accepted pool across its accounts.
 
@@ -187,7 +189,10 @@ def distribute_niche(
 
     already = assigned_pool_item_ids(session, niche)
     unassigned_items = [
-        item for item in pool_items_for_niche(session, niche) if item.id not in already
+        item
+        for item in pool_items_for_niche(session, niche)
+        if item.id not in already
+        and (eligible_pool_item_ids is None or item.id in eligible_pool_item_ids)
     ]
     unassigned_ids = [item.id for item in unassigned_items]
     if not unassigned_ids:

@@ -6,8 +6,8 @@ share one implementation. Exposes list/get/create/update/delete over the
 :class:`Account` model.
 
 Delete mirrors the desktop behavior: an account's download items are unassigned
-(kept), while its upload jobs, scrape candidates, scrape runs, and sources are
-removed, then the account row itself.
+(kept), while its upload jobs, scrape candidates, scrape runs, sources, and
+assignments are removed, then the account row itself.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from sqlalchemy import func, select
 
 from nicheflow_studio.db.models import (
     Account,
+    Assignment,
     DownloadItem,
     ScrapeCandidate,
     ScrapeRun,
@@ -49,7 +50,7 @@ _TEXT_FIELDS = (
     "upload_schedule_slots",
 )
 _BOOL_FIELDS = ("auto_schedule_on_export",)
-_OPTIONAL_POSITIVE_INT_FIELDS = ("daily_posts_target",)
+_OPTIONAL_POSITIVE_INT_FIELDS = ("daily_posts_target", "distribute_daily_target")
 
 
 class AccountError(ServiceError):
@@ -91,6 +92,7 @@ def _account_detail(session, account: Account) -> dict:
             "upload_default_privacy": account.upload_default_privacy,
             "upload_schedule_slots": account.upload_schedule_slots,
             "daily_posts_target": account.daily_posts_target,
+            "distribute_daily_target": account.distribute_daily_target,
             "auto_schedule_on_export": bool(account.auto_schedule_on_export),
             "download_item_count": session.scalar(
                 select(func.count(DownloadItem.id)).where(DownloadItem.account_id == account.id)
@@ -209,7 +211,8 @@ def set_active_account(account_id: int | None) -> dict:
 
 def delete_account(account_id: int) -> dict:
     """Delete an account, unassigning its download items and removing its
-    upload jobs, scrape candidates, scrape runs, and sources (mirrors PyQt)."""
+    upload jobs, scrape candidates, scrape runs, sources, and assignments
+    (mirrors PyQt)."""
     with get_session() as session:
         account = session.get(Account, account_id)
         if account is None:
@@ -237,10 +240,19 @@ def delete_account(account_id: int) -> dict:
             session.delete(run)
         for source in session.scalars(select(Source).where(Source.account_id == account_id)).all():
             session.delete(source)
+        # Assignment rows must go too: assigned_pool_item_ids() filters by niche
+        # only, so any leftover row keeps its pool clip looking booked forever.
+        removed_assignments = 0
+        for assignment in session.scalars(
+            select(Assignment).where(Assignment.account_id == account_id)
+        ).all():
+            session.delete(assignment)
+            removed_assignments += 1
         session.delete(account)
         session.commit()
         return {
             "deleted_account_id": account_id,
             "unassigned_download_items": unassigned,
             "removed_upload_jobs": removed_jobs,
+            "removed_assignments": removed_assignments,
         }

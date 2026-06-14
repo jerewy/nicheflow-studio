@@ -204,7 +204,13 @@ def list_global_publish_jobs() -> dict:
             created = _aware(job.created_at)
             if not path.exists():
                 continue
-            if status not in {"ready", "scheduled"} and created is not None and created < cutoff:
+            # Failed jobs stay visible past the recency cutoff: they need a
+            # manual republish and would otherwise silently disappear.
+            if (
+                status not in {"ready", "scheduled", "failed"}
+                and created is not None
+                and created < cutoff
+            ):
                 continue
             path_key = str(path.resolve()).casefold()
             if path_key in seen_paths:
@@ -223,12 +229,16 @@ def list_global_publish_jobs() -> dict:
                     "status": status,
                     "is_due": _due(job, now),
                     "scheduled_at": _iso(job.scheduled_at),
+                    "error_message": job.error_message,
                     "profile": (job.account.instagram_profile if job.account else None),
                     "output_name": path.name,
                     "processed_path": str(path),
                 }
             )
-    counts = {key: sum(1 for row in visible if row["status"] == key) for key in ("draft", "ready", "scheduled")}
+    counts = {
+        key: sum(1 for row in visible if row["status"] == key)
+        for key in ("draft", "ready", "scheduled", "failed")
+    }
     return {"jobs": visible, "due_count": sum(1 for row in visible if row["is_due"]), **counts}
 
 
@@ -303,6 +313,9 @@ def mark_ready(job_ids: list[int]) -> dict:
                 continue
             job.status = "ready"
             job.scheduled_at = None
+            # Reviving a failed job is an explicit user action — clear the old
+            # error so the next attempt gets its one automatic retry again.
+            job.error_message = None
             updated += 1
         session.commit()
     return {"updated": updated}

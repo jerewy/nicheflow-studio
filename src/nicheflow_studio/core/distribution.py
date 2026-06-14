@@ -28,6 +28,12 @@ from dataclasses import dataclass
 # cut; can later move to a per-account field or a global setting.
 DEFAULT_DAILY_POSTS_PER_ACCOUNT = 4
 DEFAULT_PLANNING_WINDOW_DAYS = 7
+# Rolling distribution backlog kept ready per account when it sets no explicit
+# ``distribute_daily_target``: auto-distribute / the hourly top-up maintain about
+# this many unposted clips, replenishing as posts and rejects drain them.
+# Decoupled from posting cadence so the review funnel can hold a few more than it
+# posts. See docs/SOURCING_POOLING_PLAN.md §4.
+DEFAULT_DISTRIBUTE_DAILY_TARGET = 5
 
 
 def target_backlog(

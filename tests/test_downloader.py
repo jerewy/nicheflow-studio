@@ -77,6 +77,63 @@ def test_instagram_downloader_uses_yt_dlp_first(monkeypatch, tmp_path: Path) -> 
     assert result.file_path.read_bytes() == b"video"
 
 
+class _CapturingYoutubeDL:
+    """Records the options it was constructed with and writes a dummy file."""
+
+    calls: list[dict[str, object]] = []
+
+    def __init__(self, options: dict[str, object]) -> None:
+        type(self).calls.append(options)
+
+    def __enter__(self):  # noqa: ANN204
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+    def extract_info(self, _url: str, *, download: bool) -> dict[str, object]:
+        out = Path(self._out)
+        out.write_bytes(b"video")
+        return {"id": "X1", "title": "t", "extractor": "Instagram"}
+
+    def prepare_filename(self, _info: dict[str, object]) -> str:
+        return self._out
+
+
+def test_instagram_downloader_threads_sourcing_cookies(monkeypatch, tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    _CapturingYoutubeDL.calls = []
+    _CapturingYoutubeDL._out = str(tmp_path / "Instagram_X1_Video.mp4")
+    monkeypatch.setattr("nicheflow_studio.downloader.instagram.YoutubeDL", _CapturingYoutubeDL)
+    monkeypatch.setattr(
+        "nicheflow_studio.downloader.instagram.instagram_yt_dlp_cookie_status",
+        lambda: SimpleNamespace(cookiefile=str(tmp_path / "cookies.txt"), has_sessionid=True),
+    )
+
+    _download_with_yt_dlp(url="https://www.instagram.com/reel/X1/", output_dir=tmp_path)
+
+    assert _CapturingYoutubeDL.calls
+    assert _CapturingYoutubeDL.calls[0].get("cookiefile") == str(tmp_path / "cookies.txt")
+
+
+def test_instagram_downloader_omits_cookiefile_when_none(monkeypatch, tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    _CapturingYoutubeDL.calls = []
+    _CapturingYoutubeDL._out = str(tmp_path / "Instagram_X1_Video.mp4")
+    monkeypatch.setattr("nicheflow_studio.downloader.instagram.YoutubeDL", _CapturingYoutubeDL)
+    monkeypatch.setattr(
+        "nicheflow_studio.downloader.instagram.instagram_yt_dlp_cookie_status",
+        lambda: SimpleNamespace(cookiefile=None, has_sessionid=False),
+    )
+
+    _download_with_yt_dlp(url="https://www.instagram.com/reel/X1/", output_dir=tmp_path)
+
+    assert _CapturingYoutubeDL.calls
+    assert "cookiefile" not in _CapturingYoutubeDL.calls[0]
+
+
 def test_instagram_downloader_does_not_fall_back_to_instaloader(
     monkeypatch, tmp_path: Path
 ) -> None:

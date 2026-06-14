@@ -23,6 +23,7 @@ const SINGLE_LINE: { key: string; label: string; placeholder?: string }[] = [
   { key: "upload_default_privacy", label: "Default privacy", placeholder: "private" },
   { key: "upload_schedule_slots", label: "Schedule slots", placeholder: "09:00, 18:00" },
   { key: "daily_posts_target", label: "Daily posts target", placeholder: "Default: 4" },
+  { key: "distribute_daily_target", label: "Distribute per day (backlog)", placeholder: "Default: 5" },
 ];
 
 const MULTI_LINE: { key: string; label: string }[] = [

@@ -84,6 +84,41 @@ def test_list_items_filters_by_account() -> None:
     assert [r["id"] for r in rows] == [item_a]
 
 
+def test_list_items_assigns_per_account_sequence() -> None:
+    a = _make_account("A")
+    b = _make_account("B")
+    # Interleave two accounts so global ids alternate; each account's "#N" must
+    # ignore the other account's items.
+    a1 = _make_item(account_id=a)
+    _make_item(account_id=b)
+    a2 = _make_item(account_id=a)
+    _make_item(account_id=b)
+    a3 = _make_item(account_id=a)
+
+    seq = {r["id"]: r["account_seq"] for r in library.list_items(account_id=a)}
+
+    assert seq == {a1: 1, a2: 2, a3: 3}
+    # The newest item's number equals how many clips the account has.
+    assert max(seq.values()) == 3
+
+
+def test_per_account_sequence_skips_blocked_items() -> None:
+    a = _make_account("A")
+    first = _make_item(account_id=a)
+    blocked = _make_item(account_id=a)
+    last = _make_item(account_id=a)
+    with get_session() as session:
+        session.get(DownloadItem, blocked).review_state = "blocked"
+        session.commit()
+
+    seq = {r["id"]: r["account_seq"] for r in library.list_items(account_id=a)}
+
+    # A blocked item is hidden and consumes no number, so the visible sequence
+    # stays contiguous (no gap where the blocked clip was).
+    assert blocked not in seq
+    assert seq == {first: 1, last: 2}
+
+
 def test_status_derivation_draft_exported_posted() -> None:
     from nicheflow_studio.db.models import UploadJob
 
@@ -108,6 +143,26 @@ def test_status_derivation_draft_exported_posted() -> None:
     assert by_id[draft] == "draft"
     assert by_id[exported] == "exported"
     assert by_id[posted] == "posted"
+
+
+def test_status_derivation_failed_publish_outranks_exported() -> None:
+    account_id = _make_account()
+    failed = _make_item(account_id=account_id)
+    with get_session() as session:
+        session.get(DownloadItem, failed).processed_path = "C:/out.mp4"
+        session.add(
+            UploadJob(
+                account_id=account_id,
+                download_item_id=failed,
+                processed_path="C:/out.mp4",
+                status="failed",
+                error_message="not logged in",
+            )
+        )
+        session.commit()
+
+    by_id = {r["id"]: r["status"] for r in library.list_items(account_id=account_id)}
+    assert by_id[failed] == "failed"
 
 
 def test_assign_and_clear_account() -> None:

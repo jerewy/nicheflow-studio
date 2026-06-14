@@ -39,6 +39,37 @@ def _make_item(
         return item.id
 
 
+def test_next_safe_slot_keeps_gap_from_recent_post() -> None:
+    after = dt.datetime(2026, 6, 13, 10, 0, tzinfo=dt.timezone.utc)
+    with get_session() as session:
+        account = Account(
+            name="Spaced",
+            platform="instagram",
+            niche_label="history",
+            upload_schedule_slots="09:00, 11:00, 18:00",
+        )
+        session.add(account)
+        session.commit()
+        # Posted 09:00 -> the 11:00 slot is only 2h later (inside the 4h gap).
+        session.add(
+            UploadJob(
+                account_id=account.id,
+                processed_path="C:/out.mp4",
+                status="posted",
+                posted_at=dt.datetime(2026, 6, 13, 9, 0, tzinfo=dt.timezone.utc),
+            )
+        )
+        session.commit()
+
+        slot = publishing.next_safe_slot_for_account(
+            session, account, after=after, rng=random.Random(0)
+        )
+
+    assert slot is not None
+    # 11:00 is rejected (2h gap); 18:00 (9h gap) is the first safe slot.
+    assert slot.astimezone(dt.timezone.utc).hour == 18
+
+
 def test_queue_creates_draft_job() -> None:
     item_id = _make_item()
 

@@ -45,6 +45,11 @@ $config = @{
 }
 [System.IO.File]::WriteAllText($HostConfig, ($config | ConvertTo-Json -Depth 3), $utf8NoBom)
 
+& $Python (Join-Path $PSScriptRoot 'smoke_capture_host.py') $HostExe
+if ($LASTEXITCODE -ne 0) {
+    throw "Native Messaging host smoke check failed."
+}
+
 $registryPaths = @(
     'HKCU:\Software\Google\Chrome\NativeMessagingHosts\com.nicheflow.capture',
     'HKCU:\Software\Microsoft\Edge\NativeMessagingHosts\com.nicheflow.capture'

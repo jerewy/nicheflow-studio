@@ -6,39 +6,64 @@
     <title>NicheFlow Capture</title>
     <style>
       * { box-sizing: border-box; }
-      body { width: 320px; margin: 0; padding: 12px; background: #111827; color: #f8fafc; font: 12px/1.35 system-ui, sans-serif; }
-      header, .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-      h1 { margin: 0; font-size: 15px; }
-      select, button { border-radius: 6px; font: inherit; padding: 7px 8px; }
-      select { width: 112px; border: 1px solid #475569; background: #1e293b; color: #f8fafc; }
-      .pin { margin-top: 8px; }
-      .pin select { width: 190px; }
+      body { width: auto; min-width: 260px; margin: 0; padding: 9px 10px; background: #111827; color: #f8fafc; font: 12px/1.3 system-ui, sans-serif; }
+      header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+      h1 { margin: 0; font-size: 13px; }
+      .row { display: flex; align-items: center; gap: 6px; }
+      select, button { border-radius: 6px; font: inherit; padding: 5px 7px; }
+      select { border: 1px solid #475569; background: #1e293b; color: #f8fafc; }
+      #niche { width: 96px; }
+      .pin { margin-top: 7px; }
+      .pin label { color: #94a3b8; }
+      #pinned-account { flex: 1; min-width: 0; }
+      .hint { margin-top: 3px; font-size: 10px; color: #64748b; }
       button { border: 0; cursor: pointer; font-weight: 700; }
-      button:disabled { opacity: .55; cursor: wait; }
+      button:disabled { opacity: .5; cursor: default; }
+      .actions { margin-top: 8px; gap: 6px; }
       .primary { flex: 1; background: #22c55e; color: #052e16; }
-      .secondary { flex: 1; background: #2563eb; color: white; }
-      .stats { margin: 10px 0; padding: 8px; border: 1px solid #334155; border-radius: 7px; background: #1e293b; }
-      .value { font-weight: 750; color: #f8fafc; }
-      #result { margin-top: 9px; padding-top: 8px; border-top: 1px solid #334155; color: #cbd5e1; }
+      .secondary { flex: 1; background: #2563eb; color: #fff; }
+      .stats { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 3px 8px; font-size: 11px; color: #94a3b8; }
+      .stats b { color: #f8fafc; font-weight: 700; }
+      .qhead { display: flex; align-items: center; justify-content: space-between; margin-top: 9px; }
+      .qhead h2 { margin: 0; font-size: 11px; font-weight: 700; color: #cbd5e1; text-transform: uppercase; letter-spacing: .03em; }
+      .qclear { background: none; color: #94a3b8; padding: 1px 3px; font-weight: 600; font-size: 11px; }
+      .qclear:hover:not(:disabled) { color: #fca5a5; }
+      .qclear:disabled { opacity: .4; }
+      .queue-list { margin-top: 5px; max-height: 240px; overflow-y: auto; display: flex; flex-direction: column; gap: 3px; }
+      .qitem { display: flex; align-items: center; gap: 6px; padding: 4px 6px; border: 1px solid #334155; border-radius: 6px; background: #1e293b; }
+      .qlabel { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .qpin { color: #86efac; }
+      .qremove { background: none; color: #94a3b8; font-size: 15px; line-height: 1; padding: 0 2px; }
+      .qremove:hover { color: #fca5a5; }
+      .qempty { color: #64748b; padding: 3px 1px; font-size: 11px; }
+      #result { margin-top: 7px; padding-top: 6px; border-top: 1px solid #334155; font-size: 11px; color: #cbd5e1; }
       #result[data-tone="success"] { color: #86efac; }
       #result[data-tone="error"] { color: #fca5a5; }
-      .muted { color: #94a3b8; }
     </style>
   </head>
   <body>
-    <header><h1>NicheFlow Capture</h1><select id="niche"><option value="history">History</option><option value="movie">Movie</option></select></header>
-    <div class="row pin"><label for="pinned-account">Pin to account</label><select id="pinned-account"><option value="">No pin</option></select></div>
-    <div class="stats">
-      <div class="row"><span>Queue</span><span class="value" id="queue-count">0</span></div>
-      <div class="row"><span id="pool-label">History pool</span><span class="value" id="pool-count">...</span></div>
-      <div class="row"><span>Apify estimate</span><span class="value" id="apify-cost">...</span></div>
-      <div class="row muted"><span>Monthly results</span><span id="apify-results">...</span></div>
+    <header>
+      <h1>NicheFlow Capture</h1>
+      <select id="niche"><option value="history">History</option><option value="movie">Movie</option></select>
+    </header>
+    <div class="row pin">
+      <label for="pinned-account">Pin</label>
+      <select id="pinned-account"><option value="">No pin</option></select>
     </div>
-    <div class="row">
+    <div class="hint">No pin → added to the pool. Pinned → sent to that account for processing.</div>
+    <div class="row actions">
       <button class="primary" id="queue">Queue Current</button>
       <button class="secondary" id="process">Process Queue</button>
     </div>
-    <div id="result" data-tone="neutral">Queue several Reels, then process them together.</div>
+    <div class="stats">
+      <span><span id="pool-label">Pool</span> <b id="pool-count">…</b></span>
+      <span>Apify est <b id="apify-cost">…</b></span>
+      <span><b id="apify-results">…</b> results</span>
+    </div>
+    <div class="qhead"><h2>In queue (<span id="queue-count">0</span>)</h2><button class="qclear" id="queue-clear" type="button">Clear all</button></div>
+    <div class="queue-list" id="queue-list"><div class="qempty">Queue is empty.</div></div>
+    <div id="result" data-tone="neutral">Queue Reels, then process together.</div>
+    <script src="media-url.js"></script>
     <script src="popup.js"></script>
   </body>
 </html>

@@ -108,6 +108,7 @@ export interface PublishJob {
   scheduled_at: string | null;
   posted_at: string | null;
   posted_url: string | null;
+  error_message: string | null;
   processed_path: string | null;
 }
 
@@ -116,6 +117,25 @@ export interface QueueResult {
   status: string;
   scheduled_at: string | null;
   created: boolean;
+}
+
+// Recent-post recency warning shown before a manual publish: the account posted
+// within the 4h same-account window. `on_cooldown` false means safe to post.
+export interface PublishRecency {
+  on_cooldown: boolean;
+  account_id?: number;
+  account_name?: string | null;
+  last_posted_at?: string | null;
+  minutes_since?: number;
+  recommended_next_at?: string | null;
+}
+
+export interface DueRecencyWarning {
+  account_id: number;
+  account_name: string | null;
+  last_posted_at: string;
+  minutes_since: number;
+  recommended_next_at: string;
 }
 
 export interface WorkflowOption {
@@ -158,6 +178,7 @@ export interface AccountDetail extends AccountSummary {
   upload_default_privacy: string | null;
   upload_schedule_slots: string | null;
   daily_posts_target: number | null;
+  distribute_daily_target: number | null;
   auto_schedule_on_export: boolean;
   download_item_count: number;
   upload_job_count: number;
@@ -167,6 +188,7 @@ export interface DeleteAccountResult {
   deleted_account_id: number;
   unassigned_download_items: number;
   removed_upload_jobs: number;
+  removed_assignments: number;
 }
 
 export interface SourceProfile {
@@ -228,6 +250,10 @@ export interface ScrapeToPoolResult {
 
 export interface LibraryItem {
   id: number;
+  // Per-account running number shown as "#N" in Processing (oldest = 1). Stable
+  // per item and == the account's clip count for the newest item. Differs from
+  // `id`, which is the global primary key. Null only if it could not be ranked.
+  account_seq: number | null;
   title: string | null;
   source_url: string;
   status: string; // derived workflow status: new | draft | exported | posted | skipped
@@ -301,6 +327,7 @@ export interface DistributeNicheResult {
   niche: string;
   assigned: number;
   pinned: number;
+  download_failures: number;
   max_per_account: number | null;
   accounts: {
     account_id: number;
@@ -310,7 +337,7 @@ export interface DistributeNicheResult {
     target: number;
   }[];
   /** Only present when assigned === 0. Explains why nothing was distributed. */
-  reason?: "no_accounts" | "all_at_cap" | "pool_empty";
+  reason?: "no_accounts" | "no_ready_accounts" | "all_at_cap" | "pool_empty" | "download_failed";
 }
 
 export interface DashboardPublishJob {
@@ -321,6 +348,7 @@ export interface DashboardPublishJob {
   status: string;
   is_due: boolean;
   scheduled_at: string | null;
+  error_message: string | null;
   profile: string | null;
   output_name: string;
   processed_path: string;
@@ -332,6 +360,7 @@ export interface DashboardPublishQueue {
   draft: number;
   ready: number;
   scheduled: number;
+  failed: number;
 }
 
 export interface DashboardAccountStatsRow {

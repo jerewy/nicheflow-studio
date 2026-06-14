@@ -16,16 +16,33 @@ async function updateBadge() {
   await chrome.action.setBadgeText({ text });
 }
 
+// Keep in sync with popup.js: a batch whose worker was killed is treated as
+// finished after this, so a stuck `processing` flag can't lock out re-processing.
+const PROCESSING_STALE_MS = 10 * 60 * 1000;
+
 async function processQueue() {
-  const stored = await chrome.storage.local.get({ captureQueue: [], processing: false });
-  if (stored.processing) return { ok: false, error: "The queue is already processing." };
+  const stored = await chrome.storage.local.get({
+    captureQueue: [],
+    processing: false,
+    processingStartedAt: 0,
+  });
+  const stale =
+    stored.processing && Date.now() - (stored.processingStartedAt || 0) > PROCESSING_STALE_MS;
+  if (stored.processing && !stale) return { ok: false, error: "The queue is already processing." };
   if (!stored.captureQueue.length) return { ok: false, error: "The capture queue is empty." };
 
-  await chrome.storage.local.set({ processing: true, lastBatch: null });
+  // Snapshot what we send so items queued DURING the batch survive completion.
+  const batchItems = stored.captureQueue.slice();
+  const batchUrls = new Set(batchItems.map((item) => item.url));
+  await chrome.storage.local.set({
+    processing: true,
+    processingStartedAt: Date.now(),
+    lastBatch: null,
+  });
   await updateBadge();
   chrome.runtime.sendNativeMessage(
     HOST_NAME,
-    { action: "capture_batch", items: stored.captureQueue },
+    { action: "capture_batch", items: batchItems },
     async (response) => {
       if (chrome.runtime.lastError || !response?.ok) {
         const error = chrome.runtime.lastError?.message ?? response?.error ?? "Unknown error.";
@@ -36,8 +53,11 @@ async function processQueue() {
         return;
       }
       const summary = response.batch.summary;
+      // Remove only the items we just processed; keep anything queued meanwhile.
+      const current = await chrome.storage.local.get({ captureQueue: [] });
+      const remaining = current.captureQueue.filter((item) => !batchUrls.has(item.url));
       await chrome.storage.local.set({
-        captureQueue: [],
+        captureQueue: remaining,
         processing: false,
         lastBatch: { ok: true, ...response.batch },
       });
@@ -65,5 +85,17 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   return false;
 });
 
-chrome.runtime.onInstalled.addListener(updateBadge);
-chrome.runtime.onStartup.addListener(updateBadge);
+// Clicking the toolbar icon opens the docked Side Panel (stays open while you
+// click around Instagram) instead of a popup that closes on blur.
+chrome.runtime.onInstalled.addListener(() => {
+  if (chrome.sidePanel?.setPanelBehavior) {
+    chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
+  }
+  updateBadge();
+});
+chrome.runtime.onStartup.addListener(() => {
+  if (chrome.sidePanel?.setPanelBehavior) {
+    chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
+  }
+  updateBadge();
+});

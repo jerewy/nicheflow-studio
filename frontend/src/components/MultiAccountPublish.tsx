@@ -124,7 +124,11 @@ export function MultiAccountPublish() {
       {queue && (
         <p className="text-sm text-muted-foreground">
           {queue.jobs.length} recent exported/due item(s). {queue.draft} exported,{" "}
-          {queue.ready} ready, {queue.scheduled} scheduled, {queue.due_count} due now.
+          {queue.ready} ready, {queue.scheduled} scheduled, {queue.due_count} due now
+          {queue.failed > 0 ? (
+            <span className="font-medium text-red-500">, {queue.failed} failed</span>
+          ) : null}
+          .
         </p>
       )}
       <div className="flex flex-wrap items-center gap-2">
@@ -143,7 +147,42 @@ export function MultiAccountPublish() {
             <td className="whitespace-nowrap px-3 py-2">{job.account_name}</td>
             <td className="max-w-56 truncate px-3 py-2">{job.video}</td>
             <td className="max-w-md truncate px-3 py-2">{job.title ?? "-"}</td>
-            <td className="px-3 py-2">{job.is_due ? "Due now" : job.status === "draft" ? "Exported" : job.status}</td>
+            <td className="px-3 py-2">
+              {job.status === "failed" ? (
+                <span className="flex items-center gap-2">
+                  <span
+                    className="font-medium text-red-500"
+                    title={job.error_message ?? "Publish failed."}
+                  >
+                    Failed
+                  </span>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-6 px-2 text-xs"
+                    title={`Reschedule as due now${job.error_message ? ` (failed: ${job.error_message})` : ""}`}
+                    onClick={() =>
+                      run(
+                        () =>
+                          bridge.rescheduleJob(
+                            job.id,
+                            new Date().toISOString().replace("Z", "+00:00"),
+                          ),
+                        "Failed reel rescheduled — due now. Auto-publish or “Publish due now” will post it.",
+                      )
+                    }
+                  >
+                    Republish
+                  </Button>
+                </span>
+              ) : job.is_due ? (
+                "Due now"
+              ) : job.status === "draft" ? (
+                "Exported"
+              ) : (
+                job.status
+              )}
+            </td>
             <td className="whitespace-nowrap px-3 py-2">{formatDate(job.scheduled_at)}</td>
             <td className="px-3 py-2">{job.profile ?? "-"}</td>
             <td className="px-3 py-2">{job.output_name}</td>

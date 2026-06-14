@@ -30,6 +30,10 @@ from nicheflow_studio.services.errors import ServiceError
 _DEFAULT_TIMEZONE = "Asia/Bangkok"
 _DEFAULT_PRIVACY = "private"
 _ITEM_LIST_LIMIT = 50
+# Minimum spacing between two posts on the SAME account. Used both when
+# auto-scheduling a new post and when deferring a due post that would otherwise
+# land too soon after the account's last post (reach cannibalization / bot tell).
+SAME_ACCOUNT_MIN_GAP_HOURS = 4
 
 
 class PublishError(ServiceError):
@@ -74,6 +78,56 @@ def _account_in_checkpoint_cooldown(account_id: int, *, now: dt.datetime) -> boo
     return _account_on_cooldown(account_id, now=now.astimezone(dt.timezone.utc))
 
 
+def next_safe_slot_for_account(
+    session,
+    account: Account,
+    *,
+    after: dt.datetime,
+    exclude_job_id: int | None = None,
+    rng: _random.Random | None = None,
+    fallback_gap: bool = True,
+) -> dt.datetime | None:
+    """Next post time for an account that respects its slots AND keeps a
+    ``SAME_ACCOUNT_MIN_GAP_HOURS`` gap from every existing same-account post
+    (scheduled or already posted).
+
+    Walks the account's configured slots forward from ``after`` and returns the
+    first that no existing post sits within the gap of. ``exclude_job_id`` drops a
+    job's own time from the occupied set (so deferring a job never collides with
+    itself).
+
+    With no usable slot: ``fallback_gap`` True returns ``latest_occupied + gap``
+    (or ``after``) so an unattended defer always gets a concrete time; False
+    returns ``None`` so the caller can surface a "configure your slots" message.
+    """
+    gap = dt.timedelta(hours=SAME_ACCOUNT_MIN_GAP_HOURS)
+    jobs = session.scalars(
+        select(UploadJob).where(UploadJob.account_id == account.id)
+    ).all()
+    occupied = [
+        _aware(value)
+        for row in jobs
+        if row.id != exclude_job_id
+        for value in (row.scheduled_at, row.posted_at)
+        if value is not None
+    ]
+    slot = next_open_slot_time(
+        account.upload_schedule_slots,
+        after=after,
+        occupied=occupied,
+        rng=rng,
+        collision_minutes=SAME_ACCOUNT_MIN_GAP_HOURS * 60,
+    )
+    if slot is not None:
+        return slot
+    if not fallback_gap:
+        return None
+    # No slots configured -> just enforce the raw gap from the latest known post.
+    latest = max(occupied, default=None)
+    base = (latest + gap) if latest is not None else after
+    return max(base, after)
+
+
 def list_items() -> list[dict]:
     """Recent downloaded items that can be worked on (have a local file)."""
     with get_session() as session:
@@ -113,6 +167,7 @@ def list_publish_jobs(item_id: int) -> list[dict]:
                 "scheduled_at": _iso(row.scheduled_at),
                 "posted_at": _iso(row.posted_at),
                 "posted_url": row.posted_url,
+                "error_message": row.error_message,
                 "processed_path": row.processed_path,
             }
             for row in rows
@@ -259,11 +314,6 @@ def auto_schedule_for_publish(
             result["schedule_path"] = "kept_existing"
             result["message"] = f"Kept existing schedule for {kept_time.astimezone():%H:%M}"
             return result
-        forward_occupied = [
-            _aware(row.scheduled_at)
-            for row in jobs
-            if row.posted_at is None and row.scheduled_at is not None
-        ]
         catch_up_occupied = [
             _aware(value)
             for row in jobs
@@ -280,6 +330,7 @@ def auto_schedule_for_publish(
             occupied=catch_up_occupied,
             last_posted_at=last_posted_at,
             checkpoint_cooldown=checkpoint_cooldown,
+            min_gap_hours=SAME_ACCOUNT_MIN_GAP_HOURS,
             rng=rng,
         )
         missed_slot = (
@@ -289,11 +340,15 @@ def auto_schedule_for_publish(
         )
         schedule_path = "catch_up" if scheduled_local is not None else "next_open_slot"
         if scheduled_local is None:
-            scheduled_local = next_open_slot_time(
-                account.upload_schedule_slots,
+            # Enforce the same-account gap and respect already-posted times, not
+            # just scheduled ones, so a new post never lands too soon after a
+            # recent one.
+            scheduled_local = next_safe_slot_for_account(
+                session,
+                account,
                 after=now_local,
-                occupied=forward_occupied,
                 rng=rng,
+                fallback_gap=False,
             )
 
     if scheduled_local is None:

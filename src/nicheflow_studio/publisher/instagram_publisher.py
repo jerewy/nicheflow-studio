@@ -40,6 +40,11 @@ INSTAGRAM_URL = "https://www.instagram.com/"
 _IGNORED_CHROMIUM_DEFAULT_ARGS = ("--enable-automation",)
 _PUBLISH_CHROME_ARGS = ("--start-minimized",)
 
+# goto() returns at domcontentloaded, but Instagram is an SPA that can sit on
+# its logo splash long after that on a slow load — the nav (and its "New post"
+# button) only renders once the app has booted. Budget for that boot.
+_APP_BOOT_TIMEOUT_MS = 60000
+
 # --- Selectors. Instagram relabels/restructures these periodically; keep each
 # step tolerant by listing several candidates. ----------------------------
 _NEW_POST_SELECTORS = (
@@ -269,22 +274,29 @@ async def _dump_composer_state(page: Page, reason: str) -> None:
         log.debug("could not enumerate composer controls", exc_info=True)
 
 
-async def _ensure_file_drop_screen(page: Page) -> bool:
+async def _ensure_file_drop_screen(page: Page, *, timeout: float = _APP_BOOT_TIMEOUT_MS) -> bool:
     """Make the 'Select from computer' button reachable.
 
     Handles both web layouts without branching on account type: if the upload
     button isn't visible yet, the Create dropdown (Post / Reel / Story / Live)
     is probably open, so click the 'Post' option and look again. Returns True
     once the upload button is visible.
+
+    The Create dialog lazy-loads its content and can sit on a spinner for tens
+    of seconds on a slow connection, so poll to a deadline rather than a fixed
+    attempt count.
     """
-    for _ in range(3):
+    deadline = time.monotonic() + timeout / 1000
+    while True:
         if await _any_visible(page, _SELECT_FROM_COMPUTER_SELECTORS):
             return True
+        if time.monotonic() >= deadline:
+            return False
         # Pick "Post" from the Create dropdown (never Reel/Story). No-op if the
         # dropdown isn't there — then the next loop re-checks the upload button.
         await _click_first(page, _POST_MENU_SELECTORS, timeout=2500)
+        await _dismiss_interstitials(page)
         await _human_pause(0.4, 0.9)
-    return await _any_visible(page, _SELECT_FROM_COMPUTER_SELECTORS)
 
 
 async def _dismiss_interstitials(page: Page) -> None:
@@ -340,9 +352,22 @@ async def _open_composer_and_attach(page: Page, video: Path) -> None:
     which :func:`_ensure_file_drop_screen` resolves. On failure we capture a
     diagnostic screenshot so the cause is visible rather than guessed.
     """
-    if not await _click_first(page, _NEW_POST_SELECTORS):
-        await _dump_composer_state(page, "new-post-button-missing")
-        raise RuntimeError("could not find the 'New post' / Create button")
+    # Dismissing variant + boot budget: on a slow load the page is still on the
+    # splash screen here, and late dialogs (cookies / notifications) can cover
+    # the nav after it finally renders — a plain 8s _click_first fails both.
+    if not await _click_first_dismissing(page, _NEW_POST_SELECTORS, timeout=_APP_BOOT_TIMEOUT_MS):
+        # A page still blank after the whole boot budget usually means the SPA
+        # bundle fetch stalled on a bad connection; one reload — what a human
+        # would do — often recovers it.
+        log.warning("app shell not rendered after %sms; reloading once", _APP_BOOT_TIMEOUT_MS)
+        try:
+            await page.reload(wait_until="domcontentloaded", timeout=60000)
+        except (PlaywrightError, PlaywrightTimeout):
+            log.warning("reload after blank page failed", exc_info=True)
+        await _human_pause(0.5, 1.0)
+        if not await _click_first_dismissing(page, _NEW_POST_SELECTORS, timeout=_APP_BOOT_TIMEOUT_MS):
+            await _dump_composer_state(page, "new-post-button-missing")
+            raise RuntimeError("could not find the 'New post' / Create button")
     await _human_pause(0.3, 0.8)
     if not await _ensure_file_drop_screen(page):
         await _dump_composer_state(page, "select-from-computer-missing")
@@ -394,23 +419,32 @@ async def _advance_through_edit_steps(page: Page) -> None:
         await _human_pause(0.6, 1.4)
 
 
-async def _fill_caption(page: Page, caption: str) -> None:
+async def _fill_caption(page: Page, caption: str, *, timeout: float = 30000) -> None:
     if not caption:
         return
-    for selector in _CAPTION_SELECTORS:
-        box = page.locator(selector).first
-        try:
-            if await box.is_visible():
-                await box.click()
-                await _human_pause(0.4, 1.0)
-                # Insert the whole caption at once (paste-like) instead of typing
-                # per-key: far faster for long captions and preserves newlines.
-                await page.keyboard.insert_text(caption)
-                await _human_pause()
-                return
-        except PlaywrightError:
-            continue
-    raise RuntimeError("could not find the caption field")
+    # The caption screen renders after the last 'Next' click; on a slow machine
+    # the textbox appears seconds later, so poll to a deadline rather than
+    # checking each selector once (a single pass failed live with "could not
+    # find the caption field").
+    deadline = time.monotonic() + timeout / 1000
+    while True:
+        for selector in _CAPTION_SELECTORS:
+            box = page.locator(selector).first
+            try:
+                if await box.is_visible():
+                    await box.click()
+                    await _human_pause(0.4, 1.0)
+                    # Insert the whole caption at once (paste-like) instead of typing
+                    # per-key: far faster for long captions and preserves newlines.
+                    await page.keyboard.insert_text(caption)
+                    await _human_pause()
+                    return
+            except PlaywrightError:
+                continue
+        if time.monotonic() >= deadline:
+            raise RuntimeError("could not find the caption field")
+        await _dismiss_interstitials(page)
+        await _human_pause(0.5, 1.0)
 
 
 async def _set_reel_cover(page: Page, cover_image: Path | None) -> bool:

@@ -157,6 +157,181 @@ def test_click_first_dismissing_gives_up_at_deadline(monkeypatch: pytest.MonkeyP
     assert "click" in calls  # it tried before giving up
 
 
+class _FakeBootPage:
+    """Page stub for the composer-open step: records reload() calls."""
+
+    def __init__(self) -> None:
+        self.reloads = 0
+
+    async def reload(self, **_kwargs) -> None:
+        self.reloads += 1
+
+
+def test_open_composer_waits_for_slow_app_boot(monkeypatch: pytest.MonkeyPatch) -> None:
+    # goto() returns at domcontentloaded while Instagram can still be on its
+    # logo splash; the New post button must be awaited with the generous
+    # dismissing budget, not _click_first's 8s default (which failed live with
+    # "could not find the 'New post' / Create button" on a laggy load). If the
+    # page never renders (blank white SPA), reload once before giving up.
+    captured: dict = {"attempts": []}
+
+    async def fake_dismissing(page, selectors, *, timeout) -> bool:  # noqa: ANN001
+        captured["attempts"].append((selectors, timeout))
+        return False  # never renders, even after the reload
+
+    async def fake_dump(page, reason) -> None:  # noqa: ANN001
+        captured["dump"] = reason
+
+    monkeypatch.setattr(instagram_publisher, "_click_first_dismissing", fake_dismissing)
+    monkeypatch.setattr(instagram_publisher, "_dump_composer_state", fake_dump)
+    monkeypatch.setattr(instagram_publisher, "_human_pause", _instant)
+    page = _FakeBootPage()
+
+    with pytest.raises(RuntimeError, match="New post"):
+        asyncio.run(instagram_publisher._open_composer_and_attach(page, Path("x.mp4")))
+
+    assert page.reloads == 1
+    assert len(captured["attempts"]) == 2  # before and after the reload
+    for selectors, timeout in captured["attempts"]:
+        assert selectors == instagram_publisher._NEW_POST_SELECTORS
+        assert timeout >= 60000
+
+
+def test_open_composer_recovers_after_reload(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The blank-page reload is a recovery path: when the app shell renders
+    # after the reload, the flow must continue instead of failing.
+    state = {"calls": 0}
+
+    class _StopFlow(Exception):
+        pass
+
+    async def fake_dismissing(page, selectors, *, timeout) -> bool:  # noqa: ANN001
+        state["calls"] += 1
+        return state["calls"] >= 2  # blank before reload, renders after
+
+    async def fake_drop_screen(page, **_kwargs) -> bool:  # noqa: ANN001
+        raise _StopFlow  # made it past the New post step
+
+    monkeypatch.setattr(instagram_publisher, "_click_first_dismissing", fake_dismissing)
+    monkeypatch.setattr(instagram_publisher, "_ensure_file_drop_screen", fake_drop_screen)
+    monkeypatch.setattr(instagram_publisher, "_human_pause", _instant)
+    page = _FakeBootPage()
+
+    with pytest.raises(_StopFlow):
+        asyncio.run(instagram_publisher._open_composer_and_attach(page, Path("x.mp4")))
+
+    assert page.reloads == 1
+    assert state["calls"] == 2
+
+
+async def _instant(*_args, **_kwargs) -> None:
+    return None
+
+
+def test_ensure_file_drop_screen_waits_for_lazy_dialog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The Create dialog lazy-loads its content (a spinner on slow connections);
+    # the old fixed 3-attempt loop gave up in ~10s and failed live with
+    # "could not find 'Select from computer'". The poll must keep checking.
+    checks = {"count": 0}
+
+    async def fake_any_visible(page, selectors) -> bool:  # noqa: ANN001
+        checks["count"] += 1
+        return checks["count"] >= 3  # dialog content appears on the 3rd check
+
+    async def fake_click(page, selectors, *, timeout) -> bool:  # noqa: ANN001
+        return False  # no Create dropdown in this layout
+
+    monkeypatch.setattr(instagram_publisher, "_any_visible", fake_any_visible)
+    monkeypatch.setattr(instagram_publisher, "_click_first", fake_click)
+    monkeypatch.setattr(instagram_publisher, "_dismiss_interstitials", _instant)
+    monkeypatch.setattr(instagram_publisher, "_human_pause", _instant)
+
+    found = asyncio.run(instagram_publisher._ensure_file_drop_screen(object()))
+
+    assert found is True
+    assert checks["count"] == 3
+
+
+def test_ensure_file_drop_screen_gives_up_at_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_any_visible(page, selectors) -> bool:  # noqa: ANN001
+        return False
+
+    monkeypatch.setattr(instagram_publisher, "_any_visible", fake_any_visible)
+    monkeypatch.setattr(instagram_publisher, "_dismiss_interstitials", _instant)
+    monkeypatch.setattr(instagram_publisher, "_human_pause", _instant)
+
+    found = asyncio.run(
+        instagram_publisher._ensure_file_drop_screen(object(), timeout=0)
+    )
+
+    assert found is False
+
+
+class _FakeCaptionBox:
+    def __init__(self, visible_after_checks: int) -> None:
+        self.visible_after_checks = visible_after_checks
+        self.checks = 0
+        self.clicked = False
+
+    @property
+    def first(self):
+        return self
+
+    async def is_visible(self) -> bool:
+        self.checks += 1
+        return self.checks >= self.visible_after_checks
+
+    async def click(self) -> None:
+        self.clicked = True
+
+
+class _FakeKeyboard:
+    def __init__(self) -> None:
+        self.inserted: str | None = None
+
+    async def insert_text(self, text: str) -> None:
+        self.inserted = text
+
+
+class _FakeCaptionPage:
+    def __init__(self, visible_after_checks: int) -> None:
+        self.box = _FakeCaptionBox(visible_after_checks)
+        self.keyboard = _FakeKeyboard()
+
+    def locator(self, _selector: str) -> _FakeCaptionBox:
+        return self.box
+
+
+def test_fill_caption_waits_for_slow_caption_screen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The caption box renders late on a slow machine; a single selector pass
+    # failed live with "could not find the caption field". The poll must retry
+    # until it appears.
+    monkeypatch.setattr(instagram_publisher, "_dismiss_interstitials", _instant)
+    monkeypatch.setattr(instagram_publisher, "_human_pause", _instant)
+    # All 3 selectors miss on the first pass; the box shows up on the next one.
+    page = _FakeCaptionPage(visible_after_checks=4)
+
+    asyncio.run(instagram_publisher._fill_caption(page, "the caption"))
+
+    assert page.box.clicked is True
+    assert page.keyboard.inserted == "the caption"
+
+
+def test_fill_caption_gives_up_at_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(instagram_publisher, "_dismiss_interstitials", _instant)
+    monkeypatch.setattr(instagram_publisher, "_human_pause", _instant)
+    page = _FakeCaptionPage(visible_after_checks=10**9)
+
+    with pytest.raises(RuntimeError, match="caption field"):
+        asyncio.run(instagram_publisher._fill_caption(page, "the caption", timeout=0))
+
+
 def test_format_control_dump_dedupes_and_trims() -> None:
     labels = [
         "  Select   from computer ",  # whitespace collapses

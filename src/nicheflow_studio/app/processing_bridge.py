@@ -515,10 +515,16 @@ class ProcessingBridge:
         return publishing.queue_for_publish(item_id, scheduled_at=scheduled_at)
 
     @_guard
-    def start_publish_now(self, item_id: int) -> dict:
+    def start_publish_now(self, item_id: int, allow_recent: bool = False) -> dict:
         """Start a background job that posts the item's reel to Instagram now
-        (live). Poll it via :meth:`get_job`."""
-        job_id = self._jobs.start(publish_now_svc.publish_item_now, item_id)
+        (live). Poll it via :meth:`get_job`.
+
+        ``allow_recent`` False (default) makes the job return ``on_cooldown``
+        without posting when the account posted within the recency window; True
+        is the explicit "post anyway" path from the confirmation dialog."""
+        job_id = self._jobs.start(
+            publish_now_svc.publish_item_now, item_id, allow_recent=allow_recent
+        )
         return {"job_id": job_id}
 
     @_guard
@@ -527,9 +533,25 @@ class ProcessingBridge:
         return {"due": publish_now_svc.due_count()}
 
     @_guard
-    def start_publish_due(self) -> dict:
-        """Start a background job that posts all currently-due scheduled reels."""
-        job_id = self._jobs.start(publish_now_svc.publish_due_jobs)
+    def item_publish_recency(self, item_id: int) -> dict:
+        """Recent-post warning for posting this item now (read-only; backs the
+        Publish Now confirmation)."""
+        return publish_now_svc.item_publish_recency(item_id)
+
+    @_guard
+    def due_publish_recency(self) -> list[dict]:
+        """Accounts among the currently-due jobs that posted within the recent-post
+        window (read-only; backs the Publish due now confirmation)."""
+        return publish_now_svc.due_publish_recency()
+
+    @_guard
+    def start_publish_due(self, allow_recent: bool = False) -> dict:
+        """Start a background job that posts all currently-due scheduled reels.
+
+        ``allow_recent`` False (default, and what the auto loop uses) defers due
+        reels whose account posted too recently; True is the explicit "publish
+        anyway" path from the confirmation dialog."""
+        job_id = self._jobs.start(publish_now_svc.publish_due_jobs, allow_recent=allow_recent)
         return {"job_id": job_id}
 
     @_guard

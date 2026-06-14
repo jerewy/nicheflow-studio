@@ -12,16 +12,29 @@ that remain in the desktop app and the pool-admin scripts
 from __future__ import annotations
 
 import datetime as dt
+import logging
+import threading
 from collections import Counter
+from pathlib import Path
 
-from nicheflow_studio.core.distribution import (
-    DEFAULT_DAILY_POSTS_PER_ACCOUNT,
-    target_backlog,
-)
+from nicheflow_studio.core.account_health import HealthState, local_health
+from nicheflow_studio.core.distribution import DEFAULT_DISTRIBUTE_DAILY_TARGET
+from nicheflow_studio.core.instagram_profile_pool import ProfilePool
+from nicheflow_studio.core.paths import downloads_dir
 from nicheflow_studio.db import assignments as assignments_db, pools
-from nicheflow_studio.db.models import Account, Assignment
+from nicheflow_studio.db.media_library import mark_media_asset_downloaded
+from nicheflow_studio.db.models import (
+    Account,
+    Assignment,
+    DownloadItem,
+    MediaAsset,
+    PoolItem,
+)
 from nicheflow_studio.db.session import get_session
+from nicheflow_studio.downloader.instagram import download_instagram_url
 from nicheflow_studio.services.errors import ServiceError
+
+logger = logging.getLogger(__name__)
 
 # The shared-pool niches (docs/SOURCING_POOLING_PLAN.md). Kept explicit so the
 # overview is stable even before any pool rows exist.
@@ -30,6 +43,114 @@ NICHES = ("history", "movie")
 
 class PoolingError(ServiceError):
     """Raised for invalid pooling queries (e.g. an unknown niche)."""
+
+
+def _asset_is_downloaded(asset: MediaAsset) -> bool:
+    return bool(
+        asset.download_status == "downloaded"
+        and asset.original_download_path
+        and Path(asset.original_download_path).exists()
+    )
+
+
+def _download_error_message(exc: Exception) -> str:
+    message = next((line.strip() for line in str(exc).splitlines() if line.strip()), "")
+    return message.removeprefix("ERROR:").strip()[:200] or exc.__class__.__name__
+
+
+def _ensure_pool_item_downloaded(pool_item_id: int) -> None:
+    """Materialize a pool item's shared asset before it can be assigned."""
+    with get_session() as session:
+        pool_item = session.get(PoolItem, pool_item_id)
+        if pool_item is None:
+            raise PoolingError(f"No pool item with id {pool_item_id}.")
+        asset = session.get(MediaAsset, pool_item.media_asset_id)
+        if asset is None:
+            raise PoolingError(f"Pool item {pool_item_id} has no media asset.")
+        if _asset_is_downloaded(asset):
+            return
+        asset_id = asset.id
+        source_url = asset.canonical_source_url
+
+    try:
+        result = download_instagram_url(
+            url=source_url,
+            output_dir=downloads_dir() / "instagram",
+        )
+        file_path = Path(str(result.file_path))
+        if not file_path.exists():
+            raise FileNotFoundError(f"Downloader returned a missing file: {file_path}")
+    except Exception as exc:  # noqa: BLE001 - convert to a user-facing service error
+        raise PoolingError(
+            f"Could not download this clip before distribution: {_download_error_message(exc)}"
+        ) from exc
+
+    with get_session() as session:
+        asset = session.get(MediaAsset, asset_id)
+        if asset is None:
+            raise PoolingError(f"Media asset {asset_id} disappeared during download.")
+        mark_media_asset_downloaded(
+            asset,
+            original_download_path=str(file_path),
+            file_size_bytes=file_path.stat().st_size,
+        )
+        session.commit()
+
+
+def _unassigned_pool_item_ids(niche: str) -> list[int]:
+    """Currently unassigned accepted pool item ids for a niche (no download).
+
+    Distribution ranks and assigns from these immediately; the chosen clips'
+    footage is fetched off the request path by :func:`_start_background_download`
+    so the screen never blocks on downloads.
+    """
+    try:
+        with get_session() as session:
+            already = assignments_db.assigned_pool_item_ids(session, niche)
+            return [
+                item.id
+                for item in pools.pool_items_for_niche(session, niche)
+                if item.id not in already
+            ]
+    except ValueError as exc:
+        raise PoolingError(str(exc)) from exc
+
+
+# Heavy IG downloads are serialized so a burst of distributions (or overlapping
+# background workers) never opens several browsers/yt-dlp runs at once.
+_DOWNLOAD_LOCK = threading.Lock()
+
+
+def _download_pool_assets(pool_item_ids: list[int]) -> None:
+    """Download any not-yet-downloaded footage for these pool items, then link it
+    onto the pending-review Processing rows. Synchronous; best-effort per clip."""
+    downloaded_any = False
+    for pool_item_id in pool_item_ids:
+        with _DOWNLOAD_LOCK:
+            try:
+                _ensure_pool_item_downloaded(pool_item_id)
+                downloaded_any = True
+            except PoolingError as exc:
+                logger.warning("Background pool download failed for %s: %s", pool_item_id, exc)
+    if downloaded_any:
+        try:
+            repair_pending_review_media_links()
+        except Exception:  # noqa: BLE001 - background backfill must not crash the worker
+            logger.exception("Linking downloaded footage to pending-review items failed.")
+
+
+def _start_background_download(pool_item_ids: list[int]) -> None:
+    """Fetch the assigned clips' footage on a daemon thread so distribution
+    returns instantly. Already-downloaded clips are skipped cheaply."""
+    ids = [int(pool_item_id) for pool_item_id in pool_item_ids]
+    if not ids:
+        return
+    threading.Thread(
+        target=_download_pool_assets,
+        args=(ids,),
+        name="nicheflow-pool-download",
+        daemon=True,
+    ).start()
 
 
 def _iso(value: dt.datetime | None) -> str | None:
@@ -191,6 +312,7 @@ def distribute_clip(pool_item_id: int, account_ids: list[int]) -> dict:
     clip are skipped).
     """
     cleaned = [int(account_id) for account_id in (account_ids or [])]
+    _ensure_pool_item_downloaded(pool_item_id)
     with get_session() as session:
         try:
             created = assignments_db.assign_pool_item_to_accounts(
@@ -202,29 +324,75 @@ def distribute_clip(pool_item_id: int, account_ids: list[int]) -> dict:
         return {"pool_item_id": pool_item_id, "assigned": len(created)}
 
 
-def distribute_niche(niche: str, max_per_account: int | None = None) -> dict:
+# Health states that mean an account cannot publish AT ALL — no Instagram
+# profile assigned, or a profile that has never been logged in. Distinct from
+# merely aging (warn/stale) or cooling down, which a re-login fixes without
+# touching the backlog.
+_UNPUBLISHABLE_STATES = {HealthState.NOT_CONFIGURED, HealthState.NO_SESSION}
+
+
+def _publishable_accounts(accounts: list[Account]) -> list[Account]:
+    """Accounts that could ever publish: profile assigned + a recorded login.
+
+    Reuses the network-free readiness signal behind the publishing dashboard
+    (blank profile → NOT_CONFIGURED, no saved session → NO_SESSION) so
+    "assignable" can't drift from "publishable". Cheap enough for the hourly
+    top-up tick: it only reads local profile files, never the network.
+    """
+    pool = ProfilePool.load()
+    ready: list[Account] = []
+    for account in accounts:
+        profile = (account.instagram_profile or "").strip()
+        if not profile:
+            continue
+        if local_health(profile, account.name, pool=pool).state in _UNPUBLISHABLE_STATES:
+            continue
+        ready.append(account)
+    return ready
+
+
+def distribute_niche(
+    niche: str,
+    max_per_account: int | None = None,
+    *,
+    publish_ready_only: bool = False,
+) -> dict:
     """Auto-distribute a niche's undistributed pool across its accounts.
 
     Ranks the unassigned pool by intrinsic engagement (likes + recency), spreads
     the strongest clips one-per-account (volume-balanced, jittered within score
     tiers so accounts don't all get the same top clip), and tops each account up
-    to each account's cadence-based total target. An explicit
-    ``max_per_account`` remains a uniform override. Idempotent:
-    re-running only places clips for accounts still under target and never
-    double-books a clip. Returns how many assignments were created, a per-account
+    to its rolling ``distribute_daily_target`` (how many unposted clips to keep
+    ready; module default when unset). An explicit ``max_per_account`` remains a
+    uniform override. Idempotent: re-running only places clips for accounts still
+    under target and never double-books a clip. The chosen clips' footage is
+    fetched in the background, so this returns without waiting on downloads.
+
+    With ``publish_ready_only=True`` (the automatic top-up path) accounts whose
+    Instagram profile is missing or has never been logged in receive nothing,
+    so pool clips are never locked behind a queue that can't post them. The
+    manual Distribute flows keep the default ``False`` — pre-stocking an
+    account before its first login stays an explicit user choice.
+
+    Returns how many assignments were created, a per-account
     breakdown, and a ``reason`` string when assigned is 0 so the caller can show
     a specific message instead of a generic one:
     - ``"no_accounts"``  — no accounts are in this niche yet.
+    - ``"no_ready_accounts"`` — accounts exist, but none are publish-ready
+      (only with ``publish_ready_only=True``).
     - ``"all_at_cap"``   — every account already holds its target clips.
     - ``"pool_empty"``   — all accepted clips are already assigned.
     """
+    eligible_pool_item_ids = _unassigned_pool_item_ids(niche)
     with get_session() as session:
         accounts = session.query(Account).filter(Account.niche == niche).all()
+        if publish_ready_only:
+            accounts = _publishable_accounts(accounts)
         targets = {
             account.id: (
                 max_per_account
                 if max_per_account is not None
-                else target_backlog(account.daily_posts_target)
+                else (account.distribute_daily_target or DEFAULT_DISTRIBUTE_DAILY_TARGET)
             )
             for account in accounts
         }
@@ -233,21 +401,30 @@ def distribute_niche(niche: str, max_per_account: int | None = None) -> dict:
                 session,
                 niche,
                 max_per_account=max_per_account,
-                targets_by_account=None if max_per_account is not None else targets,
+                # targets_by_account doubles as the DB layer's account filter,
+                # so it must be passed whenever the ready-only filter applies.
+                targets_by_account=(
+                    targets if (max_per_account is None or publish_ready_only) else None
+                ),
+                eligible_pool_item_ids=eligible_pool_item_ids,
             )
         except ValueError as exc:  # unknown niche from _validate_niche
             raise PoolingError(str(exc)) from exc
+
+        created_pool_item_ids = [assignment.pool_item_id for assignment in created]
 
         reason: str | None = None
         if not created:
             acct_ids = assignments_db.account_ids_for_niche(session, niche)
             if not acct_ids:
                 reason = "no_accounts"
+            elif not targets:
+                reason = "no_ready_accounts"
             else:
                 existing = assignments_db.assignment_counts_by_account(session, niche)
                 reason = (
                     "all_at_cap"
-                    if all(existing.get(a, 0) >= targets[a] for a in acct_ids)
+                    if all(existing.get(a, 0) >= target for a, target in targets.items())
                     else "pool_empty"
                 )
 
@@ -274,7 +451,7 @@ def distribute_niche(niche: str, max_per_account: int | None = None) -> dict:
             if max_per_account is not None
             else next(iter(unique_targets))
             if len(unique_targets) == 1
-            else target_backlog()
+            else DEFAULT_DISTRIBUTE_DAILY_TARGET
             if not unique_targets
             else None
         )
@@ -293,29 +470,26 @@ def distribute_niche(niche: str, max_per_account: int | None = None) -> dict:
                 }
                 for account_id, count in sorted(per_account.items(), key=lambda kv: -kv[1])
             ],
+            "download_failures": 0,
         }
         if reason is not None:
             result["reason"] = reason
-        return result
-
-
-# Auto top-up hysteresis: refill a niche only once SOME account drops below
-# this many days of backlog, then fill every account to its full target.
-# Refilling in multi-day batches (instead of one clip per posted reel) keeps
-# the ranked, tier-shuffled batching meaningful and the assignment pattern
-# unmetronomic.
-AUTO_TOP_UP_LOW_WATER_DAYS = 3
+    _start_background_download(created_pool_item_ids)
+    return result
 
 
 def auto_top_up(niches: tuple[str, ...] | None = None) -> list[dict]:
-    """Refill under-stocked niches; the background-loop entry point.
+    """Maintain each niche's rolling distribution backlog; the loop entry point.
 
-    For each niche with accounts: when any account's pending backlog has
-    fallen below ``daily target x AUTO_TOP_UP_LOW_WATER_DAYS``, run the normal
-    ranked distribution (which tops every account up to its full cadence
-    target). Niches where everyone still has runway are left untouched, so
-    this is cheap to call on a timer. Returns one distribute result per niche
-    that was refilled.
+    For each niche with accounts: when any account holds fewer than its
+    ``distribute_daily_target`` ready clips, run the normal ranked distribution
+    (which tops every account back up to its target). As posts and rejects drain
+    the backlog the next tick refills it, so each account keeps about its target
+    of clips ready without ballooning. Niches where everyone is still topped up
+    are left untouched, so this is cheap to call on a timer. Only publish-ready
+    accounts count: an account with no usable browser profile must neither
+    trigger a refill nor receive clips (it would lock pool clips behind a queue
+    that can never post). Returns one distribute result per niche refilled.
     """
     results: list[dict] = []
     for niche in niches or NICHES:
@@ -323,24 +497,221 @@ def auto_top_up(niches: tuple[str, ...] | None = None) -> list[dict]:
             accounts = session.query(Account).filter(Account.niche == niche).all()
             if not accounts:
                 continue
+            accounts = _publishable_accounts(accounts)
+            if not accounts:
+                continue
             counts = assignments_db.assignment_counts_by_account(session, niche)
-            below_low_water = any(
+            below_target = any(
                 counts.get(account.id, 0)
-                < (account.daily_posts_target or DEFAULT_DAILY_POSTS_PER_ACCOUNT)
-                * AUTO_TOP_UP_LOW_WATER_DAYS
+                < (account.distribute_daily_target or DEFAULT_DISTRIBUTE_DAILY_TARGET)
                 for account in accounts
             )
-        if below_low_water:
-            results.append(distribute_niche(niche))
+        if below_target:
+            results.append(distribute_niche(niche, publish_ready_only=True))
     return results
 
 
+def release_unpublishable_assignments(
+    niches: tuple[str, ...] | None = None, *, dry_run: bool = False
+) -> dict:
+    """Release pool clips locked on accounts that can never publish them.
+
+    Remediation for assignments created before the top-up tick gained its
+    publish-ready filter: accounts whose Instagram profile is missing or was
+    never logged in got booked up to their full target, and because ANY
+    assignment row marks a pool item as distributed
+    (:func:`assignments_db.assigned_pool_item_ids`), those clips could never be
+    redistributed to real accounts. For each such account this deletes its
+    still-``assigned`` rows plus the pending_review DownloadItems created
+    alongside them; ``posted`` / ``skipped_duplicate`` rows are history and stay
+    untouched. With ``dry_run=True`` it only reports what would be released.
+    """
+    summary: list[dict] = []
+    total_assignments = 0
+    total_items = 0
+    with get_session() as session:
+        for niche in niches or NICHES:
+            accounts = session.query(Account).filter(Account.niche == niche).all()
+            ready_ids = {account.id for account in _publishable_accounts(accounts)}
+            for account in accounts:
+                if account.id in ready_ids:
+                    continue
+                assignments = (
+                    session.query(Assignment)
+                    .filter(
+                        Assignment.account_id == account.id,
+                        Assignment.status == assignments_db.ASSIGNMENT_STATUS_ASSIGNED,
+                    )
+                    .all()
+                )
+                if not assignments:
+                    continue
+                deleted_items = 0
+                for assignment in assignments:
+                    pool_item = session.get(PoolItem, assignment.pool_item_id)
+                    asset = (
+                        session.get(MediaAsset, pool_item.media_asset_id)
+                        if pool_item is not None
+                        else None
+                    )
+                    if asset is not None:
+                        # Only the untouched pending_review rows that
+                        # _create_pending_review_item made for this assignment;
+                        # anything the user advanced past review is kept.
+                        pending_items = (
+                            session.query(DownloadItem)
+                            .filter(
+                                DownloadItem.account_id == account.id,
+                                DownloadItem.source_url == asset.canonical_source_url,
+                                DownloadItem.status == "pending_review",
+                            )
+                            .all()
+                        )
+                        deleted_items += len(pending_items)
+                        if not dry_run:
+                            for item in pending_items:
+                                session.delete(item)
+                    if not dry_run:
+                        session.delete(assignment)
+                summary.append(
+                    {
+                        "account_id": account.id,
+                        "account_name": account.name,
+                        "niche": niche,
+                        "assignments": len(assignments),
+                        "pending_items": deleted_items,
+                    }
+                )
+                total_assignments += len(assignments)
+                total_items += deleted_items
+        if not dry_run:
+            session.commit()
+    return {
+        "dry_run": dry_run,
+        "released_assignments": total_assignments,
+        "deleted_pending_items": total_items,
+        "accounts": summary,
+    }
+
+
+def release_missing_media_assignments(
+    niches: tuple[str, ...] | None = None, *, dry_run: bool = False
+) -> dict:
+    """Release untouched legacy assignments whose shared media is missing.
+
+    Distribution now downloads a pool asset before assigning it, but assignments
+    created before that guard can still expose a pending-review Processing row
+    with no local file. Release only assignments with no progressed DownloadItem;
+    completed/drafted work is preserved for manual recovery.
+    """
+    released: list[dict] = []
+    total_assignments = 0
+    total_items = 0
+    with get_session() as session:
+        query = session.query(Assignment).filter(
+            Assignment.status == assignments_db.ASSIGNMENT_STATUS_ASSIGNED
+        )
+        if niches is not None:
+            query = query.filter(Assignment.niche.in_(niches))
+        for assignment in query.all():
+            pool_item = session.get(PoolItem, assignment.pool_item_id)
+            asset = (
+                session.get(MediaAsset, pool_item.media_asset_id)
+                if pool_item is not None
+                else None
+            )
+            if asset is not None and _asset_is_downloaded(asset):
+                continue
+
+            source_url = asset.canonical_source_url if asset is not None else None
+            matching_items = (
+                session.query(DownloadItem)
+                .filter(
+                    DownloadItem.account_id == assignment.account_id,
+                    DownloadItem.source_url == source_url,
+                )
+                .all()
+                if source_url is not None
+                else []
+            )
+            if any(item.status != "pending_review" for item in matching_items):
+                continue
+            pending_items = [
+                item for item in matching_items if item.status == "pending_review"
+            ]
+            account = session.get(Account, assignment.account_id)
+            released.append(
+                {
+                    "assignment_id": assignment.id,
+                    "account_id": assignment.account_id,
+                    "account_name": account.name if account is not None else f"#{assignment.account_id}",
+                    "niche": assignment.niche,
+                    "pool_item_id": assignment.pool_item_id,
+                    "shortcode": asset.source_shortcode if asset is not None else None,
+                    "pending_items": len(pending_items),
+                }
+            )
+            total_assignments += 1
+            total_items += len(pending_items)
+            if not dry_run:
+                for item in pending_items:
+                    session.delete(item)
+                session.delete(assignment)
+        if not dry_run:
+            session.commit()
+    return {
+        "dry_run": dry_run,
+        "released_assignments": total_assignments,
+        "deleted_pending_items": total_items,
+        "assignments": released,
+    }
+
+
+def repair_pending_review_media_links(*, dry_run: bool = False) -> dict:
+    """Backfill legacy pending-review rows from their downloaded shared asset."""
+    repaired: list[dict] = []
+    with get_session() as session:
+        pending_items = session.query(DownloadItem).filter(
+            DownloadItem.status == "pending_review"
+        ).all()
+        for item in pending_items:
+            if item.file_path and Path(item.file_path).exists():
+                continue
+            asset = (
+                session.query(MediaAsset)
+                .filter(MediaAsset.source_shortcode == item.video_id)
+                .first()
+                if item.video_id
+                else None
+            )
+            if asset is None or not _asset_is_downloaded(asset):
+                continue
+            repaired.append(
+                {
+                    "item_id": item.id,
+                    "account_id": item.account_id,
+                    "shortcode": asset.source_shortcode,
+                    "file_path": asset.original_download_path,
+                }
+            )
+            if not dry_run:
+                item.file_path = asset.original_download_path
+        if not dry_run:
+            session.commit()
+    return {"dry_run": dry_run, "repaired_items": len(repaired), "items": repaired}
+
+
 def distribute_niche_explicit(niche: str, targets_by_account: dict[int, int]) -> dict:
-    """Add explicit clip counts to selected accounts, ignoring cadence targets."""
+    """Add explicit clip counts to selected accounts, ignoring cadence targets.
+
+    The chosen clips' footage is fetched in the background, so this returns
+    without waiting on downloads.
+    """
     requested = {
         int(account_id): max(0, int(target))
         for account_id, target in (targets_by_account or {}).items()
     }
+    eligible_pool_item_ids = _unassigned_pool_item_ids(niche)
     with get_session() as session:
         existing = assignments_db.assignment_counts_by_account(session, niche)
         total_targets = {
@@ -349,10 +720,14 @@ def distribute_niche_explicit(niche: str, targets_by_account: dict[int, int]) ->
         }
         try:
             created = assignments_db.distribute_niche(
-                session, niche, targets_by_account=total_targets
+                session,
+                niche,
+                targets_by_account=total_targets,
+                eligible_pool_item_ids=eligible_pool_item_ids,
             )
         except ValueError as exc:
             raise PoolingError(str(exc)) from exc
+        created_pool_item_ids = [row.pool_item_id for row in created]
         assigned = Counter(row.account_id for row in created)
         pinned = Counter(
             row.account_id
@@ -364,11 +739,12 @@ def distribute_niche_explicit(niche: str, targets_by_account: dict[int, int]) ->
             for account in session.query(Account).filter(Account.id.in_(list(requested))).all()
         }
         session.commit()
-        return {
+        result = {
             "niche": niche,
             "assigned": len(created),
             "pinned": sum(pinned.values()),
             "max_per_account": None,
+            "download_failures": 0,
             "accounts": [
                 {
                     "account_id": account_id,
@@ -380,3 +756,5 @@ def distribute_niche_explicit(niche: str, targets_by_account: dict[int, int]) ->
                 for account_id, target in requested.items()
             ],
         }
+    _start_background_download(created_pool_item_ids)
+    return result

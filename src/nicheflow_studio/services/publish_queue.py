@@ -161,6 +161,9 @@ def reschedule(job_id: int, scheduled_at: str) -> dict:
             raise PublishQueueError("This job is already posted; it cannot be rescheduled.")
         job.scheduled_at = when
         job.status = "scheduled"
+        # Rescheduling revives failed jobs too — clear the old error so the
+        # next attempt gets its one automatic retry again.
+        job.error_message = None
         account = session.get(Account, job.account_id)
         session.commit()
         return _job_view(job, account.name if account else None)
@@ -174,6 +177,7 @@ def unschedule(job_id: int) -> dict:
             raise PublishQueueError("This job is already posted; it cannot be unscheduled.")
         job.scheduled_at = None
         job.status = "draft"
+        job.error_message = None
         account = session.get(Account, job.account_id)
         session.commit()
         return _job_view(job, account.name if account else None)

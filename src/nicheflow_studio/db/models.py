@@ -61,6 +61,11 @@ class Account(Base):
     upload_default_privacy: Mapped[str | None] = mapped_column(String(32), nullable=True)
     upload_schedule_slots: Mapped[str | None] = mapped_column(String(512), nullable=True)
     daily_posts_target: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Rolling distribution backlog kept ready per account: auto-distribute / the
+    # hourly top-up maintain about this many unposted clips, replenishing as
+    # posts and rejects drain it. None -> module default. Decoupled from posting
+    # cadence so the review funnel can hold a few more than it posts.
+    distribute_daily_target: Mapped[int | None] = mapped_column(Integer, nullable=True)
     auto_schedule_on_export: Mapped[bool] = mapped_column(Boolean, default=False)
     upload_made_for_kids: Mapped[int] = mapped_column(Integer, default=0)
     upload_contains_synthetic_media: Mapped[int] = mapped_column(Integer, default=0)

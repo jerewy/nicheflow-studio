@@ -45,6 +45,39 @@ def test_global_publish_jobs_and_mark_ready(tmp_path: Path) -> None:
     assert next(row for row in updated["jobs"] if row["id"] == job_id)["status"] == "ready"
 
 
+def test_global_publish_jobs_keeps_failed_jobs_visible_past_cutoff(tmp_path: Path) -> None:
+    job_id = _seed_job(tmp_path, status="failed")
+    with get_session() as session:
+        job = session.get(UploadJob, job_id)
+        # Older than the 24h recency cutoff that hides stale draft jobs.
+        job.created_at = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None) - dt.timedelta(
+            days=3
+        )
+        job.error_message = "not logged in (no sessionid); re-login required"
+        session.commit()
+
+    result = publishing_dashboard.list_global_publish_jobs()
+
+    row = next(row for row in result["jobs"] if row["id"] == job_id)
+    assert row["status"] == "failed"
+    assert row["error_message"] == "not logged in (no sessionid); re-login required"
+    assert result["failed"] == 1
+
+
+def test_mark_ready_clears_failure_state(tmp_path: Path) -> None:
+    job_id = _seed_job(tmp_path, status="failed")
+    with get_session() as session:
+        session.get(UploadJob, job_id).error_message = "could not find the caption field"
+        session.commit()
+
+    assert publishing_dashboard.mark_ready([job_id]) == {"updated": 1}
+
+    with get_session() as session:
+        job = session.get(UploadJob, job_id)
+        assert job.status == "ready"
+        assert job.error_message is None
+
+
 def test_global_publish_jobs_orders_nearest_schedule_first(tmp_path: Path) -> None:
     with get_session() as session:
         account = Account(name="History Daily", platform="instagram")

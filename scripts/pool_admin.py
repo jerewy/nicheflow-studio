@@ -65,6 +65,11 @@ from nicheflow_studio.db.pools import (  # noqa: E402
     restore_pool_item,
 )
 from nicheflow_studio.db.session import get_session, init_db  # noqa: E402
+from nicheflow_studio.services.pooling import (  # noqa: E402
+    repair_pending_review_media_links,
+    release_missing_media_assignments,
+    release_unpublishable_assignments,
+)
 from nicheflow_studio.downloader.instagram import instagram_shortcode_from_url  # noqa: E402
 from nicheflow_studio.processing.dedup import (  # noqa: E402
     compute_video_fingerprint,
@@ -370,6 +375,62 @@ def cmd_distribute(args) -> None:
             print(f"  {_account_name(session, account_id):24} {count}")
 
 
+def cmd_release_unpublishable(args) -> None:
+    """Free pool clips locked as 'assigned' on accounts that can't publish.
+
+    Cleans up after the pre-fix top-up tick that booked clips onto accounts
+    with no Instagram profile or no recorded login: deletes those accounts'
+    'assigned' rows and their untouched pending_review items, so the clips
+    become distributable to publish-ready accounts again. posted /
+    skipped_duplicate rows are never touched.
+    """
+    result = release_unpublishable_assignments(dry_run=args.dry_run)
+    if not result["accounts"]:
+        print("Nothing to release: no 'assigned' rows on unpublishable accounts.")
+        return
+    prefix = "[dry-run] " if args.dry_run else ""
+    verb = "Would release" if args.dry_run else "Released"
+    for row in result["accounts"]:
+        print(
+            f"  {row['niche']:8} {row['account_name']:24} "
+            f"assignments={row['assignments']} pending_items={row['pending_items']}"
+        )
+    print(
+        f"{prefix}{verb} {result['released_assignments']} assignment(s) and "
+        f"{result['deleted_pending_items']} pending-review item(s); the clips are "
+        f"distributable to publish-ready accounts again."
+    )
+
+
+def cmd_release_missing_media(args) -> None:
+    """Free legacy assignments whose shared media was never downloaded."""
+    result = release_missing_media_assignments(dry_run=args.dry_run)
+    if not result["assignments"]:
+        print("Nothing to release: every assigned clip has local media or progressed work.")
+        return
+    prefix = "[dry-run] " if args.dry_run else ""
+    verb = "Would release" if args.dry_run else "Released"
+    for row in result["assignments"]:
+        print(
+            f"  {row['niche']:8} {row['account_name']:24} "
+            f"assignment=#{row['assignment_id']} pool=#{row['pool_item_id']} "
+            f"shortcode={row['shortcode'] or '-'} pending_items={row['pending_items']}"
+        )
+    print(
+        f"{prefix}{verb} {result['released_assignments']} assignment(s) and "
+        f"{result['deleted_pending_items']} untouched pending-review item(s); "
+        f"the pool clips can be retried by the guarded distribution flow."
+    )
+
+
+def cmd_repair_pending_media(args) -> None:
+    """Backfill legacy pending-review rows from downloaded shared assets."""
+    result = repair_pending_review_media_links(dry_run=args.dry_run)
+    prefix = "[dry-run] " if args.dry_run else ""
+    verb = "Would repair" if args.dry_run else "Repaired"
+    print(f"{prefix}{verb} {result['repaired_items']} pending-review media link(s).")
+
+
 def main() -> None:
     init_db()
     parser = argparse.ArgumentParser(description="NicheFlow pool admin / UAT harness.")
@@ -419,6 +480,24 @@ def main() -> None:
     p_dist.add_argument("--niche", required=True, choices=NICHES)
     p_dist.add_argument("--max-per-account", type=int, default=None)
 
+    p_release = sub.add_parser(
+        "release-unpublishable",
+        help="Delete 'assigned' rows (+ pending-review items) on accounts that can't publish.",
+    )
+    p_release.add_argument("--dry-run", action="store_true", help="Report only; write nothing.")
+
+    p_release_missing = sub.add_parser(
+        "release-missing-media",
+        help="Release legacy assignments whose shared media is missing.",
+    )
+    p_release_missing.add_argument("--dry-run", action="store_true", help="Report only; write nothing.")
+
+    p_repair_pending = sub.add_parser(
+        "repair-pending-media",
+        help="Link legacy pending-review rows to downloaded shared media.",
+    )
+    p_repair_pending.add_argument("--dry-run", action="store_true", help="Report only; write nothing.")
+
     args = parser.parse_args()
     {
         "status": cmd_status,
@@ -432,6 +511,9 @@ def main() -> None:
         "pool-remove": cmd_pool_remove,
         "pool-restore": cmd_pool_restore,
         "distribute": cmd_distribute,
+        "release-unpublishable": cmd_release_unpublishable,
+        "release-missing-media": cmd_release_missing_media,
+        "repair-pending-media": cmd_repair_pending_media,
     }[args.command](args)
 
 

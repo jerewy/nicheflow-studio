@@ -74,6 +74,66 @@ def test_publish_item_now_marks_posted(monkeypatch: pytest.MonkeyPatch) -> None:
         assert job.posted_url == "https://instagram.com/p/XYZ/"
 
 
+def _add_recent_post(account_id: int, *, minutes_ago: int) -> None:
+    """Record a prior posted job for the account, ``minutes_ago`` in the past."""
+    with get_session() as session:
+        session.add(
+            UploadJob(
+                account_id=account_id,
+                processed_path="C:/old.mp4",
+                status="posted",
+                posted_at=dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=minutes_ago),
+            )
+        )
+        session.commit()
+
+
+def test_publish_item_now_defers_when_account_posted_recently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account_id = _make_account()
+    _add_recent_post(account_id, minutes_ago=30)  # inside the 4h recency window
+    item_id = _make_exported_item(account_id)
+    posted = {"called": False}
+
+    def fake(*_args):
+        posted["called"] = True
+        return _fake_result("posted")
+
+    monkeypatch.setattr(publish_now, "_do_publish_reel", fake)
+
+    result = publish_now.publish_item_now(item_id)
+
+    # Refused: returns the recency details and posts nothing.
+    assert result["status"] == "on_cooldown"
+    assert result["account_name"] == "Past Moments"
+    assert "recommended_next_at" in result
+    assert posted["called"] is False
+    with get_session() as session:
+        job = session.scalars(
+            select(UploadJob).where(UploadJob.download_item_id == item_id)
+        ).first()
+        assert job.posted_at is None
+
+
+def test_publish_item_now_allow_recent_overrides_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account_id = _make_account()
+    _add_recent_post(account_id, minutes_ago=30)
+    item_id = _make_exported_item(account_id)
+    monkeypatch.setattr(
+        publish_now,
+        "_do_publish_reel",
+        lambda *_args: _fake_result("posted", posted_url="https://instagram.com/p/OK/"),
+    )
+
+    result = publish_now.publish_item_now(item_id, allow_recent=True)
+
+    assert result["status"] == "posted"
+    assert result["posted_url"] == "https://instagram.com/p/OK/"
+
+
 def test_posted_job_releases_assignment_and_next_distribute_backfills(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -224,6 +284,63 @@ def _make_due_job(account_id: int, item_id: int, *, path: str = "C:/out.mp4") ->
         return job.id
 
 
+def _make_posted_job(account_id: int, item_id: int, *, posted_at: dt.datetime) -> int:
+    with get_session() as session:
+        job = UploadJob(
+            account_id=account_id,
+            download_item_id=item_id,
+            processed_path="C:/out.mp4",
+            status="posted",
+            posted_at=posted_at,
+        )
+        session.add(job)
+        session.commit()
+        return job.id
+
+
+def test_item_publish_recency_flags_recent_post() -> None:
+    account_id = _make_account()
+    item_id = _make_exported_item(account_id)
+    _make_posted_job(
+        account_id, item_id, posted_at=dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)
+    )
+
+    result = publish_now.item_publish_recency(item_id)
+
+    assert result["on_cooldown"] is True
+    assert result["account_name"] == "Past Moments"
+    assert 55 <= result["minutes_since"] <= 65
+    assert result["recommended_next_at"] is not None
+
+
+def test_item_publish_recency_clear_when_old_or_never() -> None:
+    account_id = _make_account()
+    item_id = _make_exported_item(account_id)
+    # Never posted -> safe to post.
+    assert publish_now.item_publish_recency(item_id)["on_cooldown"] is False
+    # Last post older than the 4h window -> safe to post.
+    _make_posted_job(
+        account_id, item_id, posted_at=dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=5)
+    )
+    assert publish_now.item_publish_recency(item_id)["on_cooldown"] is False
+
+
+def test_due_publish_recency_lists_recent_accounts() -> None:
+    publish_now._account_cooldowns.clear()
+    account_id = _make_account()
+    item_id = _make_exported_item(account_id)
+    _make_posted_job(
+        account_id, item_id, posted_at=dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=2)
+    )
+    _make_due_job(account_id, item_id, path="C:/out2.mp4")
+
+    warnings = publish_now.due_publish_recency()
+
+    assert len(warnings) == 1
+    assert warnings[0]["account_id"] == account_id
+    assert warnings[0]["account_name"] == "Past Moments"
+
+
 def test_failed_scheduled_job_retries_once_then_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -290,10 +407,14 @@ def test_checkpoint_fails_job_and_pauses_account(monkeypatch: pytest.MonkeyPatch
 
 def test_randomized_gap_between_batch_posts(monkeypatch: pytest.MonkeyPatch) -> None:
     publish_now._account_cooldowns.clear()
-    account_id = _make_account()
-    item_id = _make_exported_item(account_id)
-    _make_due_job(account_id, item_id, path="C:/out1.mp4")
-    _make_due_job(account_id, item_id, path="C:/out2.mp4")
+    # Two DIFFERENT accounts so both post — two same-account jobs would now defer.
+    # The randomized gap is the anti-correlation pause between consecutive posts.
+    account_a = _make_account()
+    account_b = _make_account()
+    item_a = _make_exported_item(account_a)
+    item_b = _make_exported_item(account_b)
+    _make_due_job(account_a, item_a, path="C:/out1.mp4")
+    _make_due_job(account_b, item_b, path="C:/out2.mp4")
     sleeps: list[float] = []
     monkeypatch.setattr(
         publish_now, "_do_publish_reel", lambda p, v, c: _fake_result("posted", posted_url="u")
@@ -307,6 +428,103 @@ def test_randomized_gap_between_batch_posts(monkeypatch: pytest.MonkeyPatch) -> 
     assert len(sleeps) == 1
     low, high = publish_now._INTER_POST_GAP_SECONDS
     assert low <= sleeps[0] <= high
+
+
+def test_publish_item_now_spaces_posts_across_accounts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    publish_now._account_cooldowns.clear()
+    # A DIFFERENT account just posted from this machine; posting now must keep a
+    # randomized cross-account gap so the two don't land back-to-back.
+    other_id = _make_account()
+    _make_posted_job(
+        other_id, _make_exported_item(other_id), posted_at=dt.datetime.now(dt.timezone.utc)
+    )
+    account_id = _make_account()
+    item_id = _make_exported_item(account_id)
+    sleeps: list[float] = []
+    monkeypatch.setattr(
+        publish_now, "_do_publish_reel", lambda p, v, c: _fake_result("posted", posted_url="u")
+    )
+    monkeypatch.setattr(publish_now, "_sleep", sleeps.append)
+
+    result = publish_now.publish_item_now(item_id)
+
+    assert result["status"] == "posted"
+    assert len(sleeps) == 1
+    low, high = publish_now._INTER_POST_GAP_SECONDS
+    assert low <= sleeps[0] <= high
+
+
+def test_publish_item_now_no_spacing_when_other_account_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    publish_now._account_cooldowns.clear()
+    # The other account's last post is well outside the gap window -> no extra wait.
+    other_id = _make_account()
+    _make_posted_job(
+        other_id,
+        _make_exported_item(other_id),
+        posted_at=dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=30),
+    )
+    account_id = _make_account()
+    item_id = _make_exported_item(account_id)
+    sleeps: list[float] = []
+    monkeypatch.setattr(
+        publish_now, "_do_publish_reel", lambda p, v, c: _fake_result("posted", posted_url="u")
+    )
+    monkeypatch.setattr(publish_now, "_sleep", sleeps.append)
+
+    result = publish_now.publish_item_now(item_id)
+
+    assert result["status"] == "posted"
+    assert sleeps == []
+
+
+def test_publish_due_defers_second_same_account_job(monkeypatch: pytest.MonkeyPatch) -> None:
+    publish_now._account_cooldowns.clear()
+    # The backlog scenario: two due jobs for ONE account both come due at once.
+    account_id = _make_account()
+    item_id = _make_exported_item(account_id)
+    _make_due_job(account_id, item_id, path="C:/out1.mp4")
+    _make_due_job(account_id, item_id, path="C:/out2.mp4")
+    monkeypatch.setattr(
+        publish_now, "_do_publish_reel", lambda p, v, c: _fake_result("posted", posted_url="u")
+    )
+    monkeypatch.setattr(publish_now, "_sleep", lambda s: None)
+
+    summary = publish_now.publish_due_jobs()
+
+    # First posts; the second is deferred (not posted) to a safe future slot.
+    assert summary["posted"] == 1
+    assert summary["deferred"] == 1
+    with get_session() as session:
+        statuses = sorted(j.status for j in session.scalars(select(UploadJob)).all())
+        assert statuses == ["posted", "scheduled"]
+        deferred = session.scalars(
+            select(UploadJob).where(UploadJob.status == "scheduled")
+        ).first()
+        assert deferred.scheduled_at.replace(tzinfo=dt.timezone.utc) > dt.datetime.now(
+            dt.timezone.utc
+        )
+
+
+def test_publish_due_allow_recent_posts_all(monkeypatch: pytest.MonkeyPatch) -> None:
+    publish_now._account_cooldowns.clear()
+    # "Publish anyway" from the dialog: the same-account gap is bypassed.
+    account_id = _make_account()
+    item_id = _make_exported_item(account_id)
+    _make_due_job(account_id, item_id, path="C:/out1.mp4")
+    _make_due_job(account_id, item_id, path="C:/out2.mp4")
+    monkeypatch.setattr(
+        publish_now, "_do_publish_reel", lambda p, v, c: _fake_result("posted", posted_url="u")
+    )
+    monkeypatch.setattr(publish_now, "_sleep", lambda s: None)
+
+    summary = publish_now.publish_due_jobs(allow_recent=True)
+
+    assert summary["posted"] == 2
+    assert summary["deferred"] == 0
 
 
 def test_auto_publish_toggle() -> None:

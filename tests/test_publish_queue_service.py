@@ -93,6 +93,21 @@ def test_reschedule_then_unschedule() -> None:
     assert cleared["scheduled_at"] is None
 
 
+def test_reschedule_failed_job_revives_it_and_clears_error() -> None:
+    job_id = _make_job(status="failed")
+    with get_session() as session:
+        session.get(UploadJob, job_id).error_message = "not logged in"
+        session.commit()
+
+    result = publish_queue.reschedule(job_id, "2026-08-01T20:00:00")
+
+    assert result["status"] == "scheduled"
+    with get_session() as session:
+        # The retry budget in publish_now keys off error_message; a revived job
+        # must start clean or its next failure skips the automatic retry.
+        assert session.get(UploadJob, job_id).error_message is None
+
+
 def test_reschedule_posted_job_raises() -> None:
     job_id = _make_job()
     publish_queue.mark_posted(job_id, {})

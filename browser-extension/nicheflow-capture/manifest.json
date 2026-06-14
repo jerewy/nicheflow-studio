@@ -1,13 +1,17 @@
 {
   "manifest_version": 3,
   "name": "NicheFlow Capture",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Send the active Instagram Reel to a NicheFlow shared pool.",
   "permissions": [
     "activeTab",
     "nativeMessaging",
     "notifications",
-    "storage"
+    "storage",
+    "sidePanel"
+  ],
+  "host_permissions": [
+    "https://www.instagram.com/*"
   ],
   "background": {
     "service_worker": "service-worker.js"
@@ -16,9 +20,11 @@
     "128": "icon128.png"
   },
   "action": {
-    "default_title": "Send Reel to NicheFlow pool",
-    "default_icon": "icon128.png",
-    "default_popup": "popup.html"
+    "default_title": "Open NicheFlow Capture",
+    "default_icon": "icon128.png"
+  },
+  "side_panel": {
+    "default_path": "popup.html"
   },
   "options_page": "options.html"
 }

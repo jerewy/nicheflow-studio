@@ -55,11 +55,15 @@ def _iso(value: dt.datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
 
 
-def _derive_status(item: DownloadItem, posted_item_ids: set[int]) -> str:
-    """Workflow status for the Processing table: posted > skipped > exported >
-    draft > new."""
+def _derive_status(
+    item: DownloadItem, posted_item_ids: set[int], failed_item_ids: set[int]
+) -> str:
+    """Workflow status for the Processing table: posted > failed > skipped >
+    exported > draft > new."""
     if item.id in posted_item_ids:
         return "posted"
+    if item.id in failed_item_ids:
+        return "failed"
     if item.status == "pending_review":
         return "pending_review"
     if (item.review_state or "").lower() in _SKIPPED_REVIEW_STATES:
@@ -85,6 +89,18 @@ def list_items(account_id: int | None = None, limit: int = _LIST_LIMIT) -> list[
             ).all()
             if row is not None
         }
+        # Items whose publish attempt failed and was never revived — the table
+        # must surface these so the user knows to republish.
+        failed_item_ids = {
+            row
+            for row in session.scalars(
+                select(UploadJob.download_item_id)
+                .where(UploadJob.download_item_id.is_not(None))
+                .where(UploadJob.posted_at.is_(None))
+                .where(UploadJob.status == "failed")
+            ).all()
+            if row is not None
+        }
         query = (
             select(DownloadItem)
             # Globally-rejected ("blocked") items are hidden from Processing.
@@ -95,6 +111,22 @@ def list_items(account_id: int | None = None, limit: int = _LIST_LIMIT) -> list[
         if account_id is not None:
             query = query.where(DownloadItem.account_id == account_id)
         rows = session.scalars(query).all()
+        # Per-account sequence numbers shown as "#N" in the Processing table.
+        # An item's number is its rank among its own account's (non-blocked)
+        # items, oldest = 1, so each niche reads as a clean running count: the
+        # newest item's number == how many clips that account has accumulated.
+        # Computed over ALL items (not just the loaded window) so the number is
+        # stable and accurate even though the list is capped at `limit`. This
+        # replaces exposing the global, gap-ridden primary key.
+        seq_by_item: dict[int, int] = {}
+        account_counters: dict[int | None, int] = {}
+        for seq_id, seq_account_id in session.execute(
+            select(DownloadItem.id, DownloadItem.account_id)
+            .where(DownloadItem.review_state != "blocked")
+            .order_by(DownloadItem.id.asc())
+        ):
+            account_counters[seq_account_id] = account_counters.get(seq_account_id, 0) + 1
+            seq_by_item[seq_id] = account_counters[seq_account_id]
         now = dt.datetime.now(dt.timezone.utc)
         items = []
         for row in rows:
@@ -107,9 +139,10 @@ def list_items(account_id: int | None = None, limit: int = _LIST_LIMIT) -> list[
             items.append(
                 {
                     "id": row.id,
+                    "account_seq": seq_by_item.get(row.id),
                     "title": row.title,
                     "source_url": row.source_url,
-                    "status": _derive_status(row, posted_item_ids),
+                    "status": _derive_status(row, posted_item_ids, failed_item_ids),
                     "raw_status": row.status,
                     "review_state": row.review_state,
                     "file_path": row.file_path,
