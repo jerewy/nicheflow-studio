@@ -56,14 +56,25 @@ def _iso(value: dt.datetime | None) -> str | None:
 
 
 def _derive_status(
-    item: DownloadItem, posted_item_ids: set[int], failed_item_ids: set[int]
+    item: DownloadItem,
+    posted_item_ids: set[int],
+    failed_item_ids: set[int],
+    scheduled_item_ids: set[int],
 ) -> str:
-    """Workflow status for the Processing table: posted > failed > skipped >
-    exported > draft > new."""
+    """Workflow status for the Processing table: posted > failed > scheduled >
+    pending_review > skipped > exported > draft > new.
+
+    ``scheduled`` outranks ``pending_review`` on purpose: auto-distributed clips
+    are exported AND queued for a future post in the background while their
+    ``download_items.status`` is still ``pending_review`` (awaiting the user's
+    review). The live schedule is the more useful thing to surface, so it wins —
+    a clip with no scheduled job still reads ``pending_review`` as before."""
     if item.id in posted_item_ids:
         return "posted"
     if item.id in failed_item_ids:
         return "failed"
+    if item.id in scheduled_item_ids:
+        return "scheduled"
     if item.status == "pending_review":
         return "pending_review"
     if (item.review_state or "").lower() in _SKIPPED_REVIEW_STATES:
@@ -98,6 +109,18 @@ def list_items(account_id: int | None = None, limit: int = _LIST_LIMIT) -> list[
                 .where(UploadJob.download_item_id.is_not(None))
                 .where(UploadJob.posted_at.is_(None))
                 .where(UploadJob.status == "failed")
+            ).all()
+            if row is not None
+        }
+        # Items queued for a future post (not yet posted) — surfaced as
+        # "scheduled" so the table distinguishes them from merely-exported clips.
+        scheduled_item_ids = {
+            row
+            for row in session.scalars(
+                select(UploadJob.download_item_id)
+                .where(UploadJob.download_item_id.is_not(None))
+                .where(UploadJob.posted_at.is_(None))
+                .where(UploadJob.status == "scheduled")
             ).all()
             if row is not None
         }
@@ -142,7 +165,9 @@ def list_items(account_id: int | None = None, limit: int = _LIST_LIMIT) -> list[
                     "account_seq": seq_by_item.get(row.id),
                     "title": row.title,
                     "source_url": row.source_url,
-                    "status": _derive_status(row, posted_item_ids, failed_item_ids),
+                    "status": _derive_status(
+                        row, posted_item_ids, failed_item_ids, scheduled_item_ids
+                    ),
                     "raw_status": row.status,
                     "review_state": row.review_state,
                     "file_path": row.file_path,

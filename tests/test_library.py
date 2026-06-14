@@ -145,6 +145,78 @@ def test_status_derivation_draft_exported_posted() -> None:
     assert by_id[posted] == "posted"
 
 
+def test_status_derivation_scheduled_outranks_exported() -> None:
+    account_id = _make_account()
+    scheduled = _make_item(account_id=account_id)
+    with get_session() as session:
+        session.get(DownloadItem, scheduled).processed_path = "C:/out.mp4"
+        session.add(
+            UploadJob(
+                account_id=account_id,
+                download_item_id=scheduled,
+                processed_path="C:/out.mp4",
+                status="scheduled",
+            )
+        )
+        session.commit()
+
+    by_id = {r["id"]: r["status"] for r in library.list_items(account_id=account_id)}
+    assert by_id[scheduled] == "scheduled"
+
+
+def test_status_derivation_scheduled_outranks_pending_review() -> None:
+    # Auto-distributed clips are exported + scheduled in the background while
+    # their download_items.status is still 'pending_review'. The live schedule
+    # must win so the table shows "Scheduled", not "Pending review".
+    account_id = _make_account()
+    item = _make_item(account_id=account_id)
+    with get_session() as session:
+        row = session.get(DownloadItem, item)
+        row.status = "pending_review"
+        row.processed_path = "C:/out.mp4"
+        session.add(
+            UploadJob(
+                account_id=account_id,
+                download_item_id=item,
+                processed_path="C:/out.mp4",
+                status="scheduled",
+            )
+        )
+        session.commit()
+
+    by_id = {r["id"]: r["status"] for r in library.list_items(account_id=account_id)}
+    assert by_id[item] == "scheduled"
+
+
+def test_status_derivation_posted_outranks_scheduled() -> None:
+    # A scheduled row that has since posted (e.g. a stale schedule left behind)
+    # must read as posted, not scheduled.
+    account_id = _make_account()
+    item = _make_item(account_id=account_id)
+    with get_session() as session:
+        session.get(DownloadItem, item).processed_path = "C:/out.mp4"
+        session.add(
+            UploadJob(
+                account_id=account_id,
+                download_item_id=item,
+                processed_path="C:/out.mp4",
+                status="scheduled",
+            )
+        )
+        session.add(
+            UploadJob(
+                account_id=account_id,
+                download_item_id=item,
+                processed_path="C:/out.mp4",
+                status="posted",
+            )
+        )
+        session.commit()
+
+    by_id = {r["id"]: r["status"] for r in library.list_items(account_id=account_id)}
+    assert by_id[item] == "posted"
+
+
 def test_status_derivation_failed_publish_outranks_exported() -> None:
     account_id = _make_account()
     failed = _make_item(account_id=account_id)

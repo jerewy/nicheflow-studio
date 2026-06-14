@@ -35,6 +35,7 @@ const STATUS_META: Record<string, { label: string; dot: string }> = {
   new: { label: "New", dot: "bg-sky-500" },
   draft: { label: "Draft", dot: "bg-amber-500" },
   exported: { label: "Exported", dot: "bg-violet-500" },
+  scheduled: { label: "Scheduled", dot: "bg-fuchsia-500" },
   posted: { label: "Posted", dot: "bg-emerald-500" },
   skipped: { label: "Skipped", dot: "bg-zinc-500" },
   failed: { label: "Failed", dot: "bg-red-500" },
@@ -174,6 +175,12 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
   // viewing the item they exported (state writes are gated on this).
   const itemIdRef = useRef<number | null>(itemId);
   itemIdRef.current = itemId;
+  // Ref mirror of the active niche account. A background job (export, publish)
+  // captures the account at call time; if the user switches niche while it runs,
+  // its completion must NOT repaint the Videos list with the now-previous
+  // account's items. Completion writes to `items` are gated on this ref.
+  const activeAccountIdRef = useRef(activeAccountId);
+  activeAccountIdRef.current = activeAccountId;
   const exporting = itemId !== null && exportJobs[itemId] !== undefined;
   const exportProgress = itemId !== null ? exportJobs[itemId] ?? null : null;
   // The viewed item's in-flight post message (undefined = not posting). Only the
@@ -212,6 +219,19 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
       .listPublishJobs(id)
       .then(setPublishJobs)
       .catch(() => setPublishJobs([]));
+  }, []);
+
+  // Repaint the Videos list for `accountId`, but ONLY if the user is still on
+  // that niche when the fetch returns — a background job (export, publish) or a
+  // scheduling action that finishes after a niche switch must not clobber the
+  // new account's list with the previous account's items.
+  const refreshItems = useCallback((accountId: number) => {
+    bridge
+      .listLibraryItems(accountId)
+      .then((list) => {
+        if (activeAccountIdRef.current === accountId) setItems(list);
+      })
+      .catch(() => undefined);
   }, []);
 
   const applyContext = useCallback(
@@ -307,6 +327,8 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
         `${result.created ? "Added to" : "Updated in"} publish queue as ${result.status}.`,
       );
       refreshPublishJobs(itemId);
+      // Reflect the new queue state (e.g. "Scheduled") in the Videos list.
+      refreshItems(activeAccountId);
     } catch (err: unknown) {
       setActionError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -326,6 +348,8 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
         : "the next open slot";
       setPublishMessage(`Auto-scheduled for ${scheduled}.`);
       refreshPublishJobs(itemId);
+      // Reflect the new "Scheduled" status in the Videos list.
+      refreshItems(activeAccountId);
     } catch (err: unknown) {
       setActionError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -433,7 +457,7 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
       // niche they switched to). Otherwise the toast is the only feedback.
       if (itemIdRef.current === publishItemId) {
         refreshPublishJobs(publishItemId);
-        bridge.listLibraryItems(activeAccountId).then(setItems).catch(() => undefined);
+        refreshItems(activeAccountId);
         const ctx = await bridge.getContext(publishItemId);
         if (itemIdRef.current === publishItemId) setContext(ctx);
       }
@@ -476,7 +500,7 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
       }
       await refreshDueCount();
       if (itemId !== null) refreshPublishJobs(itemId);
-      bridge.listLibraryItems(activeAccountId).then(setItems).catch(() => undefined);
+      refreshItems(activeAccountId);
     } catch (err: unknown) {
       setActionError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -796,7 +820,10 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
           refreshPublishJobs(exportItemId);
         }
       }
-      bridge.listLibraryItems(activeAccountId).then(setItems).catch(() => undefined);
+      // Repaint the Videos list ONLY if the user is still on this niche. A
+      // background export that finishes after a niche switch must not overwrite
+      // the new account's list with this (now-previous) account's items.
+      refreshItems(activeAccountId);
     } catch (err: unknown) {
       if (itemIdRef.current === exportItemId) {
         setActionError(err instanceof Error ? err.message : String(err));
@@ -938,6 +965,7 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
                 <option value="pending_review">Pending review</option>
                 <option value="draft">Draft</option>
                 <option value="exported">Exported</option>
+                <option value="scheduled">Scheduled</option>
                 <option value="posted">Posted</option>
                 <option value="failed">Failed</option>
                 <option value="skipped">Skipped</option>
