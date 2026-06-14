@@ -351,6 +351,15 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
     const recency = await bridge
       .itemPublishRecency(itemId)
       .catch(() => ({ on_cooldown: false }) as PublishRecency);
+    // A post to this account is already running (another item, or the auto
+    // loop) — warn now instead of queueing behind it for minutes.
+    if (recency.in_progress) {
+      pushToast(
+        `⏳ A post to ${recency.account_name ?? "this account"} is already in progress — try again once it finishes.`,
+        "info",
+      );
+      return;
+    }
     if (recency.on_cooldown) {
       setNowDialog(recency);
       return;

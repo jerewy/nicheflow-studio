@@ -3,6 +3,7 @@ import { useCallback, useEffect, useState } from "react";
 import { AccountManager } from "@/components/AccountManager";
 import { Dashboard } from "@/components/Dashboard";
 import { ProcessingScreen } from "@/components/ProcessingScreen";
+import { PublishEventToaster } from "@/components/PublishEventToaster";
 import { ScrapingScreen } from "@/components/ScrapingScreen";
 import { ToastProvider } from "@/components/ui/Toast";
 import { bridge, whenBridgeReady } from "@/lib/bridge";
@@ -63,6 +64,7 @@ function App() {
   return (
     <main className="dark min-h-screen bg-background text-foreground">
       <ToastProvider>
+      <PublishEventToaster />
       <nav className="flex items-center justify-between gap-3 border-b border-border px-4 py-2">
         <div className="flex items-center gap-1">
           {TABS.map((t) => {

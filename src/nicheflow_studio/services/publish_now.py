@@ -22,6 +22,7 @@ import datetime as dt
 import random as _random
 import threading
 import time
+from collections import deque
 from typing import Callable
 
 from sqlalchemy import select
@@ -56,6 +57,59 @@ _account_cooldowns: dict[int, dt.datetime] = {}
 _RECENT_POST_WINDOW = dt.timedelta(hours=4)
 # Seam for tests: patch to avoid real sleeping in the batch loop.
 _sleep = time.sleep
+
+# Accounts with a live post currently running (a real browser is open for them).
+# Lets the UI's Publish Now pre-check warn that a post is already in progress for
+# an account, instead of only catching it after the lock releases.
+_in_flight_lock = threading.Lock()
+_in_flight_accounts: set[int] = set()
+
+# A small in-memory feed of completed live posts the UI hasn't shown yet. The
+# background auto-publish loop is otherwise silent, so it records its posts here
+# for the UI to pick up (and toast) on its next poll. Bounded so a long-running
+# app with the UI closed can't grow it without limit.
+_publish_events_lock = threading.Lock()
+_publish_events: deque[dict] = deque(maxlen=50)
+_publish_event_seq = 0
+
+
+def _mark_account_in_flight(account_id: int) -> None:
+    with _in_flight_lock:
+        _in_flight_accounts.add(account_id)
+
+
+def _clear_account_in_flight(account_id: int) -> None:
+    with _in_flight_lock:
+        _in_flight_accounts.discard(account_id)
+
+
+def _account_in_flight(account_id: int) -> bool:
+    with _in_flight_lock:
+        return account_id in _in_flight_accounts
+
+
+def record_publish_event(event: dict) -> None:
+    """Append a completed-post event for the UI to pick up via
+    :func:`drain_publish_events`. Stamped with a monotonic id and a UTC time so
+    the UI can show *when* it posted even if it polls minutes later."""
+    global _publish_event_seq
+    with _publish_events_lock:
+        _publish_event_seq += 1
+        _publish_events.append(
+            {
+                "id": _publish_event_seq,
+                "at": _iso(dt.datetime.now(dt.timezone.utc)),
+                **event,
+            }
+        )
+
+
+def drain_publish_events() -> list[dict]:
+    """Return and clear the pending completed-post events (UI poll)."""
+    with _publish_events_lock:
+        events = list(_publish_events)
+        _publish_events.clear()
+        return events
 
 
 class PublishNowError(ServiceError):
@@ -230,6 +284,8 @@ def _post_and_record(
             raise PublishNowError("The job's account no longer exists.")
         item = session.get(DownloadItem, job.download_item_id) if job.download_item_id else None
         account_id = account.id
+        account_name = account.name
+        download_item_id = job.download_item_id
         profile, video, caption = _resolve_post_args(job, account, item)
 
     # 2. Keep a human-ish gap from the previous post on a DIFFERENT account
@@ -237,9 +293,15 @@ def _post_and_record(
     _wait_for_inter_account_gap(account_id, progress=progress)
 
     # 3. The real, irreversible post (no DB session held while the browser runs).
+    #    Mark the account in-flight so a concurrent recency check (the UI's
+    #    Publish Now pre-check) can warn that a post is already running for it.
     if progress is not None:
         progress(0.5, "Posting to Instagram…")
-    result = _do_publish_reel(profile, video, caption)
+    _mark_account_in_flight(account_id)
+    try:
+        result = _do_publish_reel(profile, video, caption)
+    finally:
+        _clear_account_in_flight(account_id)
 
     # 4. Record the outcome.
     with get_session() as session:
@@ -274,6 +336,9 @@ def _post_and_record(
     return {
         "status": result.status,
         "job_id": job_id,
+        "item_id": download_item_id,
+        "account_id": account_id,
+        "account_name": account_name,
         "posted_url": result.posted_url,
         "error": result.error_message,
     }
@@ -374,14 +439,24 @@ def item_publish_recency(item_id: int) -> dict:
         account_id = _target_account_id(session, item_id)
         if account_id is None:
             return {"on_cooldown": False}
+        account = session.get(Account, account_id)
+        account_name = account.name if account else None
+        # A post to this account is already running — warn now rather than after
+        # the user waits out the lock (the backend still serializes either way).
+        if _account_in_flight(account_id):
+            return {
+                "on_cooldown": True,
+                "in_progress": True,
+                "account_id": account_id,
+                "account_name": account_name,
+            }
         warning = _recency_warning(_account_last_posted(session, account_id), now=now)
         if warning is None:
             return {"on_cooldown": False}
-        account = session.get(Account, account_id)
         return {
             "on_cooldown": True,
             "account_id": account_id,
-            "account_name": account.name if account else None,
+            "account_name": account_name,
             **warning,
         }
 

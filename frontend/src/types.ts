@@ -123,11 +123,26 @@ export interface QueueResult {
 // within the 4h same-account window. `on_cooldown` false means safe to post.
 export interface PublishRecency {
   on_cooldown: boolean;
+  // True when a live post is already running for this account (vs. a recent
+  // already-completed post). The UI warns immediately instead of opening the post.
+  in_progress?: boolean;
   account_id?: number;
   account_name?: string | null;
   last_posted_at?: string | null;
   minutes_since?: number;
   recommended_next_at?: string | null;
+}
+
+// A completed background post (auto-publish loop) the UI hasn't shown yet.
+export interface PublishEvent {
+  id: number;
+  at?: string | null;
+  status: string;
+  job_id: number;
+  item_id?: number | null;
+  account_id?: number | null;
+  account_name?: string | null;
+  posted_url?: string | null;
 }
 
 export interface DueRecencyWarning {

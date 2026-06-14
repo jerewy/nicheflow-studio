@@ -325,6 +325,41 @@ def test_item_publish_recency_clear_when_old_or_never() -> None:
     assert publish_now.item_publish_recency(item_id)["on_cooldown"] is False
 
 
+def test_item_publish_recency_flags_in_flight_post() -> None:
+    # A live post already running for the account -> warn immediately (so the UI
+    # doesn't queue a second one behind it for minutes).
+    account_id = _make_account()
+    item_id = _make_exported_item(account_id)
+    publish_now._mark_account_in_flight(account_id)
+    try:
+        result = publish_now.item_publish_recency(item_id)
+    finally:
+        publish_now._clear_account_in_flight(account_id)
+
+    assert result["on_cooldown"] is True
+    assert result["in_progress"] is True
+    assert result["account_id"] == account_id
+    # Cleared once the post finishes.
+    assert publish_now.item_publish_recency(item_id)["on_cooldown"] is False
+
+
+def test_record_and_drain_publish_events_round_trip() -> None:
+    publish_now.drain_publish_events()  # clear anything left by other tests
+    publish_now.record_publish_event(
+        {"status": "posted", "job_id": 1, "item_id": 5, "account_name": "A"}
+    )
+    publish_now.record_publish_event(
+        {"status": "posted", "job_id": 2, "item_id": 6, "account_name": "B"}
+    )
+
+    events = publish_now.drain_publish_events()
+
+    assert [e["item_id"] for e in events] == [5, 6]
+    assert all("id" in e and "at" in e for e in events)
+    # Draining clears the feed so each event toasts only once.
+    assert publish_now.drain_publish_events() == []
+
+
 def test_due_publish_recency_lists_recent_accounts() -> None:
     publish_now._account_cooldowns.clear()
     account_id = _make_account()

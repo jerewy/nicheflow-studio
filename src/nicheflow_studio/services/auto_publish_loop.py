@@ -6,7 +6,11 @@ import logging
 import threading
 from collections.abc import Callable
 
-from nicheflow_studio.services.publish_now import auto_publish_enabled, publish_due_jobs
+from nicheflow_studio.services.publish_now import (
+    auto_publish_enabled,
+    publish_due_jobs,
+    record_publish_event,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,11 +40,13 @@ class AutoPublishLoop:
         publish: Callable[[], dict] = publish_due_jobs,
         top_up: Callable[[], list[dict]] = _default_top_up,
         top_up_every_ticks: int = _DEFAULT_TOP_UP_EVERY_TICKS,
+        on_posted: Callable[[dict], None] = record_publish_event,
     ) -> None:
         self._interval_seconds = interval_seconds
         self._enabled = enabled
         self._publish = publish
         self._top_up = top_up
+        self._on_posted = on_posted
         self._top_up_every_ticks = max(1, top_up_every_ticks)
         self._ticks_since_top_up: int | None = None  # None -> top-up on first tick
         self._stop_event = threading.Event()
@@ -75,6 +81,11 @@ class AutoPublishLoop:
             if not self._enabled():
                 return True
             summary = self._publish()
+            # Surface each background post to the UI (it polls drain_publish_events
+            # and toasts them); the loop is otherwise invisible to the user.
+            for result in summary.get("results", []):
+                if result.get("status") == "posted":
+                    self._on_posted(result)
             if summary.get("posted", 0) + summary.get("failed", 0) > 0:
                 logger.info("Auto-publish summary: %s", summary)
             return True

@@ -113,6 +113,38 @@ def test_loop_tops_up_on_first_tick_and_then_every_interval() -> None:
     assert len(top_ups) == 3
 
 
+def test_loop_records_posted_events_for_the_ui() -> None:
+    # Each background post is handed to on_posted so the UI can toast it; only
+    # actually-posted results (not deferred/failed) are recorded.
+    recorded: list[dict] = []
+    summary = {
+        "posted": 1,
+        "failed": 0,
+        "results": [
+            {
+                "status": "posted",
+                "job_id": 7,
+                "item_id": 95,
+                "account_name": "Past Moments",
+                "posted_url": "u",
+            },
+            {"status": "deferred", "job_id": 8},
+        ],
+    }
+    loop = AutoPublishLoop(
+        enabled=lambda: True,
+        publish=lambda: summary,
+        top_up=lambda: [],
+        on_posted=recorded.append,
+    )
+
+    assert loop.tick() is True
+
+    assert len(recorded) == 1
+    assert recorded[0]["item_id"] == 95
+    assert recorded[0]["account_name"] == "Past Moments"
+
+
 def test_loop_survives_top_up_failure() -> None:
     from nicheflow_studio.services.auto_publish_loop import AutoPublishLoop
 

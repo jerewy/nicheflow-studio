@@ -555,6 +555,12 @@ class ProcessingBridge:
         return {"job_id": job_id}
 
     @_guard
+    def drain_publish_events(self) -> list[dict]:
+        """Completed background posts the UI hasn't shown yet (auto-publish loop).
+        Returns and clears them, so the UI can toast each one once."""
+        return publish_now_svc.drain_publish_events()
+
+    @_guard
     def get_auto_publish(self) -> dict:
         return {"enabled": publish_now_svc.auto_publish_enabled()}
 

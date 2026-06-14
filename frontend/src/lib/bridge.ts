@@ -28,6 +28,7 @@ import type {
   PoolSourceClip,
   PoolingOverview,
   ProcessingContext,
+  PublishEvent,
   PublishJob,
   PublishQueueJob,
   PublishRecency,
@@ -104,6 +105,7 @@ interface PywebviewApi {
   item_publish_recency(itemId: number): Promise<Envelope<PublishRecency>>;
   due_publish_recency(): Promise<Envelope<DueRecencyWarning[]>>;
   start_publish_due(allowRecent?: boolean): Promise<Envelope<{ job_id: string }>>;
+  drain_publish_events(): Promise<Envelope<PublishEvent[]>>;
   get_auto_publish(): Promise<Envelope<{ enabled: boolean }>>;
   set_auto_publish(enabled: boolean): Promise<Envelope<{ enabled: boolean }>>;
   list_accounts(): Promise<Envelope<AccountSummary[]>>;
@@ -334,6 +336,11 @@ export const bridge = {
   startPublishDue(allowRecent = false): Promise<{ job_id: string }> {
     if (!hasBridge()) return Promise.resolve({ job_id: "mock-publish-due" });
     return unwrap(window.pywebview!.api.start_publish_due(allowRecent));
+  },
+
+  drainPublishEvents(): Promise<PublishEvent[]> {
+    if (!hasBridge()) return Promise.resolve([]);
+    return unwrap(window.pywebview!.api.drain_publish_events());
   },
 
   getAutoPublish(): Promise<{ enabled: boolean }> {
