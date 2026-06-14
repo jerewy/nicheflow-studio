@@ -5,6 +5,7 @@ import pytest
 
 from nicheflow_studio.publisher import instagram_publisher
 from nicheflow_studio.publisher.instagram_publisher import (
+    _BASE_VIEWPORT,
     _IGNORED_CHROMIUM_DEFAULT_ARGS,
     _POST_MENU_SELECTORS,
     _PUBLISH_CHROME_ARGS,
@@ -12,6 +13,8 @@ from nicheflow_studio.publisher.instagram_publisher import (
     PublishResult,
     _capture_posted_url,
     _format_control_dump,
+    _human_delay_seconds,
+    _profile_viewport,
     publish_reel,
 )
 
@@ -368,3 +371,94 @@ def test_capture_posted_url_uses_confirmation_dialog_link() -> None:
     page = _FakePage(dialog_href="/reel/current/", dialog_count=1)
 
     assert asyncio.run(_capture_posted_url(page)) == "https://www.instagram.com/reel/current/"
+
+
+class _SeqRandom:
+    """Deterministic RNG stub: pops from fixed sequences for random()/uniform()."""
+
+    def __init__(self, randoms: list[float], uniforms: list[float] | None = None) -> None:
+        self._randoms = list(randoms)
+        self._uniforms = list(uniforms or [])
+
+    def random(self) -> float:
+        return self._randoms.pop(0)
+
+    def uniform(self, a: float, b: float) -> float:
+        return self._uniforms.pop(0) if self._uniforms else (a + b) / 2
+
+
+def test_human_delay_stays_within_window_without_long_pause() -> None:
+    # First random() drives the base sample; second (>=0.08) skips the rare
+    # long-dwell branch, so the delay must sit at the window edges.
+    assert _human_delay_seconds(0.6, 1.8, rng=_SeqRandom([0.0, 1.0])) == pytest.approx(0.6)
+    assert _human_delay_seconds(0.6, 1.8, rng=_SeqRandom([1.0, 1.0])) == pytest.approx(1.8)
+
+
+def test_human_delay_is_skewed_toward_the_low_end() -> None:
+    # A flat uniform at u=0.5 would land at the midpoint (1.2); the u**1.7 skew
+    # must pull a mid sample noticeably below it (more short pauses than long).
+    midpoint = 0.6 + (1.8 - 0.6) * 0.5
+    delay = _human_delay_seconds(0.6, 1.8, rng=_SeqRandom([0.5, 1.0]))
+    assert delay < midpoint
+
+
+def test_human_delay_occasionally_adds_a_thinking_pause() -> None:
+    # Second random() < 0.08 triggers the longer dwell on top of the base sample.
+    base = _human_delay_seconds(0.6, 1.8, rng=_SeqRandom([0.5, 1.0]))
+    longer = _human_delay_seconds(0.6, 1.8, rng=_SeqRandom([0.5, 0.0], uniforms=[0.7]))
+    assert longer == pytest.approx(base + 0.7)
+
+
+def test_profile_viewport_is_deterministic_per_account() -> None:
+    # Stable per account, run to run: the same profile must always map to the
+    # same window size (string-seeded Random is process-independent).
+    assert _profile_viewport("gaming_alt_3") == _profile_viewport("gaming_alt_3")
+
+
+def test_profile_viewport_varies_across_accounts_within_bounds() -> None:
+    # Different accounts should not all share one identical viewport (that is the
+    # cross-account correlation tell), but each must stay near the base size.
+    keys = ["main", "gaming_alt_1", "gaming_alt_2", "gaming_alt_3", "history_a"]
+    sizes = {tuple(_profile_viewport(k).values()) for k in keys}
+    assert len(sizes) > 1
+    for key in keys:
+        vp = _profile_viewport(key)
+        assert _BASE_VIEWPORT[0] - 40 <= vp["width"] <= _BASE_VIEWPORT[0] + 60
+        assert _BASE_VIEWPORT[1] - 30 <= vp["height"] <= _BASE_VIEWPORT[1] + 50
+
+
+class _FakeMouse:
+    def __init__(self, *, raise_error: bool = False) -> None:
+        self.wheels: list[tuple[int, int]] = []
+        self._raise = raise_error
+
+    async def wheel(self, dx: int, dy: int) -> None:
+        if self._raise:
+            raise instagram_publisher.PlaywrightError("wheel blew up")
+        self.wheels.append((dx, dy))
+
+
+class _FakeFeedPage:
+    def __init__(self, *, raise_error: bool = False) -> None:
+        self.mouse = _FakeMouse(raise_error=raise_error)
+
+
+def test_warm_up_feed_scrolls_down_then_back_up(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Warm-up should skim the feed (>=1 scroll down) and end heading back up,
+    # never scroll the composer. Last wheel delta must be negative (upward).
+    monkeypatch.setattr(instagram_publisher, "_human_pause", _instant)
+    page = _FakeFeedPage()
+
+    asyncio.run(instagram_publisher._warm_up_feed(page))
+
+    assert len(page.mouse.wheels) >= 2
+    assert page.mouse.wheels[0][1] > 0  # first scroll goes down
+    assert page.mouse.wheels[-1][1] < 0  # ends scrolling back up
+
+
+def test_warm_up_feed_swallows_playwright_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A warm-up is cosmetic; a wheel/PlaywrightError must never break a publish.
+    monkeypatch.setattr(instagram_publisher, "_human_pause", _instant)
+    page = _FakeFeedPage(raise_error=True)
+
+    asyncio.run(instagram_publisher._warm_up_feed(page))  # must not raise

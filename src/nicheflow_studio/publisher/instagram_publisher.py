@@ -39,6 +39,23 @@ log = logging.getLogger(__name__)
 INSTAGRAM_URL = "https://www.instagram.com/"
 _IGNORED_CHROMIUM_DEFAULT_ARGS = ("--enable-automation",)
 _PUBLISH_CHROME_ARGS = ("--start-minimized",)
+_BASE_VIEWPORT = (1280, 900)
+
+
+def _profile_viewport(profile_key: str) -> dict[str, int]:
+    """Stable, per-account window size derived from the profile name.
+
+    Every account in the network sharing one identical viewport is a
+    cross-account correlation tell ("same operator"). Seed a small fixed offset
+    from the profile name so each account keeps its OWN consistent size run to
+    run — stable per account, never random per run. ``random.Random`` seeded with
+    a string is deterministic across processes (unlike ``hash``).
+    """
+    rng = random.Random(profile_key)
+    return {
+        "width": _BASE_VIEWPORT[0] + rng.randint(-40, 60),
+        "height": _BASE_VIEWPORT[1] + rng.randint(-30, 50),
+    }
 
 # goto() returns at domcontentloaded, but Instagram is an SPA that can sit on
 # its logo splash long after that on a slow load — the nav (and its "New post"
@@ -171,9 +188,25 @@ class PublishResult:
         return self.status == "checkpoint"
 
 
+def _human_delay_seconds(min_s: float = 0.6, max_s: float = 1.8, rng=random) -> float:  # noqa: ANN001
+    """Right-skewed pause length, in seconds.
+
+    A flat ``random.uniform`` is itself a mild automation tell: real people act
+    mostly fast with the occasional longer pause, not evenly across a window.
+    Bias the sample toward ``min_s`` (``u**1.7`` pushes the mass low) and, ~8% of
+    the time, add a longer "thinking" dwell. Pure (RNG injected) so the
+    distribution is unit-testable without sleeping.
+    """
+    span = max(0.0, max_s - min_s)
+    delay = min_s + span * (rng.random() ** 1.7)
+    if rng.random() < 0.08:
+        delay += rng.uniform(0.3, 1.0)
+    return delay
+
+
 async def _human_pause(min_s: float = 0.6, max_s: float = 1.8) -> None:
     """Sleep a randomized, human-ish amount. Constant timing is an automation tell."""
-    await asyncio.sleep(random.uniform(min_s, max_s))
+    await asyncio.sleep(_human_delay_seconds(min_s, max_s))
 
 
 async def _has_session(context) -> bool:  # noqa: ANN001
@@ -201,6 +234,15 @@ async def _click_first(page: Page, selectors: tuple[str, ...], *, timeout: float
                 try:
                     if await element.is_visible():
                         await _human_pause(0.3, 0.9)
+                        # Move the cursor onto the control before clicking. A bare
+                        # .click() teleports the pointer and fires with no
+                        # mousemove events — a behavioral automation tell. Hover is
+                        # best-effort: never let it block a click that would land.
+                        try:
+                            await element.hover(timeout=1500)
+                            await _human_pause(0.15, 0.5)
+                        except PlaywrightError:
+                            pass
                         # Bounded click: the outer loop owns the deadline. The
                         # default 30s actionability wait can hang here when a
                         # modal overlay (first-post dialog) blocks the control.
@@ -342,6 +384,26 @@ async def _detect_checkpoint(page: Page) -> str | None:
         except PlaywrightError:
             continue
     return None
+
+
+async def _warm_up_feed(page: Page) -> None:
+    """Briefly dwell on the home feed before opening the composer.
+
+    A real session lands on the feed, lets it settle, and skims a little before
+    deciding to post — not "land on the page, instantly click New post". One or
+    two gentle wheel scrolls down the FEED (never the composer — scrolling the
+    upload modal is a bot tell, not a human one), then part of the way back up.
+    Best-effort: a warm-up that fails must never block the publish.
+    """
+    try:
+        await _human_pause(1.5, 3.5)
+        for _ in range(random.randint(1, 2)):
+            await page.mouse.wheel(0, random.randint(350, 900))
+            await _human_pause(0.8, 2.0)
+        await page.mouse.wheel(0, -random.randint(300, 700))
+        await _human_pause(0.6, 1.4)
+    except PlaywrightError:
+        log.debug("feed warm-up skipped", exc_info=True)
 
 
 async def _open_composer_and_attach(page: Page, video: Path) -> None:
@@ -541,7 +603,7 @@ async def _publish_reel_async(
         launch_kwargs: dict = {
             "user_data_dir": str(profile_dir.resolve()),
             "headless": False,
-            "viewport": {"width": 1280, "height": 900},
+            "viewport": _profile_viewport(profile_dir.name),
             # Stay non-headless (a real Chrome window is far less bot-like than
             # headless) and start minimized so it doesn't steal focus. We ignore
             # Chrome's default "--enable-automation" switch below to avoid the
@@ -598,6 +660,7 @@ async def _publish_reel_async(
             if marker:
                 return PublishResult("checkpoint", error_message=f"checkpoint detected: {marker}")
 
+            await _warm_up_feed(page)
             log.info("opening composer and attaching %s", video.name)
             await _open_composer_and_attach(page, video)
             log.info("advancing through edit steps")
