@@ -125,6 +125,21 @@ def test_http_error_becomes_cloud_publisher_error(
         cloud_publisher.get_usage()
 
 
+def test_cloud_account_key_map(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CLOUDFLARE_PUBLISH_ACCOUNTS", raising=False)
+    assert cloud_publisher.cloud_publish_map() == {}
+    assert cloud_publisher.cloud_account_key_for(7) is None
+
+    monkeypatch.setenv("CLOUDFLARE_PUBLISH_ACCOUNTS", '{"7": "pastmomentsdaily", "12": "beneathhistory"}')
+    assert cloud_publisher.cloud_account_key_for(7) == "pastmomentsdaily"
+    assert cloud_publisher.cloud_account_key_for(12) == "beneathhistory"
+    assert cloud_publisher.cloud_account_key_for(99) is None
+
+    # Malformed JSON degrades to an empty map (feature stays inert, never crashes).
+    monkeypatch.setenv("CLOUDFLARE_PUBLISH_ACCOUNTS", "not json")
+    assert cloud_publisher.cloud_publish_map() == {}
+
+
 def test_unconfigured_request_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CLOUDFLARE_PUBLISHER_URL", raising=False)
     monkeypatch.delenv("CLOUDFLARE_PUBLISHER_API_KEY", raising=False)

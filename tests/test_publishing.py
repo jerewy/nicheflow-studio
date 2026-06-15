@@ -4,6 +4,7 @@ import datetime as dt
 import random
 
 import pytest
+from sqlalchemy import select
 
 from nicheflow_studio.db.models import Account, DownloadItem, UploadJob
 from nicheflow_studio.db.session import get_session
@@ -68,6 +69,104 @@ def test_next_safe_slot_keeps_gap_from_recent_post() -> None:
     assert slot is not None
     # 11:00 is rejected (2h gap); 18:00 (9h gap) is the first safe slot.
     assert slot.astimezone(dt.timezone.utc).hour == 18
+
+
+def _account_id_of(item_id: int) -> int:
+    with get_session() as session:
+        return session.get(DownloadItem, item_id).account_id
+
+
+def _enable_cloud(monkeypatch: pytest.MonkeyPatch, account_id: int, worker_key: str = "testkey") -> None:
+    import json as _json
+
+    monkeypatch.setenv("CLOUDFLARE_PUBLISHER_URL", "https://worker.example.dev")
+    monkeypatch.setenv("CLOUDFLARE_PUBLISHER_API_KEY", "secret")
+    monkeypatch.setenv("CLOUDFLARE_PUBLISH_ACCOUNTS", _json.dumps({str(account_id): worker_key}))
+
+
+def test_scheduled_job_hands_off_to_cloud_when_mapped(monkeypatch: pytest.MonkeyPatch) -> None:
+    from nicheflow_studio.services import cloud_publisher
+
+    item_id = _make_item()
+    account_id = _account_id_of(item_id)
+    _enable_cloud(monkeypatch, account_id)
+    captured: dict = {}
+
+    def fake_schedule_reel(**kwargs):
+        captured.update(kwargs)
+        return {"id": "worker-job", "status": "scheduled"}
+
+    monkeypatch.setattr(cloud_publisher, "schedule_reel", fake_schedule_reel)
+
+    result = publishing.queue_for_publish(item_id, scheduled_at="2026-06-16T02:00:00+00:00")
+
+    assert result["status"] == "cloud"
+    assert captured["account_key"] == "testkey"
+    assert captured["external_id"] == f"nf-{result['job_id']}"
+    assert captured["video_path"] == "C:/processed/out.mp4"
+    with get_session() as session:
+        assert session.get(UploadJob, result["job_id"]).status == "cloud"
+
+
+def test_scheduled_job_stays_local_when_account_not_mapped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nicheflow_studio.services import cloud_publisher
+
+    item_id = _make_item()
+    # Cloud is configured, but THIS account is not in the map.
+    _enable_cloud(monkeypatch, _account_id_of(item_id) + 999)
+
+    def boom(**kwargs):
+        raise AssertionError("schedule_reel must not run for an unmapped account")
+
+    monkeypatch.setattr(cloud_publisher, "schedule_reel", boom)
+
+    result = publishing.queue_for_publish(item_id, scheduled_at="2026-06-16T02:00:00+00:00")
+
+    assert result["status"] == "scheduled"
+    with get_session() as session:
+        assert session.get(UploadJob, result["job_id"]).status == "scheduled"
+
+
+def test_cloud_handoff_failure_marks_job_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+    from nicheflow_studio.services import cloud_publisher
+    from nicheflow_studio.services.cloud_publisher import CloudPublisherError
+
+    item_id = _make_item()
+    _enable_cloud(monkeypatch, _account_id_of(item_id))
+
+    def fail(**kwargs):
+        raise CloudPublisherError("Cloud publisher HTTP 500: boom")
+
+    monkeypatch.setattr(cloud_publisher, "schedule_reel", fail)
+
+    with pytest.raises(PublishError, match="Cloud handoff failed"):
+        publishing.queue_for_publish(item_id, scheduled_at="2026-06-16T02:00:00+00:00")
+
+    with get_session() as session:
+        job = session.scalars(select(UploadJob)).first()
+        assert job.status == "failed"
+        assert "Cloud handoff failed" in (job.error_message or "")
+
+
+def test_cloud_handoff_idempotent_on_duplicate(monkeypatch: pytest.MonkeyPatch) -> None:
+    from nicheflow_studio.services import cloud_publisher
+    from nicheflow_studio.services.cloud_publisher import CloudPublisherError
+
+    item_id = _make_item()
+    _enable_cloud(monkeypatch, _account_id_of(item_id))
+
+    def already(**kwargs):
+        raise CloudPublisherError("Cloud publisher HTTP 400: A job already exists for testkey/nf-1")
+
+    monkeypatch.setattr(cloud_publisher, "schedule_reel", already)
+
+    result = publishing.queue_for_publish(item_id, scheduled_at="2026-06-16T02:00:00+00:00")
+
+    assert result["status"] == "cloud"
+    with get_session() as session:
+        assert session.get(UploadJob, result["job_id"]).status == "cloud"
 
 
 def test_queue_creates_draft_job() -> None:

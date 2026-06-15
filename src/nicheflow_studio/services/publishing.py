@@ -174,6 +174,60 @@ def list_publish_jobs(item_id: int) -> list[dict]:
         ]
 
 
+def _handoff_scheduled_job_to_cloud(job_id: int) -> str | None:
+    """Push a scheduled job for a cloud-mapped account to the Cloudflare Worker.
+
+    Returns ``"cloud"`` when the job was handed off — so the caller flips its
+    result status and the local publish loop (which only acts on
+    ``status == "scheduled"``) skips it. Returns ``None`` when no handoff applies
+    (cloud not configured, account not mapped, or not a scheduled post). On a hard
+    failure it marks the job ``failed`` and raises :class:`PublishError`; a
+    duplicate (already on the Worker) is treated as success so re-scheduling is
+    idempotent.
+    """
+    from nicheflow_studio.services import cloud_publisher
+
+    if not cloud_publisher.is_configured():
+        return None
+    with get_session() as session:
+        job = session.get(UploadJob, job_id)
+        if job is None or job.status != "scheduled" or job.scheduled_at is None:
+            return None
+        worker_key = cloud_publisher.cloud_account_key_for(job.account_id)
+        if not worker_key:
+            return None
+        video = job.processed_path
+        caption = job.description or ""
+        scheduled_iso = _aware(job.scheduled_at).isoformat()
+
+    # Network upload to the Worker — outside the DB session.
+    try:
+        cloud_publisher.schedule_reel(
+            external_id=f"nf-{job_id}",
+            account_key=worker_key,
+            caption=caption,
+            scheduled_at=scheduled_iso,
+            video_path=video,
+        )
+    except cloud_publisher.CloudPublisherError as exc:
+        if "already exists" not in str(exc).lower():
+            with get_session() as session:
+                job = session.get(UploadJob, job_id)
+                if job is not None:
+                    job.status = "failed"
+                    job.error_message = f"Cloud handoff failed: {exc}"[:512]
+                    session.commit()
+            raise PublishError(f"Cloud handoff failed: {exc}") from exc
+
+    with get_session() as session:
+        job = session.get(UploadJob, job_id)
+        if job is not None and job.status == "scheduled":
+            job.status = "cloud"
+            job.error_message = None
+            session.commit()
+    return "cloud"
+
+
 def queue_for_publish(item_id: int, *, scheduled_at: str | None = None) -> dict:
     """Add (or update) the item's exported reel in the publish queue.
 
@@ -239,34 +293,43 @@ def queue_for_publish(item_id: int, *, scheduled_at: str | None = None) -> dict:
             existing.status = status
             existing.error_message = None
             session.commit()
-            return {
+            result = {
                 "job_id": existing.id,
                 "status": status,
                 "scheduled_at": _iso(scheduled),
                 "created": False,
             }
+        else:
+            job = UploadJob(
+                account_id=account.id,
+                download_item_id=item.id,
+                processed_path=path_text,
+                title=title,
+                description=description,
+                scheduled_at=scheduled,
+                timezone=timezone_label,
+                privacy_status=privacy,
+                made_for_kids=made_for_kids,
+                contains_synthetic_media=synthetic,
+                status=status,
+            )
+            session.add(job)
+            session.commit()
+            result = {
+                "job_id": job.id,
+                "status": status,
+                "scheduled_at": _iso(scheduled),
+                "created": True,
+            }
 
-        job = UploadJob(
-            account_id=account.id,
-            download_item_id=item.id,
-            processed_path=path_text,
-            title=title,
-            description=description,
-            scheduled_at=scheduled,
-            timezone=timezone_label,
-            privacy_status=privacy,
-            made_for_kids=made_for_kids,
-            contains_synthetic_media=synthetic,
-            status=status,
-        )
-        session.add(job)
-        session.commit()
-        return {
-            "job_id": job.id,
-            "status": status,
-            "scheduled_at": _iso(scheduled),
-            "created": True,
-        }
+    # Cloud handoff (outside the session): a scheduled post on a cloud-mapped
+    # account is pushed to the Worker and flips to status 'cloud' so the local
+    # publish loop skips it. Inert (returns None) unless the account is mapped.
+    if status == "scheduled":
+        cloud_status = _handoff_scheduled_job_to_cloud(result["job_id"])
+        if cloud_status:
+            result["status"] = cloud_status
+    return result
 
 
 def auto_schedule_for_publish(

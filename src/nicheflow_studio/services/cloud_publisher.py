@@ -28,7 +28,31 @@ from nicheflow_studio.services.errors import ServiceError
 
 _URL_ENV = "CLOUDFLARE_PUBLISHER_URL"
 _KEY_ENV = "CLOUDFLARE_PUBLISHER_API_KEY"
+# Opt-in map of local account id (string) -> Worker account_key, as JSON, e.g.
+# CLOUDFLARE_PUBLISH_ACCOUNTS={"7":"pastmomentsdaily"}. Empty/unset => no account
+# publishes via the cloud (the local Playwright path is used), so this whole
+# feature is inert until an account is explicitly mapped.
+_ACCOUNTS_ENV = "CLOUDFLARE_PUBLISH_ACCOUNTS"
 _TIMEOUT_S = 120
+
+
+def cloud_publish_map() -> dict[str, str]:
+    """Parsed account-id -> Worker-key map from env (empty on unset/invalid)."""
+    raw = (os.environ.get(_ACCOUNTS_ENV) or "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(key): str(value) for key, value in data.items() if str(value).strip()}
+
+
+def cloud_account_key_for(account_id: int) -> str | None:
+    """Worker account_key for a local account id, or None if not cloud-mapped."""
+    return cloud_publish_map().get(str(account_id))
 
 
 class CloudPublisherError(ServiceError):
