@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import random
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,7 @@ from nicheflow_studio.db.models import Account, DownloadItem, UploadJob
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.processing import video
 from nicheflow_studio.services import export as export_svc
+from nicheflow_studio.services import publishing
 from nicheflow_studio.services.export import ExportError
 
 
@@ -92,8 +94,25 @@ def test_export_auto_schedules_next_open_slot_when_flag_on(
         upload_schedule_slots="09:00",
     )
     _mock_video(monkeypatch, {})
-    occupied = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=1)
-    occupied = occupied.replace(hour=2, minute=0, second=0, microsecond=0)
+
+    # Freeze "now" (and the jitter RNG) so the chosen slot never depends on the
+    # wall-clock hour the test runs at. ``export_item`` reaches the scheduler via
+    # ``publishing.auto_schedule_for_publish``, which exposes a ``now=``/``rng=``
+    # seam; patch the call site to feed it deterministic values.
+    #
+    # At 06:00 UTC no 09:00 slot has passed today, so the scheduler takes the
+    # "next open slot" path (not the near-now catch-up path). The already-booked
+    # job sits exactly on today's 09:00 slot, so the new post must skip the
+    # collision and land in the next open 09:00 slot (tomorrow).
+    fixed_now = dt.datetime(2026, 6, 15, 6, 0, tzinfo=dt.timezone.utc)
+    occupied = dt.datetime(2026, 6, 15, 9, 0, tzinfo=dt.timezone.utc)
+    real_auto_schedule = publishing.auto_schedule_for_publish
+    monkeypatch.setattr(
+        publishing,
+        "auto_schedule_for_publish",
+        lambda iid, **_kw: real_auto_schedule(iid, now=fixed_now, rng=random.Random(0)),
+    )
+
     with get_session() as session:
         item = session.get(DownloadItem, item_id)
         session.add(
@@ -114,8 +133,9 @@ def test_export_auto_schedules_next_open_slot_when_flag_on(
         assert len(jobs) == 1
         assert jobs[0].status == "scheduled"
         scheduled = jobs[0].scheduled_at.replace(tzinfo=dt.timezone.utc)
+        # Landed in the next open slot AFTER the booked one, not stacked on it.
         assert scheduled > occupied
-        assert abs((scheduled - occupied).total_seconds()) > 20 * 60
+        assert (scheduled - occupied).total_seconds() > 20 * 60
 
 
 def test_export_does_not_schedule_when_flag_off(
