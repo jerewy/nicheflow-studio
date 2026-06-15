@@ -35,6 +35,10 @@ dist/
 node_modules/
 package-lock.json
 package.json
+!cloudflare-publisher/package.json
+!cloudflare-publisher/pnpm-lock.yaml
+cloudflare-publisher/.dev.vars
+cloudflare-publisher/.wrangler/
 
 # Test / tool caches
 .pytest_cache/

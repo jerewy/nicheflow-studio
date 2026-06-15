@@ -1,0 +1,19 @@
+{
+  "name": "nicheflow-cloudflare-publisher",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "dev": "wrangler dev --test-scheduled",
+    "deploy:dry": "wrangler deploy --dry-run",
+    "deploy": "wrangler deploy",
+    "db:local": "wrangler d1 execute nicheflow-publisher --local --file schema.sql",
+    "db:remote": "wrangler d1 execute nicheflow-publisher --remote --file schema.sql"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260612.0",
+    "typescript": "^6.0.2",
+    "wrangler": "^4.64.0"
+  }
+}

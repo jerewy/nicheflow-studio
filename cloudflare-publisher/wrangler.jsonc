@@ -1,0 +1,33 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "nicheflow-publisher",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-14",
+  "workers_dev": true,
+  "preview_urls": false,
+  "vars": {
+    "PUBLISH_MODE": "disabled",
+    "GRAPH_HOST": "graph.instagram.com",
+    "GRAPH_VERSION": "v21.0",
+    "PUBLIC_BASE_URL": "https://nicheflow-publisher.jeremywijaya81.workers.dev",
+    "MAX_STORED_BYTES": "8000000000",
+    "MAX_UPLOAD_BYTES": "95000000",
+    "MAX_ACTIVE_JOBS": "150"
+  },
+  "triggers": {
+    "crons": ["* * * * *"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "nicheflow-publisher",
+      "database_id": "ee84adc2-de33-4ede-8fb9-a3651ed8c4dc"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "MEDIA",
+      "bucket_name": "nicheflow-publish-media"
+    }
+  ]
+}
