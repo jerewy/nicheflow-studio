@@ -71,6 +71,54 @@ def test_next_safe_slot_keeps_gap_from_recent_post() -> None:
     assert slot.astimezone(dt.timezone.utc).hour == 18
 
 
+def test_account_min_gap_minutes_default_and_override() -> None:
+    account = Account(name="Gap", platform="instagram")
+    assert publishing.account_min_gap_minutes(account) == 240  # default 4h
+    account.upload_min_gap_minutes = 210
+    assert publishing.account_min_gap_minutes(account) == 210
+    account.upload_min_gap_minutes = 0  # invalid -> fall back to default
+    assert publishing.account_min_gap_minutes(account) == 240
+
+
+def test_per_account_gap_unblocks_exact_4h_slots() -> None:
+    # Slots exactly 4h apart (the 6/day layout). A post at 09:00 sits exactly
+    # 4h from the 13:00 slot, so the default 4h window rejects it (the boundary
+    # is inclusive) — but a 3.5h per-account gap lets 13:00 through.
+    after = dt.datetime(2026, 6, 13, 9, 30, tzinfo=dt.timezone.utc)
+    with get_session() as session:
+        account = Account(
+            name="Six",
+            platform="instagram",
+            niche_label="history",
+            upload_schedule_slots="09:00, 13:00, 17:00",
+        )
+        session.add(account)
+        session.commit()
+        session.add(
+            UploadJob(
+                account_id=account.id,
+                processed_path="C:/out.mp4",
+                status="posted",
+                posted_at=dt.datetime(2026, 6, 13, 9, 0, tzinfo=dt.timezone.utc),
+            )
+        )
+        session.commit()
+
+        # Default 4h gap: 13:00 (exactly 4h later) is rejected -> next is 17:00.
+        default_slot = publishing.next_safe_slot_for_account(
+            session, account, after=after, rng=random.Random(0)
+        )
+        assert default_slot.astimezone(dt.timezone.utc).hour == 17
+
+        # 3.5h per-account gap: 13:00 now clears the collision window.
+        account.upload_min_gap_minutes = 210
+        session.commit()
+        tight_slot = publishing.next_safe_slot_for_account(
+            session, account, after=after, rng=random.Random(0)
+        )
+        assert tight_slot.astimezone(dt.timezone.utc).hour == 13
+
+
 def _account_id_of(item_id: int) -> int:
     with get_session() as session:
         return session.get(DownloadItem, item_id).account_id

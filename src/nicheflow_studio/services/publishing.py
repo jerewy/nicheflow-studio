@@ -89,6 +89,20 @@ def _account_in_checkpoint_cooldown(account_id: int, *, now: dt.datetime) -> boo
     return _account_on_cooldown(account_id, now=now.astimezone(dt.timezone.utc))
 
 
+def account_min_gap_minutes(account: Account) -> int:
+    """Minimum minutes between two posts on THIS account.
+
+    Uses the account's ``upload_min_gap_minutes`` override when set, otherwise the
+    module default (``SAME_ACCOUNT_MIN_GAP_HOURS``). Accounts running 6/day with
+    slots exactly 4h apart need this below 240 (e.g. 210) so the scheduler's
+    collision guard doesn't reject an adjacent slot once jitter is applied.
+    """
+    value = account.upload_min_gap_minutes
+    if value is None or value <= 0:
+        return SAME_ACCOUNT_MIN_GAP_HOURS * 60
+    return int(value)
+
+
 def next_safe_slot_for_account(
     session,
     account: Account,
@@ -111,7 +125,8 @@ def next_safe_slot_for_account(
     (or ``after``) so an unattended defer always gets a concrete time; False
     returns ``None`` so the caller can surface a "configure your slots" message.
     """
-    gap = dt.timedelta(hours=SAME_ACCOUNT_MIN_GAP_HOURS)
+    min_gap_minutes = account_min_gap_minutes(account)
+    gap = dt.timedelta(minutes=min_gap_minutes)
     jobs = session.scalars(
         select(UploadJob).where(UploadJob.account_id == account.id)
     ).all()
@@ -127,7 +142,7 @@ def next_safe_slot_for_account(
         after=after,
         occupied=occupied,
         rng=rng,
-        collision_minutes=SAME_ACCOUNT_MIN_GAP_HOURS * 60,
+        collision_minutes=min_gap_minutes,
     )
     if slot is not None:
         return slot
@@ -435,7 +450,7 @@ def auto_schedule_for_publish(
             occupied=catch_up_occupied,
             last_posted_at=last_posted_at,
             checkpoint_cooldown=checkpoint_cooldown,
-            min_gap_hours=SAME_ACCOUNT_MIN_GAP_HOURS,
+            min_gap_hours=account_min_gap_minutes(account) / 60,
             rng=rng,
         )
         missed_slot = (

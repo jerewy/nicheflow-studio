@@ -50,7 +50,11 @@ _TEXT_FIELDS = (
     "upload_schedule_slots",
 )
 _BOOL_FIELDS = ("auto_schedule_on_export",)
-_OPTIONAL_POSITIVE_INT_FIELDS = ("daily_posts_target", "distribute_daily_target")
+_OPTIONAL_POSITIVE_INT_FIELDS = (
+    "daily_posts_target",
+    "distribute_daily_target",
+    "upload_min_gap_minutes",
+)
 
 
 class AccountError(ServiceError):
@@ -91,6 +95,7 @@ def _account_detail(session, account: Account) -> dict:
             "upload_timezone": account.upload_timezone,
             "upload_default_privacy": account.upload_default_privacy,
             "upload_schedule_slots": account.upload_schedule_slots,
+            "upload_min_gap_minutes": account.upload_min_gap_minutes,
             "daily_posts_target": account.daily_posts_target,
             "distribute_daily_target": account.distribute_daily_target,
             "auto_schedule_on_export": bool(account.auto_schedule_on_export),

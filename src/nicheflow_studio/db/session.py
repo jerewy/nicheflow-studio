@@ -263,6 +263,10 @@ def _ensure_compatibility() -> None:
             connection.execute(
                 text("ALTER TABLE accounts ADD COLUMN upload_schedule_slots VARCHAR(512)")
             )
+        if "upload_min_gap_minutes" not in account_columns:
+            connection.execute(
+                text("ALTER TABLE accounts ADD COLUMN upload_min_gap_minutes INTEGER")
+            )
         if "daily_posts_target" not in account_columns:
             connection.execute(text("ALTER TABLE accounts ADD COLUMN daily_posts_target INTEGER"))
         if "distribute_daily_target" not in account_columns:

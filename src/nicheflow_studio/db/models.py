@@ -60,6 +60,11 @@ class Account(Base):
     upload_timezone: Mapped[str | None] = mapped_column(String(64), nullable=True)
     upload_default_privacy: Mapped[str | None] = mapped_column(String(32), nullable=True)
     upload_schedule_slots: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    # Minimum minutes between two posts on THIS account, used by the scheduler's
+    # collision guard. None -> the module default (SAME_ACCOUNT_MIN_GAP_HOURS, 4h).
+    # Lower it (e.g. 210) for accounts running 6/day whose slots sit exactly 4h
+    # apart, so jitter doesn't push an adjacent slot inside the 4h window.
+    upload_min_gap_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     daily_posts_target: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Rolling distribution backlog kept ready per account: auto-distribute / the
     # hourly top-up maintain about this many unposted clips, replenishing as
