@@ -125,6 +125,56 @@ def test_http_error_becomes_cloud_publisher_error(
         cloud_publisher.get_usage()
 
 
+def test_upsert_account_puts_metadata_without_token(
+    monkeypatch: pytest.MonkeyPatch, _configured
+) -> None:
+    captured: list = []
+
+    def fake_urlopen(request, timeout=120):  # noqa: ANN001
+        captured.append(request)
+        return _FakeResponse(b'{"account_key":"beneathhistory","enabled":true,"daily_limit":3}')
+
+    monkeypatch.setattr(cloud_publisher.urllib.request, "urlopen", fake_urlopen)
+
+    result = cloud_publisher.upsert_account(
+        account_key="beneathhistory",
+        instagram_user_id="17841400000000000",
+        token_secret_name="IG_TOKEN_BENEATHHISTORY",
+        enabled=True,
+        daily_limit=3,
+        min_gap_minutes=240,
+    )
+
+    assert result["account_key"] == "beneathhistory"
+    req = captured[0]
+    assert req.get_method() == "PUT"
+    assert req.full_url == "https://worker.example.dev/v1/accounts"
+    assert req.headers.get("Authorization") == "Bearer secret-key"
+    body = json.loads(req.data)
+    assert body["instagram_user_id"] == "17841400000000000"
+    assert body["token_secret_name"] == "IG_TOKEN_BENEATHHISTORY"
+    assert body["daily_limit"] == 3
+    # The IG token must never be part of the account registration payload.
+    assert "token" not in body and "access_token" not in body
+
+
+def test_run_due_posts_to_run_endpoint(monkeypatch: pytest.MonkeyPatch, _configured) -> None:
+    captured: list = []
+
+    def fake_urlopen(request, timeout=120):  # noqa: ANN001
+        captured.append(request)
+        return _FakeResponse(b'{"processed":1,"mode":"live"}')
+
+    monkeypatch.setattr(cloud_publisher.urllib.request, "urlopen", fake_urlopen)
+
+    result = cloud_publisher.run_due()
+
+    assert result == {"processed": 1, "mode": "live"}
+    req = captured[0]
+    assert req.get_method() == "POST"
+    assert req.full_url == "https://worker.example.dev/v1/run"
+
+
 def test_cloud_account_key_map(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CLOUDFLARE_PUBLISH_ACCOUNTS", raising=False)
     assert cloud_publisher.cloud_publish_map() == {}

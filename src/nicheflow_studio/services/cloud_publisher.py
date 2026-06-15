@@ -169,6 +169,36 @@ def schedule_reel(
     return created
 
 
+def upsert_account(
+    *,
+    account_key: str,
+    instagram_user_id: str,
+    token_secret_name: str,
+    enabled: bool = True,
+    daily_limit: int = 6,
+    min_gap_minutes: int = 240,
+) -> dict:
+    """Register or update a publishing account on the Worker (PUT ``/v1/accounts``).
+
+    The IG access token is **never** sent here — it lives only as a Worker secret
+    named ``token_secret_name`` (set with ``wrangler secret put``). This call just
+    records the metadata the Worker needs to find that secret and enforce its
+    per-account caps (``daily_limit``, ``min_gap_minutes``).
+    """
+    return _request(
+        "PUT",
+        "/v1/accounts",
+        json_body={
+            "account_key": account_key,
+            "instagram_user_id": instagram_user_id,
+            "token_secret_name": token_secret_name,
+            "enabled": enabled,
+            "daily_limit": daily_limit,
+            "min_gap_minutes": min_gap_minutes,
+        },
+    )
+
+
 def list_jobs() -> dict:
     """All publish jobs known to the Worker (and the current publish_mode)."""
     return _request("GET", "/v1/jobs")
@@ -182,3 +212,13 @@ def get_usage() -> dict:
 def cancel_job(job_id: str) -> dict:
     """Cancel a job and delete its R2 media (if not already published/validated)."""
     return _request("POST", f"/v1/jobs/{job_id}/cancel")
+
+
+def run_due() -> dict:
+    """Ask the Worker to process due jobs immediately (POST ``/v1/run``).
+
+    The Worker also runs this on a 1-minute cron; calling it directly lets a cloud
+    "Publish Now" start the Meta container right away instead of waiting up to a
+    minute for the next cron tick. Returns the Worker's ``{processed, mode}``.
+    """
+    return _request("POST", "/v1/run")

@@ -204,6 +204,25 @@ def _recency_warning(last_posted: dt.datetime | None, *, now: dt.datetime) -> di
     }
 
 
+def _on_cooldown_payload(item_id: int, account_id: int) -> dict | None:
+    """``on_cooldown`` result if this account posted within the recency window,
+    else None. Shared by the local and cloud Publish Now paths so both honour the
+    same same-account spacing backstop."""
+    now = dt.datetime.now(dt.timezone.utc)
+    with get_session() as session:
+        warning = _recency_warning(_account_last_posted(session, account_id), now=now)
+        account = session.get(Account, account_id)
+    if warning is None:
+        return None
+    return {
+        "item_id": item_id,
+        "status": "on_cooldown",
+        "account_id": account_id,
+        "account_name": account.name if account else None,
+        **warning,
+    }
+
+
 def _target_account_id(session, item_id: int) -> int | None:
     """The account an item's reel will post to: its latest unposted job's account,
     falling back to the item's own assignment."""
@@ -362,38 +381,88 @@ def publish_item_now(
     offer reschedule / "post anyway" instead of silently double-posting. This is
     the backend backstop for the Publish Now confirmation; ``allow_recent=True``
     is the explicit override.
+
+    Cloud-mapped accounts publish via the Cloudflare Worker / Meta Graph API
+    instead of the local browser (see :func:`_publish_item_now_via_cloud`); every
+    other account uses the local Playwright path below.
     """
     # Reuse the queue upsert for validation + job creation (raises if the item
     # isn't exported / has no account / is already posted).
     queue_for_publish(item_id)
+    with get_session() as session:
+        job = session.scalars(
+            select(UploadJob)
+            .where(UploadJob.download_item_id == item_id)
+            .where(UploadJob.posted_at.is_(None))
+            .where(UploadJob.status != "posted")
+            .order_by(UploadJob.id.desc())
+            .limit(1)
+        ).first()
+        if job is None:
+            raise PublishNowError("Could not find a publish job for this item.")
+        job_id = job.id
+        account_id = job.account_id
+
+    # Cloud-mapped account -> hand off to the Worker (Meta Graph API). No browser,
+    # so this path never touches the Playwright publish lock.
+    from nicheflow_studio.services import cloud_publisher
+
+    if cloud_publisher.is_configured() and cloud_publisher.cloud_account_key_for(account_id):
+        return _publish_item_now_via_cloud(item_id, account_id, allow_recent=allow_recent)
+
+    # Local Playwright path: serialized, with the recency backstop re-checked
+    # under the lock so a post committed while we waited is seen before we post.
     with _PUBLISH_LOCK:
-        with get_session() as session:
-            job = session.scalars(
-                select(UploadJob)
-                .where(UploadJob.download_item_id == item_id)
-                .where(UploadJob.posted_at.is_(None))
-                .where(UploadJob.status != "posted")
-                .order_by(UploadJob.id.desc())
-                .limit(1)
-            ).first()
-            if job is None:
-                raise PublishNowError("Could not find a publish job for this item.")
-            job_id = job.id
-            account_id = job.account_id
         if not allow_recent:
-            now = dt.datetime.now(dt.timezone.utc)
-            with get_session() as session:
-                warning = _recency_warning(_account_last_posted(session, account_id), now=now)
-                account = session.get(Account, account_id)
-            if warning is not None:
-                return {
-                    "item_id": item_id,
-                    "status": "on_cooldown",
-                    "account_id": account_id,
-                    "account_name": account.name if account else None,
-                    **warning,
-                }
+            blocked = _on_cooldown_payload(item_id, account_id)
+            if blocked is not None:
+                return blocked
         return {"item_id": item_id, **_post_and_record(job_id, progress=progress)}
+
+
+def _publish_item_now_via_cloud(
+    item_id: int, account_id: int, *, allow_recent: bool
+) -> dict:
+    """Publish an item *now* through the Cloudflare Worker / Meta Graph API.
+
+    "Now" means scheduling the cloud job for the current time and nudging the
+    Worker to process it immediately, rather than opening a local browser. The
+    reel lands within ~1–3 minutes (Meta needs to transcode the container), so
+    this returns status ``"cloud"`` — the existing :func:`sync_cloud_jobs` poll
+    flips the local job to ``posted`` once the Worker reports it published.
+
+    The same-account recency backstop applies here too (unless ``allow_recent``);
+    note the Worker independently enforces its own per-account daily limit and
+    minimum gap as a hard safety floor.
+    """
+    if not allow_recent:
+        blocked = _on_cooldown_payload(item_id, account_id)
+        if blocked is not None:
+            return blocked
+
+    from nicheflow_studio.services import cloud_publisher
+
+    now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
+    # queue_for_publish performs the cloud handoff for a scheduled, cloud-mapped
+    # job and returns status "cloud" (or raises PublishError if the handoff fails).
+    result = queue_for_publish(item_id, scheduled_at=now_iso)
+    # Kick the Worker so it starts the Meta container right away instead of
+    # waiting up to ~60s for its cron; harmless if it's momentarily unreachable.
+    try:
+        cloud_publisher.run_due()
+    except cloud_publisher.CloudPublisherError:
+        pass
+
+    with get_session() as session:
+        account = session.get(Account, account_id)
+    return {
+        "item_id": item_id,
+        "status": result.get("status", "cloud"),
+        "job_id": result.get("job_id"),
+        "account_id": account_id,
+        "account_name": account.name if account else None,
+        "cloud": True,
+    }
 
 
 def list_due_jobs() -> list[dict]:

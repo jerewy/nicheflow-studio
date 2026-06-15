@@ -479,6 +479,13 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
           minute: "2-digit",
         });
         pushToast(`✅ ${accountLabel} — posted #${publishItemId} at ${when}`, "success");
+      } else if (result.status === "cloud") {
+        // Cloud-mapped account: the Worker (Meta Graph API) publishes it; the
+        // reel lands in ~1–3 min and the cloud-sync poll flips it to posted.
+        pushToast(
+          `☁️ ${accountLabel} — #${publishItemId} sent to cloud, posting shortly`,
+          "success",
+        );
       } else if (result.status === "on_cooldown") {
         // Backend backstop tripped (shouldn't normally happen since the UI
         // pre-checks). Re-open the dialog only if still on this item, else toast.

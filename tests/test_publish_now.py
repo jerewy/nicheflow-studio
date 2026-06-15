@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -560,6 +561,112 @@ def test_publish_due_allow_recent_posts_all(monkeypatch: pytest.MonkeyPatch) -> 
 
     assert summary["posted"] == 2
     assert summary["deferred"] == 0
+
+
+def _configure_cloud(monkeypatch: pytest.MonkeyPatch, account_id: int, *, key: str = "pastmomentsdaily") -> None:
+    """Point the cloud client at a Worker and map ``account_id`` to a Worker key."""
+    monkeypatch.setenv("CLOUDFLARE_PUBLISHER_URL", "https://worker.example.dev")
+    monkeypatch.setenv("CLOUDFLARE_PUBLISHER_API_KEY", "secret-key")
+    monkeypatch.setenv("CLOUDFLARE_PUBLISH_ACCOUNTS", json.dumps({str(account_id): key}))
+
+
+def test_publish_item_now_routes_cloud_account_to_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    publish_now._account_cooldowns.clear()
+    account_id = _make_account()
+    item_id = _make_exported_item(account_id)
+    _configure_cloud(monkeypatch, account_id)
+
+    from nicheflow_studio.services import cloud_publisher
+
+    scheduled: dict = {}
+
+    def fake_schedule(**kwargs):
+        scheduled.update(kwargs)
+        return {"id": "w1"}
+
+    ran = {"called": False}
+
+    def fake_run_due():
+        ran["called"] = True
+        return {"processed": 1, "mode": "live"}
+
+    monkeypatch.setattr(cloud_publisher, "list_jobs", lambda: {"jobs": []})
+    monkeypatch.setattr(cloud_publisher, "schedule_reel", fake_schedule)
+    monkeypatch.setattr(cloud_publisher, "run_due", fake_run_due)
+    monkeypatch.setattr(
+        publish_now,
+        "_do_publish_reel",
+        lambda *_a: pytest.fail("cloud-mapped account must not use the local browser"),
+    )
+
+    result = publish_now.publish_item_now(item_id)
+
+    # Handed to the cloud (Meta Graph API via the Worker), not posted locally.
+    assert result["status"] == "cloud"
+    assert result["cloud"] is True
+    assert result["account_name"] == "Past Moments"
+    assert scheduled["account_key"] == "pastmomentsdaily"
+    assert ran["called"] is True  # nudged the Worker to start immediately
+    with get_session() as session:
+        job = session.scalars(
+            select(UploadJob).where(UploadJob.download_item_id == item_id)
+        ).first()
+        assert job.status == "cloud"  # local loop skips it; cloud-sync flips to posted
+        assert job.posted_at is None
+
+
+def test_publish_item_now_cloud_respects_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    publish_now._account_cooldowns.clear()
+    account_id = _make_account()
+    _add_recent_post(account_id, minutes_ago=30)  # inside the 4h recency window
+    item_id = _make_exported_item(account_id)
+    _configure_cloud(monkeypatch, account_id)
+
+    from nicheflow_studio.services import cloud_publisher
+
+    monkeypatch.setattr(
+        cloud_publisher, "schedule_reel", lambda **_k: pytest.fail("no cloud handoff on cooldown")
+    )
+    monkeypatch.setattr(
+        cloud_publisher, "run_due", lambda: pytest.fail("no cloud run on cooldown")
+    )
+    monkeypatch.setattr(
+        publish_now, "_do_publish_reel", lambda *_a: pytest.fail("must not post on cooldown")
+    )
+
+    result = publish_now.publish_item_now(item_id)
+
+    assert result["status"] == "on_cooldown"
+    assert result["account_name"] == "Past Moments"
+
+
+def test_publish_item_now_cloud_allow_recent_overrides_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    publish_now._account_cooldowns.clear()
+    account_id = _make_account()
+    _add_recent_post(account_id, minutes_ago=30)
+    item_id = _make_exported_item(account_id)
+    _configure_cloud(monkeypatch, account_id)
+
+    from nicheflow_studio.services import cloud_publisher
+
+    scheduled: dict = {}
+    monkeypatch.setattr(cloud_publisher, "list_jobs", lambda: {"jobs": []})
+    monkeypatch.setattr(
+        cloud_publisher, "schedule_reel", lambda **k: scheduled.update(k) or {"id": "w2"}
+    )
+    monkeypatch.setattr(cloud_publisher, "run_due", lambda: {"processed": 1, "mode": "live"})
+
+    result = publish_now.publish_item_now(item_id, allow_recent=True)
+
+    # Override bypasses the local recency backstop and hands off to the cloud.
+    assert result["status"] == "cloud"
+    assert scheduled["account_key"] == "pastmomentsdaily"
 
 
 def test_auto_publish_toggle() -> None:
