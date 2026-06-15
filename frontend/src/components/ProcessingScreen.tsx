@@ -134,6 +134,9 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
   const [publishJobs, setPublishJobs] = useState<PublishJob[]>([]);
   const [scheduleAt, setScheduleAt] = useState("");
   const [publishMessage, setPublishMessage] = useState<string | null>(null);
+  // Cloud scheduling can upload the full reel, so track it per item and let the
+  // user keep working elsewhere while the background bridge job finishes.
+  const [schedulingItems, setSchedulingItems] = useState<Record<number, string>>({});
   // Live-posting state: the opt-in auto-publish toggle and how many scheduled
   // reels are currently past due.
   //
@@ -189,6 +192,9 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
   const thisItemPublishMessage =
     itemId !== null ? publishingItems[itemId] : undefined;
   const isThisItemPublishing = thisItemPublishMessage !== undefined;
+  const thisItemScheduleMessage =
+    itemId !== null ? schedulingItems[itemId] : undefined;
+  const isThisItemScheduling = thisItemScheduleMessage !== undefined;
   const dirty = useMemo(
     () => loadedRevision !== null && !sameOptions(edits, loadedRevision),
     [edits, loadedRevision],
@@ -307,11 +313,10 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
 
   const queueForPublish = async (scheduled: string | null) => {
     if (itemId === null) return;
-    setBusy(true);
     setActionError(null);
     setPublishMessage(null);
+    let scheduledIso: string | null = null;
     try {
-      let scheduledIso: string | null = null;
       if (scheduled) {
         // datetime-local gives a naive string like "2026-06-09T12:05". Convert
         // to a UTC ISO string so the backend never guesses the local timezone.
@@ -323,6 +328,11 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
         // Python 3.10 fromisoformat does not support "Z"; use "+00:00" instead.
         scheduledIso = d.toISOString().replace("Z", "+00:00");
       }
+      if (scheduledIso !== null) {
+        void runScheduleInBackground(itemId, activeAccountId, scheduledIso, false);
+        return;
+      }
+      setBusy(true);
       const result = await bridge.queueForPublish(itemId, scheduledIso);
       setPublishMessage(
         `${result.created ? "Added to" : "Updated in"} publish queue as ${result.status}.`,
@@ -333,28 +343,62 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
     } catch (err: unknown) {
       setActionError(err instanceof Error ? err.message : String(err));
     } finally {
-      setBusy(false);
+      if (scheduledIso === null) setBusy(false);
     }
   };
 
   const autoScheduleForPublish = async () => {
     if (itemId === null) return;
-    setBusy(true);
     setActionError(null);
     setPublishMessage(null);
+    void runScheduleInBackground(itemId, activeAccountId, null, true);
+  };
+
+  const runScheduleInBackground = async (
+    scheduleItemId: number,
+    scheduleAccountId: number,
+    scheduledIso: string | null,
+    automatic: boolean,
+  ) => {
+    const accountLabel = activeAccountName ?? "Account";
+    setSchedulingItems((current) => ({
+      ...current,
+      [scheduleItemId]: automatic ? "Auto-scheduling..." : "Scheduling...",
+    }));
+    pushToast(
+      `${accountLabel} - scheduling #${scheduleItemId} in the background.`,
+      "info",
+    );
     try {
-      const result = await bridge.autoScheduleForPublish(itemId);
+      const { job_id } = automatic
+        ? await bridge.startAutoScheduleForPublish(scheduleItemId)
+        : await bridge.startQueueForPublish(scheduleItemId, scheduledIso);
+      const result = (await waitForJob(job_id)) as {
+        status: string;
+        scheduled_at: string | null;
+      };
       const scheduled = result.scheduled_at
         ? new Date(result.scheduled_at).toLocaleString()
         : "the next open slot";
-      setPublishMessage(`Auto-scheduled for ${scheduled}.`);
-      refreshPublishJobs(itemId);
-      // Reflect the new "Scheduled" status in the Videos list.
-      refreshItems(activeAccountId);
+      pushToast(
+        `${accountLabel} - #${scheduleItemId} scheduled for ${scheduled} as ${result.status}.`,
+        "success",
+      );
+      if (itemIdRef.current === scheduleItemId) {
+        setPublishMessage(`Scheduled for ${scheduled} as ${result.status}.`);
+        refreshPublishJobs(scheduleItemId);
+      }
+      refreshItems(scheduleAccountId);
     } catch (err: unknown) {
-      setActionError(err instanceof Error ? err.message : String(err));
+      const message = err instanceof Error ? err.message : String(err);
+      if (itemIdRef.current === scheduleItemId) setActionError(message);
+      pushToast(`${accountLabel} - #${scheduleItemId} scheduling failed: ${message}`, "error");
     } finally {
-      setBusy(false);
+      setSchedulingItems((current) => {
+        const next = { ...current };
+        delete next[scheduleItemId];
+        return next;
+      });
     }
   };
 
@@ -1533,17 +1577,24 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
           <div className="flex flex-wrap items-center gap-2">
             <Button
               variant="secondary"
-              disabled={!item.processed_path || busy || isThisItemPublishing}
+              disabled={!item.processed_path || busy || isThisItemPublishing || isThisItemScheduling}
               onClick={() => queueForPublish(null)}
             >
               Add to Publish Queue
             </Button>
             <Button
               variant="secondary"
-              disabled={!item.processed_path || busy || isThisItemPublishing}
+              disabled={!item.processed_path || busy || isThisItemPublishing || isThisItemScheduling}
               onClick={autoScheduleForPublish}
             >
-              Auto Schedule
+              {isThisItemScheduling ? (
+                <>
+                  <span className="h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent" />
+                  {thisItemScheduleMessage}
+                </>
+              ) : (
+                "Auto Schedule"
+              )}
             </Button>
             <input
               type="datetime-local"
@@ -1552,13 +1603,26 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
               onChange={(e) => setScheduleAt(e.target.value)}
             />
             <Button
-              disabled={!item.processed_path || !scheduleAt || busy || isThisItemPublishing}
+              disabled={
+                !item.processed_path ||
+                !scheduleAt ||
+                busy ||
+                isThisItemPublishing ||
+                isThisItemScheduling
+              }
               onClick={() => queueForPublish(scheduleAt)}
             >
-              Schedule
+              {isThisItemScheduling ? (
+                <>
+                  <span className="h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent" />
+                  {thisItemScheduleMessage}
+                </>
+              ) : (
+                "Schedule"
+              )}
             </Button>
             <Button
-              disabled={!item.processed_path || busy || isThisItemPublishing}
+              disabled={!item.processed_path || busy || isThisItemPublishing || isThisItemScheduling}
               onClick={publishNow}
             >
               {thisItemPublishMessage ?? "Publish Now"}
@@ -1602,7 +1666,7 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
           {nowDialog && (
             <PublishNowDialog
               recency={nowDialog}
-              busy={isThisItemPublishing || busy}
+              busy={isThisItemPublishing || isThisItemScheduling || busy}
               onSchedule={() => {
                 setNowDialog(null);
                 void autoScheduleForPublish();

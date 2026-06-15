@@ -99,7 +99,12 @@ interface PywebviewApi {
     itemId: number,
     scheduledAt?: string | null,
   ): Promise<Envelope<QueueResult>>;
+  start_queue_for_publish(
+    itemId: number,
+    scheduledAt?: string | null,
+  ): Promise<Envelope<{ job_id: string }>>;
   auto_schedule_for_publish(itemId: number): Promise<Envelope<QueueResult>>;
+  start_auto_schedule_for_publish(itemId: number): Promise<Envelope<{ job_id: string }>>;
   sync_cloud_publish_jobs(): Promise<Envelope<{ synced: boolean; updated: number }>>;
   start_publish_now(itemId: number, allowRecent?: boolean): Promise<Envelope<{ job_id: string }>>;
   publish_due_count(): Promise<Envelope<{ due: number }>>;
@@ -309,9 +314,19 @@ export const bridge = {
     return unwrap(window.pywebview!.api.queue_for_publish(itemId, scheduledAt ?? null));
   },
 
+  startQueueForPublish(itemId: number, scheduledAt?: string | null): Promise<{ job_id: string }> {
+    if (!hasBridge()) return Promise.resolve({ job_id: "mock-queue-publish" });
+    return unwrap(window.pywebview!.api.start_queue_for_publish(itemId, scheduledAt ?? null));
+  },
+
   autoScheduleForPublish(itemId: number): Promise<QueueResult> {
     if (!hasBridge()) return mock.autoScheduleForPublish();
     return unwrap(window.pywebview!.api.auto_schedule_for_publish(itemId));
+  },
+
+  startAutoScheduleForPublish(itemId: number): Promise<{ job_id: string }> {
+    if (!hasBridge()) return Promise.resolve({ job_id: "mock-auto-schedule" });
+    return unwrap(window.pywebview!.api.start_auto_schedule_for_publish(itemId));
   },
 
   syncCloudPublishJobs(): Promise<{ synced: boolean; updated: number }> {
@@ -917,7 +932,22 @@ const mock = {
       created: true,
     };
   },
-  async getJob(): Promise<JobSnapshot> {
+  async getJob(jobId?: string): Promise<JobSnapshot> {
+    if (jobId === "mock-queue-publish" || jobId === "mock-auto-schedule") {
+      return {
+        id: jobId,
+        status: "succeeded",
+        progress: 1,
+        message: "Scheduled",
+        result: {
+          job_id: 1,
+          status: "cloud",
+          scheduled_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+          created: false,
+        },
+        error: null,
+      };
+    }
     return {
       id: "mock-job",
       status: "succeeded",

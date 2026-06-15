@@ -369,6 +369,64 @@ def test_bridge_auto_schedule_for_publish() -> None:
     assert result["data"]["scheduled_at"] is not None
 
 
+def test_bridge_start_queue_for_publish_runs_in_background(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge = ProcessingBridge()
+    calls: list[tuple[int, str | None]] = []
+    running = threading.Event()
+    release = threading.Event()
+
+    def fake_queue(item_id: int, *, scheduled_at: str | None = None) -> dict:
+        calls.append((item_id, scheduled_at))
+        running.set()
+        assert release.wait(2)
+        return {"job_id": 7, "status": "cloud", "scheduled_at": scheduled_at, "created": False}
+
+    monkeypatch.setattr("nicheflow_studio.services.publishing.queue_for_publish", fake_queue)
+
+    started = bridge.start_queue_for_publish(12, "2026-06-15T04:30:00+00:00")
+    assert started["ok"] is True
+    assert running.wait(1)
+    assert bridge.get_job(started["data"]["job_id"])["data"]["status"] == "running"
+    release.set()
+    snapshot = bridge._jobs.join(started["data"]["job_id"])
+
+    assert snapshot is not None
+    assert snapshot["status"] == "succeeded"
+    assert snapshot["result"]["status"] == "cloud"
+    assert calls == [(12, "2026-06-15T04:30:00+00:00")]
+
+
+def test_bridge_start_auto_schedule_for_publish_runs_in_background(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge = ProcessingBridge()
+    calls: list[int] = []
+
+    def fake_auto_schedule(item_id: int) -> dict:
+        calls.append(item_id)
+        return {
+            "job_id": 8,
+            "status": "cloud",
+            "scheduled_at": "2026-06-15T04:30:00+00:00",
+            "created": False,
+        }
+
+    monkeypatch.setattr(
+        "nicheflow_studio.services.publishing.auto_schedule_for_publish",
+        fake_auto_schedule,
+    )
+
+    started = bridge.start_auto_schedule_for_publish(12)
+    snapshot = bridge._jobs.join(started["data"]["job_id"])
+
+    assert snapshot is not None
+    assert snapshot["status"] == "succeeded"
+    assert snapshot["result"]["status"] == "cloud"
+    assert calls == [12]
+
+
 # --------------------------------------------------------------------------- #
 # launcher entry resolution
 # --------------------------------------------------------------------------- #

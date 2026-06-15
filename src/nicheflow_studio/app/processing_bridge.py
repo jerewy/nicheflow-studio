@@ -515,6 +515,20 @@ class ProcessingBridge:
         return publishing.queue_for_publish(item_id, scheduled_at=scheduled_at)
 
     @_guard
+    def start_queue_for_publish(self, item_id: int, scheduled_at: str | None = None) -> dict:
+        """Queue/schedule an exported reel in the background.
+
+        Cloud-mapped schedules upload the full video to the Worker, so this entry
+        point keeps the pywebview bridge responsive while React polls the job.
+        """
+        job_id = self._jobs.start(
+            publishing.queue_for_publish,
+            item_id,
+            scheduled_at=scheduled_at,
+        )
+        return {"job_id": job_id}
+
+    @_guard
     def start_publish_now(self, item_id: int, allow_recent: bool = False) -> dict:
         """Start a background job that posts the item's reel to Instagram now
         (live). Poll it via :meth:`get_job`.
@@ -572,6 +586,12 @@ class ProcessingBridge:
     def auto_schedule_for_publish(self, item_id: int) -> dict:
         """Schedule the exported reel in the account's next open posting slot."""
         return publishing.auto_schedule_for_publish(item_id)
+
+    @_guard
+    def start_auto_schedule_for_publish(self, item_id: int) -> dict:
+        """Auto-schedule an exported reel in the background."""
+        job_id = self._jobs.start(publishing.auto_schedule_for_publish, item_id)
+        return {"job_id": job_id}
 
     @_guard
     def sync_cloud_publish_jobs(self) -> dict:
