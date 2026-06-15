@@ -6,7 +6,7 @@
   "workers_dev": true,
   "preview_urls": false,
   "vars": {
-    "PUBLISH_MODE": "validate",
+    "PUBLISH_MODE": "live",
     "GRAPH_HOST": "graph.instagram.com",
     "GRAPH_VERSION": "v21.0",
     "PUBLIC_BASE_URL": "https://nicheflow-publisher.jeremywijaya81.workers.dev",
