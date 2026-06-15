@@ -49,18 +49,18 @@ GET /v1/usage
 From this directory:
 
 ```powershell
-corepack pnpm install
-corepack pnpm exec wrangler login
-corepack pnpm exec wrangler d1 create nicheflow-publisher
-corepack pnpm exec wrangler r2 bucket create nicheflow-publish-media
+npm install
+npx wrangler login
+npx wrangler d1 create nicheflow-publisher
+npx wrangler r2 bucket create nicheflow-publish-media
 ```
 
 Copy the returned D1 `database_id` into `wrangler.jsonc`, then initialize it:
 
 ```powershell
-corepack pnpm run db:remote
-corepack pnpm exec wrangler secret put API_KEY
-corepack pnpm run deploy
+npm run db:remote
+npx wrangler secret put API_KEY
+npm run deploy
 ```
 
 After deployment, copy the Worker URL into `PUBLIC_BASE_URL` in
@@ -69,7 +69,7 @@ After deployment, copy the Worker URL into `PUBLIC_BASE_URL` in
 For each account, add its token as a separate encrypted Worker secret:
 
 ```powershell
-corepack pnpm exec wrangler secret put IG_TOKEN_PASTMOMENTSDAILY
+npx wrangler secret put IG_TOKEN_PASTMOMENTSDAILY
 ```
 
 Do not put secret values directly in commands or `wrangler.jsonc`; Wrangler
@@ -77,7 +77,15 @@ will prompt securely.
 
 ## Register an account
 
-Keep `enabled` false until its token and user ID are verified:
+Easiest path — the repo's helper reads `IG_USER_ID_<ACCOUNT>` from `.env`, runs a
+read-only token check (confirms the token works and the account is Professional),
+then registers it. Run it from the repo root after setting the Worker secret:
+
+```powershell
+.venv\Scripts\python.exe scripts\cloudflare_register_account.py beneathhistory --daily-limit 3
+```
+
+Or call the API directly. Keep `enabled` false until its token and user ID are verified:
 
 ```powershell
 $headers = @{ Authorization = "Bearer <API_KEY>" }

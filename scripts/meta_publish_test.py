@@ -15,7 +15,7 @@ video format are all good. Add --publish only when you actually want it live.
 Prerequisites:
   - ngrok forwarding your static domain to the SAME --port, e.g.:
         ngrok http --url=gopher-gentleman-modular.ngrok-free.dev 8723
-  - .env with <ACCOUNT>_IG_USER_ID and <ACCOUNT>_IG_TOKEN.
+  - .env with IG_USER_ID_<ACCOUNT> and IG_TOKEN_<ACCOUNT>.
 
 Example (dry run):
   .venv\\Scripts\\python.exe scripts\\meta_publish_test.py ^
@@ -97,10 +97,10 @@ def main() -> int:
 
     load_dotenv()
     prefix = args.account.upper()
-    user_id = os.environ.get(f"{prefix}_IG_USER_ID")
-    token = os.environ.get(f"{prefix}_IG_TOKEN")
+    user_id = os.environ.get(f"IG_USER_ID_{prefix}")
+    token = os.environ.get(f"IG_TOKEN_{prefix}")
     if not user_id or not token:
-        raise SystemExit(f"Missing {prefix}_IG_USER_ID or {prefix}_IG_TOKEN in .env")
+        raise SystemExit(f"Missing IG_USER_ID_{prefix} or IG_TOKEN_{prefix} in .env")
 
     video_path = pathlib.Path(args.video)
     if not video_path.is_file():

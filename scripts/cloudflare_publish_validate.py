@@ -8,7 +8,7 @@ the Worker deliberately skipped ``media_publish``.
 Required .env values:
   CLOUDFLARE_PUBLISHER_URL=https://nicheflow-publisher.<subdomain>.workers.dev
   CLOUDFLARE_PUBLISHER_API_KEY=<Worker API_KEY secret value>
-  <ACCOUNT>_IG_USER_ID=<Instagram user id>
+  IG_USER_ID_<ACCOUNT>=<Instagram user id>
 
 The matching Instagram token must already exist as an encrypted Worker secret,
 for example IG_TOKEN_PASTMOMENTSDAILY.
@@ -72,11 +72,11 @@ def main() -> int:
     base_url = os.environ.get("CLOUDFLARE_PUBLISHER_URL", "").rstrip("/")
     api_key = os.environ.get("CLOUDFLARE_PUBLISHER_API_KEY", "")
     prefix = args.account.upper()
-    instagram_user_id = os.environ.get(f"{prefix}_IG_USER_ID", "")
+    instagram_user_id = os.environ.get(f"IG_USER_ID_{prefix}", "")
     if not base_url or not api_key or not instagram_user_id:
         raise SystemExit(
             "Missing CLOUDFLARE_PUBLISHER_URL, CLOUDFLARE_PUBLISHER_API_KEY, "
-            f"or {prefix}_IG_USER_ID in .env"
+            f"or IG_USER_ID_{prefix} in .env"
         )
 
     video_path = pathlib.Path(args.video).resolve()
