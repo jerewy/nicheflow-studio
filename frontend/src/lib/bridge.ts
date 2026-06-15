@@ -100,6 +100,7 @@ interface PywebviewApi {
     scheduledAt?: string | null,
   ): Promise<Envelope<QueueResult>>;
   auto_schedule_for_publish(itemId: number): Promise<Envelope<QueueResult>>;
+  sync_cloud_publish_jobs(): Promise<Envelope<{ synced: boolean; updated: number }>>;
   start_publish_now(itemId: number, allowRecent?: boolean): Promise<Envelope<{ job_id: string }>>;
   publish_due_count(): Promise<Envelope<{ due: number }>>;
   item_publish_recency(itemId: number): Promise<Envelope<PublishRecency>>;
@@ -311,6 +312,11 @@ export const bridge = {
   autoScheduleForPublish(itemId: number): Promise<QueueResult> {
     if (!hasBridge()) return mock.autoScheduleForPublish();
     return unwrap(window.pywebview!.api.auto_schedule_for_publish(itemId));
+  },
+
+  syncCloudPublishJobs(): Promise<{ synced: boolean; updated: number }> {
+    if (!hasBridge()) return Promise.resolve({ synced: false, updated: 0 });
+    return unwrap(window.pywebview!.api.sync_cloud_publish_jobs());
   },
 
   startPublishNow(itemId: number, allowRecent = false): Promise<{ job_id: string }> {

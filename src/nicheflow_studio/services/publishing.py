@@ -67,6 +67,16 @@ def _parse_scheduled_at(value: str | None) -> dt.datetime | None:
     return parsed.astimezone(dt.timezone.utc)
 
 
+def _parse_iso(value: str | None) -> dt.datetime | None:
+    """Tolerant ISO-8601 -> aware UTC (or None). Accepts a trailing ``Z``."""
+    if not value:
+        return None
+    try:
+        return dt.datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(dt.timezone.utc)
+    except ValueError:
+        return None
+
+
 def _aware(value: dt.datetime) -> dt.datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=dt.timezone.utc)
 
@@ -429,3 +439,47 @@ def auto_schedule_for_publish(
     else:
         result["message"] = f"Scheduled for {scheduled_local:%H:%M}"
     return result
+
+
+def sync_cloud_jobs() -> dict:
+    """Pull job states from the Cloudflare Worker and update local ``cloud`` jobs.
+
+    Matches Worker jobs by ``external_id`` (``nf-<local job id>``):
+    ``published`` -> local ``posted`` (with ``posted_at``); ``failed``/``canceled``
+    -> local ``failed`` (with the Worker's error). ``validated``/``scheduled``/
+    ``processing`` stay ``cloud`` (still pending a real post). No-op when cloud
+    publishing isn't configured or the Worker is unreachable.
+    """
+    from nicheflow_studio.services import cloud_publisher
+
+    if not cloud_publisher.is_configured():
+        return {"synced": False, "updated": 0}
+    try:
+        worker_jobs = cloud_publisher.list_jobs().get("jobs", [])
+    except cloud_publisher.CloudPublisherError:
+        return {"synced": False, "updated": 0}
+    by_external = {job["external_id"]: job for job in worker_jobs if job.get("external_id")}
+
+    updated = 0
+    with get_session() as session:
+        local_jobs = session.scalars(select(UploadJob).where(UploadJob.status == "cloud")).all()
+        for job in local_jobs:
+            worker = by_external.get(f"nf-{job.id}")
+            if worker is None:
+                continue
+            wstatus = (worker.get("status") or "").lower()
+            if wstatus == "published":
+                job.status = "posted"
+                job.posted_at = _parse_iso(worker.get("published_at")) or dt.datetime.now(
+                    dt.timezone.utc
+                )
+                job.error_message = None
+                updated += 1
+            elif wstatus in ("failed", "canceled"):
+                job.status = "failed"
+                job.error_message = (worker.get("error_message") or f"cloud job {wstatus}")[:512]
+                updated += 1
+            # validated / scheduled / processing -> still 'cloud' (no change yet)
+        if updated:
+            session.commit()
+    return {"synced": True, "updated": updated}

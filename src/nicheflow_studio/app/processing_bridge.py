@@ -572,3 +572,10 @@ class ProcessingBridge:
     def auto_schedule_for_publish(self, item_id: int) -> dict:
         """Schedule the exported reel in the account's next open posting slot."""
         return publishing.auto_schedule_for_publish(item_id)
+
+    @_guard
+    def sync_cloud_publish_jobs(self) -> dict:
+        """Pull cloud job states from the Worker into local jobs, so cloud
+        posted/failed outcomes show up in the Processing list. The UI calls this
+        on a timer; it is a no-op unless cloud publishing is configured."""
+        return publishing.sync_cloud_jobs()

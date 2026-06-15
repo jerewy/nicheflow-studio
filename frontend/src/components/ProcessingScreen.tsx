@@ -36,6 +36,7 @@ const STATUS_META: Record<string, { label: string; dot: string }> = {
   draft: { label: "Draft", dot: "bg-amber-500" },
   exported: { label: "Exported", dot: "bg-violet-500" },
   scheduled: { label: "Scheduled", dot: "bg-fuchsia-500" },
+  cloud: { label: "Cloud", dot: "bg-indigo-500" },
   posted: { label: "Posted", dot: "bg-emerald-500" },
   skipped: { label: "Skipped", dot: "bg-zinc-500" },
   failed: { label: "Failed", dot: "bg-red-500" },
@@ -556,6 +557,27 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
     return () => window.clearTimeout(timer);
   }, [refreshDueCount]);
 
+  // Pull cloud job outcomes (the Worker posts off-PC) into the local list on a
+  // timer, and refresh the table when something changed. No-op unless cloud
+  // publishing is configured, so this is free for accounts on the local path.
+  useEffect(() => {
+    let cancelled = false;
+    const tick = () => {
+      bridge
+        .syncCloudPublishJobs()
+        .then((result) => {
+          if (!cancelled && result.updated > 0) refreshItems(activeAccountId);
+        })
+        .catch(() => undefined);
+    };
+    tick();
+    const id = window.setInterval(tick, 30000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [activeAccountId, refreshItems]);
+
   // Poll for newer revisions (Codex writes, or another window's edits).
   useEffect(() => {
     if (itemId === null) return;
@@ -966,6 +988,7 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
                 <option value="draft">Draft</option>
                 <option value="exported">Exported</option>
                 <option value="scheduled">Scheduled</option>
+                <option value="cloud">Cloud</option>
                 <option value="posted">Posted</option>
                 <option value="failed">Failed</option>
                 <option value="skipped">Skipped</option>

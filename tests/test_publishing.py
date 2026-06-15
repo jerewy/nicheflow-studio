@@ -169,6 +169,49 @@ def test_cloud_handoff_idempotent_on_duplicate(monkeypatch: pytest.MonkeyPatch) 
         assert session.get(UploadJob, result["job_id"]).status == "cloud"
 
 
+def test_sync_cloud_jobs_updates_local(monkeypatch: pytest.MonkeyPatch) -> None:
+    from nicheflow_studio.services import cloud_publisher
+
+    item_id = _make_item()
+    with get_session() as session:
+        account_id = session.get(DownloadItem, item_id).account_id
+        j1 = UploadJob(account_id=account_id, download_item_id=item_id, processed_path="C:/a.mp4", status="cloud")
+        j2 = UploadJob(account_id=account_id, download_item_id=item_id, processed_path="C:/b.mp4", status="cloud")
+        session.add_all([j1, j2])
+        session.commit()
+        id1, id2 = j1.id, j2.id
+
+    monkeypatch.setenv("CLOUDFLARE_PUBLISHER_URL", "https://worker.example.dev")
+    monkeypatch.setenv("CLOUDFLARE_PUBLISHER_API_KEY", "secret")
+
+    def fake_list_jobs():
+        return {
+            "jobs": [
+                {"external_id": f"nf-{id1}", "status": "published", "published_at": "2026-06-16T02:00:00Z"},
+                {"external_id": f"nf-{id2}", "status": "failed", "error_message": "boom"},
+            ]
+        }
+
+    monkeypatch.setattr(cloud_publisher, "list_jobs", fake_list_jobs)
+
+    result = publishing.sync_cloud_jobs()
+
+    assert result == {"synced": True, "updated": 2}
+    with get_session() as session:
+        posted = session.get(UploadJob, id1)
+        assert posted.status == "posted"
+        assert posted.posted_at is not None
+        failed = session.get(UploadJob, id2)
+        assert failed.status == "failed"
+        assert "boom" in (failed.error_message or "")
+
+
+def test_sync_cloud_jobs_noop_without_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CLOUDFLARE_PUBLISHER_URL", raising=False)
+    monkeypatch.delenv("CLOUDFLARE_PUBLISHER_API_KEY", raising=False)
+    assert publishing.sync_cloud_jobs() == {"synced": False, "updated": 0}
+
+
 def test_queue_creates_draft_job() -> None:
     item_id = _make_item()
 

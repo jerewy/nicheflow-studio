@@ -60,21 +60,25 @@ def _derive_status(
     posted_item_ids: set[int],
     failed_item_ids: set[int],
     scheduled_item_ids: set[int],
+    cloud_item_ids: set[int],
 ) -> str:
     """Workflow status for the Processing table: posted > failed > scheduled >
-    pending_review > skipped > exported > draft > new.
+    cloud > pending_review > skipped > exported > draft > new.
 
-    ``scheduled`` outranks ``pending_review`` on purpose: auto-distributed clips
-    are exported AND queued for a future post in the background while their
+    ``scheduled``/``cloud`` outrank ``pending_review`` on purpose: auto-distributed
+    clips are exported AND queued for a future post in the background while their
     ``download_items.status`` is still ``pending_review`` (awaiting the user's
     review). The live schedule is the more useful thing to surface, so it wins —
-    a clip with no scheduled job still reads ``pending_review`` as before."""
+    a clip with no queued post still reads ``pending_review`` as before. ``cloud``
+    is the same as ``scheduled`` but handed off to the Cloudflare Worker."""
     if item.id in posted_item_ids:
         return "posted"
     if item.id in failed_item_ids:
         return "failed"
     if item.id in scheduled_item_ids:
         return "scheduled"
+    if item.id in cloud_item_ids:
+        return "cloud"
     if item.status == "pending_review":
         return "pending_review"
     if (item.review_state or "").lower() in _SKIPPED_REVIEW_STATES:
@@ -124,6 +128,18 @@ def list_items(account_id: int | None = None, limit: int = _LIST_LIMIT) -> list[
             ).all()
             if row is not None
         }
+        # Items handed off to the Cloudflare Worker (status 'cloud', not yet
+        # posted) — surfaced distinctly so the table shows they publish via cloud.
+        cloud_item_ids = {
+            row
+            for row in session.scalars(
+                select(UploadJob.download_item_id)
+                .where(UploadJob.download_item_id.is_not(None))
+                .where(UploadJob.posted_at.is_(None))
+                .where(UploadJob.status == "cloud")
+            ).all()
+            if row is not None
+        }
         query = (
             select(DownloadItem)
             # Globally-rejected ("blocked") items are hidden from Processing.
@@ -166,7 +182,7 @@ def list_items(account_id: int | None = None, limit: int = _LIST_LIMIT) -> list[
                     "title": row.title,
                     "source_url": row.source_url,
                     "status": _derive_status(
-                        row, posted_item_ids, failed_item_ids, scheduled_item_ids
+                        row, posted_item_ids, failed_item_ids, scheduled_item_ids, cloud_item_ids
                     ),
                     "raw_status": row.status,
                     "review_state": row.review_state,

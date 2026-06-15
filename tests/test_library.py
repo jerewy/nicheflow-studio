@@ -188,6 +188,31 @@ def test_status_derivation_scheduled_outranks_pending_review() -> None:
     assert by_id[item] == "scheduled"
 
 
+def test_status_derivation_cloud_job() -> None:
+    # A job handed off to the Cloudflare Worker (status 'cloud') reads as "Cloud"
+    # in the table, ranked like 'scheduled' (above pending_review).
+    from nicheflow_studio.db.models import UploadJob
+
+    account_id = _make_account()
+    item = _make_item(account_id=account_id)
+    with get_session() as session:
+        row = session.get(DownloadItem, item)
+        row.status = "pending_review"
+        row.processed_path = "C:/out.mp4"
+        session.add(
+            UploadJob(
+                account_id=account_id,
+                download_item_id=item,
+                processed_path="C:/out.mp4",
+                status="cloud",
+            )
+        )
+        session.commit()
+
+    by_id = {r["id"]: r["status"] for r in library.list_items(account_id=account_id)}
+    assert by_id[item] == "cloud"
+
+
 def test_status_derivation_posted_outranks_scheduled() -> None:
     # A scheduled row that has since posted (e.g. a stale schedule left behind)
     # must read as posted, not scheduled.
