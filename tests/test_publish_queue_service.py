@@ -108,6 +108,25 @@ def test_reschedule_failed_job_revives_it_and_clears_error() -> None:
         assert session.get(UploadJob, job_id).error_message is None
 
 
+def test_reschedule_hands_cloud_mapped_job_to_worker(monkeypatch: pytest.MonkeyPatch) -> None:
+    from nicheflow_studio.services import cloud_publisher
+
+    job_id = _make_job()
+    with get_session() as session:
+        account_id = session.get(UploadJob, job_id).account_id
+    monkeypatch.setenv("CLOUDFLARE_PUBLISHER_URL", "https://worker.example.dev")
+    monkeypatch.setenv("CLOUDFLARE_PUBLISHER_API_KEY", "secret")
+    monkeypatch.setenv("CLOUDFLARE_PUBLISH_ACCOUNTS", f'{{"{account_id}":"testkey"}}')
+    monkeypatch.setattr(cloud_publisher, "list_jobs", lambda: {"jobs": []})
+    monkeypatch.setattr(cloud_publisher, "schedule_reel", lambda **_kwargs: {})
+
+    result = publish_queue.reschedule(job_id, "2026-08-01T20:00:00+00:00")
+
+    assert result["status"] == "cloud"
+    with get_session() as session:
+        assert session.get(UploadJob, job_id).status == "cloud"
+
+
 def test_reschedule_posted_job_raises() -> None:
     job_id = _make_job()
     publish_queue.mark_posted(job_id, {})

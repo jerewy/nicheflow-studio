@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import datetime as dt
 import random as _random
+import time
 
 from sqlalchemy import select
 
@@ -184,16 +185,44 @@ def list_publish_jobs(item_id: int) -> list[dict]:
         ]
 
 
-def _handoff_scheduled_job_to_cloud(job_id: int) -> str | None:
+def _worker_jobs_for_local(worker_jobs: list[dict], job_id: int) -> list[dict]:
+    """Worker jobs belonging to a local job id. external_id is ``nf-<id>-<time_ns>``
+    (a fresh id per push); the legacy ``nf-<id>`` form is matched too."""
+    legacy = f"nf-{job_id}"
+    prefix = f"nf-{job_id}-"
+    return [
+        w
+        for w in worker_jobs
+        if (w.get("external_id") == legacy or (w.get("external_id") or "").startswith(prefix))
+    ]
+
+
+def _latest_worker_job_for_local(worker_jobs: list[dict], job_id: int) -> dict | None:
+    """Newest Worker generation for a local job, with legacy ids sorting first."""
+    matches = _worker_jobs_for_local(worker_jobs, job_id)
+    prefix = f"nf-{job_id}-"
+
+    def generation(worker: dict) -> int:
+        external_id = worker.get("external_id") or ""
+        if not external_id.startswith(prefix):
+            return -1
+        try:
+            return int(external_id.removeprefix(prefix))
+        except ValueError:
+            return -1
+
+    return max(matches, key=generation, default=None)
+
+
+def handoff_scheduled_job_to_cloud(job_id: int) -> str | None:
     """Push a scheduled job for a cloud-mapped account to the Cloudflare Worker.
 
-    Returns ``"cloud"`` when the job was handed off — so the caller flips its
-    result status and the local publish loop (which only acts on
-    ``status == "scheduled"``) skips it. Returns ``None`` when no handoff applies
-    (cloud not configured, account not mapped, or not a scheduled post). On a hard
-    failure it marks the job ``failed`` and raises :class:`PublishError`; a
-    duplicate (already on the Worker) is treated as success so re-scheduling is
-    idempotent.
+    Each push uses a FRESH ``nf-<job id>-<time_ns>`` external id, and any existing
+    Worker job for this local job is canceled first — so re-scheduling actually
+    replaces the cloud job (with its new time) instead of silently no-op'ing
+    against a stale one. Returns ``"cloud"`` when handed off (so the local publish
+    loop, which only acts on ``status == "scheduled"``, skips it), or ``None`` when
+    no handoff applies. A hard failure marks the job ``failed`` and raises.
     """
     from nicheflow_studio.services import cloud_publisher
 
@@ -210,24 +239,27 @@ def _handoff_scheduled_job_to_cloud(job_id: int) -> str | None:
         caption = job.description or ""
         scheduled_iso = _aware(job.scheduled_at).isoformat()
 
-    # Network upload to the Worker — outside the DB session.
     try:
+        # Cancel any prior active Worker job before pushing its replacement.
+        # Failing closed here prevents the old and new schedules both publishing.
+        for worker in _worker_jobs_for_local(cloud_publisher.list_jobs().get("jobs", []), job_id):
+            if worker.get("status") in ("awaiting_upload", "scheduled", "processing"):
+                cloud_publisher.cancel_job(worker["id"])
         cloud_publisher.schedule_reel(
-            external_id=f"nf-{job_id}",
+            external_id=f"nf-{job_id}-{time.time_ns()}",
             account_key=worker_key,
             caption=caption,
             scheduled_at=scheduled_iso,
             video_path=video,
         )
     except cloud_publisher.CloudPublisherError as exc:
-        if "already exists" not in str(exc).lower():
-            with get_session() as session:
-                job = session.get(UploadJob, job_id)
-                if job is not None:
-                    job.status = "failed"
-                    job.error_message = f"Cloud handoff failed: {exc}"[:512]
-                    session.commit()
-            raise PublishError(f"Cloud handoff failed: {exc}") from exc
+        with get_session() as session:
+            job = session.get(UploadJob, job_id)
+            if job is not None:
+                job.status = "failed"
+                job.error_message = f"Cloud handoff failed: {exc}"[:512]
+                session.commit()
+        raise PublishError(f"Cloud handoff failed: {exc}") from exc
 
     with get_session() as session:
         job = session.get(UploadJob, job_id)
@@ -336,7 +368,7 @@ def queue_for_publish(item_id: int, *, scheduled_at: str | None = None) -> dict:
     # account is pushed to the Worker and flips to status 'cloud' so the local
     # publish loop skips it. Inert (returns None) unless the account is mapped.
     if status == "scheduled":
-        cloud_status = _handoff_scheduled_job_to_cloud(result["job_id"])
+        cloud_status = handoff_scheduled_job_to_cloud(result["job_id"])
         if cloud_status:
             result["status"] = cloud_status
     return result
@@ -444,7 +476,8 @@ def auto_schedule_for_publish(
 def sync_cloud_jobs() -> dict:
     """Pull job states from the Cloudflare Worker and update local ``cloud`` jobs.
 
-    Matches Worker jobs by ``external_id`` (``nf-<local job id>``):
+    Matches the newest Worker generation by ``external_id`` prefix
+    (``nf-<local job id>-<time_ns>``; legacy exact ids still work):
     ``published`` -> local ``posted`` (with ``posted_at``); ``failed``/``canceled``
     -> local ``failed`` (with the Worker's error). ``validated``/``scheduled``/
     ``processing`` stay ``cloud`` (still pending a real post). No-op when cloud
@@ -458,13 +491,11 @@ def sync_cloud_jobs() -> dict:
         worker_jobs = cloud_publisher.list_jobs().get("jobs", [])
     except cloud_publisher.CloudPublisherError:
         return {"synced": False, "updated": 0}
-    by_external = {job["external_id"]: job for job in worker_jobs if job.get("external_id")}
-
     updated = 0
     with get_session() as session:
         local_jobs = session.scalars(select(UploadJob).where(UploadJob.status == "cloud")).all()
         for job in local_jobs:
-            worker = by_external.get(f"nf-{job.id}")
+            worker = _latest_worker_job_for_local(worker_jobs, job.id)
             if worker is None:
                 continue
             wstatus = (worker.get("status") or "").lower()

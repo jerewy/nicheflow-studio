@@ -164,8 +164,17 @@ def reschedule(job_id: int, scheduled_at: str) -> dict:
         # Rescheduling revives failed jobs too — clear the old error so the
         # next attempt gets its one automatic retry again.
         job.error_message = None
-        account = session.get(Account, job.account_id)
         session.commit()
+
+    # Multi-Account Publish edits use this service rather than
+    # publishing.queue_for_publish(), so explicitly perform the same cloud
+    # replacement handoff after the local schedule is committed.
+    from nicheflow_studio.services import publishing
+
+    publishing.handoff_scheduled_job_to_cloud(job_id)
+    with get_session() as session:
+        job = _require_job(session, job_id)
+        account = session.get(Account, job.account_id)
         return _job_view(job, account.name if account else None)
 
 

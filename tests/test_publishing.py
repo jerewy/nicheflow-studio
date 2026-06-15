@@ -96,13 +96,14 @@ def test_scheduled_job_hands_off_to_cloud_when_mapped(monkeypatch: pytest.Monkey
         captured.update(kwargs)
         return {"id": "worker-job", "status": "scheduled"}
 
+    monkeypatch.setattr(cloud_publisher, "list_jobs", lambda: {"jobs": []})
     monkeypatch.setattr(cloud_publisher, "schedule_reel", fake_schedule_reel)
 
     result = publishing.queue_for_publish(item_id, scheduled_at="2026-06-16T02:00:00+00:00")
 
     assert result["status"] == "cloud"
     assert captured["account_key"] == "testkey"
-    assert captured["external_id"] == f"nf-{result['job_id']}"
+    assert captured["external_id"].startswith(f"nf-{result['job_id']}-")
     assert captured["video_path"] == "C:/processed/out.mp4"
     with get_session() as session:
         assert session.get(UploadJob, result["job_id"]).status == "cloud"
@@ -139,6 +140,7 @@ def test_cloud_handoff_failure_marks_job_failed(monkeypatch: pytest.MonkeyPatch)
     def fail(**kwargs):
         raise CloudPublisherError("Cloud publisher HTTP 500: boom")
 
+    monkeypatch.setattr(cloud_publisher, "list_jobs", lambda: {"jobs": []})
     monkeypatch.setattr(cloud_publisher, "schedule_reel", fail)
 
     with pytest.raises(PublishError, match="Cloud handoff failed"):
@@ -150,21 +152,33 @@ def test_cloud_handoff_failure_marks_job_failed(monkeypatch: pytest.MonkeyPatch)
         assert "Cloud handoff failed" in (job.error_message or "")
 
 
-def test_cloud_handoff_idempotent_on_duplicate(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cloud_handoff_replaces_existing_worker_job(monkeypatch: pytest.MonkeyPatch) -> None:
     from nicheflow_studio.services import cloud_publisher
-    from nicheflow_studio.services.cloud_publisher import CloudPublisherError
 
     item_id = _make_item()
     _enable_cloud(monkeypatch, _account_id_of(item_id))
+    canceled: list[str] = []
+    captured: dict = {}
 
-    def already(**kwargs):
-        raise CloudPublisherError("Cloud publisher HTTP 400: A job already exists for testkey/nf-1")
+    monkeypatch.setattr(
+        cloud_publisher,
+        "list_jobs",
+        lambda: {
+            "jobs": [
+                {"id": "old", "external_id": "nf-1", "status": "scheduled"},
+                {"id": "done", "external_id": "nf-1-100", "status": "published"},
+            ]
+        },
+    )
+    monkeypatch.setattr(cloud_publisher, "cancel_job", lambda worker_id: canceled.append(worker_id))
+    monkeypatch.setattr(cloud_publisher, "schedule_reel", lambda **kwargs: captured.update(kwargs))
 
-    monkeypatch.setattr(cloud_publisher, "schedule_reel", already)
-
-    result = publishing.queue_for_publish(item_id, scheduled_at="2026-06-16T02:00:00+00:00")
+    result = publishing.queue_for_publish(item_id, scheduled_at="2026-06-16T03:00:00+00:00")
 
     assert result["status"] == "cloud"
+    assert canceled == ["old"]
+    assert captured["external_id"].startswith(f"nf-{result['job_id']}-")
+    assert captured["external_id"] not in {"nf-1", "nf-1-100"}
     with get_session() as session:
         assert session.get(UploadJob, result["job_id"]).status == "cloud"
 
@@ -187,7 +201,8 @@ def test_sync_cloud_jobs_updates_local(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_list_jobs():
         return {
             "jobs": [
-                {"external_id": f"nf-{id1}", "status": "published", "published_at": "2026-06-16T02:00:00Z"},
+                {"external_id": f"nf-{id1}-100", "status": "canceled"},
+                {"external_id": f"nf-{id1}-200", "status": "published", "published_at": "2026-06-16T02:00:00Z"},
                 {"external_id": f"nf-{id2}", "status": "failed", "error_message": "boom"},
             ]
         }
@@ -257,6 +272,25 @@ def test_auto_schedule_uses_next_open_account_slot() -> None:
     assert result["status"] == "scheduled"
     scheduled = dt.datetime.fromisoformat(result["scheduled_at"])
     assert scheduled > dt.datetime.now(dt.timezone.utc)
+
+
+def test_auto_schedule_hands_cloud_mapped_job_to_worker(monkeypatch: pytest.MonkeyPatch) -> None:
+    from nicheflow_studio.services import cloud_publisher
+
+    item_id = _make_item()
+    account_id = _account_id_of(item_id)
+    with get_session() as session:
+        session.get(Account, account_id).upload_schedule_slots = "09:00, 18:00"
+        session.commit()
+    _enable_cloud(monkeypatch, account_id)
+    monkeypatch.setattr(cloud_publisher, "list_jobs", lambda: {"jobs": []})
+    monkeypatch.setattr(cloud_publisher, "schedule_reel", lambda **_kwargs: {})
+
+    result = publishing.auto_schedule_for_publish(item_id)
+
+    assert result["status"] == "cloud"
+    with get_session() as session:
+        assert session.get(UploadJob, result["job_id"]).status == "cloud"
 
 
 def test_auto_schedule_keeps_existing_schedule_on_reexport() -> None:
