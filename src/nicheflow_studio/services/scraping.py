@@ -27,6 +27,7 @@ from nicheflow_studio.db.media_library import (
 from nicheflow_studio.db.models import Account, DownloadItem, ScrapeCandidate, Source
 from nicheflow_studio.db.pool_intake import ReelMetadata, add_reel_to_pool
 from nicheflow_studio.db.session import get_session
+from nicheflow_studio.processing.dedup import safe_video_fingerprint
 from nicheflow_studio.downloader.instagram import download_instagram_url
 from nicheflow_studio.scraper.instagram_apify import scrape_instagram_source_apify
 from nicheflow_studio.services.errors import ServiceError
@@ -211,11 +212,17 @@ def add_candidate_to_processing(
             raise ScrapingError(f"Download failed: {exc}") from exc
         file_path = str(result.file_path)
         downloaded = True
+        # Perceptual fingerprint for cross-repost footage dedup; best-effort so a
+        # fingerprinting failure never fails the scrape. With the hash present at
+        # intake, accept_into_pool's content-dedup can fire immediately.
+        content_hash = safe_video_fingerprint(Path(file_path))
         with get_session() as session:
             asset, _ = find_or_register_media_asset(
                 session, source_url=source_url, shortcode=shortcode, platform="instagram"
             )
-            mark_media_asset_downloaded(asset, original_download_path=file_path)
+            mark_media_asset_downloaded(
+                asset, original_download_path=file_path, content_hash=content_hash
+            )
             session.commit()
 
     # 3. Create the Processing item and link the candidate to it.

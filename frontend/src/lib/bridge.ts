@@ -13,6 +13,9 @@ import type {
   AccountSummary,
   ApifyUsage,
   ApplyResult,
+  BatchDraftImportResult,
+  BatchFramesResult,
+  CloudPublisherHealth,
   CropRect,
   DeleteAccountResult,
   DistributeNicheResult,
@@ -24,10 +27,13 @@ import type {
   LibraryItem,
   NicheAccount,
   PoolClip,
+  PoolItemPreview,
+  PoolReviewItem,
   PoolSource,
   PoolSourceClip,
   PoolingOverview,
   ProcessingContext,
+  SetProcessingStatusResult,
   PublishEvent,
   PublishJob,
   PublishQueueJob,
@@ -35,6 +41,7 @@ import type {
   AccountReadiness,
   DashboardAccountStats,
   QueueResult,
+  ScheduleCoverage,
   ScrapeCandidate,
   SourceProfile,
   WorkflowSettings,
@@ -68,6 +75,17 @@ interface PywebviewApi {
     payload: Record<string, unknown>,
   ): Promise<Envelope<{ prompt: string }>>;
   import_pasted_draft(itemId: number, text: string): Promise<Envelope<DraftRevision>>;
+  build_account_batch_chat_prompt(
+    accountId: number,
+    itemIds: number[],
+    payload?: Record<string, unknown> | null,
+  ): Promise<Envelope<{ prompt: string }>>;
+  import_account_batch_draft(
+    text: string,
+    itemIds: number[],
+  ): Promise<Envelope<BatchDraftImportResult>>;
+  prepare_account_batch_frames(itemIds: number[]): Promise<Envelope<BatchFramesResult>>;
+  open_batch_frames_folder(folder: string): Promise<Envelope<{ folder: string }>>;
   get_workflow_settings(itemId: number): Promise<Envelope<WorkflowSettings>>;
   save_workflow_settings(
     itemId: number,
@@ -95,6 +113,10 @@ interface PywebviewApi {
   start_export(itemId: number): Promise<Envelope<{ job_id: string }>>;
   get_job(jobId: string): Promise<Envelope<JobSnapshot>>;
   list_publish_jobs(itemId: number): Promise<Envelope<PublishJob[]>>;
+  set_processing_status(
+    itemId: number,
+    status: string,
+  ): Promise<Envelope<SetProcessingStatusResult>>;
   queue_for_publish(
     itemId: number,
     scheduledAt?: string | null,
@@ -106,7 +128,11 @@ interface PywebviewApi {
   auto_schedule_for_publish(itemId: number): Promise<Envelope<QueueResult>>;
   start_auto_schedule_for_publish(itemId: number): Promise<Envelope<{ job_id: string }>>;
   sync_cloud_publish_jobs(): Promise<Envelope<{ synced: boolean; updated: number }>>;
-  start_publish_now(itemId: number, allowRecent?: boolean): Promise<Envelope<{ job_id: string }>>;
+  start_publish_now(
+    itemId: number,
+    allowRecent?: boolean,
+    forceLocal?: boolean,
+  ): Promise<Envelope<{ job_id: string }>>;
   publish_due_count(): Promise<Envelope<{ due: number }>>;
   item_publish_recency(itemId: number): Promise<Envelope<PublishRecency>>;
   due_publish_recency(): Promise<Envelope<DueRecencyWarning[]>>;
@@ -181,6 +207,16 @@ interface PywebviewApi {
     sourceLabel: string,
     includeRemoved?: boolean,
   ): Promise<Envelope<PoolSourceClip[]>>;
+  pool_review_queue(
+    niche: string,
+    sourceLabel?: string | null,
+  ): Promise<Envelope<PoolReviewItem[]>>;
+  pool_item_preview(poolItemId: number): Promise<Envelope<PoolItemPreview>>;
+  start_pool_item_preview_download(
+    poolItemId: number,
+  ): Promise<Envelope<{ job_id: string }>>;
+  approve_pool_items(ids: number[]): Promise<Envelope<{ approved: number }>>;
+  reject_pool_items(ids: number[], reason: string): Promise<Envelope<{ rejected: number }>>;
   remove_pool_item(
     poolItemId: number,
     reason: string,
@@ -202,6 +238,8 @@ interface PywebviewApi {
     targets: Record<number, number>,
   ): Promise<Envelope<DistributeNicheResult>>;
   dashboard_publish_jobs(): Promise<Envelope<DashboardPublishQueue>>;
+  dashboard_schedule_coverage(): Promise<Envelope<ScheduleCoverage>>;
+  cloud_publisher_health(): Promise<Envelope<CloudPublisherHealth>>;
   dashboard_account_stats(activeAccountId: number): Promise<Envelope<DashboardAccountStats>>;
   dashboard_mark_ready(jobIds: number[]): Promise<Envelope<{ updated: number }>>;
   dashboard_open_output(jobId: number): Promise<Envelope<{ opened: string }>>;
@@ -334,9 +372,13 @@ export const bridge = {
     return unwrap(window.pywebview!.api.sync_cloud_publish_jobs());
   },
 
-  startPublishNow(itemId: number, allowRecent = false): Promise<{ job_id: string }> {
+  startPublishNow(
+    itemId: number,
+    allowRecent = false,
+    forceLocal = false,
+  ): Promise<{ job_id: string }> {
     if (!hasBridge()) return Promise.resolve({ job_id: "mock-publish" });
-    return unwrap(window.pywebview!.api.start_publish_now(itemId, allowRecent));
+    return unwrap(window.pywebview!.api.start_publish_now(itemId, allowRecent, forceLocal));
   },
 
   publishDueCount(): Promise<{ due: number }> {
@@ -428,6 +470,57 @@ export const bridge = {
   importPastedDraft(itemId: number, text: string): Promise<DraftRevision> {
     if (!hasBridge()) return mock.getLatest() as Promise<DraftRevision>;
     return unwrap(window.pywebview!.api.import_pasted_draft(itemId, text));
+  },
+
+  setProcessingStatus(itemId: number, status: string): Promise<SetProcessingStatusResult> {
+    if (!hasBridge()) {
+      return Promise.resolve({
+        item_id: itemId,
+        repost_job_id: itemId + 1000,
+        status: status as SetProcessingStatusResult["status"],
+        created: true,
+      });
+    }
+    return unwrap(window.pywebview!.api.set_processing_status(itemId, status));
+  },
+
+  buildAccountBatchChatPrompt(
+    accountId: number,
+    itemIds: number[],
+    payload: Record<string, unknown>,
+  ): Promise<{ prompt: string }> {
+    if (!hasBridge())
+      return Promise.resolve({
+        prompt: itemIds
+          .map((itemId, index) => `===== REEL ${index + 1} | item ${itemId} | Mock =====`)
+          .join("\n\n"),
+      });
+    return unwrap(
+      window.pywebview!.api.build_account_batch_chat_prompt(accountId, itemIds, payload),
+    );
+  },
+
+  importAccountBatchDraft(text: string, itemIds: number[]): Promise<BatchDraftImportResult> {
+    if (!hasBridge())
+      return Promise.resolve({ imported: itemIds, failed: [], unmatched: text ? [] : itemIds });
+    return unwrap(window.pywebview!.api.import_account_batch_draft(text, itemIds));
+  },
+
+  prepareAccountBatchFrames(itemIds: number[]): Promise<BatchFramesResult> {
+    if (!hasBridge())
+      return Promise.resolve({
+        folder: "C:/mock/batch-frames",
+        frames: itemIds.map((itemId, index) => ({
+          item_id: itemId,
+          path: `C:/mock/batch-frames/reel_${index + 1}_item${itemId}.jpg`,
+        })),
+      });
+    return unwrap(window.pywebview!.api.prepare_account_batch_frames(itemIds));
+  },
+
+  openBatchFramesFolder(folder: string): Promise<{ folder: string }> {
+    if (!hasBridge()) return Promise.resolve({ folder });
+    return unwrap(window.pywebview!.api.open_batch_frames_folder(folder));
   },
 
   getWorkflowSettings(itemId: number): Promise<WorkflowSettings> {
@@ -652,6 +745,31 @@ export const bridge = {
     );
   },
 
+  poolReviewQueue(niche: string, sourceLabel?: string | null): Promise<PoolReviewItem[]> {
+    if (!hasBridge()) return mock.poolReviewQueue(niche, sourceLabel);
+    return unwrap(window.pywebview!.api.pool_review_queue(niche, sourceLabel ?? null));
+  },
+
+  poolItemPreview(poolItemId: number): Promise<PoolItemPreview> {
+    if (!hasBridge()) return mock.poolItemPreview(poolItemId);
+    return unwrap(window.pywebview!.api.pool_item_preview(poolItemId));
+  },
+
+  startPoolItemPreviewDownload(poolItemId: number): Promise<{ job_id: string }> {
+    if (!hasBridge()) return Promise.resolve({ job_id: "mock-pool-preview-dl" });
+    return unwrap(window.pywebview!.api.start_pool_item_preview_download(poolItemId));
+  },
+
+  approvePoolItems(ids: number[]): Promise<{ approved: number }> {
+    if (!hasBridge()) return Promise.resolve({ approved: ids.length });
+    return unwrap(window.pywebview!.api.approve_pool_items(ids));
+  },
+
+  rejectPoolItems(ids: number[], reason: string): Promise<{ rejected: number }> {
+    if (!hasBridge()) return Promise.resolve({ rejected: ids.length });
+    return unwrap(window.pywebview!.api.reject_pool_items(ids, reason));
+  },
+
   removePoolItem(
     poolItemId: number,
     reason = "manual removal",
@@ -698,6 +816,111 @@ export const bridge = {
     if (!hasBridge())
       return Promise.resolve({ jobs: [], due_count: 0, draft: 0, ready: 0, scheduled: 0, failed: 0 });
     return unwrap(window.pywebview!.api.dashboard_publish_jobs());
+  },
+
+  dashboardScheduleCoverage(): Promise<ScheduleCoverage> {
+    if (!hasBridge())
+      return Promise.resolve({
+        horizon_days: 2,
+        accounts: [
+          {
+            account_id: 1,
+            account_name: "Mock Movie Account",
+            timezone: "Asia/Jakarta",
+            daily_target: 2,
+            auto_schedule_on_export: true,
+            filled: 2,
+            total: 4,
+            days: [
+              {
+                date: new Date().toISOString().slice(0, 10),
+                is_today: true,
+                filled: 2,
+                total: 2,
+                slots: [
+                  {
+                    slot: "09:00",
+                    slot_at: new Date().toISOString(),
+                    state: "posted",
+                    job_id: 1,
+                    item_id: 101,
+                    job_title: "Mock posted reel",
+                    scheduled_at: new Date().toISOString(),
+                    timing: "on_time",
+                  },
+                  {
+                    slot: "18:00",
+                    slot_at: new Date().toISOString(),
+                    state: "cloud",
+                    job_id: 2,
+                    item_id: 102,
+                    job_title: "Mock cloud reel",
+                    scheduled_at: new Date(Date.now() + 3_600_000).toISOString(),
+                    timing: "late",
+                  },
+                ],
+              },
+              {
+                date: new Date(Date.now() + 86_400_000).toISOString().slice(0, 10),
+                is_today: false,
+                filled: 0,
+                total: 2,
+                slots: [
+                  {
+                    slot: "09:00",
+                    slot_at: new Date(Date.now() + 86_400_000).toISOString(),
+                    state: "open",
+                    job_id: null,
+                    item_id: null,
+                    job_title: null,
+                    scheduled_at: null,
+                    timing: null,
+                  },
+                  {
+                    slot: "18:00",
+                    slot_at: new Date(Date.now() + 86_400_000).toISOString(),
+                    state: "open",
+                    job_id: null,
+                    item_id: null,
+                    job_title: null,
+                    scheduled_at: null,
+                    timing: null,
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      });
+    return unwrap(window.pywebview!.api.dashboard_schedule_coverage());
+  },
+
+  cloudPublisherHealth(): Promise<CloudPublisherHealth> {
+    if (!hasBridge())
+      return Promise.resolve({
+        publish_mode: "live",
+        stored_bytes: 5_766_268,
+        max_stored_bytes: 8_000_000_000,
+        remaining_bytes: 7_994_233_732,
+        usage_percent: 0.07,
+        active_jobs: 1,
+        max_active_jobs: 150,
+        active_usage_percent: 0.67,
+        active_jobs_by_status: { scheduled: 1 },
+        oldest_active_created_at: new Date(Date.now() - 20 * 60_000).toISOString(),
+        oldest_active_age_minutes: 20,
+        max_upload_bytes: 95_000_000,
+        stale_jobs: {
+          awaiting_upload_over_minutes: 120,
+          awaiting_upload: 0,
+          processing_over_minutes: 120,
+          processing: 0,
+          processing_age_unknown: 0,
+          scheduled_past_due: 0,
+          oldest_scheduled_at: null,
+        },
+      });
+    return unwrap(window.pywebview!.api.cloud_publisher_health());
   },
 
   dashboardAccountStats(activeAccountId: number): Promise<DashboardAccountStats> {
@@ -1000,6 +1223,7 @@ const mock = {
           assigned: 2,
           unused: 1,
           rejected: 0,
+          pending: 1,
           assignments_by_account: [
             { account_id: 1, account_name: "Past Moments Daily", count: 2 },
           ],
@@ -1010,6 +1234,7 @@ const mock = {
           assigned: 0,
           unused: 0,
           rejected: 0,
+          pending: 0,
           assignments_by_account: [],
         },
       ],
@@ -1026,6 +1251,40 @@ const mock = {
         is_distributed: true,
       },
     ];
+  },
+  async poolReviewQueue(niche: string, sourceLabel?: string | null): Promise<PoolReviewItem[]> {
+    const rows: PoolReviewItem[] = [
+      {
+        pool_item_id: 101,
+        niche,
+        clip_label: "Mock pending reel",
+        source_label: "thehistologian",
+        created_at: new Date().toISOString(),
+        thumbnail_url: null,
+        source_url: "https://www.instagram.com/reel/mock",
+        preview_url: null,
+        fit_score: 0.057,
+        source_er: 0.045,
+        topic_tier: "S",
+        suggested_action: "accept",
+        view_count: 56789,
+        like_count: 1234,
+        comment_count: 42,
+        duration_seconds: 18,
+        description: "Browser-dev mock pending pool clip.",
+        channel_name: "thehistologian",
+        published_at: new Date(Date.now() - 3 * 86400 * 1000).toISOString(),
+      },
+    ];
+    return sourceLabel ? rows.filter((row) => row.source_label === sourceLabel) : rows;
+  },
+  async poolItemPreview(poolItemId: number): Promise<PoolItemPreview> {
+    return {
+      pool_item_id: poolItemId,
+      preview_url: null,
+      thumbnail_url: null,
+      source_url: "https://www.instagram.com/reel/mock",
+    };
   },
   async source(): Promise<SourceProfile> {
     return {
@@ -1116,11 +1375,18 @@ const mock = {
       clip_premise: "",
       caption_style: "contextual_info",
       title_style: "",
+      title_length: "long",
       template: "gaming_meme_black",
       title_draft: "",
       caption_draft: "",
       caption_style_options: [{ value: "contextual_info", label: "Context / info" }],
       title_style_options: [{ value: "", label: "Auto" }],
+      title_length_options: [
+        { value: "short", label: "Short (5-9 words)" },
+        { value: "medium", label: "Medium (10-16 words)" },
+        { value: "long", label: "Long (15-28 words)" },
+        { value: "auto", label: "Auto mix" },
+      ],
       template_options: [{ value: "gaming_meme_black", label: "Gaming Meme Black" }],
     };
   },

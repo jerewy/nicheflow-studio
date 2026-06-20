@@ -79,6 +79,7 @@ def accept_into_pool(
     *,
     media_asset: MediaAsset,
     niche: str,
+    acceptance_status: str = "accepted",
     accepted_reason: str | None = None,
     topic_tag: str | None = None,
     is_evergreen_candidate: bool = False,
@@ -121,8 +122,12 @@ def accept_into_pool(
     item = PoolItem(
         media_asset_id=media_asset.id,
         niche=niche,
-        acceptance_status="accepted",
-        accepted_at=dt.datetime.now(dt.timezone.utc),
+        acceptance_status=acceptance_status,
+        accepted_at=(
+            dt.datetime.now(dt.timezone.utc)
+            if acceptance_status == POOL_STATUS_ACCEPTED
+            else None
+        ),
         accepted_reason=accepted_reason,
         topic_tag=topic_tag,
         is_evergreen_candidate=1 if is_evergreen_candidate else 0,
@@ -171,6 +176,7 @@ def accept_candidate_into_pool(
         session,
         media_asset=asset,
         niche=niche,
+        acceptance_status=POOL_STATUS_PENDING_REVIEW,
         accepted_reason=accepted_reason,
         topic_tag=topic_tag,
         is_evergreen_candidate=is_evergreen_candidate,
@@ -291,6 +297,7 @@ class NichePoolStats:
     assigned: int
     unused: int
     rejected: int
+    pending: int = 0
 
 
 @dataclass(frozen=True)
@@ -370,12 +377,14 @@ def niche_pool_stats(session: Session, niche: str) -> NichePoolStats:
         .filter(ScrapeCandidate.state.like("rejected%"))
         .count()
     )
+    pending = pool_size(session, niche, status=POOL_STATUS_PENDING_REVIEW)
     return NichePoolStats(
         niche=niche,
         pooled=pooled,
         assigned=assigned,
         unused=max(0, pooled - assigned),
         rejected=rejected,
+        pending=pending,
     )
 
 
@@ -385,6 +394,7 @@ def niche_pool_stats(session: Session, niche: str) -> NichePoolStats:
 #   "removed"   — manually pruned in review (the manual-check gate)
 # Only "accepted" items are distributed; the others stay for audit/restore.
 POOL_STATUS_ACCEPTED = "accepted"
+POOL_STATUS_PENDING_REVIEW = "pending_review"
 POOL_STATUS_REMOVED = "removed"
 
 

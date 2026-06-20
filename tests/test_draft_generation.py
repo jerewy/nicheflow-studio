@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import pytest
 
-from nicheflow_studio.db.models import Account, DownloadItem, UploadJob
+import datetime as dt
+
+from nicheflow_studio.db.models import AccountPostMetric, Account, DownloadItem
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.processing import smart_drafts
 from nicheflow_studio.services import draft_generation
@@ -81,21 +83,23 @@ def test_generate_passes_accounts_measured_top_titles(
     item_id = _make_item()
     with get_session() as session:
         item = session.get(DownloadItem, item_id)
+        account = session.get(Account, item.account_id)
+        account.instagram_handle = "pastmomentsdaily"
         session.add_all(
             [
-                UploadJob(
-                    account_id=item.account_id,
-                    processed_path="C:/winner-one.mp4",
-                    title="Measured winner one",
-                    status="posted",
-                    posted_likes=300,
+                AccountPostMetric(
+                    account_key="pastmomentsdaily",
+                    shortcode="winner-one",
+                    caption="Measured winner one",
+                    conversion_score=0.8,
+                    pulled_at=dt.datetime.now(dt.timezone.utc),
                 ),
-                UploadJob(
-                    account_id=item.account_id,
-                    processed_path="C:/winner-two.mp4",
-                    title="Measured winner two",
-                    status="posted",
-                    posted_likes=200,
+                AccountPostMetric(
+                    account_key="pastmomentsdaily",
+                    shortcode="winner-two",
+                    caption="Measured winner two",
+                    conversion_score=0.5,
+                    pulled_at=dt.datetime.now(dt.timezone.utc),
                 ),
             ]
         )
@@ -111,6 +115,24 @@ def test_generate_passes_accounts_measured_top_titles(
     draft_generation.generate_revision_for_item(item_id)
 
     assert captured["few_shot_winners"] == ["Measured winner one", "Measured winner two"]
+
+
+def test_generate_threads_title_length_and_requires_vision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    item_id = _make_item()
+    captured: dict = {}
+
+    def fake_generate(**kwargs):
+        captured.update(kwargs)
+        return _fake_drafts()
+
+    monkeypatch.setattr(smart_drafts, "generate_smart_drafts", fake_generate)
+
+    draft_generation.generate_revision_for_item(item_id, title_length="short")
+
+    assert captured["title_length"] == "short"
+    assert captured["require_vision"] is True
 
 
 def test_generate_flags_unsupported_claim_and_moves_recommendation(
@@ -223,9 +245,25 @@ def test_generate_unknown_item_raises() -> None:
     with pytest.raises(DraftRevisionError):
         draft_generation.generate_revision_for_item(99999)
 
-def test_caption_outro_for_account_by_niche_and_handle() -> None:
+def test_caption_outro_disabled_for_all_accounts() -> None:
     from types import SimpleNamespace
 
+    history = SimpleNamespace(instagram_handle="pastmomentsdaily", niche="history")
+    movie = SimpleNamespace(instagram_handle="@cinemafilesdaily", niche="movie")
+    unknown = SimpleNamespace(instagram_handle="someacct", niche=None)
+    no_handle = SimpleNamespace(instagram_handle=None, niche="history")
+
+    # Disabled globally: every account (with or without a handle) gets no outro.
+    for account in (history, movie, unknown, no_handle, None):
+        assert draft_generation.caption_outro_for_account(account) is None
+
+
+def test_caption_outro_templates_restore_when_re_enabled(monkeypatch) -> None:
+    # The per-niche templates are dormant, not deleted: flipping the flag back on
+    # restores them (handle-aware, leading @ not doubled).
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(draft_generation, "_CAPTION_OUTRO_ENABLED", True)
     history = SimpleNamespace(instagram_handle="pastmomentsdaily", niche="history")
     movie = SimpleNamespace(instagram_handle="@cinemafilesdaily", niche="movie")
     unknown = SimpleNamespace(instagram_handle="someacct", niche=None)
@@ -245,7 +283,6 @@ def test_caption_outro_for_account_by_niche_and_handle() -> None:
         == "More every day → @someacct"
     )
     assert draft_generation.caption_outro_for_account(no_handle) is None
-    assert draft_generation.caption_outro_for_account(None) is None
 
 
 def test_smart_draft_prompt_injects_caption_outro() -> None:

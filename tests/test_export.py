@@ -138,6 +138,33 @@ def test_export_auto_schedules_next_open_slot_when_flag_on(
         assert (scheduled - occupied).total_seconds() > 20 * 60
 
 
+def test_export_returns_cloud_status_from_auto_schedule(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake")
+    item_id = _make_item(
+        file_path=str(source),
+        auto_schedule_on_export=True,
+        upload_schedule_slots="09:00",
+    )
+    _mock_video(monkeypatch, {})
+    monkeypatch.setattr(
+        publishing,
+        "auto_schedule_for_publish",
+        lambda _item_id: {
+            "job_id": 7,
+            "status": "cloud",
+            "scheduled_at": "2026-06-16T02:00:00+00:00",
+            "created": True,
+        },
+    )
+
+    result = export_svc.export_item(item_id)
+
+    assert result["scheduled_publish"]["status"] == "cloud"
+
+
 def test_export_does_not_schedule_when_flag_off(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -20,6 +20,7 @@ class HistorySourcePreset:
 # 2026-06-01 scrape (thelegendartist [personal art account], themysterist,
 # thecinemast, entertainist, thelegendast); thelegendarist is the correct handle.
 DEFAULT_HISTORY_SOURCE_PRESETS: tuple[HistorySourcePreset, ...] = (
+    HistorySourcePreset("historytrails", "long-form documentary hook engine — the style we imitate"),
     HistorySourcePreset("theanomalists", "history anomalies and broad curiosity"),
     HistorySourcePreset("crazyfactscorner", "fact-led curiosity clips"),
     HistorySourcePreset("thehistologian", "high-volume history feed"),

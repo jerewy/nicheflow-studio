@@ -1,5 +1,8 @@
-from nicheflow_studio.db.models import Account, DownloadItem, UploadJob
+import datetime as dt
+
+from nicheflow_studio.db.models import AccountPostMetric, Account, DownloadItem
 from nicheflow_studio.db.session import get_session
+from nicheflow_studio.processing import smart_drafts
 from nicheflow_studio.services import draft_handoff, draft_revisions
 
 
@@ -25,7 +28,36 @@ def _make_item() -> int:
         return item.id
 
 
-def test_build_chat_prompt_includes_follow_outro_for_handle_account() -> None:
+def _make_account_items(count: int = 2) -> tuple[int, list[int]]:
+    with get_session() as session:
+        account = Account(
+            name="History Batch",
+            platform="instagram",
+            niche_label="history",
+            title_style_notes="Use specific subject-first hooks.",
+        )
+        session.add(account)
+        session.flush()
+        ids: list[int] = []
+        for index in range(1, count + 1):
+            item = DownloadItem(
+                source_url=f"https://instagram.com/reel/batch{index}",
+                title=f"Batch source {index}",
+                source_description=f"Description {index}",
+                file_path=f"C:/clips/batch{index}.mp4",
+                account_id=account.id,
+                status="downloaded",
+            )
+            session.add(item)
+            session.flush()
+            ids.append(item.id)
+        session.commit()
+        return account.id, ids
+
+
+def test_build_chat_prompt_omits_follow_outro_even_with_handle() -> None:
+    # The follow outro is disabled across all accounts, so even an account that
+    # has a handle gets no signature line in the caption contract.
     item_id = _make_item()
     with get_session() as session:
         item = session.get(DownloadItem, item_id)
@@ -36,8 +68,8 @@ def test_build_chat_prompt_includes_follow_outro_for_handle_account() -> None:
 
     prompt = draft_handoff.build_chat_prompt(item_id)
 
-    assert "Caption follow outro (MANDATORY)" in prompt
-    assert "Lost moments from history, every day → @pastmomentsdaily" in prompt
+    assert "Caption follow outro" not in prompt
+    assert "Lost moments from history, every day" not in prompt
 
 
 def test_build_chat_prompt_omits_follow_outro_without_handle() -> None:
@@ -61,39 +93,51 @@ def test_build_chat_prompt_contains_selected_item_context() -> None:
 
 def test_build_chat_prompt_carries_title_rules_and_hook_framing() -> None:
     # The chat path must share the live prompt's title rules (history account
-    # with no explicit style auto-routes to the history hook rules) and the
+    # with no explicit style auto-routes to the Cinematic Record hook) and the
     # green/yellow/red hook framing, so chat models write to the same contract.
     item_id = _make_item()
 
     prompt = draft_handoff.build_chat_prompt(item_id)
 
     assert "On-screen title rules" in prompt
-    assert "CURIOSITY GAP shape" in prompt
-    assert "AT LEAST one of the three options" in prompt
+    assert "SIX MOVES" in prompt
+    assert "ANTI-AI-TELL GUARD" in prompt
     assert "STATIC WINNER EXAMPLES" in prompt
-    assert "COMMENT TEST" in prompt
+    assert "VOICE GUARD" in prompt
     assert "GREEN" in prompt and "YELLOW" in prompt and "RED" in prompt
+
+
+def test_build_chat_prompt_uses_same_title_length_rule_as_api_prompt() -> None:
+    item_id = _make_item()
+
+    prompt = draft_handoff.build_chat_prompt(item_id, {"title_length": "short"})
+    expected_rules = smart_drafts._title_length_rules("short")
+
+    assert all(rule in prompt for rule in expected_rules)
+    assert "Title length: Short" in prompt
 
 
 def test_build_chat_prompt_uses_accounts_measured_top_titles() -> None:
     item_id = _make_item()
     with get_session() as session:
         item = session.get(DownloadItem, item_id)
+        account = session.get(Account, item.account_id)
+        account.instagram_handle = "pastmomentsdaily"
         session.add_all(
             [
-                UploadJob(
-                    account_id=item.account_id,
-                    processed_path="C:/winner-one.mp4",
-                    title="Measured winner one",
-                    status="posted",
-                    posted_likes=300,
+                AccountPostMetric(
+                    account_key="pastmomentsdaily",
+                    shortcode="winner-one",
+                    caption="Measured winner one",
+                    conversion_score=0.8,
+                    pulled_at=dt.datetime.now(dt.timezone.utc),
                 ),
-                UploadJob(
-                    account_id=item.account_id,
-                    processed_path="C:/winner-two.mp4",
-                    title="Measured winner two",
-                    status="posted",
-                    posted_likes=200,
+                AccountPostMetric(
+                    account_key="pastmomentsdaily",
+                    shortcode="winner-two",
+                    caption="Measured winner two",
+                    conversion_score=0.5,
+                    pulled_at=dt.datetime.now(dt.timezone.utc),
                 ),
             ]
         )
@@ -157,6 +201,120 @@ def test_build_chat_prompt_includes_stored_vision_payload() -> None:
     assert "Visual evidence JSON" in prompt
 
 
+def test_build_account_batch_chat_prompt_has_shared_rules_and_item_delimiters() -> None:
+    account_id, item_ids = _make_account_items(2)
+
+    prompt = draft_handoff.build_account_batch_chat_prompt(account_id, item_ids)
+
+    for index, item_id in enumerate(item_ids, start=1):
+        assert f"===== REEL {index} =====" in prompt
+        assert f"reel_{index}_item{item_id}.jpg" in prompt
+    assert prompt.count("On-screen title rules") == 1
+    assert prompt.count("Hook framing") == 1
+    assert "Automatic NicheFlow handoff" not in prompt
+
+
+def test_build_account_batch_chat_prompt_uses_measured_winners_and_title_length() -> None:
+    account_id, item_ids = _make_account_items(2)
+    with get_session() as session:
+        account = session.get(Account, account_id)
+        account.instagram_handle = "pastmomentsdaily"
+        session.add(
+            AccountPostMetric(
+                account_key="pastmomentsdaily",
+                shortcode="batch-winner",
+                caption="Measured batch winner",
+                conversion_score=0.9,
+                pulled_at=dt.datetime.now(dt.timezone.utc),
+            )
+        )
+        session.commit()
+
+    prompt = draft_handoff.build_account_batch_chat_prompt(
+        account_id,
+        item_ids,
+        {"title_length": "auto"},
+    )
+
+    assert "MEASURED ACCOUNT WINNER EXAMPLES" in prompt
+    assert "Measured batch winner" in prompt
+    assert "Title length: Auto" in prompt
+    assert "Option 1 SHORT" in prompt
+
+
+def test_import_account_batch_draft_routes_by_reel_number_when_shuffled() -> None:
+    _account_id, item_ids = _make_account_items(2)
+    first, second = item_ids
+
+    # Blocks pasted out of order; routing is by reel number, not text order.
+    result = draft_handoff.import_account_batch_draft(
+        """===== REEL 2 =====
+Title Option 1: Second title
+Caption Option 1: Second caption
+
+===== REEL 1 =====
+Title Option 1: First title
+Caption Option 1: First caption
+""",
+        item_ids,
+    )
+
+    assert result == {"imported": [first, second], "failed": [], "unmatched": []}
+    assert draft_revisions.latest_revision(first).title_options == ["First title"]
+    assert draft_revisions.latest_revision(second).title_options == ["Second title"]
+
+
+def test_import_account_batch_draft_tolerates_mangled_reel_headers() -> None:
+    # The real failure: ChatGPT drops the "=====", bolds or colon-suffixes the
+    # header, and omits the opaque item id. Routing by reel number must still work.
+    _account_id, item_ids = _make_account_items(2)
+    first, second = item_ids
+
+    result = draft_handoff.import_account_batch_draft(
+        """**Reel 1**
+Title Option 1: First title
+Caption Option 1: First caption
+
+Reel 2:
+Title Option 1: Second title
+Caption Option 1: Second caption
+""",
+        item_ids,
+    )
+
+    assert result["imported"] == [first, second]
+    assert result["unmatched"] == []
+    assert draft_revisions.latest_revision(first).title_options == ["First title"]
+    assert draft_revisions.latest_revision(second).title_options == ["Second title"]
+
+
+def test_import_account_batch_draft_reports_failed_and_unmatched() -> None:
+    _account_id, item_ids = _make_account_items(3)
+    first, second, third = item_ids
+
+    result = draft_handoff.import_account_batch_draft(
+        f"""===== REEL 1 | item {first} | First =====
+Title Option 1: First title
+Caption Option 1: First caption
+
+===== REEL 2 | item {second} | Second =====
+This block has no importable sections.
+
+===== REEL 99 | item 999999 | Unknown =====
+Title Option 1: Unknown title
+Caption Option 1: Unknown caption
+""",
+        item_ids,
+    )
+
+    assert result["imported"] == [first]
+    assert result["failed"][0]["item_id"] == second
+    assert "No 'Title Option'" in result["failed"][0]["error"]
+    assert result["unmatched"] == [third]
+    assert draft_revisions.latest_revision(first).title_options == ["First title"]
+    assert draft_revisions.latest_revision(second) is None
+
+
 def test_parse_pasted_draft_preserves_plain_title_and_recommendation() -> None:
     parsed = draft_handoff.parse_pasted_draft(
         """Title Option 1:
@@ -179,6 +337,29 @@ Option 1: Specific and clear.
     assert parsed.recommended_title_index == 1
     assert parsed.recommended_caption_index == 1
     assert parsed.option_notes == ["Specific and clear."]
+
+
+def test_parse_pasted_draft_drops_trailing_citation_from_notes() -> None:
+    # Chat models append a sources block ("[1]: https://...") after the last
+    # block; it must not bleed into that reel's final selection note.
+    parsed = draft_handoff.parse_pasted_draft(
+        """Title Option 1:
+A title
+
+Caption Option 1:
+A caption.
+
+Recommended Pick: Title Option 1 + Caption Option 1
+Why: Strongest.
+Selection Notes:
+Option 1: Best fit because it is specific.
+
+[1]: https://en.wikipedia.org/wiki/Music_for_Montserrat?utm_source=chatgpt.com "Music for Montserrat"
+https://example.com/bare-url
+"""
+    )
+
+    assert parsed.option_notes == ["Best fit because it is specific."]
 
 
 def test_import_pasted_draft_saves_revision() -> None:

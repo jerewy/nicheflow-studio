@@ -114,6 +114,124 @@ def test_global_publish_jobs_orders_nearest_schedule_first(tmp_path: Path) -> No
     assert [row["id"] for row in result["jobs"]] == expected_ids
 
 
+def test_schedule_coverage_matches_jittered_jobs_and_marks_open_slots() -> None:
+    now = dt.datetime(2026, 6, 15, 8, 0, tzinfo=dt.timezone.utc)
+    with get_session() as session:
+        account = Account(
+            name="History",
+            platform="instagram",
+            upload_timezone="Asia/Jakarta",
+            upload_schedule_slots="09:00, 13:00",
+            daily_posts_target=2,
+            auto_schedule_on_export=True,
+        )
+        session.add(account)
+        session.flush()
+        session.add(
+            UploadJob(
+                account_id=account.id,
+                processed_path="C:/cloud.mp4",
+                title="Cloud reel",
+                status="cloud",
+                # 13:09 local, inside the normal jitter window.
+                scheduled_at=dt.datetime(2026, 6, 15, 6, 9),
+            )
+        )
+        session.commit()
+        account_id = account.id
+
+    result = publishing_dashboard.schedule_coverage(days=2, now=now)
+
+    account = next(row for row in result["accounts"] if row["account_id"] == account_id)
+    assert account["filled"] == 1
+    assert account["total"] == 4
+    assert account["auto_schedule_on_export"] is True
+    assert account["days"][0]["slots"][0]["state"] == "missed"
+    assert account["days"][0]["slots"][1]["state"] == "cloud"
+    assert account["days"][0]["slots"][1]["timing"] == "on_time"
+    assert account["days"][1]["slots"][0]["state"] == "open"
+
+
+def test_schedule_coverage_counts_late_job_before_next_slot_as_filled() -> None:
+    now = dt.datetime(2026, 6, 15, 9, 0, tzinfo=dt.timezone.utc)
+    with get_session() as session:
+        account = Account(
+            name="History",
+            platform="instagram",
+            upload_timezone="Asia/Jakarta",
+            upload_schedule_slots="13:00, 17:00",
+        )
+        session.add(account)
+        session.flush()
+        session.add(
+            UploadJob(
+                account_id=account.id,
+                processed_path="C:/late.mp4",
+                status="cloud",
+                # 14:20 local: late for 13:00, but still before the 17:00 slot.
+                scheduled_at=dt.datetime(2026, 6, 15, 7, 20),
+            )
+        )
+        session.commit()
+        account_id = account.id
+
+    account = next(
+        row
+        for row in publishing_dashboard.schedule_coverage(days=1, now=now)["accounts"]
+        if row["account_id"] == account_id
+    )
+
+    slot = account["days"][0]["slots"][0]
+    assert account["filled"] == 1
+    assert slot["state"] == "cloud"
+    assert slot["timing"] == "late"
+
+
+def test_schedule_coverage_slot_exposes_library_item_id() -> None:
+    """Slots carry the DownloadItem id so the UI can deep-link to Processing.
+    The exported job title differs from the library item's original title, so the
+    id is the only reliable link back to the item to re-edit."""
+    now = dt.datetime(2026, 6, 15, 9, 0, tzinfo=dt.timezone.utc)
+    with get_session() as session:
+        account = Account(
+            name="History",
+            platform="instagram",
+            upload_timezone="Asia/Jakarta",
+            upload_schedule_slots="13:00",
+        )
+        item = DownloadItem(
+            source_url="https://instagram.com/reel/abc",
+            title="Original scraped title",
+        )
+        session.add_all([account, item])
+        session.flush()
+        session.add(
+            UploadJob(
+                account_id=account.id,
+                download_item_id=item.id,
+                processed_path="C:/reel.mp4",
+                title="Exported overlay title",
+                status="cloud",
+                scheduled_at=dt.datetime(2026, 6, 15, 6, 0),  # 13:00 local (Asia/Jakarta)
+            )
+        )
+        session.commit()
+        account_id = account.id
+        item_id = item.id
+
+    account = next(
+        row
+        for row in publishing_dashboard.schedule_coverage(days=1, now=now)["accounts"]
+        if row["account_id"] == account_id
+    )
+    slot = account["days"][0]["slots"][0]
+    assert slot["job_id"] is not None
+    assert slot["item_id"] == item_id
+    # The link must survive the title mismatch that broke the old search-by-title.
+    assert slot["job_title"] == "Exported overlay title"
+    assert slot["job_title"] != "Original scraped title"
+
+
 def test_account_readiness_lists_accounts_and_due_work(tmp_path: Path) -> None:
     _seed_job(tmp_path, status="ready")
 

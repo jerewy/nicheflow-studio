@@ -15,7 +15,12 @@ from nicheflow_studio.db.pool_intake import (
     ReelMetadata,
     add_reel_to_pool,
 )
-from nicheflow_studio.db.pools import POOL_STATUS_ACCEPTED, VALID_NICHES, pool_size  # noqa: E501
+from nicheflow_studio.db.pools import (
+    POOL_STATUS_ACCEPTED,
+    POOL_STATUS_PENDING_REVIEW,
+    VALID_NICHES,
+    pool_size,
+)  # noqa: E501
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.downloader.instagram import instagram_shortcode_from_url
 from nicheflow_studio.scraper.instagram_apify import scrape_instagram_urls_apify  # noqa: E501
@@ -99,7 +104,9 @@ def _existing_pool_result(normalized_url: str, shortcode: str | None) -> dict | 
             session.query(PoolItem)
             .filter(
                 PoolItem.media_asset_id == asset.id,
-                PoolItem.acceptance_status == POOL_STATUS_ACCEPTED,
+                PoolItem.acceptance_status.in_(
+                    [POOL_STATUS_ACCEPTED, POOL_STATUS_PENDING_REVIEW]
+                ),
             )
             .first()
         )

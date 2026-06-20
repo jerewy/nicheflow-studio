@@ -1210,14 +1210,54 @@ HISTORY_NICHE = "History moments, old clips, strange facts, and forgotten storie
 
 def test_effective_title_rules_auto_routes_history_without_explicit_style() -> None:
     # No explicit title_style, generic/broad caption_style: a history account
-    # should still get the history hook rules, not the generic fallback.
+    # should still get the strong Cinematic Record hook, not the generic fallback.
     rules = smart_drafts.effective_title_rules(
         title_style=None, caption_style="broad_short_form", niche_label=HISTORY_NICHE
     )
     joined = "\n".join(rules)
 
-    assert "CURIOSITY GAP shape" in joined
+    assert "SIX MOVES" in joined
+    assert "ANTI-AI-TELL GUARD" in joined
     assert "10-16 words" in joined
+
+
+def test_curiosity_open_loop_uses_cinematic_record_voice() -> None:
+    # The "Curiosity / Open Loop" pick now drives the Cinematic Record voice,
+    # not the old flat "state the bare fact" default.
+    rules = smart_drafts._title_style_rules("curiosity_open_loop")
+    assert rules is not None
+    joined = "\n".join(rules)
+
+    assert "cinematic restraint plus forensic specificity" in joined
+    assert "SIX MOVES" in joined
+    assert "DATE-STAMP" in joined
+    assert "MODE A, STATE THE COMPLETE FACT" not in joined
+
+
+def test_curiosity_open_loop_bans_dashes_and_competitor_openers() -> None:
+    rules = smart_drafts._title_style_rules("curiosity_open_loop")
+    joined = "\n".join(rules)
+
+    assert "ANTI-AI-TELL GUARD" in joined
+    # The saturated competitor openers appear only because they are BANNED.
+    assert "Nobody expected" in joined
+    assert "What happened when" in joined
+    # The rule text itself must stay free of em-dashes and en-dashes.
+    assert "—" not in joined
+    assert "–" not in joined
+
+
+def test_curiosity_open_loop_renders_measured_winners() -> None:
+    winners = ["Measured cinematic winner one", "Measured cinematic winner two"]
+
+    rules = smart_drafts._title_style_rules(
+        "curiosity_open_loop", few_shot_winners=winners
+    )
+    rendered = "\n".join(rules)
+
+    assert all(winner in rendered for winner in winners)
+    assert "MEASURED ACCOUNT WINNER EXAMPLES" in rendered
+    assert smart_drafts._CINEMATIC_RECORD_FEW_SHOT_WINNERS[0] not in rendered
 
 
 def test_effective_title_rules_renders_measured_winners_instead_of_static_examples() -> None:
@@ -1314,10 +1354,10 @@ def test_history_prompt_auto_applies_history_title_rules_end_to_end() -> None:
         title_style=None,
     )
 
-    assert "CURIOSITY GAP shape" in prompt
-    assert "AT LEAST one of the three options" in prompt
+    assert "SIX MOVES" in prompt
+    assert "DATE-STAMP" in prompt
     assert "STATIC WINNER EXAMPLES" in prompt
-    assert "camping tents to scooters" in prompt
+    assert "Elvis ever sang" in prompt
 
 
 def test_live_groq_history_prompt_emits_wo2_rules(monkeypatch) -> None:
@@ -1341,8 +1381,8 @@ def test_live_groq_history_prompt_emits_wo2_rules(monkeypatch) -> None:
     )
 
     writer_prompt = captured_prompts[-1]
-    assert "CURIOSITY GAP shape" in writer_prompt
-    assert "AT LEAST one of the three options" in writer_prompt
+    assert "SIX MOVES" in writer_prompt
+    assert "ANTI-AI-TELL GUARD" in writer_prompt
     assert "STATIC WINNER EXAMPLES" in writer_prompt
 
 
@@ -2579,6 +2619,33 @@ def test_generate_smart_drafts_threads_title_style_into_request(monkeypatch) -> 
     assert "CREATIVE REMIX IS REQUIRED" in writer_prompt
 
 
+def test_generate_smart_drafts_threads_title_length_into_request(monkeypatch) -> None:
+    monkeypatch.setenv("GROQ_API_KEY", "groq-key")
+    monkeypatch.setattr(
+        smart_drafts,
+        "sample_video_frame_data_urls",
+        lambda path, max_frames=5: [],
+    )
+    captured_prompts: list[str] = []
+
+    def fake_urlopen(request, timeout=90):  # noqa: ANN001
+        payload = smart_drafts.json.loads(request.data.decode("utf-8"))
+        captured_prompts.append(payload["messages"][1]["content"])
+        return _FakeJsonResponse(_WRITER_OK_BODY)
+
+    monkeypatch.setattr(smart_drafts.urllib.request, "urlopen", fake_urlopen)
+
+    result = smart_drafts.generate_smart_drafts(
+        transcript_text="Some transcript that gives high context to skip vision",
+        source_title="Specific descriptive title",
+        niche_label="history",
+        title_length="short",
+    )
+
+    assert "5-9 words" in captured_prompts[-1]
+    assert result.generation_meta["title_length"] == "short"
+
+
 # ---------------------------------------------------------------------------
 # Bugfix follow-ups: title_style override + widened encyclopedia ban + meta
 # ---------------------------------------------------------------------------
@@ -2675,6 +2742,50 @@ def test_generation_meta_includes_caption_style_and_title_style_for_groq(monkeyp
     meta = result.generation_meta or {}
     assert meta["caption_style"] == "contextual_info"
     assert meta["title_style"] == "meme_setup_punchline"
+
+
+@pytest.mark.parametrize(
+    ("title_length", "expected"),
+    [
+        ("short", "5-9 words"),
+        ("medium", "10-16 words"),
+        ("long", "15-28 words"),
+    ],
+)
+def test_title_length_rules_define_requested_word_band(
+    title_length: str,
+    expected: str,
+) -> None:
+    assert expected in "\n".join(smart_drafts._title_length_rules(title_length))
+
+
+def test_title_length_rules_default_to_long() -> None:
+    assert smart_drafts._title_length_rules(None) == smart_drafts._title_length_rules("long")
+
+
+def test_title_length_rules_auto_spans_all_three_options() -> None:
+    rules = "\n".join(smart_drafts._title_length_rules("auto"))
+
+    assert "Option 1" in rules and "5-9 words" in rules
+    assert "Option 2" in rules and "10-16 words" in rules
+    assert "Option 3" in rules and "15-28 words" in rules
+
+
+def test_smart_draft_prompt_default_title_length_matches_explicit_long() -> None:
+    default_prompt = smart_drafts._smart_draft_prompt(
+        transcript_text="",
+        source_title="A known historical clip",
+        niche_label="history",
+    )
+    long_prompt = smart_drafts._smart_draft_prompt(
+        transcript_text="",
+        source_title="A known historical clip",
+        niche_label="history",
+        title_length="long",
+    )
+
+    assert default_prompt == long_prompt
+    assert "15-28 words" in default_prompt
 
 
 def test_generation_meta_records_none_styles_when_omitted(monkeypatch) -> None:

@@ -369,6 +369,10 @@ def _ensure_compatibility() -> None:
             connection.execute(
                 text("ALTER TABLE scrape_candidates ADD COLUMN scrape_run_id INTEGER")
             )
+        if "engagement_rate" not in candidate_columns:
+            connection.execute(
+                text("ALTER TABLE scrape_candidates ADD COLUMN engagement_rate FLOAT")
+            )
 
         # Content dedup fingerprint (additive). media_assets is created by
         # create_all on fresh DBs (already has the column); this backfills it on

@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS publish_jobs (
     content_type TEXT NOT NULL DEFAULT 'video/mp4',
     media_size_bytes INTEGER NOT NULL DEFAULT 0,
     meta_container_id TEXT,
+    processing_started_at TEXT,
     meta_media_id TEXT,
     attempts INTEGER NOT NULL DEFAULT 0,
     next_attempt_at TEXT NOT NULL,

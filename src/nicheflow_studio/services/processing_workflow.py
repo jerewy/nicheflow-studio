@@ -21,9 +21,12 @@ CAPTION_STYLES = [
     {"value": "meme_daily_cope", "label": "(Meme) Daily Cope"},
     {"value": "cinema_hook", "label": "(Movie) Cinema Atmospheric"},
     {"value": "history_lost_archive", "label": "(History) Past Moments"},
+    {"value": "historytrails_archive", "label": "(History) HistoryTrails"},
 ]
 TITLE_STYLES = [
     {"value": "", "label": "Auto (match caption style)"},
+    {"value": "curiosity_open_loop", "label": "(History) Cinematic Record"},
+    {"value": "historytrails_record", "label": "(History) HistoryTrails"},
     {"value": "meme_setup_punchline", "label": "(Meme) Setup -> Punchline"},
     {"value": "meme_relatable", "label": "(Meme) Relatable Hook"},
     {"value": "meme_friend_group", "label": "(Meme) Friend Group"},
@@ -35,11 +38,18 @@ TITLE_STYLES = [
     {"value": "cinema_bold_keywords", "label": "(Movie) Cinema Bold Keywords"},
     {"value": "history_lost_archive", "label": "(History) Past Moments"},
 ]
+TITLE_LENGTHS = [
+    {"value": "short", "label": "Short (5-9 words)"},
+    {"value": "medium", "label": "Medium (10-16 words)"},
+    {"value": "long", "label": "Long (15-28 words)"},
+    {"value": "auto", "label": "Auto mix"},
+]
 TEMPLATES = [
     {"value": "gaming_meme_black", "label": "Gaming Meme Black"},
     {"value": "reaction_clip_black", "label": "Reaction Clip Black"},
     {"value": "story_reel_clean", "label": "Story Reel Clean"},
     {"value": "lost_archive_black", "label": "Past Moments Black"},
+    {"value": "historytrails_left", "label": "(History) HistoryTrails Left"},
     {"value": "cinematic_study", "label": "Cinematic Study"},
     {"value": "cinema_viral_bold", "label": "Cinema Viral Bold"},
     {"value": "cinema_normal", "label": "Cinema Normal"},
@@ -47,15 +57,70 @@ TEMPLATES = [
     {"value": "full_video_overlay", "label": "Full Video Overlay"},
 ]
 TEMPLATE_RENDER_CONFIG = {
-    "gaming_meme_black": {"layout": "top_band", "font_size": 64, "font_name": "arial_bold", "color": "#FFFFFF"},
-    "reaction_clip_black": {"layout": "top_band", "font_size": 60, "font_name": "arial_bold", "color": "#FFFFFF"},
-    "story_reel_clean": {"layout": "top_band", "font_size": 56, "font_name": "arial_bold", "color": "#FFFFFF"},
-    "lost_archive_black": {"layout": "top_band", "font_size": 46, "font_name": "past_moments_arial_bold", "color": "#FFFFFF"},
-    "cinematic_study": {"layout": "top_band", "font_size": 58, "font_name": "comic_italic", "color": "#F7F3EA"},
-    "cinema_viral_bold": {"layout": "top_band", "font_size": 56, "font_name": "arial_rounded_bold", "color": "#FFFFFF"},
-    "cinema_normal": {"layout": "top_band", "font_size": 54, "font_name": "georgia", "color": "#F2E8D0"},
-    "cinema_bold_keywords": {"layout": "top_band", "font_size": 54, "font_name": "georgia", "color": "#F2E8D0", "bold_keywords": True},
-    "full_video_overlay": {"layout": "overlay", "font_size": 50, "font_name": "arial_bold", "color": "#F8FAFC", "background": "dark"},
+    "gaming_meme_black": {
+        "layout": "top_band",
+        "font_size": 64,
+        "font_name": "arial_bold",
+        "color": "#FFFFFF",
+    },
+    "reaction_clip_black": {
+        "layout": "top_band",
+        "font_size": 60,
+        "font_name": "arial_bold",
+        "color": "#FFFFFF",
+    },
+    "story_reel_clean": {
+        "layout": "top_band",
+        "font_size": 56,
+        "font_name": "arial_bold",
+        "color": "#FFFFFF",
+    },
+    "lost_archive_black": {
+        "layout": "top_band",
+        "font_size": 46,
+        "font_name": "past_moments_arial_bold",
+        "color": "#FFFFFF",
+    },
+    "historytrails_left": {
+        "layout": "top_band",
+        "font_size": 54,
+        "font_name": "arial",
+        "color": "#FFFFFF",
+        "align": "left",
+        "line_gap_scale": 0.20,
+    },
+    "cinematic_study": {
+        "layout": "top_band",
+        "font_size": 58,
+        "font_name": "comic_italic",
+        "color": "#F7F3EA",
+    },
+    "cinema_viral_bold": {
+        "layout": "top_band",
+        "font_size": 56,
+        "font_name": "arial_rounded_bold",
+        "color": "#FFFFFF",
+    },
+    "cinema_normal": {
+        "layout": "top_band",
+        "font_size": 54,
+        "font_name": "georgia",
+        "color": "#F2E8D0",
+    },
+    "cinema_bold_keywords": {
+        "layout": "top_band",
+        "font_size": 54,
+        "font_name": "georgia",
+        "color": "#F2E8D0",
+        "bold_keywords": True,
+    },
+    "full_video_overlay": {
+        "layout": "overlay",
+        "font_size": 50,
+        "font_name": "arial_bold",
+        "color": "#F8FAFC",
+        "background": "dark",
+    },
 }
 _PREMISE_KEY_PREFIX = "processing_clip_premise_"
 
@@ -77,17 +142,25 @@ def get_settings(item_id: int) -> dict:
             raise DraftRevisionError(f"No download item with id {item_id}.")
         account = session.get(Account, item.account_id) if item.account_id else None
         prefs = _account_preferences(account)
-        default_caption = "history_lost_archive" if account and account.niche == "history" else "contextual_info"
-        default_template = "lost_archive_black" if account and account.niche == "history" else "gaming_meme_black"
+        default_caption = (
+            "history_lost_archive" if account and account.niche == "history" else "contextual_info"
+        )
+        default_template = (
+            "lost_archive_black" if account and account.niche == "history" else "gaming_meme_black"
+        )
         return {
             "clip_premise": get_ui_pref(f"{_PREMISE_KEY_PREFIX}{item.id}", ""),
-            "caption_style": prefs.get("caption_style") or item.caption_style_preset or default_caption,
+            "caption_style": prefs.get("caption_style")
+            or item.caption_style_preset
+            or default_caption,
             "title_style": prefs.get("prompt_title_style") or "",
+            "title_length": prefs.get("title_length") or "long",
             "template": prefs.get("template") or default_template,
             "title_draft": item.title_draft or "",
             "caption_draft": item.caption_draft or "",
             "caption_style_options": CAPTION_STYLES,
             "title_style_options": TITLE_STYLES,
+            "title_length_options": TITLE_LENGTHS,
             "template_options": TEMPLATES,
         }
 
@@ -96,6 +169,7 @@ def save_settings(item_id: int, payload: dict) -> dict:
     premise = str(payload.get("clip_premise") or "").strip()
     caption_style = str(payload.get("caption_style") or "contextual_info")
     title_style = str(payload.get("title_style") or "")
+    title_length = str(payload.get("title_length") or "long")
     template = str(payload.get("template") or "gaming_meme_black")
     set_ui_pref(f"{_PREMISE_KEY_PREFIX}{item_id}", premise)
     with get_session() as session:
@@ -110,6 +184,7 @@ def save_settings(item_id: int, payload: dict) -> dict:
                 {
                     "caption_style": caption_style,
                     "prompt_title_style": title_style,
+                    "title_length": title_length,
                     "template": template,
                 }
             )

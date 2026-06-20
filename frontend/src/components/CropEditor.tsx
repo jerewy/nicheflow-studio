@@ -7,7 +7,7 @@ import type { CropRect } from "@/types";
 const MIN_SIZE = 0.05; // smallest keep-region, as a fraction of the source
 const FULL: CropRect = { x: 0, y: 0, w: 1, h: 1 };
 
-type Handle = "nw" | "ne" | "sw" | "se";
+type Handle = "nw" | "ne" | "sw" | "se" | "n" | "e" | "s" | "w";
 type Mode = "move" | Handle;
 
 interface DragState {
@@ -39,6 +39,21 @@ function applyDrag(drag: DragState, dx: number, dy: number): CropRect {
   if (drag.mode === "sw") {
     const nx = clamp(x + dx, 0, x + w - MIN_SIZE);
     return { x: nx, y, w: w + (x - nx), h: clamp(h + dy, MIN_SIZE, 1 - y) };
+  }
+  // Edge handles move a single side; the opposite three stay put.
+  if (drag.mode === "n") {
+    const ny = clamp(y + dy, 0, y + h - MIN_SIZE);
+    return { x, y: ny, w, h: h + (y - ny) };
+  }
+  if (drag.mode === "s") {
+    return { x, y, w, h: clamp(h + dy, MIN_SIZE, 1 - y) };
+  }
+  if (drag.mode === "w") {
+    const nx = clamp(x + dx, 0, x + w - MIN_SIZE);
+    return { x: nx, y, w: w + (x - nx), h };
+  }
+  if (drag.mode === "e") {
+    return { x, y, w: clamp(w + dx, MIN_SIZE, 1 - x), h };
   }
   // "se"
   return { x, y, w: clamp(w + dx, MIN_SIZE, 1 - x), h: clamp(h + dy, MIN_SIZE, 1 - y) };
@@ -158,6 +173,9 @@ export function CropEditor({ itemId, onClose, onSaved }: CropEditorProps) {
   };
 
   const handleStyle = "absolute h-3 w-3 rounded-sm border border-black/60 bg-white";
+  // Edge handles are elongated along their side so they read as "drag this edge"
+  // and offer a bigger hit target than the corner squares.
+  const edgeStyle = "absolute rounded-sm border border-black/60 bg-white";
 
   return (
     <div className="flex w-full flex-col gap-3 rounded-xl border border-border bg-muted/20 p-4">
@@ -165,7 +183,7 @@ export function CropEditor({ itemId, onClose, onSaved }: CropEditorProps) {
           <div>
             <h2 className="text-base font-semibold">Adjust source crop for next export</h2>
             <p className="text-sm text-muted-foreground">
-              Drag the box over the original video to choose what the next exported reel keeps.
+              Drag inside the box to move it, or drag any edge or corner to resize.
               The title and layout are applied after this crop.
             </p>
           </div>
@@ -177,7 +195,7 @@ export function CropEditor({ itemId, onClose, onSaved }: CropEditorProps) {
         <div
           ref={containerRef}
           className="relative mx-auto touch-none select-none overflow-hidden bg-black"
-          style={{ aspectRatio: String(aspect), height: "min(56vh, 70vw)" }}
+          style={{ aspectRatio: String(aspect), height: "min(78vh, 92vw)" }}
         >
           {previewUrl ? (
             <img
@@ -252,6 +270,26 @@ export function CropEditor({ itemId, onClose, onSaved }: CropEditorProps) {
             <span
               className={`${handleStyle} -bottom-1.5 -right-1.5 cursor-nwse-resize`}
               data-mode="se"
+              onPointerDown={onHandlePointerDown}
+            />
+            <span
+              className={`${edgeStyle} -top-1.5 left-1/2 h-3 w-6 -translate-x-1/2 cursor-ns-resize`}
+              data-mode="n"
+              onPointerDown={onHandlePointerDown}
+            />
+            <span
+              className={`${edgeStyle} -bottom-1.5 left-1/2 h-3 w-6 -translate-x-1/2 cursor-ns-resize`}
+              data-mode="s"
+              onPointerDown={onHandlePointerDown}
+            />
+            <span
+              className={`${edgeStyle} -left-1.5 top-1/2 h-6 w-3 -translate-y-1/2 cursor-ew-resize`}
+              data-mode="w"
+              onPointerDown={onHandlePointerDown}
+            />
+            <span
+              className={`${edgeStyle} -right-1.5 top-1/2 h-6 w-3 -translate-y-1/2 cursor-ew-resize`}
+              data-mode="e"
               onPointerDown={onHandlePointerDown}
             />
           </div>

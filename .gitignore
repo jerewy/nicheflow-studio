@@ -43,6 +43,9 @@ cloudflare-publisher/.wrangler/
 # Test / tool caches
 .pytest_cache/
 
+# Local scratch / agent temp output (diagnostic clips, frame dumps, draft probes)
+.codex_tmp/
+
 # Local app data (downloads, db, logs, cache)
 data/
 

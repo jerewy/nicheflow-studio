@@ -145,6 +145,46 @@ def test_status_derivation_draft_exported_posted() -> None:
     assert by_id[posted] == "posted"
 
 
+def test_only_explicit_repost_draft_overrides_historical_post() -> None:
+    account_id = _make_account()
+    untouched = _make_item(account_id=account_id)
+    reopened = _make_item(account_id=account_id)
+    with get_session() as session:
+        session.get(DownloadItem, untouched).status = "pending_review"
+        session.get(DownloadItem, reopened).status = "exported"
+        session.add(
+            UploadJob(
+                account_id=account_id,
+                download_item_id=untouched,
+                processed_path=f"C:/{untouched}.mp4",
+                status="draft",
+            )
+        )
+        session.flush()
+        for item_id in (untouched, reopened):
+            session.add(
+                UploadJob(
+                    account_id=account_id,
+                    download_item_id=item_id,
+                    processed_path=f"C:/{item_id}.mp4",
+                    status="posted",
+                )
+            )
+        session.add(
+            UploadJob(
+                account_id=account_id,
+                download_item_id=reopened,
+                processed_path=f"C:/{reopened}.mp4",
+                status="draft",
+            )
+        )
+        session.commit()
+
+    by_id = {r["id"]: r["status"] for r in library.list_items(account_id=account_id)}
+    assert by_id[untouched] == "posted"
+    assert by_id[reopened] == "exported"
+
+
 def test_status_derivation_scheduled_outranks_exported() -> None:
     account_id = _make_account()
     scheduled = _make_item(account_id=account_id)
@@ -206,6 +246,33 @@ def test_status_derivation_cloud_job() -> None:
                 processed_path="C:/out.mp4",
                 status="cloud",
             )
+        )
+        session.commit()
+
+    by_id = {r["id"]: r["status"] for r in library.list_items(account_id=account_id)}
+    assert by_id[item] == "cloud"
+
+
+def test_status_derivation_cloud_outranks_stale_scheduled_job() -> None:
+    account_id = _make_account()
+    item = _make_item(account_id=account_id)
+    with get_session() as session:
+        session.get(DownloadItem, item).processed_path = "C:/out.mp4"
+        session.add_all(
+            [
+                UploadJob(
+                    account_id=account_id,
+                    download_item_id=item,
+                    processed_path="C:/old.mp4",
+                    status="scheduled",
+                ),
+                UploadJob(
+                    account_id=account_id,
+                    download_item_id=item,
+                    processed_path="C:/out.mp4",
+                    status="cloud",
+                ),
+            ]
         )
         session.commit()
 
@@ -464,6 +531,78 @@ def test_pending_review_first_use_downloads_once_and_reuses_globally(tmp_path: P
     assert first["downloaded"] is True
     assert second["downloaded"] is False
     assert calls == [source_url]
+
+
+def test_download_persists_content_hash(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The webview download path must compute and store the perceptual
+    fingerprint. Regression: mark_media_asset_downloaded was called without
+    content_hash, so every webview-downloaded asset kept content_hash=NULL and
+    cross-repost footage dedup never matched."""
+    source_url = "https://instagram.com/reel/fp/"
+    with get_session() as session:
+        account = Account(name="A", niche="history")
+        session.add(account)
+        session.flush()
+        session.add(
+            DownloadItem(
+                source_url=source_url,
+                video_id="fp",
+                account_id=account.id,
+                status="pending_review",
+                review_state="pending_review",
+            )
+        )
+        session.commit()
+        item_id = session.query(DownloadItem).one().id
+
+    # Stub fingerprinting: the fake file isn't a real video, so exercise the
+    # wiring (compute -> store) with a known hash instead of decoding frames.
+    monkeypatch.setattr(library, "safe_video_fingerprint", lambda _path: "deadbeef,c0ffee")
+
+    def fake_download(*, url, output_dir):
+        path = tmp_path / "fp.mp4"
+        path.write_bytes(b"video")
+        return SimpleNamespace(file_path=path)
+
+    result = library.ensure_item_downloaded(item_id, downloader=fake_download)
+    assert result["downloaded"] is True
+
+    with get_session() as session:
+        asset = session.scalars(select(MediaAsset)).one()
+        assert asset.content_hash == "deadbeef,c0ffee"
+
+
+def test_deleted_source_raises_clean_reject_prompt() -> None:
+    """A removed/private Instagram post should surface as a clear, rejectable
+    message — not a generic 'Unexpected error' from a raw yt-dlp DownloadError."""
+    item_id = _make_item(file_path=None)
+
+    def gone_download(*, url, output_dir):
+        raise RuntimeError(
+            "ERROR: [Instagram] ABC: Instagram sent an empty media response."
+        )
+
+    with pytest.raises(library.SourceUnavailableError) as excinfo:
+        library.ensure_item_downloaded(item_id, downloader=gone_download)
+    assert "no longer available" in str(excinfo.value).lower() or "deleted" in str(
+        excinfo.value
+    ).lower()
+    # Stays a ServiceError so the bridge shows the message verbatim.
+    assert isinstance(excinfo.value, LibraryError)
+
+
+def test_generic_download_failure_is_translated_not_unexpected() -> None:
+    """Other download failures (network, etc.) become a clean LibraryError rather
+    than leaking a raw exception that the bridge would report generically."""
+    item_id = _make_item(file_path=None)
+
+    def flaky_download(*, url, output_dir):
+        raise RuntimeError("Connection reset by peer")
+
+    with pytest.raises(LibraryError) as excinfo:
+        library.ensure_item_downloaded(item_id, downloader=flaky_download)
+    assert not isinstance(excinfo.value, library.SourceUnavailableError)
+    assert "instagram" in str(excinfo.value).lower()
 
 
 def _row_for(account_id: int, item_id: int):

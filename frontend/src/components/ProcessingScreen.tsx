@@ -11,6 +11,7 @@ import { useToast } from "@/components/ui/Toast";
 import { bridge, whenBridgeReady } from "@/lib/bridge";
 import { formatDate } from "@/lib/format";
 import type {
+  BatchDraftImportResult,
   DraftRevision,
   DueRecencyWarning,
   ExportResult,
@@ -29,6 +30,10 @@ const PUBLISH_TIMEOUT_MS = 480000;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+function isPastDate(date: Date): boolean {
+  return date.getTime() <= Date.now();
+}
+
 // Workflow status -> label + colored dot (Tailwind bg class) for the videos table.
 const STATUS_META: Record<string, { label: string; dot: string }> = {
   pending_review: { label: "Pending review", dot: "bg-sky-500" },
@@ -41,6 +46,12 @@ const STATUS_META: Record<string, { label: string; dot: string }> = {
   skipped: { label: "Skipped", dot: "bg-zinc-500" },
   failed: { label: "Failed", dot: "bg-red-500" },
 };
+
+const MANUAL_STATUS_OPTIONS = [
+  { value: "pending_review", label: "Pending review" },
+  { value: "draft", label: "Draft" },
+  { value: "exported", label: "Exported" },
+] as const;
 
 const REVIEW_REASON_LABELS: Record<string, string> = {
   wrong_niche: "Wrong niche",
@@ -59,9 +70,22 @@ function shortDate(iso: string | null): string {
   return Number.isNaN(d.getTime()) ? "" : d.toLocaleDateString();
 }
 
+function scheduleStatusMessage(status: string, scheduled: string): string {
+  return status === "cloud"
+    ? `Sent to cloud for ${scheduled}.`
+    : `Scheduled locally for ${scheduled}.`;
+}
+
 interface ProcessingScreenProps {
   activeAccountId: number;
   activeAccountName: string | null;
+  // Deep-link target when arriving via "Edit in Processing" from the publish
+  // schedule. initialItemId pins the exact library item (reliable: the exported
+  // title differs from the item's original title). initialSearch is a fallback
+  // text seed used only when no item id is available. Applied on mount; the
+  // screen remounts per visit.
+  initialItemId?: number | null;
+  initialSearch?: string;
 }
 
 function workflowPayload(workflow: WorkflowSettings | null): Record<string, unknown> {
@@ -69,6 +93,7 @@ function workflowPayload(workflow: WorkflowSettings | null): Record<string, unkn
     clip_premise: workflow?.clip_premise ?? "",
     caption_style: workflow?.caption_style ?? "",
     title_style: workflow?.title_style ?? "",
+    title_length: workflow?.title_length ?? "long",
     template: workflow?.template ?? "",
   };
 }
@@ -114,7 +139,12 @@ function sameOptions(a: EditableOptions, revision: DraftRevision | null): boolea
   );
 }
 
-export function ProcessingScreen({ activeAccountId, activeAccountName }: ProcessingScreenProps) {
+export function ProcessingScreen({
+  activeAccountId,
+  activeAccountName,
+  initialItemId,
+  initialSearch,
+}: ProcessingScreenProps) {
   const { pushToast } = useToast();
   const [context, setContext] = useState<ProcessingContext | null>(null);
   const [itemsLoaded, setItemsLoaded] = useState(false);
@@ -146,6 +176,8 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
   const [publishingItems, setPublishingItems] = useState<Record<number, string>>({});
   // The "Publish due now" batch flow (not tied to a single item).
   const [publishingDue, setPublishingDue] = useState(false);
+  const [cancelingScheduleIds, setCancelingScheduleIds] = useState<Record<number, boolean>>({});
+  const [updatingStatusIds, setUpdatingStatusIds] = useState<Record<number, boolean>>({});
   const [autoPublish, setAutoPublish] = useState(false);
   const [dueCount, setDueCount] = useState(0);
   // Open recent-post confirmation for "Publish due now" (null = closed).
@@ -154,9 +186,22 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
   const [nowDialog, setNowDialog] = useState<PublishRecency | null>(null);
   const [isDesktop, setIsDesktop] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
-  const [itemSearch, setItemSearch] = useState("");
+  // A deep link pins one item by id; the text seed is only used without an id.
+  const [itemSearch, setItemSearch] = useState(initialItemId != null ? "" : (initialSearch ?? ""));
+  const [focusItemId, setFocusItemId] = useState<number | null>(initialItemId ?? null);
   const [itemFilter, setItemFilter] = useState("all");
   const [handoffMessage, setHandoffMessage] = useState<string | null>(null);
+  const [batchSize, setBatchSize] = useState(6);
+  const [batchBusy, setBatchBusy] = useState(false);
+  const [batchResult, setBatchResult] = useState<BatchDraftImportResult | null>(null);
+  // Snapshot of the reel->item mapping captured at "Prepare batch" time. Import
+  // routes REEL <n> by POSITION, so it must target exactly the items the pasted
+  // prompt was built from, not the live draftable window (which slides as items
+  // gain drafts). null until a batch is prepared and after a fully clean import;
+  // import falls back to the live window only then (e.g. after an app restart).
+  const [preparedBatch, setPreparedBatch] = useState<{ id: number; label: string }[] | null>(
+    null,
+  );
   const [workflow, setWorkflow] = useState<WorkflowSettings | null>(null);
   const [finalTitle, setFinalTitle] = useState("");
   const [finalCaption, setFinalCaption] = useState("");
@@ -178,13 +223,17 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
   // Ref mirror so async export completions can tell whether the user is still
   // viewing the item they exported (state writes are gated on this).
   const itemIdRef = useRef<number | null>(itemId);
-  itemIdRef.current = itemId;
   // Ref mirror of the active niche account. A background job (export, publish)
   // captures the account at call time; if the user switches niche while it runs,
   // its completion must NOT repaint the Videos list with the now-previous
   // account's items. Completion writes to `items` are gated on this ref.
   const activeAccountIdRef = useRef(activeAccountId);
-  activeAccountIdRef.current = activeAccountId;
+  useEffect(() => {
+    itemIdRef.current = itemId;
+  }, [itemId]);
+  useEffect(() => {
+    activeAccountIdRef.current = activeAccountId;
+  }, [activeAccountId]);
   const exporting = itemId !== null && exportJobs[itemId] !== undefined;
   const exportProgress = itemId !== null ? exportJobs[itemId] ?? null : null;
   // The viewed item's in-flight post message (undefined = not posting). Only the
@@ -322,7 +371,7 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
         // to a UTC ISO string so the backend never guesses the local timezone.
         const d = new Date(scheduled);
         if (isNaN(d.getTime())) throw new Error("Invalid scheduled time.");
-        if (d.getTime() <= Date.now()) {
+        if (isPastDate(d)) {
           throw new Error("Scheduled time is in the past — pick a future time.");
         }
         // Python 3.10 fromisoformat does not support "Z"; use "+00:00" instead.
@@ -354,6 +403,36 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
     void runScheduleInBackground(itemId, activeAccountId, null, true);
   };
 
+  const cancelSchedule = async (job: PublishJob) => {
+    if (itemId === null || !job.scheduled_at || job.posted_at) return;
+    if (
+      !window.confirm(
+        "Cancel this scheduled publish? If it was sent to cloud, the cloud job will be canceled too.",
+      )
+    )
+      return;
+    setActionError(null);
+    setPublishMessage(null);
+    setCancelingScheduleIds((current) => ({ ...current, [job.id]: true }));
+    try {
+      const result = await bridge.unscheduleJob(job.id);
+      setPublishMessage(`Canceled schedule for ${result.title ?? "this reel"}.`);
+      pushToast("Scheduled publish canceled.", "success");
+      refreshPublishJobs(itemId);
+      refreshItems(activeAccountId);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      setActionError(message);
+      pushToast(`Could not cancel schedule: ${message}`, "error");
+    } finally {
+      setCancelingScheduleIds((current) => {
+        const next = { ...current };
+        delete next[job.id];
+        return next;
+      });
+    }
+  };
+
   const runScheduleInBackground = async (
     scheduleItemId: number,
     scheduleAccountId: number,
@@ -380,12 +459,13 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
       const scheduled = result.scheduled_at
         ? new Date(result.scheduled_at).toLocaleString()
         : "the next open slot";
+      const statusMessage = scheduleStatusMessage(result.status, scheduled);
       pushToast(
-        `${accountLabel} - #${scheduleItemId} scheduled for ${scheduled} as ${result.status}.`,
+        `${accountLabel} - #${scheduleItemId} ${statusMessage}`,
         "success",
       );
       if (itemIdRef.current === scheduleItemId) {
-        setPublishMessage(`Scheduled for ${scheduled} as ${result.status}.`);
+        setPublishMessage(statusMessage);
         refreshPublishJobs(scheduleItemId);
       }
       refreshItems(scheduleAccountId);
@@ -433,7 +513,25 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
       )
     )
       return;
-    await doPublishNow(false);
+    await doPublishNow(false, false);
+  };
+
+  const publishViaBrowser = async () => {
+    if (itemId === null) return;
+    const recency = await bridge
+      .itemPublishRecency(itemId)
+      .catch(() => ({ on_cooldown: false }) as PublishRecency);
+    if (recency.on_cooldown) {
+      setNowDialog(recency);
+      return;
+    }
+    if (
+      !window.confirm(
+        "Publish this reel now with the local Instagram browser session? This requires the app to stay open and cannot be undone.",
+      )
+    )
+      return;
+    await doPublishNow(false, true);
   };
 
   // The actual live post. `allowRecent` true is the explicit "post anyway"
@@ -444,7 +542,7 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
   // keep working while it posts. On completion we DON'T snap the view back to the
   // posted item — a toast reports the result, and the screen only refreshes if
   // the user is still viewing that item.
-  const doPublishNow = async (allowRecent: boolean) => {
+  const doPublishNow = async (allowRecent: boolean, forceLocal = false) => {
     if (itemId === null) return;
     // Pin id + account name at call time; the user may move on before this
     // multi-minute post finishes.
@@ -455,7 +553,7 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
     setActionError(null);
     setPublishMessage(null);
     try {
-      const { job_id } = await bridge.startPublishNow(publishItemId, allowRecent);
+      const { job_id } = await bridge.startPublishNow(publishItemId, allowRecent, forceLocal);
       const result = (await waitForJob(
         job_id,
         (_value, message) => {
@@ -522,8 +620,52 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
       }
     } finally {
       setPublishingItems((m) => {
-        const { [publishItemId]: _done, ...rest } = m;
-        return rest;
+        const next = { ...m };
+        delete next[publishItemId];
+        return next;
+      });
+    }
+  };
+
+  const setProcessingStatus = async (candidate: LibraryItem, status: string) => {
+    if (status === candidate.status) return;
+    if (candidate.status === "posted") {
+      const label = statusMeta(status).label;
+      if (
+        !window.confirm(
+          `Change only #${candidate.account_seq ?? candidate.id} from Posted to ${label}? The original post history will be kept and a new publish attempt will be created.`,
+        )
+      )
+        return;
+    }
+    setActionError(null);
+    setPublishMessage(null);
+    setUpdatingStatusIds((current) => ({ ...current, [candidate.id]: true }));
+    try {
+      const result = await bridge.setProcessingStatus(candidate.id, status);
+      const label = statusMeta(result.status).label;
+      pushToast(`#${candidate.account_seq ?? candidate.id} changed to ${label}.`, "success");
+      setItems((current) =>
+        current.map((row) =>
+          row.id === result.item_id ? { ...row, status: result.status } : row,
+        ),
+      );
+      setContext((current) =>
+        current && current.item.id === result.item_id
+          ? { ...current, item: { ...current.item, status: result.status } }
+          : current,
+      );
+      if (itemId === result.item_id) refreshPublishJobs(result.item_id);
+      refreshItems(activeAccountId);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      setActionError(message);
+      pushToast(`Could not change status: ${message}`, "error");
+    } finally {
+      setUpdatingStatusIds((current) => {
+        const next = { ...current };
+        delete next[candidate.id];
+        return next;
       });
     }
   };
@@ -673,6 +815,7 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
         clip_premise: workflow?.clip_premise ?? "",
         caption_style: workflow?.caption_style ?? null,
         title_style: workflow?.title_style || null,
+        title_length: workflow?.title_length ?? "long",
       });
       const revision = (await waitForJob(job_id)) as DraftRevision;
       // Respect dirty-edit protection: don't clobber unsaved edits.
@@ -699,6 +842,17 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
     } catch (err: unknown) {
       setActionError(err instanceof Error ? err.message : String(err));
     }
+  };
+
+  // Persist a workflow field change immediately so style/template selections are
+  // "sticky": they survive switching clips and restarting the app without needing
+  // the Save button. Account-scoped (mirrors the backend), fire-and-forget so the
+  // dropdown stays snappy. Clip premise stays manual — it is per-clip free text.
+  const applyWorkflowChange = (patch: Partial<WorkflowSettings>) => {
+    if (itemId === null || !workflow) return;
+    const next = { ...workflow, ...patch };
+    setWorkflow(next);
+    void bridge.saveWorkflowSettings(itemId, workflowPayload(next)).catch(() => undefined);
   };
 
   const saveWorkflow = async () => {
@@ -864,6 +1018,91 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
     }
   };
 
+  const draftableItems = items.filter(
+    (candidate) =>
+      !candidate.has_draft &&
+      candidate.status !== "posted" &&
+      candidate.status !== "skipped" &&
+      candidate.review_state !== "rejected",
+  );
+
+  const selectedBatchItems = draftableItems.slice(0, Math.max(1, batchSize));
+  const selectedBatchIds = selectedBatchItems.map((candidate) => candidate.id);
+
+  const prepareBatchDraft = async () => {
+    if (!selectedBatchIds.length) {
+      setActionError("No draftable reels found for this account.");
+      return;
+    }
+    setBatchBusy(true);
+    setActionError(null);
+    setBatchResult(null);
+    setHandoffMessage(null);
+    try {
+      const frames = await bridge.prepareAccountBatchFrames(selectedBatchIds);
+      const { prompt } = await bridge.buildAccountBatchChatPrompt(
+        activeAccountId,
+        selectedBatchIds,
+        workflowPayload(workflow),
+      );
+      await navigator.clipboard.writeText(prompt);
+      await bridge.openBatchFramesFolder(frames.folder);
+      // Pin exactly what this prompt was built from so a later Import lands on
+      // these reels even if the draftable window shifts in the meantime.
+      setPreparedBatch(
+        selectedBatchItems.map((candidate) => ({
+          id: candidate.id,
+          label: `#${candidate.account_seq ?? candidate.id}`,
+        })),
+      );
+      setHandoffMessage(
+        `Batch prompt copied and ${frames.frames.length} frame(s) opened. Attach the frames in ChatGPT or Claude, paste the prompt, then paste the reply back.`,
+      );
+    } catch (err: unknown) {
+      setActionError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBatchBusy(false);
+    }
+  };
+
+  const importBatchDraft = async () => {
+    // Route against the PINNED batch when present, so REEL <n> maps to the item
+    // that reel was generated for, not the live window (which may have slid).
+    // Fall back to the live selection only when nothing is pinned (e.g. import
+    // after an app restart cleared the in-memory snapshot).
+    const targetIds = preparedBatch ? preparedBatch.map((entry) => entry.id) : selectedBatchIds;
+    if (!targetIds.length) {
+      setActionError("No draftable reels found for this account.");
+      return;
+    }
+    setBatchBusy(true);
+    setActionError(null);
+    setHandoffMessage(null);
+    try {
+      const text = await navigator.clipboard.readText();
+      if (!text.trim()) throw new Error("Clipboard is empty. Copy the ChatGPT or Claude reply first.");
+      const result = await bridge.importAccountBatchDraft(text, targetIds);
+      setBatchResult(result);
+      setHandoffMessage(
+        `Batch imported ${result.imported.length} reel(s), ${result.failed.length} failed, ${result.unmatched.length} unmatched.`,
+      );
+      // Keep the pin when something did not land cleanly so a corrected reply
+      // can be re-imported to the same reels; clear it only on a clean import.
+      if (!result.failed.length && !result.unmatched.length) {
+        setPreparedBatch(null);
+      }
+      refreshItems(activeAccountId);
+      if (itemId !== null && result.imported.includes(itemId)) {
+        const ctx = await bridge.getContext(itemId);
+        applyContext(ctx);
+      }
+    } catch (err: unknown) {
+      setActionError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBatchBusy(false);
+    }
+  };
+
   const exportReel = async () => {
     if (itemId === null) return;
     // Pin the id: the user may select another item while this export runs in
@@ -885,6 +1124,14 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
           setActionError(
             `Exported successfully, but auto-scheduling needs attention: ${result.warning}`,
           );
+        } else if (result.scheduled_publish) {
+          const scheduled = result.scheduled_publish.scheduled_at
+            ? new Date(result.scheduled_publish.scheduled_at).toLocaleString()
+            : "the next open slot";
+          const scheduleMessage = scheduleStatusMessage(result.scheduled_publish.status, scheduled);
+          const statusMessage = `Exported. ${scheduleMessage}`;
+          setPublishMessage(statusMessage);
+          pushToast(`${activeAccountName ?? "Account"} - ${statusMessage}`, "success");
         }
         // Refetch so the item's processed_path is reflected, and refresh the queue.
         const ctx = await bridge.getContext(exportItemId);
@@ -903,8 +1150,9 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
       }
     } finally {
       setExportJobs((jobs) => {
-        const { [exportItemId]: _done, ...rest } = jobs;
-        return rest;
+        const next = { ...jobs };
+        delete next[exportItemId];
+        return next;
       });
     }
   };
@@ -984,6 +1232,9 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
   const appliedIndex = loadedRevision?.applied_title_index ?? null;
   const previewUrl = item.original_preview_url;
   const filteredItems = items.filter((candidate) => {
+    // Deep link from the schedule: show only the pinned item, regardless of the
+    // status filter or search text (status may be anything; title won't match).
+    if (focusItemId != null) return candidate.id === focusItemId;
     const matchesStatus = itemFilter === "all" || candidate.status === itemFilter;
     const search = itemSearch.trim().toLowerCase();
     const matchesSearch =
@@ -1026,12 +1277,18 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
                 className="h-9 min-w-0 rounded-md border border-input bg-transparent px-3 text-sm"
                 placeholder="Search videos..."
                 value={itemSearch}
-                onChange={(event) => setItemSearch(event.target.value)}
+                onChange={(event) => {
+                  setItemSearch(event.target.value);
+                  setFocusItemId(null);
+                }}
               />
               <select
                 className="h-9 rounded-md border border-input bg-transparent px-2 text-sm"
                 value={itemFilter}
-                onChange={(event) => setItemFilter(event.target.value)}
+                onChange={(event) => {
+                  setItemFilter(event.target.value);
+                  setFocusItemId(null);
+                }}
               >
                 <option value="all">All</option>
                 <option value="new">New</option>
@@ -1056,12 +1313,28 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
                 <option value="duplicate">Duplicate</option>
               </select>
             </div>
+            {focusItemId != null && (
+              <div className="flex items-center justify-between gap-2 rounded-md border border-ring/40 bg-accent/40 px-3 py-2 text-xs">
+                <span className="text-muted-foreground">
+                  {filteredItems.length === 1
+                    ? "Showing the reel linked from the schedule."
+                    : "Linked reel not found in this account's list."}
+                </span>
+                <button
+                  type="button"
+                  className="font-medium text-foreground underline-offset-2 hover:underline"
+                  onClick={() => setFocusItemId(null)}
+                >
+                  Show all
+                </button>
+              </div>
+            )}
           </div>
           <div className="max-h-[600px] overflow-auto">
             <table className="w-full table-fixed text-left text-sm">
               <thead className="sticky top-0 bg-muted text-xs text-muted-foreground">
                 <tr>
-                  <th className="w-28 px-3 py-2 font-medium">Status</th>
+                  <th className="w-36 px-3 py-2 font-medium">Status</th>
                   <th className="px-3 py-2 font-medium">Title</th>
                   <th className="w-24 px-3 py-2 font-medium">Added</th>
                   <th className="w-20 px-3 py-2 text-right font-medium">Action</th>
@@ -1080,10 +1353,35 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
                       }`}
                       onClick={() => switchItem(candidate.id)}
                     >
-                      <td className="px-3 py-2">
-                        <span className="flex items-center gap-2">
+                      <td className="px-2 py-1" onClick={(event) => event.stopPropagation()}>
+                        <span className="flex items-center gap-1.5">
                           <span className={`h-2.5 w-2.5 shrink-0 rounded-full ${meta.dot}`} />
-                          <span>{meta.label}</span>
+                          <select
+                            className="h-8 min-w-0 flex-1 rounded-md border border-input bg-background px-1 text-xs"
+                            value={candidate.status}
+                            disabled={
+                              updatingStatusIds[candidate.id] ||
+                              candidate.status === "scheduled" ||
+                              candidate.status === "cloud"
+                            }
+                            title={
+                              candidate.status === "scheduled" || candidate.status === "cloud"
+                                ? "Cancel the schedule before changing this status"
+                                : "Change this video's workflow status"
+                            }
+                            onChange={(event) =>
+                              void setProcessingStatus(candidate, event.target.value)
+                            }
+                          >
+                            {!MANUAL_STATUS_OPTIONS.some(
+                              (option) => option.value === candidate.status,
+                            ) && <option value={candidate.status}>{meta.label}</option>}
+                            {MANUAL_STATUS_OPTIONS.map((option) => (
+                              <option key={option.value} value={option.value}>
+                                {option.label}
+                              </option>
+                            ))}
+                          </select>
                         </span>
                       </td>
                       <td
@@ -1232,17 +1530,31 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
                 }
               />
             </label>
-            <div className="grid gap-3 md:grid-cols-3">
+            <div className="grid gap-3 md:grid-cols-4">
               <label className="space-y-1">
                 <span className="text-sm font-medium">Caption Style</span>
                 <select
                   className="h-10 w-full rounded-md border border-input bg-transparent px-2 text-sm"
                   value={workflow.caption_style}
                   onChange={(event) =>
-                    setWorkflow({ ...workflow, caption_style: event.target.value })
+                    applyWorkflowChange({ caption_style: event.target.value })
                   }
                 >
                   {workflow.caption_style_options.map((option) => (
+                    <option key={option.value} value={option.value}>{option.label}</option>
+                  ))}
+                </select>
+              </label>
+              <label className="space-y-1">
+                <span className="text-sm font-medium">Title Length</span>
+                <select
+                  className="h-10 w-full rounded-md border border-input bg-transparent px-2 text-sm"
+                  value={workflow.title_length}
+                  onChange={(event) =>
+                    applyWorkflowChange({ title_length: event.target.value })
+                  }
+                >
+                  {workflow.title_length_options.map((option) => (
                     <option key={option.value} value={option.value}>{option.label}</option>
                   ))}
                 </select>
@@ -1253,7 +1565,7 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
                   className="h-10 w-full rounded-md border border-input bg-transparent px-2 text-sm"
                   value={workflow.title_style}
                   onChange={(event) =>
-                    setWorkflow({ ...workflow, title_style: event.target.value })
+                    applyWorkflowChange({ title_style: event.target.value })
                   }
                 >
                   {workflow.title_style_options.map((option) => (
@@ -1267,7 +1579,7 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
                   className="h-10 w-full rounded-md border border-input bg-transparent px-2 text-sm"
                   value={workflow.template}
                   onChange={(event) =>
-                    setWorkflow({ ...workflow, template: event.target.value })
+                    applyWorkflowChange({ template: event.target.value })
                   }
                 >
                   {workflow.template_options.map((option) => (
@@ -1332,6 +1644,86 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
               <code className="mx-1">scripts/nicheflow_drafts.py</code>. New revisions
               appear here automatically without pasting.
             </p>
+          </section>
+
+          <section className="space-y-3 rounded-lg border p-4 md:col-span-2">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <p className="font-medium">Batch draft (ChatGPT or Claude)</p>
+                <p className="text-sm text-muted-foreground">
+                  Prepare the next draftless reels for this account, attach the extracted
+                  frames in ChatGPT or Claude, then import one pasted reply.
+                </p>
+              </div>
+              <label className="grid gap-1 text-xs text-muted-foreground">
+                Batch size
+                <input
+                  type="number"
+                  min="1"
+                  max="20"
+                  className="h-9 w-24 rounded-md border border-input bg-transparent px-2 text-sm text-foreground"
+                  value={batchSize}
+                  onChange={(event) =>
+                    setBatchSize(Math.max(1, Number(event.target.value) || 1))
+                  }
+                />
+              </label>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              {selectedBatchItems.length} selected for the next batch from{" "}
+              {draftableItems.length} draftless reel(s).
+            </p>
+            {selectedBatchItems.length > 0 && (
+              <div className="flex flex-wrap gap-1">
+                {selectedBatchItems.map((candidate, index) => (
+                  <Badge key={candidate.id} variant="secondary">
+                    Reel {index + 1}: #{candidate.account_seq ?? candidate.id}
+                  </Badge>
+                ))}
+              </div>
+            )}
+            {preparedBatch && (
+              <div className="space-y-1 rounded-md border border-primary/40 bg-primary/5 p-2">
+                <p className="text-xs font-medium text-foreground">
+                  Pending import: paste the reply for these reels. Import writes here, not the
+                  list above.
+                </p>
+                <div className="flex flex-wrap gap-1">
+                  {preparedBatch.map((entry, index) => (
+                    <Badge key={entry.id} variant="outline">
+                      Reel {index + 1}: {entry.label}
+                    </Badge>
+                  ))}
+                </div>
+              </div>
+            )}
+            <div className="flex flex-wrap gap-2">
+              <Button
+                variant="secondary"
+                onClick={prepareBatchDraft}
+                disabled={batchBusy || !selectedBatchItems.length}
+              >
+                {batchBusy ? "Working..." : "Prepare batch"}
+              </Button>
+              <Button
+                variant="outline"
+                onClick={importBatchDraft}
+                disabled={batchBusy || (!preparedBatch && !selectedBatchItems.length)}
+              >
+                Import batch results
+              </Button>
+            </div>
+            {batchResult && (
+              <div className="space-y-1 rounded-md border border-border bg-muted/30 p-3 text-xs text-muted-foreground">
+                <p>Imported: {batchResult.imported.join(", ") || "none"}</p>
+                <p>Unmatched: {batchResult.unmatched.join(", ") || "none"}</p>
+                {batchResult.failed.map((failure) => (
+                  <p key={failure.item_id} className="text-destructive">
+                    Item {failure.item_id}: {failure.error}
+                  </p>
+                ))}
+              </div>
+            )}
           </section>
 
           {handoffMessage && (
@@ -1634,6 +2026,13 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
             >
               {thisItemPublishMessage ?? "Publish Now"}
             </Button>
+            <Button
+              variant="outline"
+              disabled={!item.processed_path || busy || isThisItemPublishing || isThisItemScheduling}
+              onClick={publishViaBrowser}
+            >
+              Publish via Browser
+            </Button>
           </div>
           <div className="flex flex-wrap items-center gap-3 border-t border-border pt-3 text-sm">
             <label className="flex items-center gap-2">
@@ -1683,12 +2082,21 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
             />
           )}
           {publishJobs.length > 0 ? (
-            <ul className="space-y-1.5 text-sm">
+            <div className="space-y-2 border-t border-border pt-3">
+              <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                Scheduled / queued publish
+              </p>
+              <ul className="space-y-1.5 text-sm">
               {publishJobs.map((job) => {
                 const failed = job.status === "failed";
+                const canCancelSchedule =
+                  !job.posted_at &&
+                  job.scheduled_at !== null &&
+                  (job.status === "scheduled" || job.status === "cloud");
+                const canceling = Boolean(cancelingScheduleIds[job.id]);
                 return (
                   <li key={job.id} className="space-y-0.5">
-                    <span className="flex items-center gap-2">
+                    <span className="flex flex-wrap items-center gap-2">
                       <Badge
                         variant={failed ? "destructive" : job.posted_at ? "default" : "secondary"}
                       >
@@ -1701,6 +2109,16 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
                           : ""}
                         {job.posted_at ? ` — posted ${formatDate(job.posted_at)}` : ""}
                       </span>
+                      {canCancelSchedule && (
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={canceling || busy || isThisItemPublishing || isThisItemScheduling}
+                          onClick={() => void cancelSchedule(job)}
+                        >
+                          {canceling ? "Canceling..." : "Cancel schedule"}
+                        </Button>
+                      )}
                     </span>
                     {failed && (
                       <p className="text-xs text-red-500">
@@ -1711,7 +2129,8 @@ export function ProcessingScreen({ activeAccountId, activeAccountName }: Process
                   </li>
                 );
               })}
-            </ul>
+              </ul>
+            </div>
           ) : (
             <p className="text-xs text-muted-foreground">
               No publish-queue entries for this item yet. Posting to Instagram still happens

@@ -20,3 +20,27 @@ export function parseRange(value: string | null, size: number): R2Range | undefi
   if (!Number.isFinite(start) || !Number.isFinite(end) || start > end) return undefined;
   return { offset: start, length: end - start + 1 };
 }
+
+// Meta error codes that mean "not this job's fault — it will recover on its own" rather
+// than a permanent failure: blocked/restricted API access (200), invalid or expired access
+// token (190, 102, 463, 467), and rate limits (4, 17, 32, 368, 613). On these we keep the
+// media and back off, instead of burning retries and deleting the video — so a temporary
+// account restriction only delays posts rather than destroying them.
+const RECOVERABLE_META_CODES = new Set([4, 17, 32, 102, 190, 200, 368, 463, 467, 613]);
+const MANUAL_LOCAL_META_CODES = new Set([4, 17, 32, 102, 190, 200, 463, 467, 613]);
+
+function metaErrorCode(error: unknown): number | null {
+  const match = String(error).match(/"code":\s*(\d+)/);
+  if (!match) return null;
+  return Number(match[1]);
+}
+
+export function isRecoverableMetaError(error: unknown): boolean {
+  const code = metaErrorCode(error);
+  return code !== null && RECOVERABLE_META_CODES.has(code);
+}
+
+export function shouldOfferManualLocalPublish(error: unknown): boolean {
+  const code = metaErrorCode(error);
+  return code !== null && MANUAL_LOCAL_META_CODES.has(code);
+}

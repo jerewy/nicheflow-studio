@@ -16,6 +16,7 @@ from sqlalchemy.orm import joinedload
 from nicheflow_studio.core.account_health import HealthState, live_health, local_health
 from nicheflow_studio.core.distribution import DEFAULT_DAILY_POSTS_PER_ACCOUNT
 from nicheflow_studio.core.instagram_profile_pool import ProfilePool
+from nicheflow_studio.core.scheduling import parse_slots
 from nicheflow_studio.core.publishing_dashboard import (
     PublishJobView,
     build_dashboard_row,
@@ -29,6 +30,7 @@ from nicheflow_studio.services.errors import ServiceError
 
 _TOP_POSTS_LIMIT = 5
 _DEFAULT_TIMEZONE = "Asia/Bangkok"
+_PREFERRED_SLOT_WINDOW_HOURS = 1
 
 HEALTH_LABELS = {
     HealthState.OK: "OK",
@@ -240,6 +242,143 @@ def list_global_publish_jobs() -> dict:
         for key in ("draft", "ready", "scheduled", "failed")
     }
     return {"jobs": visible, "due_count": sum(1 for row in visible if row["is_due"]), **counts}
+
+
+def schedule_coverage(*, days: int = 2, now: dt.datetime | None = None) -> dict:
+    """Configured slot coverage for each account over today and upcoming days.
+
+    A scheduled job fills the configured slot window from that slot until the
+    next slot. Jobs within the first hour are on time; later jobs still fill the
+    slot but are marked late so cadence coverage and timing quality stay distinct.
+    """
+    now = _aware(now) or dt.datetime.now(dt.timezone.utc)
+    days = max(1, min(days, 7))
+    with get_session() as session:
+        accounts = session.query(Account).order_by(Account.name.asc(), Account.id.asc()).all()
+        jobs = (
+            session.query(UploadJob)
+            .options(joinedload(UploadJob.download_item))
+            .filter(
+                UploadJob.account_id.in_([account.id for account in accounts]),
+                (UploadJob.scheduled_at.is_not(None)) | (UploadJob.posted_at.is_not(None)),
+            )
+            .all()
+        )
+
+    jobs_by_account: dict[int, list[UploadJob]] = {}
+    for job in jobs:
+        if job.account_id is not None:
+            jobs_by_account.setdefault(job.account_id, []).append(job)
+
+    account_rows = []
+    for account in accounts:
+        timezone = _timezone(account.upload_timezone)
+        local_now = now.astimezone(timezone)
+        slots = parse_slots(account.upload_schedule_slots)
+        day_rows = []
+        filled_total = 0
+        for offset in range(days):
+            date = local_now.date() + dt.timedelta(days=offset)
+            slot_rows = []
+            for slot_index, (hour, minute) in enumerate(slots):
+                slot_time = dt.datetime(
+                    date.year, date.month, date.day, hour, minute, tzinfo=timezone
+                )
+                next_hour, next_minute = slots[(slot_index + 1) % len(slots)]
+                next_date = date + dt.timedelta(days=1) if slot_index + 1 == len(slots) else date
+                next_slot_time = dt.datetime(
+                    next_date.year,
+                    next_date.month,
+                    next_date.day,
+                    next_hour,
+                    next_minute,
+                    tzinfo=timezone,
+                )
+                matching: list[tuple[dt.datetime, UploadJob]] = []
+                for job in jobs_by_account.get(account.id, []):
+                    value = _aware(job.scheduled_at) or _aware(job.posted_at)
+                    if value is None:
+                        continue
+                    local_value = value.astimezone(timezone)
+                    if slot_time <= local_value < next_slot_time:
+                        matching.append((local_value, job))
+                status_priority = {"posted": 0, "cloud": 1, "scheduled": 2, "failed": 3}
+                matching.sort(
+                    key=lambda pair: (
+                        status_priority.get(
+                            "posted"
+                            if pair[1].posted_at is not None
+                            else (pair[1].status or "").lower(),
+                            4,
+                        ),
+                        pair[0],
+                    )
+                )
+                matched = matching[0] if matching else None
+                if matched:
+                    filled_total += 1
+                job = matched[1] if matched else None
+                status = (job.status or "").lower() if job else None
+                if job and job.posted_at is not None:
+                    status = "posted"
+                slot_rows.append(
+                    {
+                        "slot": f"{hour:02d}:{minute:02d}",
+                        "slot_at": slot_time.isoformat(),
+                        "state": status or ("missed" if slot_time < local_now else "open"),
+                        "job_id": job.id if job else None,
+                        # Processing/library item id (DownloadItem.id) so the UI can
+                        # deep-link straight to this reel for re-editing. The exported
+                        # job_title differs from the library item's original title, so
+                        # an exact id is the only reliable link.
+                        "item_id": (
+                            job.download_item.id
+                            if job and job.download_item is not None
+                            else None
+                        ),
+                        "job_title": (
+                            job.title
+                            or (
+                                job.download_item.title
+                                if job and job.download_item is not None
+                                else None
+                            )
+                        )
+                        if job
+                        else None,
+                        "scheduled_at": matched[0].isoformat() if matched else None,
+                        "timing": (
+                            "on_time"
+                            if matched
+                            and matched[0] < slot_time + dt.timedelta(hours=_PREFERRED_SLOT_WINDOW_HOURS)
+                            else "late"
+                            if matched
+                            else None
+                        ),
+                    }
+                )
+            day_rows.append(
+                {
+                    "date": date.isoformat(),
+                    "is_today": offset == 0,
+                    "filled": sum(row["job_id"] is not None for row in slot_rows),
+                    "total": len(slot_rows),
+                    "slots": slot_rows,
+                }
+            )
+        account_rows.append(
+            {
+                "account_id": account.id,
+                "account_name": account.name,
+                "timezone": getattr(timezone, "key", None) or str(timezone),
+                "daily_target": account.daily_posts_target or DEFAULT_DAILY_POSTS_PER_ACCOUNT,
+                "auto_schedule_on_export": bool(account.auto_schedule_on_export),
+                "filled": filled_total,
+                "total": len(slots) * days,
+                "days": day_rows,
+            }
+        )
+    return {"horizon_days": days, "accounts": account_rows}
 
 
 def top_posts(account_id: int, *, limit: int = _TOP_POSTS_LIMIT) -> list[dict]:

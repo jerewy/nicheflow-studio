@@ -1510,6 +1510,70 @@ def test_fit_title_band_prefers_two_balanced_lines_over_three_uneven() -> None:
     assert font_size <= 50
 
 
+def test_fit_title_band_historytrails_uses_consistent_size_and_wider_lines() -> None:
+    font_size, wrapped, _band_height = video._fit_title_band(
+        "That time Princess Diana stepped out in the revenge dress after "
+        "Charles admitted his affair.",
+        canvas_width=1080,
+        requested_font_size=54,
+        title_font_name="arial",
+    )
+
+    assert font_size == 46
+    assert wrapped.splitlines() == [
+        "That time Princess Diana stepped out in",
+        "the revenge dress after Charles admitted",
+        "his affair.",
+    ]
+
+
+def test_fit_title_band_historytrails_wraps_each_line_by_rendered_width() -> None:
+    font_size, wrapped, _band_height = video._fit_title_band(
+        "That time Tom Cruise ran through an empty Times Square for Vanilla Sky, "
+        "after the city briefly went silent",
+        canvas_width=1080,
+        requested_font_size=54,
+        title_font_name="arial",
+    )
+
+    assert font_size == 46
+    assert wrapped.splitlines() == [
+        "That time Tom Cruise ran through an",
+        "empty Times Square for Vanilla Sky, after",
+        "the city briefly went silent",
+    ]
+
+
+def test_fit_title_band_historytrails_expands_long_title_without_overflow() -> None:
+    text = (
+        "In 1969, millions watched Apollo 11 leave Earth while engineers in a quiet "
+        "Houston control room made hundreds of decisions that determined whether "
+        "Neil Armstrong, Buzz Aldrin, and Michael Collins would ever return home safely."
+    )
+
+    font_size, wrapped, band_height = video._fit_title_band(
+        text,
+        canvas_width=1080,
+        requested_font_size=54,
+        title_font_name="arial",
+    )
+
+    lines = wrapped.splitlines()
+    assert font_size == 46
+    assert len(lines) == 6
+    assert " ".join(lines) == text
+    assert all(
+        video._title_line_pixel_width(
+            line,
+            font_size=font_size,
+            title_font_name="arial",
+        )
+        <= 888
+        for line in lines
+    )
+    assert band_height == 449
+
+
 def test_fit_title_band_cinematic_soft_uses_greedy_two_line_wrap() -> None:
     """Cinema titles keep a compact body font (~46px at 1080px) and wrap
     greedily into a natural long-first-line pull quote rather than balancing
@@ -1756,6 +1820,70 @@ def test_title_band_insets_past_moments_content_width() -> None:
 
     assert "scale=968:" in filter_string
     assert ":56:0:color=black[content]" in filter_string
+
+
+def test_title_band_insets_historytrails_left_content_width() -> None:
+    filter_string = video._title_band_filter_complex(
+        "Rey Mysterio was forced to remove his mask\n"
+        "with great sorrow for the first time in his career\n"
+        "after losing the match. (1999)",
+        crop="crop=964:418:58:828",
+        crop_width=964,
+        crop_height=418,
+        font_path=Path("dummy.ttf"),
+        requested_font_size=50,
+        title_font_name="arial",
+        title_color="white",
+        title_text_dir=Path("."),
+        duration_seconds=2.0,
+        title_align="left",
+        title_line_gap_scale=0.20,
+    )
+
+    assert "scale=888:" in filter_string
+    assert ":96:0:color=black[content]" in filter_string
+    assert "x=96:" in filter_string
+
+
+def test_title_band_moves_long_historytrails_composition_down_40px() -> None:
+    filter_string = video._title_band_filter_complex(
+        "In 1969, millions watched Apollo 11 leave Earth while engineers in a quiet "
+        "Houston control room made hundreds of decisions that determined whether "
+        "Neil Armstrong, Buzz Aldrin, and Michael Collins would ever return home safely.",
+        crop="crop=964:418:58:828",
+        crop_width=964,
+        crop_height=418,
+        font_path=Path("dummy.ttf"),
+        requested_font_size=54,
+        title_font_name="arial",
+        title_color="white",
+        title_text_dir=Path("."),
+        duration_seconds=2.0,
+        title_align="left",
+        title_line_gap_scale=0.20,
+    )
+
+    assert "[block]pad=1080:1920:(ow-iw)/2:360:color=black[vout]" in filter_string
+
+
+def test_title_band_centers_single_line_historytrails_title() -> None:
+    filter_string = video._title_band_filter_complex(
+        "It's never that serious, I'm crying.",
+        crop="crop=964:418:58:828",
+        crop_width=964,
+        crop_height=418,
+        font_path=Path("dummy.ttf"),
+        requested_font_size=54,
+        title_font_name="arial",
+        title_color="white",
+        title_text_dir=Path("."),
+        duration_seconds=2.0,
+        title_align="left",
+        title_line_gap_scale=0.20,
+    )
+
+    assert "fontsize=46:" in filter_string
+    assert "x=(w-text_w)/2:" in filter_string
 
 
 def test_title_band_insets_legacy_past_moments_arial_bold_content_width() -> None:

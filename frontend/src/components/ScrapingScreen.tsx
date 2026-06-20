@@ -97,6 +97,10 @@ export function ScrapingScreen({ activeAccountId, activeAccountName }: ScrapingS
   const [scrapeProgress, setScrapeProgress] = useState<{ value: number; message: string } | null>(
     null,
   );
+  // How many recent posts a "Scrape -> pool" pulls. Default 30; raise it to
+  // backfill a source's whole history in one run (first scrape of a source has
+  // no "newer than" cutoff, so it pulls the most recent N).
+  const [scrapeCount, setScrapeCount] = useState(30);
   // Set of candidate ids currently being downloaded — lets multiple downloads
   // run concurrently without locking the whole table.
   const [addingIds, setAddingIds] = useState<Set<number>>(new Set());
@@ -154,10 +158,16 @@ export function ScrapingScreen({ activeAccountId, activeAccountName }: ScrapingS
   }, []);
 
   useEffect(() => {
-    loadSources();
+    const timer = window.setTimeout(() => {
+      void loadSources();
+    }, 0);
+    return () => window.clearTimeout(timer);
   }, [loadSources]);
   useEffect(() => {
-    loadCandidates();
+    const timer = window.setTimeout(() => {
+      void loadCandidates();
+    }, 0);
+    return () => window.clearTimeout(timer);
   }, [loadCandidates]);
   useEffect(() => {
     const timer = window.setTimeout(loadUsage, 0);
@@ -238,7 +248,7 @@ export function ScrapingScreen({ activeAccountId, activeAccountName }: ScrapingS
     setScrapingSourceId(src.id);
     setScrapeProgress({ value: 0, message: "Starting…" });
     try {
-      const { job_id } = await bridge.startSourceScrape(src.id);
+      const { job_id } = await bridge.startSourceScrape(src.id, Math.max(1, scrapeCount));
       const result = (await waitForJob(job_id, (value, message) =>
         setScrapeProgress({ value, message }),
       )) as ScrapeToPoolResult;
@@ -331,6 +341,16 @@ export function ScrapingScreen({ activeAccountId, activeAccountName }: ScrapingS
             <Button onClick={addSource} disabled={busy || !newUrl.trim()}>
               Add source
             </Button>
+            <label className="ml-auto flex items-center gap-2 text-sm text-muted-foreground">
+              Posts per scrape
+              <Input
+                type="number"
+                min={1}
+                className="w-24"
+                value={scrapeCount}
+                onChange={(e) => setScrapeCount(Math.max(1, Number(e.target.value) || 1))}
+              />
+            </label>
           </div>
           {sources.length === 0 ? (
             <p className="text-sm text-muted-foreground">No sources yet.</p>

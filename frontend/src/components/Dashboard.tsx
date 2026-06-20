@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 
 import { DashboardTable } from "@/components/DashboardTable";
 import { PoolingScreen } from "@/components/PoolingScreen";
+import { PoolReviewScreen } from "@/components/PoolReviewScreen";
 import { MultiAccountPublish } from "@/components/MultiAccountPublish";
 import { AccountReadiness } from "@/components/AccountReadiness";
 import { Button } from "@/components/ui/button";
@@ -10,15 +11,22 @@ import { formatDate } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import type { DashboardAccountStats } from "@/types";
 
-type Sub = "pool" | "publish" | "readiness";
+type Sub = "review" | "pool" | "publish" | "readiness";
 
 const SUBS: { id: Sub; label: string }[] = [
+  { id: "review", label: "Review" },
   { id: "pool", label: "Pool & Distribute" },
   { id: "publish", label: "Multi-Account Publish" },
   { id: "readiness", label: "Account Readiness" },
 ];
 
-export function Dashboard({ activeAccountId }: { activeAccountId: number }) {
+export function Dashboard({
+  activeAccountId,
+  onOpenInProcessing,
+}: {
+  activeAccountId: number;
+  onOpenInProcessing?: (accountId: number, itemId: number | null, search: string) => void;
+}) {
   const [sub, setSub] = useState<Sub>("pool");
   const [stats, setStats] = useState<DashboardAccountStats | null>(null);
   const [statsError, setStatsError] = useState<string | null>(null);
@@ -95,8 +103,9 @@ export function Dashboard({ activeAccountId }: { activeAccountId: number }) {
         ))}
       </div>
 
-      {sub === "pool" && <PoolingScreen />}
-      {sub === "publish" && <MultiAccountPublish />}
+      {sub === "review" && <PoolReviewScreen />}
+      {sub === "pool" && <PoolingScreen activeAccountId={activeAccountId} />}
+      {sub === "publish" && <MultiAccountPublish onOpenInProcessing={onOpenInProcessing} />}
       {sub === "readiness" && <AccountReadiness />}
     </div>
   );

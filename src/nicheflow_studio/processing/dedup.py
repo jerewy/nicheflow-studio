@@ -94,6 +94,20 @@ def compute_video_fingerprint(
     return ",".join(f"{value:016x}" for value in hashes)
 
 
+def safe_video_fingerprint(path: Path) -> str | None:
+    """Best-effort :func:`compute_video_fingerprint` that never raises.
+
+    Download paths call this so a fingerprinting failure (unreadable file,
+    missing codec) can never break the download or asset registration — the
+    asset just keeps a ``None`` ``content_hash`` and is excluded from footage
+    dedup until it is re-fingerprinted.
+    """
+    try:
+        return compute_video_fingerprint(Path(path))
+    except Exception:  # noqa: BLE001 - fingerprinting is always best-effort
+        return None
+
+
 def _parse_fingerprint(fingerprint: str | None) -> list[int]:
     if not fingerprint:
         return []

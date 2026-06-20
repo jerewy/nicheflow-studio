@@ -14,10 +14,14 @@ from pathlib import Path
 
 from sqlalchemy.orm import Session
 
-from nicheflow_studio.core.distribution import (
-    engagement_score,
-    plan_first_cycle,
-    ranked_clip_order,
+from nicheflow_studio.core.distribution import plan_first_cycle, ranked_clip_order
+from nicheflow_studio.core.engagement import (
+    SuggestedAction,
+    TopicTier,
+    classify_topic_tier,
+    source_engagement_rate,
+    source_fit_score,
+    suggested_action,
 )
 from nicheflow_studio.db.models import (
     Account,
@@ -75,58 +79,111 @@ def account_ids_for_niche(session: Session, niche: str) -> list[int]:
     return [row[0] for row in rows]
 
 
-def _engagement_scores_for_pool_items(
-    session: Session, pool_item_ids: list[int]
-) -> dict[int, float]:
-    """Engagement score per pool item, for ranked distribution.
+@dataclass(frozen=True)
+class PoolItemEngagement:
+    fit_score: float
+    source_er: float
+    topic_tier: TopicTier
+    suggested_action: SuggestedAction
 
-    Two chunked IN() lookups (pool item -> source shortcode -> candidate
-    like_count/published_at) instead of an N+1 per-item query, then the pure
-    :func:`engagement_score`. Items whose footage carries no candidate metadata
-    score 0.0 and sink to the bottom of the ranking.
+
+def _engagement_signals_for_pool_items(
+    session: Session, pool_item_ids: list[int]
+) -> dict[int, PoolItemEngagement]:
+    """Resolve and persist topic metadata used by review and distribution.
+
+    Two chunked lookups avoid an N+1 query. Missing candidate metrics yield zero
+    ER, while title and description are classified with the shared topic map.
     """
     if not pool_item_ids:
         return {}
-    # pool item -> source shortcode (via its media asset)
+    pool_items: dict[int, PoolItem] = {}
     id_to_shortcode: dict[int, str] = {}
     for start in range(0, len(pool_item_ids), _SCORE_IN_CHUNK):
         chunk = pool_item_ids[start : start + _SCORE_IN_CHUNK]
         rows = (
-            session.query(PoolItem.id, MediaAsset.source_shortcode)
+            session.query(PoolItem, MediaAsset.source_shortcode)
             .join(MediaAsset, MediaAsset.id == PoolItem.media_asset_id)
             .filter(PoolItem.id.in_(chunk))
             .all()
         )
-        for pool_item_id, shortcode in rows:
+        for pool_item, shortcode in rows:
+            pool_items[pool_item.id] = pool_item
             if shortcode:
-                id_to_shortcode[pool_item_id] = shortcode
-    # source shortcode -> (like_count, published_at)
+                id_to_shortcode[pool_item.id] = shortcode
     shortcodes = list(set(id_to_shortcode.values()))
-    meta: dict[str, tuple[int | None, dt.datetime | None]] = {}
+    meta: dict[
+        str,
+        tuple[
+            str | None,
+            str | None,
+            int | None,
+            int | None,
+            int | None,
+            int | None,
+            dt.datetime | None,
+        ],
+    ] = {}
     for start in range(0, len(shortcodes), _SCORE_IN_CHUNK):
         chunk = shortcodes[start : start + _SCORE_IN_CHUNK]
         rows = (
             session.query(
                 ScrapeCandidate.video_id,
+                ScrapeCandidate.title,
+                ScrapeCandidate.description,
+                ScrapeCandidate.view_count,
                 ScrapeCandidate.like_count,
+                ScrapeCandidate.comment_count,
+                ScrapeCandidate.duration_seconds,
                 ScrapeCandidate.published_at,
             )
             .filter(ScrapeCandidate.video_id.in_(chunk))
             .all()
         )
-        for video_id, like_count, published_at in rows:
-            meta.setdefault(video_id, (like_count, published_at))
+        for row in rows:
+            meta.setdefault(row[0], tuple(row[1:]))
     now = dt.datetime.now(dt.timezone.utc)
-    scores: dict[int, float] = {}
+    signals: dict[int, PoolItemEngagement] = {}
     for pool_item_id in pool_item_ids:
         shortcode = id_to_shortcode.get(pool_item_id)
-        like_count, published_at = (
-            meta.get(shortcode, (None, None)) if shortcode else (None, None)
+        title, description, views, likes, comments, duration, published_at = (
+            meta.get(shortcode, (None, None, None, None, None, None, None))
+            if shortcode
+            else (None, None, None, None, None, None, None)
         )
-        scores[pool_item_id] = engagement_score(
-            like_count=like_count, published_at=published_at, now=now
+        topic_tier = classify_topic_tier(" ".join(part for part in (title, description) if part))
+        source_er = source_engagement_rate(views=views, likes=likes, comments=comments)
+        pool_item = pool_items.get(pool_item_id)
+        if pool_item is not None:
+            pool_item.topic_tag = topic_tier
+        signals[pool_item_id] = PoolItemEngagement(
+            fit_score=source_fit_score(
+                tier=topic_tier,
+                source_er=source_er,
+                published_at=published_at,
+                now=now,
+            ),
+            source_er=source_er,
+            topic_tier=topic_tier,
+            suggested_action=suggested_action(
+                topic_tier,
+                source_er=source_er,
+                duration_seconds=duration,
+            ),
         )
-    return scores
+    return signals
+
+
+def _engagement_scores_for_pool_items(
+    session: Session, pool_item_ids: list[int]
+) -> dict[int, float]:
+    """Return tier-weighted source-ER scores for ranked distribution."""
+    return {
+        pool_item_id: signal.fit_score
+        for pool_item_id, signal in _engagement_signals_for_pool_items(
+            session, pool_item_ids
+        ).items()
+    }
 
 
 def _create_pending_review_item(
@@ -229,7 +286,7 @@ def distribute_niche(
         session.flush()
         return created
 
-    # Rank the undistributed pool by intrinsic engagement (likes + recency) so the
+    # Rank by tier-weighted public engagement rate plus recency so the
     # strongest clips go out first, jittered within tiers so the network doesn't
     # funnel the same top clip onto every account. plan_first_cycle then places
     # them one-per-account, best-first (shuffle_items=False preserves the rank).

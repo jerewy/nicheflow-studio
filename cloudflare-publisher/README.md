@@ -44,6 +44,12 @@ Authenticated usage status is available at:
 GET /v1/usage
 ```
 
+The response includes tracked R2 storage, active-job cap utilization, active
+counts by status, oldest active-job age, and warning counts for uploads or Meta
+processing jobs older than two hours. Past-due scheduled jobs are reported for
+inspection but are not automatically deleted because account limits can
+legitimately defer them.
+
 ## Initial setup
 
 From this directory:

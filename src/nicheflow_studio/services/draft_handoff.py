@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import re
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
+from nicheflow_studio.core.paths import processed_dir
 from nicheflow_studio.db.models import Account, DownloadItem
+from nicheflow_studio.db.post_metrics import top_titles_for_account
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.processing import draft_guard, smart_drafts
-from nicheflow_studio.services import draft_generation, draft_revisions, publishing_dashboard
+from nicheflow_studio.services import draft_generation, draft_revisions, export as export_svc
 from nicheflow_studio.services.draft_revisions import DraftRevisionDTO, DraftRevisionError
 
 
@@ -32,6 +36,22 @@ _HEADERS: list[tuple[str, re.Pattern[str]]] = [
     ("notes", re.compile(r"^selection\s*notes\s*:\s*(.*)$", re.IGNORECASE)),
 ]
 _NOTE_LINE = re.compile(r"^option\s*(\d+)\s*:\s*(.*)$", re.IGNORECASE)
+# Chat models often append a sources block after the last reel: a markdown
+# reference-style footnote ("[1]: https://...") or a bare URL line. These are
+# not selection notes, and because they trail the final block they otherwise
+# bleed into that reel's last note. Drop them when building notes.
+_CITATION_LINE = re.compile(r"^\[\d+\]\s*:|^https?://\S+$", re.IGNORECASE)
+# A reel header line in a pasted batch reply. We route by the REEL NUMBER, not by
+# any database id, because ChatGPT reliably reproduces "Reel 1" / "REEL 2" but
+# routinely mangles or drops an opaque "item 402" tag and the trailing "=====".
+# Tolerant of: leading/trailing "=", markdown (** , ## ), an optional "#", and a
+# trailing "| item N | label" the model may or may not echo. A normal prose line
+# like "Reel 1 of the series" is rejected because the char after the number must
+# be a delimiter (:|)-=#*_ ), not a letter.
+_REEL_HEADER = re.compile(
+    r"^\s*(?:[*_#=]+\s*)?reel\s*#?\s*(\d+)\s*(?:[:|)\-=#*_].*)?$",
+    re.IGNORECASE,
+)
 
 
 def parse_pasted_draft(text: str) -> PastedDraft:
@@ -96,7 +116,7 @@ def parse_pasted_draft(text: str) -> PastedDraft:
     last_note_index: int | None = None
     for line in singleton["notes"]:
         note = line.strip()
-        if not note:
+        if not note or _CITATION_LINE.match(note):
             continue
         match = _NOTE_LINE.match(note)
         if match:
@@ -133,9 +153,8 @@ def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
         account = session.get(Account, item.account_id) if item.account_id else None
         path = Path(item.file_path or "").expanduser().resolve()
         niche_label = account.niche_label if account and account.niche_label else None
-        few_shot_winners = (
-            publishing_dashboard.top_post_titles(account.id) if account is not None else []
-        )
+        account_key = account.instagram_handle if account is not None else None
+        few_shot_winners = top_titles_for_account(account_key) if account_key else []
         caption_outro = draft_generation.caption_outro_for_account(account)
         fields = [
             f"Account: {account.name if account else '(none)'}",
@@ -161,6 +180,7 @@ def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
         caption_style,
         niche_label,
         few_shot_winners=few_shot_winners,
+        title_length=settings.get("title_length") or "long",
     )
     hook_rules = smart_drafts._hook_drama_and_fact_safety_rules()
     return "\n".join(
@@ -175,6 +195,7 @@ def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
             f"Clip premise / user direction: {settings.get('clip_premise') or '(none)'}",
             f"Caption style: {settings.get('caption_style') or '(none)'}",
             f"Title style: {settings.get('title_style') or 'Auto (match caption style)'}",
+            f"Title length: {(settings.get('title_length') or 'long').title()}",
             f"Processing template: {settings.get('template') or '(none)'}",
             "",
             "Visual evidence JSON (from an earlier vision pass; empty means no pass ran):",
@@ -250,6 +271,198 @@ def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
             "Option 3:",
         ]
     )
+
+
+def _batch_item_delimiter(index: int) -> str:
+    # Keep the header to just the reel number. The id and the title (which starts
+    # with a confusing "#NNN") used to live here and the model echoed the wrong
+    # number; routing is by reel number now, so the header carries only that.
+    return f"===== REEL {index} ====="
+
+
+def _account_prompt_header(
+    account: Account | None,
+    *,
+    settings: dict,
+    item_ids: list[int],
+) -> list[str]:
+    niche_label = account.niche_label if account and account.niche_label else None
+    account_key = account.instagram_handle if account is not None else None
+    few_shot_winners = top_titles_for_account(account_key) if account_key else []
+    title_rules = smart_drafts.effective_title_rules(
+        settings.get("title_style") or None,
+        settings.get("caption_style") or None,
+        niche_label,
+        few_shot_winners=few_shot_winners,
+        title_length=settings.get("title_length") or "long",
+    )
+    hook_rules = smart_drafts._hook_drama_and_fact_safety_rules()
+    return [
+        "You are drafting Instagram Reel titles and captions for one NicheFlow account.",
+        "This is for ChatGPT or Claude web. The user will attach one still image per reel.",
+        "",
+        "Shared account voice and style:",
+        f"Account: {account.name if account else '(none)'}",
+        f"Niche: {niche_label or '(none)'}",
+        f"Tone: {account.writing_tone if account and account.writing_tone else '(none)'}",
+        f"Target audience: {account.target_audience if account and account.target_audience else '(none)'}",
+        f"Hook style: {account.hook_style if account and account.hook_style else '(none)'}",
+        f"Banned phrases: {account.banned_phrases if account and account.banned_phrases else '(none)'}",
+        f"Title rules: {account.title_style_notes if account and account.title_style_notes else '(none)'}",
+        f"Caption rules: {account.caption_style_notes if account and account.caption_style_notes else '(none)'}",
+        f"Clip premise / user direction: {settings.get('clip_premise') or '(none)'}",
+        f"Caption style: {settings.get('caption_style') or '(none)'}",
+        f"Title style: {settings.get('title_style') or 'Auto (match caption style)'}",
+        f"Title length: {(settings.get('title_length') or 'long').title()}",
+        f"Processing template: {settings.get('template') or '(none)'}",
+        f"Number of reels in this batch: {len(item_ids)}",
+        "",
+        "On-screen title rules (follow these exactly):",
+        *title_rules,
+        "",
+        "Hook framing (drama is allowed, overclaiming is not):",
+        *hook_rules,
+        "",
+        "Plain-text rules:",
+        "- Keep display titles plain text.",
+        "- Do not use markdown formatting in section headers or titles.",
+        "- Never write em dashes or double hyphens ('--') in titles or captions.",
+        "- Do not invent unsupported facts.",
+        "- The recommended title and caption MUST share the same option number.",
+        "",
+        "Return one block per reel, one for every reel, in order.",
+        "START each reel's block with its own header line that is exactly:",
+        "===== REEL <n> =====",
+        "using the same reel number shown in that reel's context below (REEL 1, REEL 2, ...).",
+        "Do not rename, renumber, merge, or skip any reel, even if two clips look similar.",
+        "Inside each block, use this exact plain-text format:",
+        "Title Option 1:",
+        "Caption Option 1:",
+        "Title Option 2:",
+        "Caption Option 2:",
+        "Title Option 3:",
+        "Caption Option 3:",
+        "Recommended Pick: Title Option N + Caption Option N",
+        "Why:",
+        "Selection Notes:",
+        "Option 1:",
+        "Option 2:",
+        "Option 3:",
+    ]
+
+
+def _batch_item_context(index: int, item: DownloadItem) -> list[str]:
+    transcript = (item.transcript_text or "").strip() or "(none)"
+    vision_text = (item.smart_vision_payload or "").strip() or "(none)"
+    frame_name = f"reel_{index}_item{item.id}.jpg"
+    return [
+        _batch_item_delimiter(index),
+        f"Attach and inspect image file: {frame_name}",
+        f"Source title: {item.title or '(none)'}",
+        f"Source URL: {item.source_url or '(none)'}",
+        f"Source description: {item.source_description or '(none)'}",
+        "",
+        "Visual evidence JSON:",
+        vision_text[:4000],
+        "",
+        "Transcript/context excerpt:",
+        transcript[:3000],
+    ]
+
+
+def build_account_batch_chat_prompt(
+    account_id: int, item_ids: list[int], settings: dict | None = None
+) -> str:
+    settings = settings or {}
+    ids = [int(item_id) for item_id in item_ids]
+    if not ids:
+        raise DraftRevisionError("Choose at least one item for the batch.")
+    with get_session() as session:
+        account = session.get(Account, account_id)
+        if account is None:
+            raise DraftRevisionError(f"No account with id {account_id}.")
+        items = (
+            session.query(DownloadItem)
+            .filter(DownloadItem.id.in_(ids), DownloadItem.account_id == account_id)
+            .all()
+        )
+        by_id = {item.id: item for item in items}
+        missing = [item_id for item_id in ids if item_id not in by_id]
+        if missing:
+            raise DraftRevisionError(
+                f"Item(s) not found for this account: {', '.join(map(str, missing))}."
+            )
+        ordered = [by_id[item_id] for item_id in ids]
+        lines = _account_prompt_header(account, settings=settings, item_ids=ids)
+        lines.extend(["", "Reel contexts:"])
+        for index, item in enumerate(ordered, start=1):
+            lines.extend(["", *_batch_item_context(index, item)])
+    return "\n".join(lines)
+
+
+def _split_batch_blocks(text: str) -> dict[int, str]:
+    """Split a pasted reply into blocks keyed by 1-based REEL NUMBER.
+
+    A repeated header for the same reel keeps the first block (later headers are
+    treated as continuations of nothing useful and ignored).
+    """
+    blocks: dict[int, list[str]] = {}
+    current_reel: int | None = None
+    for line in (text or "").splitlines():
+        match = _REEL_HEADER.match(line.strip())
+        if match:
+            current_reel = int(match.group(1))
+            blocks.setdefault(current_reel, [])
+            continue
+        if current_reel is not None:
+            blocks[current_reel].append(line)
+    return {reel: "\n".join(lines).strip() for reel, lines in blocks.items()}
+
+
+def import_account_batch_draft(text: str, item_ids: list[int]) -> dict:
+    """Import a batch reply, mapping each ``REEL <n>`` block to the n-th requested
+    item. Routing is by reel number (which the model preserves), not by any id the
+    model echoes — so a reordered, re-headed, or id-stripped reply still lands on
+    the right reels."""
+    requested = [int(item_id) for item_id in item_ids]
+    blocks_by_reel = _split_batch_blocks(text)
+    imported: list[int] = []
+    failed: list[dict] = []
+    seen: set[int] = set()
+    for reel, block in sorted(blocks_by_reel.items()):
+        if reel < 1 or reel > len(requested):
+            continue  # a reel number outside this batch — ignore it
+        item_id = requested[reel - 1]
+        if item_id in seen:
+            continue  # duplicate reel header — first block wins
+        seen.add(item_id)
+        try:
+            import_pasted_draft(item_id, block)
+            imported.append(item_id)
+        except DraftRevisionError as exc:
+            failed.append({"item_id": item_id, "error": str(exc)})
+    matched = set(imported) | {row["item_id"] for row in failed}
+    return {
+        "imported": imported,
+        "failed": failed,
+        "unmatched": [item_id for item_id in requested if item_id not in matched],
+    }
+
+
+def batch_frames(item_ids: list[int]) -> dict:
+    ids = [int(item_id) for item_id in item_ids]
+    if not ids:
+        raise DraftRevisionError("Choose at least one item for the batch.")
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
+    folder = processed_dir() / "chatgpt-batches" / f"batch-{stamp}"
+    folder.mkdir(parents=True, exist_ok=True)
+    frames: list[dict] = []
+    for index, item_id in enumerate(ids, start=1):
+        source = export_svc.crop_preview_frame(item_id)
+        target = folder / f"reel_{index}_item{item_id}.jpg"
+        shutil.copyfile(source, target)
+        frames.append({"item_id": item_id, "path": str(target)})
+    return {"folder": str(folder), "frames": frames}
 
 
 def import_pasted_draft(item_id: int, text: str) -> DraftRevisionDTO:

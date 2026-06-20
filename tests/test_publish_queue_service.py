@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import pytest
 
-from nicheflow_studio.db.models import Account, UploadJob
+from nicheflow_studio.db.models import Account, DownloadItem, UploadJob
 from nicheflow_studio.db.session import get_session
-from nicheflow_studio.services import publish_queue
+from nicheflow_studio.services import publish_queue, publishing
 from nicheflow_studio.services.publish_queue import PublishQueueError
 
 
@@ -127,11 +127,126 @@ def test_reschedule_hands_cloud_mapped_job_to_worker(monkeypatch: pytest.MonkeyP
         assert session.get(UploadJob, job_id).status == "cloud"
 
 
+def test_unschedule_cloud_job_cancels_worker_job(monkeypatch: pytest.MonkeyPatch) -> None:
+    from nicheflow_studio.services import cloud_publisher
+
+    job_id = _make_job(status="cloud")
+    canceled: list[str] = []
+    monkeypatch.setenv("CLOUDFLARE_PUBLISHER_URL", "https://worker.example.dev")
+    monkeypatch.setenv("CLOUDFLARE_PUBLISHER_API_KEY", "secret")
+    monkeypatch.setattr(
+        cloud_publisher,
+        "list_jobs",
+        lambda: {
+            "jobs": [
+                {"id": "worker-active", "external_id": f"nf-{job_id}-300", "status": "scheduled"},
+                {"id": "worker-done", "external_id": f"nf-{job_id}-200", "status": "published"},
+            ]
+        },
+    )
+    monkeypatch.setattr(cloud_publisher, "cancel_job", lambda worker_id: canceled.append(worker_id))
+
+    result = publish_queue.unschedule(job_id)
+
+    assert canceled == ["worker-active"]
+    assert result["status"] == "draft"
+    assert result["scheduled_at"] is None
+    with get_session() as session:
+        assert session.get(UploadJob, job_id).status == "draft"
+
+
+def test_unschedule_cloud_job_fails_closed_when_worker_cancel_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nicheflow_studio.services import cloud_publisher
+    from nicheflow_studio.services.cloud_publisher import CloudPublisherError
+
+    job_id = _make_job(status="cloud")
+    monkeypatch.setenv("CLOUDFLARE_PUBLISHER_URL", "https://worker.example.dev")
+    monkeypatch.setenv("CLOUDFLARE_PUBLISHER_API_KEY", "secret")
+    monkeypatch.setattr(cloud_publisher, "list_jobs", lambda: {"jobs": []})
+    monkeypatch.setattr(
+        cloud_publisher,
+        "list_jobs",
+        lambda: (_ for _ in ()).throw(CloudPublisherError("worker unreachable")),
+    )
+
+    with pytest.raises(PublishQueueError, match="Cloud schedule cancel failed"):
+        publish_queue.unschedule(job_id)
+
+    with get_session() as session:
+        assert session.get(UploadJob, job_id).status == "cloud"
+
+
 def test_reschedule_posted_job_raises() -> None:
     job_id = _make_job()
     publish_queue.mark_posted(job_id, {})
     with pytest.raises(PublishQueueError):
         publish_queue.reschedule(job_id, "2026-08-01T20:00:00")
+
+
+def test_set_processing_status_reopens_only_selected_posted_item() -> None:
+    with get_session() as session:
+        account = Account(name="History", platform="instagram")
+        session.add(account)
+        session.flush()
+        item = DownloadItem(
+            account_id=account.id,
+            source_url="https://instagram.com/reel/history",
+            file_path="C:/source.mp4",
+            processed_path="C:/history.mp4",
+            title="Source title",
+            title_draft="Improved title",
+            caption_draft="Improved caption",
+            status="posted",
+        )
+        session.add(item)
+        session.flush()
+        posted = UploadJob(
+            account_id=account.id,
+            download_item_id=item.id,
+            processed_path=item.processed_path,
+            title="Original title",
+            description="Original caption",
+            status="posted",
+            posted_at=publish_queue.dt.datetime(2026, 6, 20, tzinfo=publish_queue.dt.timezone.utc),
+            posted_url="https://instagram.com/p/original",
+            posted_views=1200,
+        )
+        session.add(posted)
+        session.commit()
+        item_id = item.id
+        posted_job_id = posted.id
+
+    result = publish_queue.set_processing_status(item_id, "exported")
+
+    assert result["status"] == "exported"
+    assert result["created"] is True
+    with get_session() as session:
+        original = session.get(UploadJob, posted_job_id)
+        repost = session.get(UploadJob, result["repost_job_id"])
+        item = session.get(DownloadItem, item_id)
+        assert original.status == "posted"
+        assert original.posted_url == "https://instagram.com/p/original"
+        assert original.posted_views == 1200
+        assert repost.status == "draft"
+        assert repost.posted_at is None
+        assert repost.title == "Improved title"
+        assert repost.description == "Improved caption"
+        assert item.status == "exported"
+
+    queued = publishing.queue_for_publish(item_id)
+    assert queued["job_id"] == result["repost_job_id"]
+    assert queued["created"] is False
+
+    publish_queue.mark_posted(result["repost_job_id"])
+    with get_session() as session:
+        assert session.get(DownloadItem, item_id).status == "posted"
+
+
+def test_set_processing_status_rejects_operational_cloud_status() -> None:
+    with pytest.raises(PublishQueueError, match="cannot be set manually"):
+        publish_queue.set_processing_status(1, "cloud")
 
 
 def test_remove_job() -> None:

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import datetime as dt
 import random
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from sqlalchemy import select
@@ -17,6 +20,7 @@ def _make_item(
     processed_path: str | None = "C:/processed/out.mp4",
     with_account: bool = True,
     title_draft: str | None = "Chosen title",
+    caption_draft: str | None = "A caption.",
 ) -> int:
     with get_session() as session:
         account_id = None
@@ -29,7 +33,7 @@ def _make_item(
             source_url="https://instagram.com/reel/abc",
             title="Source",
             title_draft=title_draft,
-            caption_draft="A caption.",
+            caption_draft=caption_draft,
             file_path="C:/clips/x.mp4",
             processed_path=processed_path,
             status="completed",
@@ -231,6 +235,57 @@ def test_cloud_handoff_replaces_existing_worker_job(monkeypatch: pytest.MonkeyPa
         assert session.get(UploadJob, result["job_id"]).status == "cloud"
 
 
+def test_cloud_handoff_serializes_concurrent_requests_for_same_job(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nicheflow_studio.services import cloud_publisher
+
+    item_id = _make_item()
+    account_id = _account_id_of(item_id)
+    _enable_cloud(monkeypatch, account_id)
+    with get_session() as session:
+        job = UploadJob(
+            account_id=account_id,
+            download_item_id=item_id,
+            processed_path="C:/processed/out.mp4",
+            title="Chosen title",
+            description="A caption.",
+            status="scheduled",
+            scheduled_at=dt.datetime(2026, 6, 21, 4, 0, tzinfo=dt.timezone.utc),
+        )
+        session.add(job)
+        session.commit()
+        job_id = job.id
+
+    first_upload_started = threading.Event()
+    release_first_upload = threading.Event()
+    schedule_calls: list[str] = []
+
+    monkeypatch.setattr(cloud_publisher, "list_jobs", lambda: {"jobs": []})
+
+    def schedule_reel(**kwargs) -> dict:
+        schedule_calls.append(kwargs["external_id"])
+        if len(schedule_calls) == 1:
+            first_upload_started.set()
+            assert release_first_upload.wait(timeout=2)
+        return {}
+
+    monkeypatch.setattr(cloud_publisher, "schedule_reel", schedule_reel)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(publishing.handoff_scheduled_job_to_cloud, job_id)
+        assert first_upload_started.wait(timeout=2)
+        second = executor.submit(publishing.handoff_scheduled_job_to_cloud, job_id)
+        time.sleep(0.1)
+        release_first_upload.set()
+        results = [first.result(timeout=2), second.result(timeout=2)]
+
+    assert len(schedule_calls) == 1
+    assert sorted(results, key=lambda value: value or "") == [None, "cloud"]
+    with get_session() as session:
+        assert session.get(UploadJob, job_id).status == "cloud"
+
+
 def test_sync_cloud_jobs_updates_local(monkeypatch: pytest.MonkeyPatch) -> None:
     from nicheflow_studio.services import cloud_publisher
 
@@ -269,6 +324,52 @@ def test_sync_cloud_jobs_updates_local(monkeypatch: pytest.MonkeyPatch) -> None:
         assert "boom" in (failed.error_message or "")
 
 
+def test_sync_cloud_jobs_marks_clean_cloud_failure_for_manual_local_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nicheflow_studio.services import cloud_publisher
+
+    item_id = _make_item()
+    scheduled_at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=5)
+    with get_session() as session:
+        account_id = session.get(DownloadItem, item_id).account_id
+        job = UploadJob(
+            account_id=account_id,
+            download_item_id=item_id,
+            processed_path="C:/fallback.mp4",
+            status="cloud",
+            scheduled_at=scheduled_at,
+        )
+        session.add(job)
+        session.commit()
+        job_id = job.id
+
+    monkeypatch.setenv("CLOUDFLARE_PUBLISHER_URL", "https://worker.example.dev")
+    monkeypatch.setenv("CLOUDFLARE_PUBLISHER_API_KEY", "secret")
+    monkeypatch.setattr(
+        cloud_publisher,
+        "list_jobs",
+        lambda: {
+            "jobs": [
+                {
+                    "external_id": f"nf-{job_id}-300",
+                    "status": "manual_local_available",
+                    "error_message": "cloud blocked; manual browser publish available: API access blocked",
+                }
+            ]
+        },
+    )
+
+    result = publishing.sync_cloud_jobs()
+
+    assert result == {"synced": True, "updated": 1}
+    with get_session() as session:
+        blocked = session.get(UploadJob, job_id)
+        assert blocked.status == "failed"
+        assert publishing._aware(blocked.scheduled_at) == scheduled_at
+        assert "API access blocked" in (blocked.error_message or "")
+
+
 def test_sync_cloud_jobs_noop_without_config(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CLOUDFLARE_PUBLISHER_URL", raising=False)
     monkeypatch.delenv("CLOUDFLARE_PUBLISHER_API_KEY", raising=False)
@@ -305,6 +406,55 @@ def test_queue_with_schedule_sets_scheduled_status() -> None:
 
     assert result["status"] == "scheduled"
     assert result["scheduled_at"] is not None
+
+
+def test_queue_with_schedule_requires_final_caption() -> None:
+    item_id = _make_item(caption_draft=None)
+
+    with pytest.raises(PublishError, match="final caption"):
+        publishing.queue_for_publish(item_id, scheduled_at="2026-07-01T20:00:00")
+
+
+def test_queue_with_schedule_rejects_placeholder_source_title() -> None:
+    item_id = _make_item(title_draft=None)
+    with get_session() as session:
+        item = session.get(DownloadItem, item_id)
+        item.title = "Video by theanomalists"
+        session.commit()
+
+    with pytest.raises(PublishError, match="final title"):
+        publishing.queue_for_publish(item_id, scheduled_at="2026-07-01T20:00:00")
+
+
+def test_cloud_handoff_fails_stale_job_without_caption(monkeypatch: pytest.MonkeyPatch) -> None:
+    from nicheflow_studio.services import cloud_publisher
+
+    item_id = _make_item()
+    account_id = _account_id_of(item_id)
+    _enable_cloud(monkeypatch, account_id)
+    monkeypatch.setattr(cloud_publisher, "schedule_reel", lambda **_kwargs: pytest.fail("no handoff"))
+
+    with get_session() as session:
+        job = UploadJob(
+            account_id=account_id,
+            download_item_id=item_id,
+            processed_path="C:/stale.mp4",
+            title="Video by theanomalists",
+            description=None,
+            status="scheduled",
+            scheduled_at=dt.datetime(2026, 7, 1, 20, 0, tzinfo=dt.timezone.utc),
+        )
+        session.add(job)
+        session.commit()
+        job_id = job.id
+
+    with pytest.raises(PublishError, match="final title"):
+        publishing.handoff_scheduled_job_to_cloud(job_id)
+
+    with get_session() as session:
+        failed = session.get(UploadJob, job_id)
+        assert failed.status == "failed"
+        assert "final title" in (failed.error_message or "")
 
 
 def test_auto_schedule_uses_next_open_account_slot() -> None:
@@ -367,6 +517,36 @@ def test_auto_schedule_keeps_existing_schedule_on_reexport() -> None:
     jobs = publishing.list_publish_jobs(item_id)
     assert len(jobs) == 1  # updated in place, never duplicated
     assert jobs[0]["title"] == "Better title"
+
+
+def test_auto_schedule_does_not_reuse_failed_past_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Re-queuing a failed post must NOT cling to its old, now-past slot — that
+    made the cloud fire it immediately. It should get a fresh future slot."""
+    now = dt.datetime(2026, 6, 16, 10, 0, tzinfo=dt.timezone.utc)
+    item_id = _make_item()
+    with get_session() as session:
+        item = session.get(DownloadItem, item_id)
+        account = session.get(Account, item.account_id)
+        account.upload_schedule_slots = "09:00, 18:00"
+        # Original post failed at a slot that is now hours in the past.
+        session.add(
+            UploadJob(
+                account_id=account.id,
+                processed_path=item.processed_path,
+                status="failed",
+                scheduled_at=dt.datetime(2026, 6, 16, 3, 2, tzinfo=dt.timezone.utc),
+            )
+        )
+        session.commit()
+    monkeypatch.setattr(publishing, "_account_in_checkpoint_cooldown", lambda *_a, **_k: False)
+
+    result = publishing.auto_schedule_for_publish(item_id, now=now, rng=random.Random(7))
+
+    scheduled = dt.datetime.fromisoformat(result["scheduled_at"])
+    assert result["schedule_path"] != "kept_existing"
+    assert scheduled > now  # never a past time, so the cloud won't fire it instantly
 
 
 def test_auto_schedule_requires_account_slots() -> None:

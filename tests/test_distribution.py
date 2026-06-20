@@ -12,6 +12,12 @@ from nicheflow_studio.core.distribution import (
     ranked_clip_order,
     target_backlog,
 )
+from nicheflow_studio.core.engagement import (
+    classify_topic_tier,
+    source_engagement_rate,
+    source_fit_score,
+    suggested_action,
+)
 
 
 def test_target_backlog_mvp_default_is_28() -> None:
@@ -186,6 +192,43 @@ def test_existing_counts_none_matches_clean_first_cycle() -> None:
 
 
 _NOW = dt.datetime(2026, 6, 8, tzinfo=dt.timezone.utc)
+
+
+def test_source_engagement_rate_uses_views_as_the_denominator() -> None:
+    assert source_engagement_rate(views=1_000, likes=40, comments=10) == pytest.approx(0.05)
+    assert source_engagement_rate(views=0, likes=4, comments=1) == 5.0
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("The last time they sang this song together", "S"),
+        ("Remember this classic childhood cartoon theme song", "A"),
+        ("Behind the scenes of the record-setting sports match", "B"),
+        ("The actor was spotted at the appearance", "C"),
+        ("A hydraulic press physics demo", "D"),
+    ],
+)
+def test_classify_topic_tier_uses_seed_keywords(text: str, expected: str) -> None:
+    assert classify_topic_tier(text) == expected
+
+
+def test_suggested_action_is_advisory_from_tier_er_and_duration() -> None:
+    assert suggested_action("S", source_er=0.03, duration_seconds=30) == "accept"
+    assert suggested_action("A", source_er=0.01, duration_seconds=30) == "review"
+    assert suggested_action("B", source_er=0.03, duration_seconds=36) == "reject"
+    assert suggested_action("C", source_er=0.20, duration_seconds=20) == "reject"
+
+
+def test_source_fit_score_retains_evergreen_safe_recency_weight() -> None:
+    fresh = source_fit_score(tier="S", source_er=0.05, published_at=_NOW, now=_NOW)
+    old = source_fit_score(
+        tier="S",
+        source_er=0.05,
+        published_at=_NOW - dt.timedelta(days=365),
+        now=_NOW,
+    )
+    assert fresh > old >= fresh * 0.5
 
 
 def test_engagement_score_is_zero_without_likes() -> None:

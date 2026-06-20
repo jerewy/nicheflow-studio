@@ -669,6 +669,33 @@ def test_publish_item_now_cloud_allow_recent_overrides_cooldown(
     assert scheduled["account_key"] == "pastmomentsdaily"
 
 
+def test_publish_item_now_force_local_overrides_cloud_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    publish_now._account_cooldowns.clear()
+    account_id = _make_account()
+    item_id = _make_exported_item(account_id)
+    _configure_cloud(monkeypatch, account_id)
+
+    from nicheflow_studio.services import cloud_publisher
+
+    monkeypatch.setattr(
+        cloud_publisher,
+        "schedule_reel",
+        lambda **_k: pytest.fail("force_local must not hand off to cloud"),
+    )
+    monkeypatch.setattr(
+        publish_now,
+        "_do_publish_reel",
+        lambda *_args: _fake_result("posted", posted_url="https://instagram.com/p/local/"),
+    )
+
+    result = publish_now.publish_item_now(item_id, force_local=True)
+
+    assert result["status"] == "posted"
+    assert result["posted_url"] == "https://instagram.com/p/local/"
+
+
 def test_auto_publish_toggle() -> None:
     assert publish_now.auto_publish_enabled() is False
     publish_now.set_auto_publish_enabled(True)

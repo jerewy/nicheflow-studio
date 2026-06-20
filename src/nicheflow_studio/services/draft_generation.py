@@ -16,9 +16,10 @@ from pathlib import Path
 from sqlalchemy import select
 
 from nicheflow_studio.db.models import Account, DownloadItem
+from nicheflow_studio.db.post_metrics import top_titles_for_account
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.processing import draft_guard, smart_drafts
-from nicheflow_studio.services import draft_revisions, publishing_dashboard, library
+from nicheflow_studio.services import draft_revisions, library
 from nicheflow_studio.services.draft_revisions import DraftRevisionDTO, DraftRevisionError
 
 # Number of recent same-account drafts fed to the generator so it can avoid
@@ -41,10 +42,21 @@ _CAPTION_OUTROS_BY_NICHE = {
 }
 _CAPTION_OUTRO_DEFAULT = "More every day → @{handle}"
 
+# Disabled across all accounts (2026-06-18): the user's analytics showed the
+# follow outro had no measurable effect on follows or engagement, and a fixed
+# signature on every caption reads as templated. The niche templates above are
+# kept dormant so the line can be re-enabled later by flipping this flag.
+_CAPTION_OUTRO_ENABLED = False
+
 
 def caption_outro_for_account(account: Account | None) -> str | None:
-    """The account's follow-outro caption line, or None without a handle."""
-    if account is None:
+    """The account's follow-outro caption line.
+
+    Returns None for every account while the outro is disabled (see
+    ``_CAPTION_OUTRO_ENABLED``). When re-enabled, returns the per-niche line for
+    an account that has an Instagram handle, or None when the handle is missing.
+    """
+    if not _CAPTION_OUTRO_ENABLED or account is None:
         return None
     handle = (account.instagram_handle or "").strip().lstrip("@")
     if not handle:
@@ -116,6 +128,7 @@ def generate_revision_for_item(
     *,
     caption_style: str | None = None,
     title_style: str | None = None,
+    title_length: str | None = None,
     prompt_profile: str | None = None,
     clip_premise: str | None = None,
     source: str = "ui",
@@ -131,9 +144,7 @@ def generate_revision_for_item(
     with get_session() as session:
         pending_item = session.get(DownloadItem, item_id)
         should_download = bool(
-            pending_item
-            and pending_item.status == "pending_review"
-            and not pending_item.file_path
+            pending_item and pending_item.status == "pending_review" and not pending_item.file_path
         )
     if should_download:
         library.ensure_item_downloaded(item_id)
@@ -150,9 +161,7 @@ def generate_revision_for_item(
         has_video = bool(item.file_path and Path(item.file_path).exists())
         niche_context = (account.niche_label or account.niche) if account is not None else None
         has_text_context = bool(
-            (item.title or "").strip()
-            or (item.source_description or "").strip()
-            or niche_context
+            (item.title or "").strip() or (item.source_description or "").strip() or niche_context
         )
         if not (has_transcript or has_video or has_text_context):
             raise DraftRevisionError(
@@ -161,9 +170,8 @@ def generate_revision_for_item(
             )
         voice = _account_voice(account, clip_premise)
         recent_titles, recent_captions = _recent_drafts(session, item.account_id, item.id)
-        few_shot_winners = (
-            publishing_dashboard.top_post_titles(account.id) if account is not None else []
-        )
+        account_key = account.instagram_handle if account is not None else None
+        few_shot_winners = top_titles_for_account(account_key) if account_key else []
         gen_kwargs = {
             "transcript_text": item.transcript_text or "",
             "source_title": item.title,
@@ -174,10 +182,12 @@ def generate_revision_for_item(
             "prompt_profile": prompt_profile,
             "caption_style": caption_style,
             "title_style": title_style,
+            "title_length": title_length,
             "recent_titles": recent_titles or None,
             "recent_captions": recent_captions or None,
             "few_shot_winners": few_shot_winners or None,
             "caption_outro": caption_outro_for_account(account),
+            "require_vision": True,
         }
 
     # The provider call is slow and must run outside the DB session.

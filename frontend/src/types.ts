@@ -24,6 +24,22 @@ export interface DraftRevision {
   applied_caption_index: number | null;
 }
 
+export interface BatchFrame {
+  item_id: number;
+  path: string;
+}
+
+export interface BatchFramesResult {
+  folder: string;
+  frames: BatchFrame[];
+}
+
+export interface BatchDraftImportResult {
+  imported: number[];
+  failed: { item_id: number; error: string }[];
+  unmatched: number[];
+}
+
 export interface ProcessingItem {
   id: number;
   source_url: string;
@@ -89,6 +105,10 @@ export interface ExportResult {
   item_id: number;
   processed_path: string;
   warning?: string;
+  scheduled_publish?: QueueResult & {
+    schedule_path?: string;
+    message?: string;
+  };
 }
 
 export interface ItemSummary {
@@ -162,11 +182,13 @@ export interface WorkflowSettings {
   clip_premise: string;
   caption_style: string;
   title_style: string;
+  title_length: string;
   template: string;
   title_draft: string;
   caption_draft: string;
   caption_style_options: WorkflowOption[];
   title_style_options: WorkflowOption[];
+  title_length_options: WorkflowOption[];
   template_options: WorkflowOption[];
 }
 
@@ -296,7 +318,15 @@ export interface NichePool {
   assigned: number;
   unused: number;
   rejected: number;
+  pending: number;
   assignments_by_account: PoolAssignmentCount[];
+}
+
+export interface SetProcessingStatusResult {
+  item_id: number;
+  repost_job_id: number | null;
+  status: "pending_review" | "draft" | "exported";
+  created: boolean;
 }
 
 export interface PoolingOverview {
@@ -338,6 +368,37 @@ export interface PoolSourceClip {
   score: number;
 }
 
+export interface PoolReviewItem {
+  pool_item_id: number;
+  niche: string;
+  clip_label: string;
+  source_label: string;
+  created_at: string | null;
+  thumbnail_url: string | null;
+  // Original reel URL (to open externally) and a playable in-app URL when the
+  // footage has been downloaded; null until the clip is fetched for review.
+  source_url: string | null;
+  preview_url: string | null;
+  fit_score: number;
+  source_er: number;
+  topic_tier: "S" | "A" | "B" | "C" | "D";
+  suggested_action: "accept" | "review" | "reject";
+  view_count: number | null;
+  like_count: number | null;
+  comment_count: number | null;
+  duration_seconds: number | null;
+  description: string | null;
+  channel_name: string | null;
+  published_at: string | null;
+}
+
+export interface PoolItemPreview {
+  pool_item_id: number;
+  preview_url: string | null;
+  thumbnail_url: string | null;
+  source_url: string | null;
+}
+
 export interface DistributeNicheResult {
   niche: string;
   assigned: number;
@@ -376,6 +437,64 @@ export interface DashboardPublishQueue {
   ready: number;
   scheduled: number;
   failed: number;
+}
+
+export interface ScheduleCoverageSlot {
+  slot: string;
+  slot_at: string;
+  state: string;
+  job_id: number | null;
+  // Processing/library item id (DownloadItem.id) for deep-linking to re-edit.
+  item_id: number | null;
+  job_title: string | null;
+  scheduled_at: string | null;
+  timing: "on_time" | "late" | null;
+}
+
+export interface ScheduleCoverageAccount {
+  account_id: number;
+  account_name: string;
+  timezone: string;
+  daily_target: number;
+  auto_schedule_on_export: boolean;
+  filled: number;
+  total: number;
+  days: {
+    date: string;
+    is_today: boolean;
+    filled: number;
+    total: number;
+    slots: ScheduleCoverageSlot[];
+  }[];
+}
+
+export interface ScheduleCoverage {
+  horizon_days: number;
+  accounts: ScheduleCoverageAccount[];
+}
+
+export interface CloudPublisherHealth {
+  publish_mode: "disabled" | "validate" | "live" | null;
+  stored_bytes: number;
+  max_stored_bytes: number;
+  remaining_bytes: number;
+  usage_percent: number;
+  active_jobs: number;
+  max_active_jobs: number;
+  active_usage_percent: number;
+  active_jobs_by_status: Record<string, number>;
+  oldest_active_created_at: string | null;
+  oldest_active_age_minutes: number | null;
+  max_upload_bytes: number;
+  stale_jobs: {
+    awaiting_upload_over_minutes: number;
+    awaiting_upload: number;
+    processing_over_minutes: number;
+    processing: number;
+    processing_age_unknown: number;
+    scheduled_past_due: number;
+    oldest_scheduled_at: string | null;
+  };
 }
 
 export interface DashboardAccountStatsRow {

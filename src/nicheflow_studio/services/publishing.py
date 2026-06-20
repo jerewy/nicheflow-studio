@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import datetime as dt
 import random as _random
+import threading
 import time
 
 from sqlalchemy import select
@@ -35,10 +36,25 @@ _ITEM_LIST_LIMIT = 50
 # auto-scheduling a new post and when deferring a due post that would otherwise
 # land too soon after the account's last post (reach cannibalization / bot tell).
 SAME_ACCOUNT_MIN_GAP_HOURS = 4
+_CLOUD_HANDOFF_LOCKS: dict[int, threading.Lock] = {}
+_CLOUD_HANDOFF_LOCKS_GUARD = threading.Lock()
 
 
 class PublishError(ServiceError):
     """Raised for invalid publish-queue operations (not exported, no account…)."""
+
+
+def _looks_like_placeholder_title(value: str | None) -> bool:
+    title = (value or "").strip().lower()
+    return title.startswith("video by ")
+
+
+def _validate_scheduled_metadata(title: str | None, description: str | None) -> None:
+    """Scheduled/live posts must use finalized draft text, not raw source labels."""
+    if not (title or "").strip() or _looks_like_placeholder_title(title):
+        raise PublishError("Choose a final title before scheduling this reel.")
+    if not (description or "").strip():
+        raise PublishError("Choose a final caption before scheduling this reel.")
 
 
 def _iso(value: dt.datetime | None) -> str | None:
@@ -229,7 +245,18 @@ def _latest_worker_job_for_local(worker_jobs: list[dict], job_id: int) -> dict |
     return max(matches, key=generation, default=None)
 
 
+def _cloud_handoff_lock(job_id: int) -> threading.Lock:
+    with _CLOUD_HANDOFF_LOCKS_GUARD:
+        return _CLOUD_HANDOFF_LOCKS.setdefault(job_id, threading.Lock())
+
+
 def handoff_scheduled_job_to_cloud(job_id: int) -> str | None:
+    """Serialize cloud handoffs for one local job to avoid duplicate uploads."""
+    with _cloud_handoff_lock(job_id):
+        return _handoff_scheduled_job_to_cloud(job_id)
+
+
+def _handoff_scheduled_job_to_cloud(job_id: int) -> str | None:
     """Push a scheduled job for a cloud-mapped account to the Cloudflare Worker.
 
     Each push uses a FRESH ``nf-<job id>-<time_ns>`` external id, and any existing
@@ -251,8 +278,16 @@ def handoff_scheduled_job_to_cloud(job_id: int) -> str | None:
         if not worker_key:
             return None
         video = job.processed_path
+        title = job.title
         caption = job.description or ""
         scheduled_iso = _aware(job.scheduled_at).isoformat()
+        try:
+            _validate_scheduled_metadata(title, caption)
+        except PublishError as exc:
+            job.status = "failed"
+            job.error_message = str(exc)[:512]
+            session.commit()
+            raise
 
     try:
         # Cancel any prior active Worker job before pushing its replacement.
@@ -285,13 +320,36 @@ def handoff_scheduled_job_to_cloud(job_id: int) -> str | None:
     return "cloud"
 
 
+def cancel_cloud_handoff(job_id: int) -> int:
+    """Cancel active Worker jobs for a local publish job.
+
+    Used before a local schedule is cleared. If the Worker cannot be reached, let
+    the caller fail closed so the UI does not show an unscheduled draft while the
+    cloud copy may still publish.
+    """
+    from nicheflow_studio.services import cloud_publisher
+
+    if not cloud_publisher.is_configured():
+        return 0
+    try:
+        canceled = 0
+        for worker in _worker_jobs_for_local(cloud_publisher.list_jobs().get("jobs", []), job_id):
+            if worker.get("status") in ("awaiting_upload", "scheduled", "processing"):
+                cloud_publisher.cancel_job(worker["id"])
+                canceled += 1
+        return canceled
+    except cloud_publisher.CloudPublisherError as exc:
+        raise PublishError(f"Cloud schedule cancel failed: {exc}") from exc
+
+
 def queue_for_publish(item_id: int, *, scheduled_at: str | None = None) -> dict:
     """Add (or update) the item's exported reel in the publish queue.
 
     Requires the item to be exported (``processed_path`` set) and assigned to an
     account. With ``scheduled_at`` the job is ``scheduled``; otherwise it is a
-    ``draft``. Mirrors the PyQt upsert: an existing non-posted job for the same
-    account+file is updated, an already-posted one is rejected.
+    ``draft``. An existing non-posted job for the same account+file is updated.
+    A posted export is rejected unless an explicit repost action has already
+    created a fresh non-posted attempt.
     """
     scheduled = _parse_scheduled_at(scheduled_at)
 
@@ -311,17 +369,8 @@ def queue_for_publish(item_id: int, *, scheduled_at: str | None = None) -> dict:
         description = item.caption_draft
         status = "scheduled" if scheduled is not None else "draft"
         path_text = item.processed_path
-
-        already_posted = session.scalars(
-            select(UploadJob)
-            .where(UploadJob.account_id == account.id)
-            .where(UploadJob.processed_path == path_text)
-            .where((UploadJob.posted_at.is_not(None)) | (UploadJob.status == "posted"))
-            .order_by(UploadJob.id.desc())
-            .limit(1)
-        ).first()
-        if already_posted is not None:
-            raise PublishError("This export is already marked posted in the publish queue.")
+        if status == "scheduled":
+            _validate_scheduled_metadata(title, description)
 
         existing = session.scalars(
             select(UploadJob)
@@ -332,6 +381,18 @@ def queue_for_publish(item_id: int, *, scheduled_at: str | None = None) -> dict:
             .order_by(UploadJob.id.desc())
             .limit(1)
         ).first()
+
+        if existing is None:
+            already_posted = session.scalars(
+                select(UploadJob)
+                .where(UploadJob.account_id == account.id)
+                .where(UploadJob.processed_path == path_text)
+                .where((UploadJob.posted_at.is_not(None)) | (UploadJob.status == "posted"))
+                .order_by(UploadJob.id.desc())
+                .limit(1)
+            ).first()
+            if already_posted is not None:
+                raise PublishError("This export is already marked posted in the publish queue.")
 
         made_for_kids = int(account.upload_made_for_kids or 0)
         synthetic = int(account.upload_contains_synthetic_media or 0)
@@ -417,13 +478,20 @@ def auto_schedule_for_publish(
         # own time would otherwise read as "occupied" and silently push the
         # post to the next open slot on every re-export. Refresh the job's
         # content (title/caption) at the existing time instead.
+        #
+        # Only keep a slot that is still genuinely pending in the FUTURE. A
+        # failed/canceled job, or one whose time is already in the past, must
+        # NOT anchor the re-queue: otherwise re-queuing a missed post reuses its
+        # dead past time and the cloud fires it immediately instead of finding a
+        # fresh slot.
         existing_scheduled = next(
             (
                 row
                 for row in jobs
                 if row.posted_at is None
-                and row.status != "posted"
+                and row.status not in ("posted", "failed", "canceled")
                 and row.scheduled_at is not None
+                and _aware(row.scheduled_at) > now_local
                 and row.processed_path == item.processed_path
             ),
             None,
@@ -493,8 +561,9 @@ def sync_cloud_jobs() -> dict:
 
     Matches the newest Worker generation by ``external_id`` prefix
     (``nf-<local job id>-<time_ns>``; legacy exact ids still work):
-    ``published`` -> local ``posted`` (with ``posted_at``); ``failed``/``canceled``
-    -> local ``failed`` (with the Worker's error). ``validated``/``scheduled``/
+    ``published`` -> local ``posted`` (with ``posted_at``);
+    ``manual_local_available``/``local_fallback``/``failed``/``canceled`` ->
+    local ``failed`` (with the Worker's error). ``validated``/``scheduled``/
     ``processing`` stay ``cloud`` (still pending a real post). No-op when cloud
     publishing isn't configured or the Worker is unreachable.
     """
@@ -519,7 +588,18 @@ def sync_cloud_jobs() -> dict:
                 job.posted_at = _parse_iso(worker.get("published_at")) or dt.datetime.now(
                     dt.timezone.utc
                 )
+                if job.download_item_id is not None:
+                    item = session.get(DownloadItem, job.download_item_id)
+                    if item is not None:
+                        item.status = "posted"
                 job.error_message = None
+                updated += 1
+            elif wstatus in ("manual_local_available", "local_fallback"):
+                job.status = "failed"
+                job.error_message = (
+                    worker.get("error_message")
+                    or "Cloud publisher could not post this job. Use manual browser publish if needed."
+                )[:512]
                 updated += 1
             elif wstatus in ("failed", "canceled"):
                 job.status = "failed"

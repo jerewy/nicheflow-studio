@@ -6,7 +6,15 @@ from types import SimpleNamespace
 import pytest
 
 from nicheflow_studio.db import assignments as assignments_db
-from nicheflow_studio.db.models import Account, Assignment, DownloadItem, MediaAsset, PoolItem
+from nicheflow_studio.db.models import (
+    Account,
+    Assignment,
+    DownloadItem,
+    MediaAsset,
+    PoolItem,
+    ScrapeCandidate,
+)
+from nicheflow_studio.db.pool_intake import ReelMetadata, add_reel_to_pool
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.services import pooling
 from nicheflow_studio.services.pooling import PoolingError
@@ -279,6 +287,188 @@ def test_distribute_niche_service_assigns_and_summarizes() -> None:
     assert result["assigned"] == 6  # 2 accounts x cap 3
     assert sum(account["count"] for account in result["accounts"]) == 6
     assert all(account["account_name"] for account in result["accounts"])
+
+
+def test_newly_pooled_reel_starts_pending_review() -> None:
+    with get_session() as session:
+        session.add(Account(name="History", platform="instagram", niche="history"))
+        session.commit()
+
+        result = add_reel_to_pool(
+            session,
+            niche="history",
+            metadata=ReelMetadata(
+                source_url="https://instagram.com/reel/pending/",
+                shortcode="pending",
+                channel_name="source",
+                title="Pending clip",
+                like_count=100,
+            ),
+        )
+        session.commit()
+
+        item = session.query(PoolItem).one()
+        assert result.status == "added"
+        assert item.acceptance_status == "pending_review"
+        assert item.accepted_at is None
+
+
+def test_pending_review_clip_is_not_unassigned_or_distributed() -> None:
+    with get_session() as session:
+        session.add(Account(name="History", platform="instagram", niche="history"))
+        asset = MediaAsset(
+            platform="instagram",
+            canonical_source_url="https://instagram.com/reel/pending/",
+            source_shortcode="pending",
+            download_status="downloaded",
+        )
+        session.add(asset)
+        session.flush()
+        session.add(
+            PoolItem(
+                media_asset_id=asset.id,
+                niche="history",
+                acceptance_status="pending_review",
+            )
+        )
+        session.commit()
+
+    assert pooling._unassigned_pool_item_ids("history") == []
+    assert pooling.distribute_niche("history", max_per_account=1)["assigned"] == 0
+    with get_session() as session:
+        assert session.query(Assignment).count() == 0
+
+
+def test_approve_pool_items_makes_clip_distributable() -> None:
+    with get_session() as session:
+        account = Account(name="History", platform="instagram", niche="history")
+        asset = MediaAsset(
+            platform="instagram",
+            canonical_source_url="https://instagram.com/reel/approve/",
+            source_shortcode="approve",
+            download_status="downloaded",
+        )
+        session.add_all([account, asset])
+        session.flush()
+        pool_item = PoolItem(
+            media_asset_id=asset.id,
+            niche="history",
+            acceptance_status="pending_review",
+        )
+        session.add(pool_item)
+        session.commit()
+        pool_item_id = pool_item.id
+
+    assert pooling.approve_pool_items([pool_item_id]) == {"approved": 1}
+    result = pooling.distribute_niche("history", max_per_account=1)
+
+    assert result["assigned"] == 1
+    with get_session() as session:
+        item = session.get(PoolItem, pool_item_id)
+        assert item.acceptance_status == "accepted"
+        assert item.accepted_reason == "approved in review"
+        assert item.accepted_at is not None
+        assert session.query(Assignment).count() == 1
+
+
+def test_review_queue_ranks_by_source_er_and_exposes_advisory_topic_metadata() -> None:
+    with get_session() as session:
+        account = Account(name="History", platform="instagram", niche="history")
+        session.add(account)
+        session.flush()
+        cases = [
+            ("large", "A photographed appearance", 1_000_000, 50_000, 0),
+            ("focused", "The last time they sang this song together", 10_000, 500, 50),
+        ]
+        ids: dict[str, int] = {}
+        for shortcode, title, views, likes, comments in cases:
+            url = f"https://instagram.com/reel/{shortcode}/"
+            asset = MediaAsset(
+                platform="instagram",
+                canonical_source_url=url,
+                source_shortcode=shortcode,
+                download_status="downloaded",
+            )
+            session.add(asset)
+            session.flush()
+            pool_item = PoolItem(
+                media_asset_id=asset.id,
+                niche="history",
+                acceptance_status="pending_review",
+            )
+            session.add(pool_item)
+            session.flush()
+            ids[shortcode] = pool_item.id
+            session.add(
+                ScrapeCandidate(
+                    scrape_source_url=url,
+                    source_url=url,
+                    video_id=shortcode,
+                    title=title,
+                    account_id=account.id,
+                    view_count=views,
+                    like_count=likes,
+                    comment_count=comments,
+                    duration_seconds=25,
+                )
+            )
+        session.commit()
+
+    rows = pooling.review_queue("history")
+
+    assert [row["pool_item_id"] for row in rows] == [ids["focused"], ids["large"]]
+    assert rows[0]["source_er"] == pytest.approx(0.055)
+    assert rows[0]["topic_tier"] == "S"
+    assert rows[0]["suggested_action"] == "accept"
+    assert rows[1]["topic_tier"] == "C"
+    assert rows[1]["suggested_action"] == "reject"
+    with get_session() as session:
+        focused = session.get(PoolItem, ids["focused"])
+        large = session.get(PoolItem, ids["large"])
+        assert focused.topic_tag == "S"
+        assert large.topic_tag == "C"
+        assert focused.acceptance_status == "pending_review"
+        assert large.acceptance_status == "pending_review"
+
+
+def test_reject_pool_items_removes_from_review_and_distribution() -> None:
+    with get_session() as session:
+        session.add(Account(name="History", platform="instagram", niche="history"))
+        asset = MediaAsset(
+            platform="instagram",
+            canonical_source_url="https://instagram.com/reel/reject/",
+            source_shortcode="reject",
+            download_status="downloaded",
+        )
+        session.add(asset)
+        session.flush()
+        pool_item = PoolItem(
+            media_asset_id=asset.id,
+            niche="history",
+            acceptance_status="pending_review",
+        )
+        session.add(pool_item)
+        session.commit()
+        pool_item_id = pool_item.id
+
+    assert len(pooling.review_queue("history")) == 1
+    assert pooling.reject_pool_items([pool_item_id], "wrong niche") == {"rejected": 1}
+
+    assert pooling.review_queue("history") == []
+    assert pooling.distribute_niche("history", max_per_account=1)["assigned"] == 0
+    with get_session() as session:
+        item = session.get(PoolItem, pool_item_id)
+        assert item.acceptance_status == "removed"
+        assert item.accepted_reason == "wrong niche"
+        assert session.query(Assignment).count() == 0
+
+
+def test_direct_accepted_clip_still_distributes_for_grandfathering() -> None:
+    _seed_history_network(accounts=1, clips=1)
+
+    result = pooling.distribute_niche("history", max_per_account=1)
+
+    assert result["assigned"] == 1
 
 
 def test_distribute_niche_assigns_then_downloads_in_background(

@@ -206,6 +206,8 @@ def export_item(item_id: int, *, progress: ProgressFn | None = None) -> dict:
         title_color=str(render.get("color", "#FFFFFF")),
         title_background=str(render.get("background", "none")),
         enable_bold_keywords=bool(render.get("bold_keywords", False)),
+        title_align=str(render.get("align", "center")),
+        title_line_gap_scale=render.get("line_gap_scale"),
     )
 
     report(0.9, "Saving…")

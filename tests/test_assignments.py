@@ -52,9 +52,8 @@ def test_distribute_assigns_every_clip_once_balanced(tmp_path) -> None:
         assert len(all_pool_ids) == len(set(all_pool_ids))
 
 
-def test_distribute_prefers_high_engagement_clips_under_cap(tmp_path) -> None:
-    """With a per-account cap smaller than the pool, the highest-engagement clips
-    are the ones placed (ranked distribution), not a random subset."""
+def test_distribute_prefers_high_source_er_clips_under_cap(tmp_path) -> None:
+    """Distribution ranks by tier-weighted ER instead of raw likes."""
     init_db()
     with get_session() as session:
         (account_id,) = _make_accounts(session, "history", 1)
@@ -69,16 +68,19 @@ def test_distribute_prefers_high_engagement_clips_under_cap(tmp_path) -> None:
                     scrape_source_url=url,
                     source_url=url,
                     video_id=shortcode,
+                    title="Behind the scenes of a record-setting sports match",
                     state="pooled",
                     account_id=account_id,
-                    like_count=i * 1000,  # eng00=0 ... eng19=19000
+                    view_count=100_000,
+                    like_count=i * 1_000,
+                    comment_count=0,
                     published_at=published,
                 )
             )
         session.commit()
 
         # Cap 5 with one account and a tier fraction of 0.25 (top tier = 5 clips)
-        # means the 5 highest-like clips (eng15..eng19) are exactly what's placed.
+        # means the 5 highest-ER clips (eng15..eng19) are exactly what's placed.
         created = distribute_niche(session, "history", rng=random.Random(1), max_per_account=5)
         session.commit()
         assert len(created) == 5
@@ -90,6 +92,41 @@ def test_distribute_prefers_high_engagement_clips_under_cap(tmp_path) -> None:
         )
         placed_codes = {shortcodes[a.pool_item_id] for a in created}
         assert placed_codes == {f"eng{i:02d}" for i in range(15, 20)}
+
+
+def test_distribute_prefers_lower_likes_when_source_er_and_tier_are_higher(tmp_path) -> None:
+    init_db()
+    with get_session() as session:
+        (account_id,) = _make_accounts(session, "history", 1)
+        rows = [
+            ("raw-likes", "A photographed appearance", 1_000_000, 50_000, 0),
+            ("conversion", "The last time they sang this song together", 10_000, 500, 50),
+        ]
+        pool_ids: dict[str, int] = {}
+        for shortcode, title, views, likes, comments in rows:
+            url = f"https://www.instagram.com/reel/{shortcode}/"
+            asset, _ = find_or_register_media_asset(session, source_url=url, shortcode=shortcode)
+            pool_item = accept_into_pool(session, media_asset=asset, niche="history")
+            pool_ids[shortcode] = pool_item.id
+            session.add(
+                ScrapeCandidate(
+                    scrape_source_url=url,
+                    source_url=url,
+                    video_id=shortcode,
+                    title=title,
+                    state="pooled",
+                    account_id=account_id,
+                    view_count=views,
+                    like_count=likes,
+                    comment_count=comments,
+                )
+            )
+        session.commit()
+
+        created = distribute_niche(session, "history", rng=random.Random(1), max_per_account=1)
+        session.commit()
+
+        assert [assignment.pool_item_id for assignment in created] == [pool_ids["conversion"]]
 
 
 def test_distribute_is_niche_isolated(tmp_path) -> None:

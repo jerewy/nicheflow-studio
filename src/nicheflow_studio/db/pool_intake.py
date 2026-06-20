@@ -23,6 +23,7 @@ from nicheflow_studio.db.media_library import find_or_register_media_asset
 from nicheflow_studio.db.models import Account, PoolItem, ScrapeCandidate
 from nicheflow_studio.db.pools import (
     POOL_STATUS_ACCEPTED,
+    POOL_STATUS_PENDING_REVIEW,
     VALID_NICHES,
     CrossNicheError,
     DuplicateContentError,
@@ -96,7 +97,7 @@ def add_reel_to_pool(
     for item in (
         session.query(PoolItem).filter(PoolItem.media_asset_id == asset.id).all()
     ):
-        if item.acceptance_status == POOL_STATUS_ACCEPTED:
+        if item.acceptance_status in {POOL_STATUS_ACCEPTED, POOL_STATUS_PENDING_REVIEW}:
             return PoolIntakeResult(
                 status="duplicate",
                 niche=item.niche,

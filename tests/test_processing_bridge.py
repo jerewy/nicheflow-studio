@@ -10,7 +10,7 @@ from nicheflow_studio.app.processing_bridge import ProcessingBridge
 from nicheflow_studio.db.models import Account, DownloadItem
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.processing import smart_drafts
-from nicheflow_studio.services import draft_revisions as svc
+from nicheflow_studio.services import cloud_publisher, draft_revisions as svc
 
 
 def _make_item(*, file_path: str | None = "C:/clips/x.mp4", transcript: str | None = None) -> int:
@@ -69,6 +69,28 @@ def test_bridge_get_context_unknown_item_returns_error_envelope() -> None:
 
     assert result["ok"] is False
     assert "99999" in result["error"]
+
+
+def test_bridge_cloud_publisher_health_combines_usage_and_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cloud_publisher,
+        "get_usage",
+        lambda: {"active_jobs": 1, "max_active_jobs": 150},
+    )
+    monkeypatch.setattr(cloud_publisher, "list_jobs", lambda: {"publish_mode": "live"})
+
+    result = ProcessingBridge().cloud_publisher_health()
+
+    assert result == {
+        "ok": True,
+        "data": {
+            "active_jobs": 1,
+            "max_active_jobs": 150,
+            "publish_mode": "live",
+        },
+    }
 
 
 def test_bridge_list_pool_source_clips_passes_include_removed(
@@ -194,19 +216,27 @@ def test_bridge_start_generation_runs_job_and_saves_revision(
 ) -> None:
     item_id = _make_item(transcript="A transcript with enough grounding to generate.")
     bridge = ProcessingBridge()
+    captured: dict = {}
 
-    monkeypatch.setattr(
-        smart_drafts,
-        "generate_smart_drafts",
-        lambda **_: smart_drafts.SmartDrafts(
+    def fake_generate(**kwargs):
+        captured.update(kwargs)
+        return smart_drafts.SmartDrafts(
             summary="s",
             title_options=["t1", "t2", "t3"],
             caption_options=["c1", "c2", "c3"],
             provider_label="Groq (test)",
-        ),
+        )
+
+    monkeypatch.setattr(
+        smart_drafts,
+        "generate_smart_drafts",
+        fake_generate,
     )
 
-    started = bridge.start_generation(item_id, {"caption_style": "contextual_info"})
+    started = bridge.start_generation(
+        item_id,
+        {"caption_style": "contextual_info", "title_length": "medium"},
+    )
     assert started["ok"] is True
     job_id = started["data"]["job_id"]
 
@@ -216,6 +246,7 @@ def test_bridge_start_generation_runs_job_and_saves_revision(
     assert job["ok"] is True
     assert job["data"]["status"] == "succeeded"
     assert job["data"]["result"]["title_options"] == ["t1", "t2", "t3"]
+    assert captured["title_length"] == "medium"
 
     # The saved revision is now the latest for the item.
     latest = bridge.get_latest_revision(item_id)
@@ -340,6 +371,25 @@ def test_bridge_list_items_and_queue_for_publish() -> None:
     jobs = bridge.list_publish_jobs(item_id)
     assert jobs["ok"] is True
     assert len(jobs["data"]) == 1
+
+
+def test_bridge_set_processing_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    bridge = ProcessingBridge()
+    monkeypatch.setattr(
+        "nicheflow_studio.services.publish_queue.set_processing_status",
+        lambda item_id, status: {
+            "item_id": 12,
+            "repost_job_id": 45,
+            "status": status,
+            "created": True,
+        },
+    )
+
+    result = bridge.set_processing_status(12, "exported")
+
+    assert result["ok"] is True
+    assert result["data"]["item_id"] == 12
+    assert result["data"]["status"] == "exported"
 
 
 def test_bridge_queue_without_export_returns_error() -> None:

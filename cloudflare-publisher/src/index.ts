@@ -32,6 +32,7 @@ interface JobRow {
   media_token: string;
   content_type: string;
   meta_container_id: string | null;
+  processing_started_at: string | null;
   attempts: number;
 }
 
@@ -53,13 +54,25 @@ interface JobInput {
   content_type?: string;
 }
 
-import { normalizeAccountKey, parseRange, safeFileName } from "./helpers";
+import { isRecoverableMetaError, normalizeAccountKey, parseRange, safeFileName, shouldOfferManualLocalPublish } from "./helpers";
+import {
+  ageMinutes,
+  STALE_AWAITING_UPLOAD_MINUTES,
+  STALE_PROCESSING_MINUTES,
+  statusCounts,
+  type StatusCountRow,
+} from "./monitoring";
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
 const ACTIVE_MEDIA_STATUSES = ["scheduled", "processing"];
 const STORED_MEDIA_STATUSES = ["scheduled", "processing", "awaiting_upload"];
 const MAX_JOBS_PER_TICK = 5;
 const MAX_ATTEMPTS = 3;
+// When Meta blocks the whole account (restriction / token / rate limit) the job is not at
+// fault, so we back off this long and retry without burning attempts or deleting media...
+const BLOCK_RETRY_MINUTES = 30;
+// ...but stop eventually so a permanent block can't pin media in storage forever.
+const BLOCK_GIVEUP_HOURS = 48;
 
 function json(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value, null, 2), { status, headers: JSON_HEADERS });
@@ -236,24 +249,72 @@ async function listJobs(env: Env): Promise<Response> {
 }
 
 async function usage(env: Env): Promise<Response> {
+  const now = nowIso();
   const stored = await env.DB.prepare(
     "SELECT COALESCE(SUM(media_size_bytes), 0) AS bytes FROM publish_jobs WHERE media_size_bytes > 0",
   ).first<{ bytes: number }>();
   const placeholders = STORED_MEDIA_STATUSES.map(() => "?").join(",");
-  const active = await env.DB.prepare(
-    `SELECT COUNT(*) AS count FROM publish_jobs WHERE status IN (${placeholders})`,
+  const activeByStatusRows = await env.DB.prepare(
+    `SELECT status, COUNT(*) AS count
+     FROM publish_jobs WHERE status IN (${placeholders})
+     GROUP BY status`,
   )
     .bind(...STORED_MEDIA_STATUSES)
-    .first<{ count: number }>();
+    .all<StatusCountRow>();
+  const oldestActive = await env.DB.prepare(
+    `SELECT MIN(created_at) AS created_at
+     FROM publish_jobs WHERE status IN (${placeholders})`,
+  )
+    .bind(...STORED_MEDIA_STATUSES)
+    .first<{ created_at: string | null }>();
+  const stale = await env.DB.prepare(
+    `SELECT
+       SUM(CASE WHEN status = 'awaiting_upload' AND created_at <= ? THEN 1 ELSE 0 END) AS awaiting_upload,
+       SUM(CASE WHEN status = 'processing' AND processing_started_at <= ? THEN 1 ELSE 0 END) AS processing,
+       SUM(CASE WHEN status = 'processing' AND processing_started_at IS NULL THEN 1 ELSE 0 END) AS processing_age_unknown,
+       SUM(CASE WHEN status = 'scheduled' AND scheduled_at <= ? THEN 1 ELSE 0 END) AS scheduled_past_due,
+       MIN(CASE WHEN status = 'scheduled' THEN scheduled_at END) AS oldest_scheduled_at
+     FROM publish_jobs
+     WHERE status IN (${placeholders})`,
+  )
+    .bind(
+      addMinutes(now, -STALE_AWAITING_UPLOAD_MINUTES),
+      addMinutes(now, -STALE_PROCESSING_MINUTES),
+      now,
+      ...STORED_MEDIA_STATUSES,
+    )
+    .first<{
+      awaiting_upload: number | null;
+      processing: number | null;
+      processing_age_unknown: number | null;
+      scheduled_past_due: number | null;
+      oldest_scheduled_at: string | null;
+    }>();
+  const activeByStatus = statusCounts(activeByStatusRows.results);
+  const activeJobs = Object.values(activeByStatus).reduce((total, count) => total + count, 0);
   const storedBytes = stored?.bytes || 0;
   const maxStoredBytes = Number(env.MAX_STORED_BYTES);
+  const maxActiveJobs = Number(env.MAX_ACTIVE_JOBS);
   return json({
     stored_bytes: storedBytes,
     max_stored_bytes: maxStoredBytes,
     remaining_bytes: Math.max(0, maxStoredBytes - storedBytes),
     usage_percent: Number(((storedBytes / maxStoredBytes) * 100).toFixed(2)),
-    active_jobs: active?.count || 0,
-    max_active_jobs: Number(env.MAX_ACTIVE_JOBS),
+    active_jobs: activeJobs,
+    max_active_jobs: maxActiveJobs,
+    active_usage_percent: Number(((activeJobs / maxActiveJobs) * 100).toFixed(2)),
+    active_jobs_by_status: activeByStatus,
+    oldest_active_created_at: oldestActive?.created_at || null,
+    oldest_active_age_minutes: ageMinutes(oldestActive?.created_at || null, now),
+    stale_jobs: {
+      awaiting_upload_over_minutes: STALE_AWAITING_UPLOAD_MINUTES,
+      awaiting_upload: Number(stale?.awaiting_upload) || 0,
+      processing_over_minutes: STALE_PROCESSING_MINUTES,
+      processing: Number(stale?.processing) || 0,
+      processing_age_unknown: Number(stale?.processing_age_unknown) || 0,
+      scheduled_past_due: Number(stale?.scheduled_past_due) || 0,
+      oldest_scheduled_at: stale?.oldest_scheduled_at || null,
+    },
     max_upload_bytes: Number(env.MAX_UPLOAD_BYTES),
   });
 }
@@ -361,6 +422,40 @@ async function failJob(env: Env, job: JobRow, error: unknown): Promise<void> {
   }
 }
 
+async function deferBlockedJob(env: Env, job: JobRow, error: unknown): Promise<void> {
+  // The account is blocked, not the job. Preserve the media and retry later so a multi-hour
+  // Meta restriction delays posts instead of destroying them — unless the job is so far past
+  // its slot that it's no longer worth keeping, in which case fail it normally (frees media).
+  const now = nowIso();
+  const overdue = Date.parse(now) - Date.parse(job.scheduled_at) >= BLOCK_GIVEUP_HOURS * 3_600_000;
+  if (overdue) {
+    await failJob(env, { ...job, attempts: MAX_ATTEMPTS - 1 }, error);
+    return;
+  }
+  await env.DB.prepare(
+    "UPDATE publish_jobs SET next_attempt_at = ?, lease_until = NULL, error_message = ?, updated_at = ? WHERE id = ?",
+  )
+    .bind(addMinutes(now, BLOCK_RETRY_MINUTES), `blocked, will retry: ${String(error).slice(0, 900)}`, now, job.id)
+    .run();
+}
+
+async function markJobForManualLocalPublish(env: Env, job: JobRow, error: unknown): Promise<void> {
+  const now = nowIso();
+  await env.DB.prepare(
+    `UPDATE publish_jobs
+     SET status = 'manual_local_available',
+         media_size_bytes = 0,
+         next_attempt_at = ?,
+         lease_until = NULL,
+         error_message = ?,
+         updated_at = ?
+     WHERE id = ? AND status = 'scheduled' AND meta_container_id IS NULL`,
+  )
+    .bind(now, `cloud blocked; manual browser publish available: ${String(error).slice(0, 900)}`, now, job.id)
+    .run();
+  await env.MEDIA.delete(job.media_key);
+}
+
 async function processJob(env: Env, job: JobRow, account: AccountRow): Promise<void> {
   const now = nowIso();
   if (job.status === "scheduled") {
@@ -382,9 +477,9 @@ async function processJob(env: Env, job: JobRow, account: AccountRow): Promise<v
     const containerId = String(created.id || "");
     if (!containerId) throw new Error("Meta did not return a container id");
     await env.DB.prepare(
-      "UPDATE publish_jobs SET status = 'processing', meta_container_id = ?, next_attempt_at = ?, lease_until = NULL, updated_at = ? WHERE id = ?",
+      "UPDATE publish_jobs SET status = 'processing', meta_container_id = ?, processing_started_at = ?, next_attempt_at = ?, lease_until = NULL, updated_at = ? WHERE id = ?",
     )
-      .bind(containerId, addMinutes(now, 1), now, job.id)
+      .bind(containerId, now, addMinutes(now, 1), now, job.id)
       .run();
     return;
   }
@@ -444,11 +539,87 @@ async function processDueJobs(env: Env): Promise<{ processed: number; mode: stri
       await processJob(env, row, row);
       processed += 1;
     } catch (error) {
-      await failJob(env, row, error);
+      if (row.status === "scheduled" && !row.meta_container_id && shouldOfferManualLocalPublish(error)) {
+        await markJobForManualLocalPublish(env, row, error);
+      } else if (isRecoverableMetaError(error)) {
+        await deferBlockedJob(env, row, error);
+      } else {
+        await failJob(env, row, error);
+      }
     }
   }
   return { processed, mode: env.PUBLISH_MODE };
 }
+
+const LEGAL_UPDATED = "2026-06-16";
+const LEGAL_CONTACT = "jeremywijaya81@gmail.com";
+
+function legalPage(title: string, bodyHtml: string): Response {
+  const html = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NicheFlow Studio — ${title}</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+         max-width: 720px; margin: 0 auto; padding: 2.5rem 1.25rem; }
+  h1 { font-size: 1.6rem; margin-bottom: .25rem; }
+  h2 { font-size: 1.1rem; margin-top: 2rem; }
+  .meta { color: #6b7280; font-size: .9rem; }
+  a { color: #6d28d9; }
+</style></head>
+<body>
+<h1>NicheFlow Studio — ${title}</h1>
+<p class="meta">Last updated ${LEGAL_UPDATED} · Contact: <a href="mailto:${LEGAL_CONTACT}">${LEGAL_CONTACT}</a></p>
+${bodyHtml}
+</body></html>`;
+  return new Response(html, { status: 200, headers: { "content-type": "text/html; charset=utf-8" } });
+}
+
+const PRIVACY_BODY = `
+<p>NicheFlow Studio ("the App") is a personal content-publishing tool operated by an
+individual to publish their own short-form videos (Reels) to their own Instagram accounts
+through the Meta Graph API. This policy explains what data the App handles.</p>
+<h2>What we handle</h2>
+<ul>
+  <li><strong>Instagram account credentials</strong> — access tokens and account IDs for Instagram accounts the operator owns, used only to publish on the operator's behalf.</li>
+  <li><strong>Content the operator creates</strong> — video files and captions queued for publishing.</li>
+  <li><strong>Operational metadata</strong> — scheduling times, publish status, and error logs.</li>
+</ul>
+<h2>What we do not do</h2>
+<ul>
+  <li>We do not collect data from the public or from third-party users.</li>
+  <li>We do not sell, rent, or share personal data for advertising.</li>
+</ul>
+<h2>Storage and retention</h2>
+<p>Access tokens are stored as encrypted Cloudflare Worker secrets. Video files are held
+temporarily in Cloudflare R2 only until publishing completes, then deleted. Minimal job
+metadata is kept in Cloudflare D1 for operational history.</p>
+<h2>Sharing</h2>
+<p>Data is shared only with Meta (to publish the operator's content) and Cloudflare (hosting
+infrastructure). No other third parties.</p>
+<h2>Your choices</h2>
+<p>The operator can revoke the App's access at any time from their Instagram/Meta account
+settings, which stops all publishing. See <a href="/data-deletion">Data Deletion</a>.</p>`;
+
+const TERMS_BODY = `
+<p>NicheFlow Studio is provided for the operator's own personal use, "as is", without warranty.</p>
+<h2>Acceptable use</h2>
+<p>The operator is solely responsible for the content they publish and for complying with
+Instagram's and Meta's Platform Terms and Community Guidelines.</p>
+<h2>Liability</h2>
+<p>The App is a personal automation tool; the operator assumes all risk arising from its use,
+including any action taken by Meta on connected accounts.</p>`;
+
+const DATA_DELETION_BODY = `
+<p>NicheFlow Studio only processes data belonging to its operator (their own Instagram accounts
+and the content they create). To delete that data:</p>
+<ol>
+  <li>Revoke the App's access from your Instagram/Meta account settings (Business Integrations), which immediately invalidates its tokens.</li>
+  <li>Email <a href="mailto:${LEGAL_CONTACT}">${LEGAL_CONTACT}</a> to request deletion of any stored tokens, queued media, and job metadata.</li>
+</ol>
+<p>Requests are honored within 30 days. Queued video files are in any case deleted automatically
+once publishing completes.</p>`;
 
 async function route(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
@@ -459,6 +630,10 @@ async function route(request: Request, env: Env): Promise<Response> {
   if (mediaMatch && ["GET", "HEAD"].includes(request.method)) {
     return serveMedia(request, env, mediaMatch[1]);
   }
+  // Public legal pages (no API key) — Meta and end users must be able to fetch these.
+  if (request.method === "GET" && url.pathname === "/privacy") return legalPage("Privacy Policy", PRIVACY_BODY);
+  if (request.method === "GET" && url.pathname === "/terms") return legalPage("Terms of Service", TERMS_BODY);
+  if (request.method === "GET" && url.pathname === "/data-deletion") return legalPage("Data Deletion", DATA_DELETION_BODY);
 
   requireAuth(request, env);
   if (request.method === "PUT" && url.pathname === "/v1/accounts") return upsertAccount(request, env);

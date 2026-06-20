@@ -1429,6 +1429,8 @@ def export_cropped_video(
     title_background: str = "none",
     title_layout: str = "overlay",
     enable_bold_keywords: bool = False,
+    title_align: str = "center",
+    title_line_gap_scale: float | None = None,
     audio_mode: str = "keep",
     audio_alter_params: AudioAlterParams | None = None,
 ) -> Path:
@@ -1487,6 +1489,8 @@ def export_cropped_video(
                     title_text_dir=title_text_dir,
                     duration_seconds=probe.duration_seconds,
                     enable_bold=keep_bold_markers,
+                    title_align=title_align,
+                    title_line_gap_scale=title_line_gap_scale,
                 )
             elif _text_has_emoji(normalized_title) and emoji_font_path is not None:
                 # Overlay layout with emoji needs filter_complex too — the
@@ -2044,6 +2048,8 @@ def _title_band_filter_complex(
     title_text_dir: Path,
     duration_seconds: float | None,
     enable_bold: bool = False,
+    title_align: str = "center",
+    title_line_gap_scale: float | None = None,
 ) -> str:
     canvas_width = 1080
     canvas_height = 1920
@@ -2088,7 +2094,8 @@ def _title_band_filter_complex(
         (index, line.strip()) for index, line in enumerate(raw_lines) if line.strip()
     ]
     line_count = max(len(raw_lines), 1)
-    line_spacing = max(10, int(font_size * 0.24))
+    gap_scale = title_line_gap_scale if title_line_gap_scale is not None else 0.24
+    line_spacing = max(10, int(font_size * gap_scale))
     text_block_height = (line_count * font_size) + (max(line_count - 1, 0) * line_spacing)
     bottom_gap = (
         max(76, int(font_size * 1.25))
@@ -2106,8 +2113,12 @@ def _title_band_filter_complex(
     # footage. Center the footage itself in the canvas; centering the combined
     # title+footage block pushes horizontal meme clips too low by half the title
     # band height.
+    safe_side_margin = _safe_inset_side_margin_px(
+        title_font_name,
+        requested_font_size=requested_font_size,
+    )
     content_max_width = (
-        _safe_inset_content_width(canvas_width)
+        _safe_inset_content_width(canvas_width, side_margin_px=safe_side_margin)
         if _uses_safe_inset_content(title_font_name, requested_font_size=requested_font_size)
         else canvas_width
     )
@@ -2120,7 +2131,7 @@ def _title_band_filter_complex(
         safe_w = content_max_width
         safe_scale = safe_w / max(1, crop_width)
         raw_h = int(crop_height * safe_scale)
-        content_x = _safe_inset_margin_px(canvas_width)
+        content_x = _safe_inset_margin_px(canvas_width, side_margin_px=safe_side_margin)
         if raw_h > video_height:
             crop_top = (raw_h - video_height) // 2
             crop_top -= crop_top % 2
@@ -2149,6 +2160,15 @@ def _title_band_filter_complex(
             f"pad={canvas_width}:{content_height}:{content_x}:0:color=black[content]"
         )
     block_y = max(0, ((canvas_height - content_height) // 2) - title_band_height)
+    if (
+        _is_historytrails_title_font(
+            title_font_name,
+            requested_font_size=requested_font_size,
+        )
+        and line_count >= 5
+    ):
+        max_block_y = max(0, canvas_height - title_band_height - content_height)
+        block_y = min(max_block_y, block_y + 40)
     titlebase = (
         f"color=c=black:s={canvas_width}x{title_band_height}:"
         f"r=30:d={title_duration:.3f}[titlebase]"
@@ -2161,7 +2181,25 @@ def _title_band_filter_complex(
         # get color emoji or mixed font weights into the output — ffmpeg's
         # ``drawtext`` loads one font file per node with no fallback.
         png_path = title_text_dir / "title-band.png"
-        align_value: str | int = max(72, content_x + 48) if dialogue_title else "center"
+        center_single_line = (
+            _is_historytrails_title_font(
+                title_font_name,
+                requested_font_size=requested_font_size,
+            )
+            and line_count == 1
+        )
+        left_aligned = (title_align == "left" or dialogue_title) and not center_single_line
+        align_value: str | int = (
+            content_x
+            if left_aligned
+            and _is_historytrails_title_font(
+                title_font_name,
+                requested_font_size=requested_font_size,
+            )
+            else max(72, content_x + 48)
+            if left_aligned
+            else "center"
+        )
         _render_overlay_title_image(
             lines=raw_lines,
             canvas_width=canvas_width,
@@ -2200,7 +2238,25 @@ def _title_band_filter_complex(
             ]
         )
 
-    text_x = str(max(72, content_x + 48)) if dialogue_title else "(w-text_w)/2"
+    center_single_line = (
+        _is_historytrails_title_font(
+            title_font_name,
+            requested_font_size=requested_font_size,
+        )
+        and line_count == 1
+    )
+    left_aligned = (title_align == "left" or dialogue_title) and not center_single_line
+    text_x = (
+        str(content_x)
+        if left_aligned
+        and _is_historytrails_title_font(
+            title_font_name,
+            requested_font_size=requested_font_size,
+        )
+        else str(max(72, content_x + 48))
+        if left_aligned
+        else "(w-text_w)/2"
+    )
     filter_parts = [content_chain, titlebase]
     for chain_index, (original_index, line_text) in enumerate(visible_lines):
         text_option = _drawtext_textfile_option(
@@ -2338,6 +2394,21 @@ def _fit_title_band(
         font_size = min(max(requested_font_size, 42), max(42, int(canvas_width * 0.049)), 54)
         max_chars = max(22, min(34, int(canvas_width / 32)))
         wrapped = _wrap_overlay_text(text, max_chars=max_chars, max_lines=2)
+    elif _is_historytrails_title_font(
+        title_font_name,
+        requested_font_size=requested_font_size,
+    ):
+        font_size = 46
+        wrapped = _wrap_overlay_text_by_pixel_width(
+            text,
+            max_width=_title_safe_text_width(
+                canvas_width,
+                title_font_name=title_font_name,
+            ),
+            font_size=font_size,
+            title_font_name=title_font_name,
+            max_lines=8,
+        )
     elif _is_cinema_title_font(title_font_name):
         # Cinema title treatment needs a narrower text measure than meme
         # templates. Keep a natural long-first-line pull quote instead of
@@ -2451,28 +2522,65 @@ def _uses_safe_inset_content(
         return True
     # Backward compatibility for accounts that saved Past Moments Black before
     # it got its own internal font key. Other Arial Bold templates use 56-64px.
-    return title_font_name == "arial_bold" and (requested_font_size or 0) <= 46
+    if title_font_name == "arial_bold" and (requested_font_size or 0) <= 46:
+        return True
+    return _is_historytrails_title_font(
+        title_font_name,
+        requested_font_size=requested_font_size,
+    )
+
+
+def _is_historytrails_title_font(
+    title_font_name: str | None, *, requested_font_size: int | None = None
+) -> bool:
+    return title_font_name == "arial" and 50 <= (requested_font_size or 0) <= 54
 
 
 _CINEMA_SIDE_MARGIN_PX = 56  # exact pixels on EACH side — left == right by construction
 # Bumped from 32 to 56 (~5% of a 1080 canvas) so the footage sits a little
 # further from the frame edges and stops getting clipped on smaller phone
 # screens with rounded corners / safe-area insets.
+_HISTORYTRAILS_SIDE_MARGIN_PX = 96
 _TITLE_SAFE_SIDE_MARGIN_PX = 72
 
 
-def _safe_inset_content_width(canvas_width: int) -> int:
-    width = canvas_width - _CINEMA_SIDE_MARGIN_PX * 2
+def _safe_inset_side_margin_px(
+    title_font_name: str | None, *, requested_font_size: int | None = None
+) -> int:
+    if _is_historytrails_title_font(
+        title_font_name,
+        requested_font_size=requested_font_size,
+    ):
+        return _HISTORYTRAILS_SIDE_MARGIN_PX
+    return _CINEMA_SIDE_MARGIN_PX
+
+
+def _safe_inset_content_width(
+    canvas_width: int, *, side_margin_px: int = _CINEMA_SIDE_MARGIN_PX
+) -> int:
+    width = canvas_width - side_margin_px * 2
     return width - (width % 2)  # keep even for H.264
 
 
-def _safe_inset_margin_px(canvas_width: int) -> int:
+def _safe_inset_margin_px(
+    canvas_width: int, *, side_margin_px: int = _CINEMA_SIDE_MARGIN_PX
+) -> int:
     """Return the exact left=right side margin so the caller never re-derives it."""
-    return (canvas_width - _safe_inset_content_width(canvas_width)) // 2
+    return (
+        canvas_width
+        - _safe_inset_content_width(canvas_width, side_margin_px=side_margin_px)
+    ) // 2
 
 
-def _title_safe_text_width(canvas_width: int) -> int:
-    return max(1, canvas_width - (_TITLE_SAFE_SIDE_MARGIN_PX * 2))
+def _title_safe_text_width(
+    canvas_width: int, *, title_font_name: str | None = None
+) -> int:
+    side_margin = (
+        _HISTORYTRAILS_SIDE_MARGIN_PX
+        if title_font_name == "arial"
+        else _TITLE_SAFE_SIDE_MARGIN_PX
+    )
+    return max(1, canvas_width - (side_margin * 2))
 
 
 def _wrapped_exceeds_safe_width(
@@ -2485,7 +2593,10 @@ def _wrapped_exceeds_safe_width(
     """True when any rendered title line would cross the left/right safe area."""
     if title_font_name is None:
         return False
-    safe_width = _title_safe_text_width(canvas_width)
+    safe_width = _title_safe_text_width(
+        canvas_width,
+        title_font_name=title_font_name,
+    )
     for line in wrapped.split("\n"):
         if not line.strip():
             continue
@@ -2590,6 +2701,47 @@ def _wrap_overlay_text_greedy(text: str, *, max_chars: int, max_lines: int) -> s
         for paragraph in paragraphs
         if paragraph.split()
     )
+
+
+def _wrap_overlay_text_by_pixel_width(
+    text: str,
+    *,
+    max_width: int,
+    font_size: int,
+    title_font_name: str | None,
+    max_lines: int,
+) -> str:
+    """Greedily wrap complete words using their rendered pixel width."""
+    paragraphs = [paragraph for paragraph in text.split("\n\n") if paragraph.strip()]
+    wrapped_paragraphs: list[str] = []
+    for paragraph in paragraphs:
+        words = paragraph.split()
+        if not words:
+            continue
+        lines: list[str] = []
+        current = ""
+        for word_index, word in enumerate(words):
+            candidate = f"{current} {word}".strip()
+            fits = (
+                _title_line_pixel_width(
+                    candidate,
+                    font_size=font_size,
+                    title_font_name=title_font_name,
+                )
+                <= max_width
+            )
+            if not current or fits:
+                current = candidate
+                continue
+            if len(lines) >= max_lines - 1:
+                current = " ".join([current, *words[word_index:]])
+                break
+            lines.append(current)
+            current = word
+        if current:
+            lines.append(current)
+        wrapped_paragraphs.append("\n".join(lines))
+    return "\n\n".join(wrapped_paragraphs)
 
 
 def _balanced_wrap_lines(words: list[str], *, max_chars: int, max_lines: int) -> list[str] | None:

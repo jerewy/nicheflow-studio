@@ -15,7 +15,7 @@ import datetime as dt
 
 from sqlalchemy import select
 
-from nicheflow_studio.db.models import Account, UploadJob
+from nicheflow_studio.db.models import Account, DownloadItem, UploadJob
 from nicheflow_studio.db.assignments import mark_assignment_posted_for_job
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.services.errors import ServiceError
@@ -118,6 +118,10 @@ def mark_posted(job_id: int, payload: dict | None = None) -> dict:
         job.status = "posted"
         if job.posted_at is None:
             job.posted_at = dt.datetime.now(dt.timezone.utc)
+        if job.download_item_id is not None:
+            item = session.get(DownloadItem, job.download_item_id)
+            if item is not None:
+                item.status = "posted"
         mark_assignment_posted_for_job(session, job)
         if "posted_url" in payload:
             job.posted_url = _clean_opt(payload["posted_url"])
@@ -148,6 +152,75 @@ def update_metrics(job_id: int, payload: dict | None = None) -> dict:
         name = _account_name(session, job.account_id)
         session.commit()
         return _job_view(job, name)
+
+
+_EDITABLE_PROCESSING_STATUSES = {"pending_review", "draft", "exported"}
+
+
+def set_processing_status(item_id: int, status: str) -> dict:
+    """Set one Processing row to a manually editable workflow status.
+
+    When reopening a posted export, keep its historical posted row and create a
+    separate draft attempt so publishing is unblocked for only this item.
+    """
+    status = str(status or "").strip().lower()
+    if status not in _EDITABLE_PROCESSING_STATUSES:
+        raise PublishQueueError(f"Status {status!r} cannot be set manually.")
+    with get_session() as session:
+        item = session.get(DownloadItem, item_id)
+        if item is None:
+            raise PublishQueueError(f"No Processing item with id {item_id}.")
+        if status == "exported" and not item.processed_path:
+            raise PublishQueueError("Export the reel before setting its status to Exported.")
+
+        posted = session.scalars(
+            select(UploadJob)
+            .where(UploadJob.download_item_id == item.id)
+            .where((UploadJob.posted_at.is_not(None)) | (UploadJob.status == "posted"))
+            .order_by(UploadJob.id.desc())
+            .limit(1)
+        ).first()
+
+        repost = session.scalars(
+            select(UploadJob)
+            .where(UploadJob.download_item_id == item.id)
+            .where(UploadJob.posted_at.is_(None))
+            .where(UploadJob.status != "posted")
+            .order_by(UploadJob.id.desc())
+            .limit(1)
+        ).first()
+        created = repost is None
+        if posted is not None and repost is None:
+            if not item.processed_path:
+                raise PublishQueueError("Export the reel again before reopening this posted item.")
+            repost = UploadJob(
+                account_id=posted.account_id,
+                download_item_id=item.id,
+                processed_path=item.processed_path,
+                title=(item.title_draft or item.title or posted.title or "").strip() or None,
+                description=item.caption_draft if item.caption_draft is not None else posted.description,
+                timezone=posted.timezone,
+                privacy_status=posted.privacy_status,
+                made_for_kids=posted.made_for_kids,
+                contains_synthetic_media=posted.contains_synthetic_media,
+                status="draft",
+            )
+            session.add(repost)
+        elif repost is not None:
+            if repost.status in {"scheduled", "cloud"}:
+                raise PublishQueueError("Cancel the active schedule before changing this status.")
+            repost.status = "draft"
+            repost.scheduled_at = None
+            repost.error_message = None
+
+        item.status = status
+        session.commit()
+        return {
+            "item_id": item.id,
+            "status": status,
+            "repost_job_id": repost.id if repost is not None else None,
+            "created": created and repost is not None,
+        }
 
 
 def reschedule(job_id: int, scheduled_at: str) -> dict:
@@ -184,6 +257,18 @@ def unschedule(job_id: int) -> dict:
         job = _require_job(session, job_id)
         if job.posted_at is not None or job.status == "posted":
             raise PublishQueueError("This job is already posted; it cannot be unscheduled.")
+        should_cancel_cloud = job.status == "cloud"
+
+    if should_cancel_cloud:
+        from nicheflow_studio.services import publishing
+
+        try:
+            publishing.cancel_cloud_handoff(job_id)
+        except publishing.PublishError as exc:
+            raise PublishQueueError(str(exc)) from exc
+
+    with get_session() as session:
+        job = _require_job(session, job_id)
         job.scheduled_at = None
         job.status = "draft"
         job.error_message = None

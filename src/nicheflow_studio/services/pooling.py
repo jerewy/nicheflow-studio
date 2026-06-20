@@ -16,6 +16,7 @@ import logging
 import threading
 from collections import Counter
 from pathlib import Path
+from typing import Callable
 
 from nicheflow_studio.core.account_health import HealthState, local_health
 from nicheflow_studio.core.distribution import DEFAULT_DISTRIBUTE_DAILY_TARGET
@@ -23,12 +24,14 @@ from nicheflow_studio.core.instagram_profile_pool import ProfilePool
 from nicheflow_studio.core.paths import downloads_dir
 from nicheflow_studio.db import assignments as assignments_db, pools
 from nicheflow_studio.db.media_library import mark_media_asset_downloaded
+from nicheflow_studio.processing.dedup import safe_video_fingerprint
 from nicheflow_studio.db.models import (
     Account,
     Assignment,
     DownloadItem,
     MediaAsset,
     PoolItem,
+    ScrapeCandidate,
 )
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.downloader.instagram import download_instagram_url
@@ -85,6 +88,10 @@ def _ensure_pool_item_downloaded(pool_item_id: int) -> None:
             f"Could not download this clip before distribution: {_download_error_message(exc)}"
         ) from exc
 
+    # Perceptual fingerprint for cross-repost footage dedup. Computed off the DB
+    # session (it reads the file) and best-effort so it never blocks distribution.
+    content_hash = safe_video_fingerprint(file_path)
+
     with get_session() as session:
         asset = session.get(MediaAsset, asset_id)
         if asset is None:
@@ -93,6 +100,7 @@ def _ensure_pool_item_downloaded(pool_item_id: int) -> None:
             asset,
             original_download_path=str(file_path),
             file_size_bytes=file_path.stat().st_size,
+            content_hash=content_hash,
         )
         session.commit()
 
@@ -180,10 +188,201 @@ def overview() -> dict:
                     "assigned": stats.assigned,
                     "unused": stats.unused,
                     "rejected": stats.rejected,
+                    "pending": stats.pending,
                     "assignments_by_account": per_account,
                 }
             )
         return {"niches": niches}
+
+
+def _clip_label(asset: MediaAsset | None, pool_item_id: int) -> str:
+    if asset is not None:
+        if asset.source_shortcode:
+            return asset.source_shortcode
+        if asset.original_download_path:
+            return Path(asset.original_download_path).name
+        if asset.canonical_source_url:
+            return asset.canonical_source_url
+    return f"item#{pool_item_id}"
+
+
+def _candidate_for_asset(session, asset: MediaAsset | None) -> ScrapeCandidate | None:
+    if asset is None:
+        return None
+    if asset.source_shortcode:
+        candidate = (
+            session.query(ScrapeCandidate)
+            .filter(ScrapeCandidate.video_id == asset.source_shortcode)
+            .first()
+        )
+        if candidate is not None:
+            return candidate
+    if asset.canonical_source_url:
+        return (
+            session.query(ScrapeCandidate)
+            .filter(ScrapeCandidate.source_url == asset.canonical_source_url)
+            .first()
+        )
+    return None
+
+
+def review_queue(niche: str, source_label: str | None = None) -> list[dict]:
+    """Pending pool clips ranked for owner review; never changes their status."""
+    source_filter = (source_label or "").strip()
+    with get_session() as session:
+        try:
+            items = pools.pool_items_for_niche(
+                session, niche, status=pools.POOL_STATUS_PENDING_REVIEW
+            )
+        except ValueError as exc:
+            raise PoolingError(str(exc)) from exc
+        signals = assignments_db._engagement_signals_for_pool_items(
+            session, [item.id for item in items]
+        )
+        rows: list[dict] = []
+        for item in items:
+            asset = item.media_asset
+            candidate = _candidate_for_asset(session, asset)
+            source = candidate.channel_name if candidate and candidate.channel_name else "-"
+            if source_filter and source != source_filter:
+                continue
+            signal = signals[item.id]
+            rows.append(
+                {
+                    "pool_item_id": item.id,
+                    "niche": item.niche,
+                    "clip_label": (
+                        candidate.title
+                        if candidate is not None and candidate.title
+                        else _clip_label(asset, item.id)
+                    ),
+                    "source_label": source,
+                    "created_at": _iso(item.created_at),
+                    "thumbnail_url": candidate.thumbnail_url if candidate else None,
+                    # Source reel URL (for opening the original) and the local
+                    # original file when footage has already been downloaded; the
+                    # bridge turns the latter into an in-app ``preview_url``.
+                    "source_url": (
+                        candidate.source_url
+                        if candidate is not None and candidate.source_url
+                        else (asset.canonical_source_url if asset is not None else None)
+                    ),
+                    "original_download_path": (
+                        asset.original_download_path if asset is not None else None
+                    ),
+                    "fit_score": round(signal.fit_score, 6),
+                    "source_er": signal.source_er,
+                    "topic_tier": signal.topic_tier,
+                    "suggested_action": signal.suggested_action,
+                    "view_count": candidate.view_count if candidate else None,
+                    "like_count": candidate.like_count if candidate else None,
+                    "comment_count": candidate.comment_count if candidate else None,
+                    "duration_seconds": candidate.duration_seconds if candidate else None,
+                    "description": candidate.description if candidate else None,
+                    "channel_name": candidate.channel_name if candidate else None,
+                    "published_at": _iso(candidate.published_at if candidate else None),
+                }
+            )
+        session.commit()
+        return sorted(
+            rows,
+            key=lambda row: signals[row["pool_item_id"]].fit_score,
+            reverse=True,
+        )
+
+
+def pool_item_preview(pool_item_id: int) -> dict:
+    """Best preview source for a single pool item, for in-app review.
+
+    Scraped IG thumbnail URLs are signed and expire within days, so for an older
+    item the remote thumbnail no longer loads. When the footage has been
+    downloaded, return its local file for a real video preview; otherwise fall
+    back to the (possibly expired) thumbnail plus the source URL to open. The
+    bridge turns ``local_path`` into an in-app ``preview_url``. Never changes the
+    item's acceptance status.
+    """
+    with get_session() as session:
+        item = session.get(PoolItem, pool_item_id)
+        if item is None:
+            raise PoolingError(f"No pool item with id {pool_item_id}.")
+        asset = item.media_asset
+        candidate = _candidate_for_asset(session, asset)
+        local_path = None
+        if asset is not None and asset.original_download_path:
+            path = Path(asset.original_download_path)
+            if path.exists():
+                local_path = str(path)
+        return {
+            "pool_item_id": pool_item_id,
+            "local_path": local_path,
+            "thumbnail_url": candidate.thumbnail_url if candidate is not None else None,
+            "source_url": (
+                candidate.source_url
+                if candidate is not None and candidate.source_url
+                else (asset.canonical_source_url if asset is not None else None)
+            ),
+        }
+
+
+def download_pool_item_for_review(
+    pool_item_id: int, *, progress: Callable[[float, str], None] | None = None
+) -> dict:
+    """Download a pending pool item's footage so it can be previewed in review.
+
+    Reuses on-disk footage when present; otherwise downloads the reel (serialized
+    with the distribution downloader via the shared lock). The original is
+    registered on the shared asset so it's reused later at distribution, but this
+    does NOT change the item's acceptance status or create a Processing row — it
+    is review-only. Returns the same shape as :func:`pool_item_preview`.
+    """
+    if progress:
+        progress(0.1, "Downloading clip…")
+    with _DOWNLOAD_LOCK:
+        _ensure_pool_item_downloaded(pool_item_id)
+    if progress:
+        progress(1.0, "Ready.")
+    return pool_item_preview(pool_item_id)
+
+
+def approve_pool_items(pool_item_ids: list[int]) -> dict:
+    """Approve pending pool items so they become eligible for distribution."""
+    ids = [int(pool_item_id) for pool_item_id in (pool_item_ids or [])]
+    if not ids:
+        return {"approved": 0}
+    now = dt.datetime.now(dt.timezone.utc)
+    with get_session() as session:
+        items = (
+            session.query(PoolItem)
+            .filter(
+                PoolItem.id.in_(ids),
+                PoolItem.acceptance_status == pools.POOL_STATUS_PENDING_REVIEW,
+            )
+            .all()
+        )
+        for item in items:
+            item.acceptance_status = pools.POOL_STATUS_ACCEPTED
+            item.accepted_at = now
+            item.accepted_reason = "approved in review"
+        session.commit()
+        return {"approved": len(items)}
+
+
+def reject_pool_items(pool_item_ids: list[int], reason: str) -> dict:
+    """Reject pending pool items by reusing the reversible pool removal flow."""
+    ids = [int(pool_item_id) for pool_item_id in (pool_item_ids or [])]
+    if not ids:
+        return {"rejected": 0}
+    note = (reason or "").strip() or "rejected in review"
+    rejected = 0
+    with get_session() as session:
+        for pool_item_id in ids:
+            item = session.get(PoolItem, pool_item_id)
+            if item is None or item.acceptance_status != pools.POOL_STATUS_PENDING_REVIEW:
+                continue
+            if pools.remove_pool_item(session, pool_item_id=pool_item_id, reason=note):
+                rejected += 1
+        session.commit()
+    return {"rejected": rejected}
 
 
 def list_pool_items(niche: str) -> list[dict]:
@@ -359,7 +558,7 @@ def distribute_niche(
 ) -> dict:
     """Auto-distribute a niche's undistributed pool across its accounts.
 
-    Ranks the unassigned pool by intrinsic engagement (likes + recency), spreads
+    Ranks the unassigned pool by tier-weighted source ER plus recency, spreads
     the strongest clips one-per-account (volume-balanced, jittered within score
     tiers so accounts don't all get the same top clip), and tops each account up
     to its rolling ``distribute_daily_target`` (how many unposted clips to keep

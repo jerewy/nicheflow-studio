@@ -61,6 +61,38 @@ _HISTORY_LOST_ARCHIVE_FEW_SHOT_WINNERS = (
 )
 
 
+# Cinematic Record static fallback examples, used only when no measured account
+# winners are supplied. They teach the cinematic-restraint + forensic-specifics
+# voice and are never copied verbatim. Real, dash-free, varied across moves.
+_CINEMATIC_RECORD_FEW_SHOT_WINNERS = (
+    # Short register: tight title-card facts.
+    "June 26, 1977. The last time Elvis ever sang to a live crowd.",
+    "Bubble wrap was invented in 1957 as textured wallpaper, and nobody bought it.",
+    "The Eiffel Tower was built to stand for only 20 years before being torn down.",
+    "An estimated 600 million people watched this 1969 broadcast live.",
+    "Grigori Perelman solved a 100-year-old problem, then turned down a million dollars.",
+    # Storytelling register: longer documentary sentences, same calm voice.
+    "In 1977, eighteen thousand people filled this arena to watch Elvis sing live, "
+    "eight weeks before he was gone.",
+    "Bubble wrap launched in 1957 as textured wallpaper, failed for years, and only "
+    "found its purpose once fragile goods needed something to survive the mail.",
+)
+
+# Real @historytrails titles (cleaned), demonstrating the long, left-aligned
+# descriptive documentary shape the HistoryTrails title style is tuned for.
+_HISTORYTRAILS_FEW_SHOT_WINNERS = (
+    "Rey Mysterio was forced to remove his mask with great sorrow for the first "
+    "time in his career after losing the match. (1999)",
+    "When Michael Jackson was nearly attacked during 'Earth Song' on the HIStory "
+    "Tour, an unforgettable moment that still sends chills.",
+    "21-year-old Adam Sandler during spring break in Fort Lauderdale, 1988, a year "
+    "after his TV debut as Smitty on The Cosby Show.",
+    "Durability test of a wolf's tooth and a human tooth under a hydraulic press.",
+    "That time Norm MacDonald guessed how the millionaire show was rigged, and was "
+    "proven right mid-show.",
+)
+
+
 @dataclass(frozen=True)
 class SmartDrafts:
     summary: str
@@ -144,6 +176,7 @@ def generate_smart_drafts(
     prompt_profile: str | None = None,
     caption_style: str | None = None,
     title_style: str | None = None,
+    title_length: str | None = None,
     recent_titles: list[str] | None = None,
     recent_captions: list[str] | None = None,
     few_shot_winners: list[str] | None = None,
@@ -198,6 +231,7 @@ def generate_smart_drafts(
                     prompt_profile=prompt_profile,
                     caption_style=caption_style,
                     title_style=title_style,
+                    title_length=title_length,
                     recent_titles=recent_titles,
                     recent_captions=recent_captions,
                     few_shot_winners=few_shot_winners,
@@ -216,6 +250,7 @@ def generate_smart_drafts(
                     prompt_profile=prompt_profile,
                     caption_style=caption_style,
                     title_style=title_style,
+                    title_length=title_length,
                     recent_titles=recent_titles,
                     recent_captions=recent_captions,
                     few_shot_winners=few_shot_winners,
@@ -309,6 +344,7 @@ def _generate_ollama_smart_drafts(
     caption_outro: str | None = None,
     low_context: bool = False,
     title_style: str | None = None,
+    title_length: str | None = None,
 ) -> SmartDrafts:
     visual_payload = _fallback_vision_payload(
         source_title=source_title,
@@ -329,10 +365,11 @@ def _generate_ollama_smart_drafts(
             prompt_profile=prompt_profile,
             caption_style=caption_style,
             title_style=title_style,
+            title_length=title_length,
             recent_titles=recent_titles,
             recent_captions=recent_captions,
             few_shot_winners=few_shot_winners,
-                    caption_outro=caption_outro,
+            caption_outro=caption_outro,
         ),
         provider_name=f"Ollama model {model}",
     )
@@ -363,6 +400,7 @@ def _generate_ollama_smart_drafts(
             "low_context": low_context,
             "caption_style": caption_style,
             "title_style": title_style,
+            "title_length": title_length or "long",
             "recommended_title_option_index": parsed.recommended_title_index,
             "recommended_caption_option_index": parsed.recommended_caption_index,
             "recommendation_reason": parsed.recommendation_reason,
@@ -390,6 +428,7 @@ def _generate_groq_smart_drafts(
     caption_outro: str | None = None,
     low_context: bool = False,
     title_style: str | None = None,
+    title_length: str | None = None,
 ) -> SmartDrafts:
     vision_model = os.environ.get("GROQ_VISION_MODEL") or DEFAULT_GROQ_VISION_MODEL
     vision_payload: dict[str, object] | None = None
@@ -479,10 +518,11 @@ def _generate_groq_smart_drafts(
             prompt_profile=prompt_profile,
             caption_style=caption_style,
             title_style=title_style,
+            title_length=title_length,
             recent_titles=recent_titles,
             recent_captions=recent_captions,
             few_shot_winners=few_shot_winners,
-                    caption_outro=caption_outro,
+            caption_outro=caption_outro,
         ),
         provider_name=f"Groq reasoning model {reasoning_model}",
     )
@@ -517,6 +557,7 @@ def _generate_groq_smart_drafts(
             # round-trip when output doesn't match the dropdown.
             "caption_style": caption_style,
             "title_style": title_style,
+            "title_length": title_length or "long",
             "recommended_title_option_index": parsed.recommended_title_index,
             "recommended_caption_option_index": parsed.recommended_caption_index,
             "recommendation_reason": parsed.recommendation_reason,
@@ -616,6 +657,7 @@ def _smart_draft_prompt(
     prompt_profile: str | None = None,
     caption_style: str | None = None,
     title_style: str | None = None,
+    title_length: str | None = None,
     recent_titles: list[str] | None = None,
     recent_captions: list[str] | None = None,
     few_shot_winners: list[str] | None = None,
@@ -731,6 +773,7 @@ def _smart_draft_prompt(
                 niche_label,
                 prompt_profile,
                 few_shot_winners=few_shot_winners,
+                title_length=title_length,
             ),
             "",
             "HOOK FRAMING (drama is allowed, overclaiming is not)",
@@ -754,8 +797,7 @@ def _smart_draft_prompt(
             "- Never open a caption with a dictionary-style definition: do not write "
             "'[Game/show/thing] is a [category] where...' as the first sentence. "
             "Lead with the feeling, situation, or moment first.",
-            f"- End with a final separate line of {_caption_hashtag_target(caption_style)} "
-            "specific hashtags. Prefer niche tags over generic spam tags. Do not exceed 5 hashtags.",
+            _caption_hashtag_instruction(caption_style),
             *(
                 [
                     "- FOLLOW OUTRO (MANDATORY): every caption_options string must include "
@@ -996,6 +1038,10 @@ def _caption_word_target(caption_style: str | None) -> str:
         # Past Moments Daily pattern: short history hook + 2 compact context
         # paragraphs. Long enough to add value, shorter than full narrative.
         return "90-150"
+    if style == "historytrails_archive":
+        # HistoryTrails pattern: two dense descriptive paragraphs (scene then
+        # significance), no hashtags. Observed captions run ~80-110 words.
+        return "80-120"
     return "70-130"
 
 
@@ -1020,7 +1066,28 @@ def _caption_hashtag_target(caption_style: str | None) -> str:
         return "0-2"
     if style == "history_lost_archive":
         return "3-5"
+    if style == "historytrails_archive":
+        # HistoryTrails captions carry no hashtags at all.
+        return "0"
     return "3-5"
+
+
+def _caption_hashtag_instruction(caption_style: str | None) -> str:
+    """The prompt line that controls the trailing hashtag block.
+
+    Styles that target ``"0"`` suppress the hashtag line entirely; everything
+    else keeps the standard "end with N specific hashtags" instruction.
+    """
+    target = _caption_hashtag_target(caption_style)
+    if target == "0":
+        return (
+            "- Do NOT add any hashtags; this style ends on the final sentence of "
+            "the description, with no hashtag line."
+        )
+    return (
+        f"- End with a final separate line of {target} "
+        "specific hashtags. Prefer niche tags over generic spam tags. Do not exceed 5 hashtags."
+    )
 
 
 def _caption_paragraph_rule(caption_style: str | None) -> str:
@@ -1145,6 +1212,29 @@ def _caption_paragraph_rule(caption_style: str | None) -> str:
             "Then a blank line and a final line of "
             f"{_caption_hashtag_target(caption_style)} narrow hashtags."
         )
+    if style == "historytrails_archive":
+        return (
+            "Each caption_options string must follow the HISTORYTRAILS template "
+            "exactly: TWO dense descriptive paragraphs, no hashtags, no emoji, no "
+            "call to action. "
+            "Paragraph 1 (SCENE, 2-4 sentences, ~40-55 words): narrate what is "
+            "happening ON SCREEN in calm present tense, naming the specific "
+            "subject, people, place, and year, plus the visible details (clothing, "
+            "colours, setting, actions) supported by the clip and source data. "
+            "Open straight into the scene, e.g. 'In a shocking 1999 WCW moment Rey "
+            "Mysterio stands in the ring as his iconic mask is pulled off...'. Do "
+            "NOT open with a short hook, a question, or archive filler ('Opening "
+            "the archive', 'A forgotten fact', 'This clip shows'). No 'me when', "
+            "no 'you won't believe'. "
+            "Then a blank line. "
+            "Paragraph 2 (SIGNIFICANCE, 2-3 sentences, ~40-55 words): explain who "
+            "or what this is and the wider context (when, where, why), then land "
+            "on why the moment mattered or how it is remembered, e.g. 'marking the "
+            "debut of one of music's greatest songs' or 'became one of wrestling's "
+            "most controversial moments'. Use real names, dates, shows, and places "
+            "only when the source supports them; never invent facts. "
+            "End on that final sentence with no hashtags and no emoji."
+        )
     if style == "contextual_info":
         # Fix A2 enhancement: codify theanomalists' "zoom-in" 3-paragraph arc
         # explicitly. The previous default rule was vague enough that the
@@ -1244,15 +1334,16 @@ def effective_title_rules(
     niche_label: str | None,
     prompt_profile: str | None = None,
     few_shot_winners: list[str] | tuple[str, ...] | None = None,
+    title_length: str | None = None,
 ) -> list[str]:
     """Pick the on-screen title rules, niche-aware.
 
     Priority:
     1. An explicit title_style the user picked always wins.
     2. Otherwise, a history-niche account on the generic/broad profile defaults
-       to the history hook rules (explanatory 9-16 word shapes) instead of the
-       generic caption-style fallback — so history hooks land even when no style
-       is chosen. A history account on a profile with its own title voice
+       to the Cinematic Record history hook (the same strong hook the manual
+       "Curiosity / Open Loop" pick uses), so history hooks land even when no
+       style is chosen. A history account on a profile with its own title voice
        (e.g. story_reel) keeps that voice.
     3. Otherwise, fall back to the caption-style-derived title rules.
 
@@ -1261,12 +1352,43 @@ def effective_title_rules(
     """
     explicit = _title_style_rules(title_style, few_shot_winners=few_shot_winners)
     if explicit is not None:
-        return explicit
-    if _history_should_auto_route(niche_label, prompt_profile):
-        return _caption_style_title_rules(
-            "history_lost_archive", few_shot_winners=few_shot_winners
+        base_rules = explicit
+    elif _history_should_auto_route(niche_label, prompt_profile):
+        base_rules = _curiosity_open_loop_title_rules(few_shot_winners=few_shot_winners)
+    else:
+        base_rules = _caption_style_title_rules(
+            caption_style,
+            few_shot_winners=few_shot_winners,
         )
-    return _caption_style_title_rules(caption_style, few_shot_winners=few_shot_winners)
+    return [*base_rules, *_title_length_rules(title_length)]
+
+
+def _title_length_rules(title_length: str | None) -> list[str]:
+    normalized = _normalize_whitespace(title_length or "long").lower()
+    if normalized == "short":
+        return [
+            "- TITLE LENGTH CONTROL: SHORT. Each title must be 5-9 words and "
+            "fit in 1-2 overlay lines. Use short only when the clip is "
+            "self-explanatory; never remove the specific subject or payoff just "
+            "to hit the word count."
+        ]
+    if normalized == "medium":
+        return [
+            "- TITLE LENGTH CONTROL: MEDIUM. Each title must be 10-16 words and "
+            "fit in 2-3 overlay lines. Keep the concrete subject and story beat."
+        ]
+    if normalized == "auto":
+        return [
+            "- TITLE LENGTH CONTROL: AUTO MIX. The three options must visibly "
+            "span all length bands: Option 1 SHORT at 5-9 words and 1-2 lines; "
+            "Option 2 MEDIUM at 10-16 words and 2-3 lines; Option 3 LONG at "
+            "15-28 words and 4 lines."
+        ]
+    return [
+        "- TITLE LENGTH CONTROL: LONG. Each title must be 15-28 words and target "
+        "4 overlay lines. This is the existing HistoryTrails-length behavior; "
+        "make every word earn its place and do not pad thin evidence."
+    ]
 
 
 def _has_specific_title_style(
@@ -1373,6 +1495,10 @@ def _title_style_rules(
             "Do NOT default to bolding 'silence', 'moment', or 'connection'; bold "
             "the word each specific title actually hinges on.",
         ]
+    if style == "curiosity_open_loop":
+        return _curiosity_open_loop_title_rules(few_shot_winners=few_shot_winners)
+    if style == "historytrails_record":
+        return _historytrails_title_rules(few_shot_winners=few_shot_winners)
     # For known caption-driven styles, delegate to the existing rules so
     # users can mix freely without us duplicating rule bodies.
     if style in {
@@ -1428,6 +1554,200 @@ def _cinema_bold_keyword_mode_rules() -> list[str]:
         "- BANNED: short meme hooks ('bro thought he had it', 'wait for it'), "
         "'me when', 'POV:', 'that friend who', news-headline form "
         "('Director X Does Y'), titles under 5 words, emoji, and hashtags.",
+    ]
+
+
+def _curiosity_open_loop_title_rules(
+    few_shot_winners: list[str] | tuple[str, ...] | None = None,
+) -> list[str]:
+    """Cinematic Record hooks: the account's own original history hook voice.
+
+    Deliberately NOT a clone of the saturated competitor openers ("Nobody
+    expected...", "What happened when..."). The voice is cinematic restraint plus
+    forensic specificity: calm, certain, one hard real fact delivered plainly so
+    the fact carries itself. Engineered for the signals that actually move
+    history reels (low skip, saves, shares), with an explicit anti-AI-tell guard
+    so the output never reads machine-written. Title format only; pairs with any
+    caption_style. The old "state the bare fact, short is fine" default was
+    dropped because it produced flat labels that closed the loop instead of
+    opening it.
+    """
+    measured = tuple(
+        cleaned
+        for value in (few_shot_winners or ())
+        if (cleaned := _normalize_whitespace(str(value)))
+    )
+    winners = measured or _CINEMATIC_RECORD_FEW_SHOT_WINNERS
+    winner_label = (
+        "MEASURED ACCOUNT WINNER EXAMPLES" if measured else "STATIC WINNER EXAMPLES"
+    )
+    return [
+        "- GOAL: every title makes a stranger stop, want to watch, and want to "
+        "SAVE or SEND it. It is a hook, not a label and not a summary of the clip.",
+        "- VOICE (this is what makes it OURS, not a copy of other history pages): "
+        "cinematic restraint plus forensic specificity. Calm and certain, like a "
+        "documentary lower third meets a film title card. State one hard real fact "
+        "plainly and let it carry itself. The restraint IS the style: no hype "
+        "words, no selling, no exclamation marks.",
+        "- THE ONE RULE THAT MATTERS MOST is BE SPECIFIC: anchor every title to a "
+        "real concrete detail from THIS clip's evidence (a recognizable name, an "
+        "exact year or date, a number, or a place). Odd exact specifics read human "
+        "and get saved; vague lines read like every other page and get skipped. "
+        "STRANGER TEST: if a stranger cannot tell THIS clip from any other clip by "
+        "the title alone, it is too vague, so add the specific.",
+        "- SIX MOVES: pick the strongest for THIS clip, and use THREE DIFFERENT "
+        "moves across the three options (never three rewrites of one line).",
+        "- MOVE 1 DATE-STAMP: open cold with the exact date or number, then the "
+        "quiet reveal. e.g. 'June 26, 1977. The last time Elvis ever sang live.'",
+        "- MOVE 2 ORDINARY TO REVEAL: frame it as mundane, then reveal what it "
+        "actually is. e.g. 'It looked like an ordinary 1977 show. It was his last.'",
+        "- MOVE 3 QUIET STAT: one concrete number that reframes everything, stated "
+        "with no hype. e.g. 'One frame of this footage took 700 hours to render.'",
+        "- MOVE 4 UNDERSTATED STAKES: name high stakes in a flat, cold line; the "
+        "calm delivery is the tension. e.g. 'Eight weeks after this show, he was "
+        "gone.'",
+        "- MOVE 5 RECORD-CORRECTION: state the common belief, then the precise "
+        "truth, only when the clip actually backs the correction. e.g. 'This sold "
+        "as wallpaper first. It failed until it became bubble wrap.'",
+        "- MOVE 6 HELD DETAIL (use for AT MOST one option, and only on a VISUAL "
+        "clip whose footage reveals the withheld element in the first seconds): "
+        "keep everything concrete but withhold the ONE thing the clip pays off, "
+        "the subject OR the outcome, never both. e.g. 'In 1977, 18,000 people "
+        "watched this man perform live for the last time.'",
+        "- OPTION DISTRIBUTION (HARD RULE): three different moves; at least TWO of "
+        "the three options must carry a hard specific (a date, a number, or a real "
+        "name); at most ONE may withhold (Move 6). Shuffle which option number "
+        "carries which move; do not always put the same move in the same slot.",
+        "- METRIC ENGINEERING: (LOW SKIP) the FIRST line must land a concrete "
+        "specific or an ordinary-to-reveal inside the first five words, so a "
+        "non-follower instantly senses a payoff. (SAVE) at least two options carry "
+        "a surprising hard specific worth keeping. (SHARE) the reveal must be the "
+        "kind of fact someone sends to one specific person. (WATCH) never state "
+        "the full payoff when the clip's VISUAL is the payoff; let the video "
+        "finish the thought.",
+        "- ANTI-AI-TELL GUARD (HARD RULE, this is how the output stays human): "
+        "NEVER use an em-dash, an en-dash, or a double hyphen anywhere; use a "
+        "period or a comma for any pause. Do NOT repeat the same two-beat parallel "
+        "shape in all three options ('It looked like X. It was Y.' in every option "
+        "reads formulaic), so vary the sentence rhythm. BANNED phrasings: 'not "
+        "just X but Y', 'in a world where', empty intensifiers ('truly', "
+        "'absolutely', 'utterly'), and perfectly symmetrical clauses. If a title "
+        "sounds like ad copy or a press release, rewrite it plainer.",
+        "- STAY GREEN-TIER (HARD RULE): every specific must be supported by the "
+        "transcript, the source caption, or the visual evidence. If a date or a "
+        "number is not supported, soften it ('decades ago', 'thousands of people') "
+        "instead of inventing it. Never add a record, a 'first/last/only', a "
+        "rarity, or a secrecy claim the signals do not back. The surprise must "
+        "come from a REAL specific, never from fabricating.",
+        "- LENGTH AND FORMAT: two registers are BOTH allowed; pick whichever THIS "
+        "clip's story needs, and vary the register across the three options. SHORT "
+        "(10-16 words, ~2 lines): a tight title-card fact. STORYTELLING (15-25 "
+        "words, 3-5 lines): a fuller documentary sentence that sets the scene, "
+        "names the specifics, and lands on the surprising or emotional beat. Lean "
+        "to the STORYTELLING register whenever the clip carries a real narrative, "
+        "because a longer line where every word earns its place tends to win; the "
+        "only ceiling is on-screen readability. Use a comma or a period for any "
+        "pause, never a dash. No emoji, no hashtags.",
+        "- PAY OFF THE CLIP (HARD RULE): the clip must actually deliver what the "
+        "title promises, visibly for a visual clip or in the narration for a story "
+        "clip. If the clip does not back the title, rebuild the title around what "
+        "the clip really shows or says.",
+        "- RECOMMENDED PICK: choose the option whose specific this clip delivers "
+        "most strongly. Justify it with a clip-specific reason, not a restatement "
+        "of these rules.",
+        "- VOICE GUARD (BANNED, so we never sound like every other history page): "
+        "the saturated listicle openers 'Nobody expected', 'Nobody talks about', "
+        "'What happened when', 'The moment when', and 'This [person]'s'; meme "
+        "framing 'me when', 'POV:', 'bro', 'send this to'; clickbait 'shocking', "
+        "'you won't believe', 'changed history forever', 'this will blow your "
+        "mind'; emoji; hashtags; any dash.",
+        "- EXAMPLES ILLUSTRATE STRUCTURE ONLY (HARD RULE): never reproduce an "
+        "example sentence verbatim, and never copy a fact from one clip onto "
+        "another. Write a fully original line for THIS clip.",
+        f"- {winner_label} (calibrate the cinematic and forensic voice and the "
+        "move shapes to these, and never copy their facts onto another clip):\n- "
+        + "\n- ".join(winners),
+    ]
+
+
+def _historytrails_title_rules(
+    few_shot_winners: list[str] | tuple[str, ...] | None = None,
+) -> list[str]:
+    """HistoryTrails hooks: long, left-aligned documentary captions.
+
+    Reverse-engineered from the @historytrails on-screen titles (see
+    data/title_analysis/historytrails-ocr/title_template_style.md). Shares the
+    Cinematic Record voice (documentary restraint, forensic specificity, open
+    loop) but writes a FULL descriptive sentence rather than a clipped two-beat
+    hook, because the data showed longer titles win on this account (20+ words
+    reached the highest median views) and the paired HistoryTrails Left template
+    renders 3-5 left-aligned lines. Title format only; pairs with any
+    caption_style.
+    """
+    measured = tuple(
+        cleaned
+        for value in (few_shot_winners or ())
+        if (cleaned := _normalize_whitespace(str(value)))
+    )
+    winners = measured or _HISTORYTRAILS_FEW_SHOT_WINNERS
+    winner_label = (
+        "MEASURED ACCOUNT WINNER EXAMPLES" if measured else "STATIC WINNER EXAMPLES"
+    )
+    return [
+        "- GOAL: write the long, calm documentary caption that sits at the top of "
+        "the clip. It SETS A SCENE in full sentences, names who/what/when, and "
+        "ends on the surprising or emotional beat so a stranger stops, watches to "
+        "the payoff, and wants to SAVE or SEND it. A hook, never a label.",
+        "- VOICE: documentary lower third meets a museum caption. Calm, certain, "
+        "past tense. State real facts plainly and let them carry; no hype words, "
+        "no selling, no exclamation marks. This is the same restraint as Cinematic "
+        "Record, only written out as a complete descriptive sentence.",
+        "- BE SPECIFIC (the rule that matters most): anchor every title to at least "
+        "one hard real detail from THIS clip's evidence — a recognizable name, an "
+        "exact year or date, a number, or a place. STRANGER TEST: if a stranger "
+        "cannot tell THIS clip from any other by the title alone, add the specific.",
+        "- LENGTH AND LAYOUT: the proven sweet spot on this account is a fuller "
+        "sentence of about 18-24 words that wraps to FOUR left-aligned overlay "
+        "lines; that length and line count earn the most saves here. A two-line "
+        "title underperforms, so never compress to a short label. Write the full "
+        "narrative WHEN THE CLIP SUPPORTS IT and make every word earn its place; "
+        "do NOT pad a thin clip just to reach the length. Hard range 15-28 words; "
+        "the only ceiling is on-screen readability.",
+        "- SHAPE: lead with the subject or the scene, give the specific action or "
+        "context (with the year/place/name), and land the final clause on the "
+        "surprising, emotional, or record detail. End on the beat the VIDEO pays "
+        "off; do not state the full visual payoff in words.",
+        "- FORMATS: use THREE DIFFERENT shapes across the three options (never "
+        "three rewrites of one). Proven shapes, strongest first: (1) 'That time "
+        "<named person> <improbable thing>'; (2) declarative 'The <moment/day> "
+        "<subject> <action>'; (3) plain descriptive sentence naming subject + "
+        "action + context; (4) 'When <person/event>...'; (5) 'In <year>, <what "
+        "happened>'; (6) a '<subject> <did X> for the first time ... (year)' "
+        "anecdote. At least TWO options must carry a hard specific (date, number, "
+        "or real name).",
+        "- OPEN LOOP (use for at most ONE option, only on a visual clip): keep "
+        "everything concrete but withhold the ONE thing the footage reveals — the "
+        "subject OR the outcome, never both.",
+        "- ANTI-AI-TELL GUARD (HARD RULE): NEVER use an em-dash, en-dash, or double "
+        "hyphen; use a comma or period for any pause. Vary the sentence rhythm "
+        "across options. BANNED: 'not just X but Y', 'in a world where', empty "
+        "intensifiers ('truly', 'absolutely'), and clickbait ('shocking', 'you "
+        "won't believe', 'this will blow your mind'). If it reads like ad copy, "
+        "rewrite it plainer.",
+        "- STAY GREEN-TIER (HARD RULE): every specific must be supported by the "
+        "transcript, the source caption, or the visible evidence. If a date or "
+        "number is not supported, soften it ('decades ago', 'thousands of people') "
+        "rather than inventing it. Never add a 'first/last/only', a record, or a "
+        "rarity claim the evidence does not back.",
+        "- NO emoji, NO hashtags, NO all-caps lines, sentence case.",
+        "- RECOMMENDED PICK: choose the option whose specific this clip delivers "
+        "most strongly, justified with a clip-specific reason.",
+        "- EXAMPLES ILLUSTRATE STRUCTURE ONLY (HARD RULE): never reproduce an "
+        "example sentence verbatim and never copy a fact from one clip onto "
+        "another. Write a fully original line for THIS clip.",
+        f"- {winner_label} (calibrate the long documentary voice and the descriptive "
+        "shape to these, and never copy their facts onto another clip):\n- "
+        + "\n- ".join(winners),
     ]
 
 
@@ -2273,6 +2593,7 @@ def _build_groq_payload(
     prompt_profile: str | None,
     caption_style: str | None,
     title_style: str | None,
+    title_length: str | None,
     recent_titles: list[str] | None,
     recent_captions: list[str] | None,
     few_shot_winners: list[str] | None = None,
@@ -2312,6 +2633,7 @@ def _build_groq_payload(
                     prompt_profile=prompt_profile,
                     caption_style=caption_style,
                     title_style=title_style,
+                    title_length=title_length,
                     recent_titles=recent_titles,
                     recent_captions=recent_captions,
                     few_shot_winners=few_shot_winners,
@@ -2337,6 +2659,7 @@ def _build_ollama_payload(
     prompt_profile: str | None,
     caption_style: str | None,
     title_style: str | None,
+    title_length: str | None,
     recent_titles: list[str] | None,
     recent_captions: list[str] | None,
     few_shot_winners: list[str] | None = None,
@@ -2363,6 +2686,7 @@ def _build_ollama_payload(
                     prompt_profile=prompt_profile,
                     caption_style=caption_style,
                     title_style=title_style,
+                    title_length=title_length,
                     recent_titles=recent_titles,
                     recent_captions=recent_captions,
                     few_shot_winners=few_shot_winners,

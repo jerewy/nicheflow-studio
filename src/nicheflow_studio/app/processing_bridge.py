@@ -20,6 +20,7 @@ Design rules:
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from pathlib import Path
 
@@ -29,6 +30,7 @@ from nicheflow_studio.db.models import DownloadItem
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.services import (
     accounts as accounts_svc,
+    cloud_publisher,
     draft_generation,
     draft_handoff,
     draft_revisions as svc,
@@ -175,6 +177,10 @@ class ProcessingBridge:
         return publish_queue.update_metrics(job_id, payload or {})
 
     @_guard
+    def set_processing_status(self, item_id: int, status: str) -> dict:
+        return publish_queue.set_processing_status(item_id, status)
+
+    @_guard
     def reschedule_job(self, job_id: int, scheduled_at: str) -> dict:
         return publish_queue.reschedule(job_id, scheduled_at)
 
@@ -276,6 +282,57 @@ class ProcessingBridge:
         return clips
 
     @_guard
+    def pool_review_queue(self, niche: str, source_label: str | None = None) -> list[dict]:
+        rows = pooling.review_queue(niche, source_label)
+        mapping_ready = self._media_ready is None or self._media_ready.wait(timeout=5)
+        for row in rows:
+            thumbnail = row.get("thumbnail_url")
+            if mapping_ready and thumbnail and "://" not in str(thumbnail):
+                row["thumbnail_url"] = media_url(str(thumbnail))
+            # Turn the local original (when downloaded) into a playable in-app URL;
+            # pending items with no footage yet get a null preview the UI can offer
+            # to download on demand.
+            local_path = row.pop("original_download_path", None)
+            row["preview_url"] = (
+                media_url(local_path)
+                if mapping_ready and local_path and Path(local_path).exists()
+                else None
+            )
+        return rows
+
+    @_guard
+    def pool_item_preview(self, pool_item_id: int) -> dict:
+        """Preview source for one pool item: a local video URL when footage is on
+        disk, else the (possibly expired) thumbnail plus the source URL to open."""
+        data = pooling.pool_item_preview(pool_item_id)
+        mapping_ready = self._media_ready is None or self._media_ready.wait(timeout=5)
+        local_path = data.pop("local_path", None)
+        data["preview_url"] = (
+            media_url(local_path)
+            if mapping_ready and local_path and Path(local_path).exists()
+            else None
+        )
+        thumbnail = data.get("thumbnail_url")
+        if mapping_ready and thumbnail and "://" not in str(thumbnail):
+            data["thumbnail_url"] = media_url(str(thumbnail))
+        return data
+
+    @_guard
+    def start_pool_item_preview_download(self, pool_item_id: int) -> dict:
+        """Background-download a pool item's footage for review preview. Review-only
+        (does not change acceptance status). Poll via :meth:`get_job`."""
+        job_id = self._jobs.start(pooling.download_pool_item_for_review, pool_item_id)
+        return {"job_id": job_id}
+
+    @_guard
+    def approve_pool_items(self, ids: list[int]) -> dict:
+        return pooling.approve_pool_items(ids)
+
+    @_guard
+    def reject_pool_items(self, ids: list[int], reason: str) -> dict:
+        return pooling.reject_pool_items(ids, reason)
+
+    @_guard
     def remove_pool_item(self, pool_item_id: int, reason: str = "manual removal") -> dict:
         return pooling.remove_pool_item(pool_item_id, reason)
 
@@ -304,6 +361,17 @@ class ProcessingBridge:
     @_guard
     def dashboard_publish_jobs(self) -> dict:
         return publishing_dashboard.list_global_publish_jobs()
+
+    @_guard
+    def dashboard_schedule_coverage(self) -> dict:
+        return publishing_dashboard.schedule_coverage()
+
+    @_guard
+    def cloud_publisher_health(self) -> dict:
+        """Read-only Cloudflare publisher capacity and stale-job signals."""
+        usage = cloud_publisher.get_usage()
+        usage["publish_mode"] = cloud_publisher.list_jobs().get("publish_mode")
+        return usage
 
     @_guard
     def dashboard_account_stats(self, active_account_id: int) -> dict:
@@ -430,6 +498,32 @@ class ProcessingBridge:
         return draft_handoff.import_pasted_draft(item_id, text).to_dict()
 
     @_guard
+    def build_account_batch_chat_prompt(
+        self, account_id: int, item_ids: list[int], payload: dict | None = None
+    ) -> dict:
+        return {
+            "prompt": draft_handoff.build_account_batch_chat_prompt(
+                account_id, item_ids, payload
+            )
+        }
+
+    @_guard
+    def import_account_batch_draft(self, text: str, item_ids: list[int]) -> dict:
+        return draft_handoff.import_account_batch_draft(text, item_ids)
+
+    @_guard
+    def prepare_account_batch_frames(self, item_ids: list[int]) -> dict:
+        return draft_handoff.batch_frames(item_ids)
+
+    @_guard
+    def open_batch_frames_folder(self, folder: str) -> dict:
+        path = Path(folder).expanduser().resolve()
+        if not path.exists() or not path.is_dir():
+            raise ServiceError(f"Batch frames folder not found: {path}")
+        os.startfile(str(path))
+        return {"folder": str(path)}
+
+    @_guard
     def get_workflow_settings(self, item_id: int) -> dict:
         return processing_workflow.get_settings(item_id)
 
@@ -478,6 +572,7 @@ class ProcessingBridge:
                 item_id,
                 caption_style=payload.get("caption_style"),
                 title_style=payload.get("title_style"),
+                title_length=payload.get("title_length"),
                 prompt_profile=payload.get("prompt_profile"),
                 clip_premise=payload.get("clip_premise"),
                 source=payload.get("source") or "ui",
@@ -529,15 +624,25 @@ class ProcessingBridge:
         return {"job_id": job_id}
 
     @_guard
-    def start_publish_now(self, item_id: int, allow_recent: bool = False) -> dict:
+    def start_publish_now(
+        self,
+        item_id: int,
+        allow_recent: bool = False,
+        force_local: bool = False,
+    ) -> dict:
         """Start a background job that posts the item's reel to Instagram now
         (live). Poll it via :meth:`get_job`.
 
         ``allow_recent`` False (default) makes the job return ``on_cooldown``
         without posting when the account posted within the recency window; True
-        is the explicit "post anyway" path from the confirmation dialog."""
+        is the explicit "post anyway" path from the confirmation dialog.
+        ``force_local`` is the explicit Playwright/browser override for cloud-
+        mapped accounts."""
         job_id = self._jobs.start(
-            publish_now_svc.publish_item_now, item_id, allow_recent=allow_recent
+            publish_now_svc.publish_item_now,
+            item_id,
+            allow_recent=allow_recent,
+            force_local=force_local,
         )
         return {"job_id": job_id}
 

@@ -22,8 +22,8 @@ from nicheflow_studio.db.session import get_session, init_db
 
 
 def _seed_pending_assigned(clips: int = 2) -> None:
-    """A history account with `clips` candidate-first pooled + distributed clips
-    (assets stay pending — nothing downloaded)."""
+    """A history account with `clips` candidate-first pooled, approved + distributed
+    clips (assets stay pending — nothing downloaded)."""
     with get_session() as session:
         account = Account(
             name="Hist 0", platform="instagram", instagram_profile="h0", niche="history"
@@ -39,7 +39,12 @@ def _seed_pending_assigned(clips: int = 2) -> None:
             )
             session.add(candidate)
             session.flush()
-            accept_candidate_into_pool(session, candidate=candidate, niche="history")
+            item = accept_candidate_into_pool(session, candidate=candidate, niche="history")
+            # Candidate-first accepts now land in the 'pending_review' approval
+            # gate; approve so the clip is distributable (review -> approve ->
+            # distribute), otherwise distribute_niche skips it and nothing pends.
+            item.acceptance_status = "accepted"
+        session.flush()
         distribute_niche(session, "history", rng=random.Random(1))
         session.commit()
 

@@ -25,6 +25,12 @@ function App() {
   const [tab, setTab] = useState<Tab>("accounts");
   const [loaded, setLoaded] = useState(false);
   const [activeAccountError, setActiveAccountError] = useState<string | null>(null);
+  // Deep-link target handed to Processing from the publish schedule ("Edit in
+  // Processing"). The item id is the reliable key (the exported title differs from
+  // the library item's original title); search is a fallback. Cleared on any
+  // manual visit so it doesn't linger.
+  const [processingItemId, setProcessingItemId] = useState<number | null>(null);
+  const [processingSearch, setProcessingSearch] = useState("");
 
   const refreshAccounts = useCallback(async () => {
     try {
@@ -57,8 +63,22 @@ function App() {
     }
   };
 
-  // Hard gate: without an active account, only Accounts is usable.
-  const effectiveTab: Tab = activeId === null && tab !== "accounts" ? "accounts" : tab;
+  // Switch the active niche to the reel's account, then jump to Processing focused
+  // on the exact library item so it can be re-edited and re-exported without hunting.
+  const openInProcessing = async (
+    accountId: number,
+    itemId: number | null,
+    search: string,
+  ) => {
+    await chooseActive(accountId);
+    setProcessingItemId(itemId);
+    setProcessingSearch(search);
+    setTab("processing");
+  };
+
+  const activeTabConfig = TABS.find((t) => t.id === tab);
+  const effectiveTab: Tab =
+    activeId === null && activeTabConfig?.gated ? "accounts" : tab;
   const activeName = accounts.find((a) => a.id === activeId)?.name ?? null;
 
   return (
@@ -72,7 +92,15 @@ function App() {
             return (
               <button
                 key={t.id}
-                onClick={() => !locked && setTab(t.id)}
+                onClick={() => {
+                  if (locked) return;
+                  // A manual visit should not inherit a stale deep-link target.
+                  if (t.id === "processing") {
+                    setProcessingItemId(null);
+                    setProcessingSearch("");
+                  }
+                  setTab(t.id);
+                }}
                 disabled={locked}
                 title={locked ? "Choose an active niche account first" : undefined}
                 className={cn(
@@ -118,10 +146,15 @@ function App() {
       )}
       {effectiveTab === "processing" &&
         (activeId !== null ? (
-          <ProcessingScreen activeAccountId={activeId} activeAccountName={activeName} />
+          <ProcessingScreen
+            activeAccountId={activeId}
+            activeAccountName={activeName}
+            initialItemId={processingItemId}
+            initialSearch={processingSearch}
+          />
         ) : null)}
       {effectiveTab === "dashboard" && activeId !== null ? (
-        <Dashboard activeAccountId={activeId} />
+        <Dashboard activeAccountId={activeId} onOpenInProcessing={openInProcessing} />
       ) : null}
       {effectiveTab === "scraping" && activeId !== null ? (
         <ScrapingScreen activeAccountId={activeId} activeAccountName={activeName} />

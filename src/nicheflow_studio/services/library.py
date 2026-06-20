@@ -23,6 +23,7 @@ from nicheflow_studio.db.media_library import (
     find_or_register_media_asset,
     mark_media_asset_downloaded,
 )
+from nicheflow_studio.processing.dedup import safe_video_fingerprint
 from nicheflow_studio.db.models import (
     Account,
     Assignment,
@@ -51,6 +52,31 @@ class LibraryError(ServiceError):
     """Raised for invalid library operations (unknown item/account)."""
 
 
+class SourceUnavailableError(LibraryError):
+    """The clip's original can't be fetched because the source post is gone
+    (deleted, made private, or removed by Instagram) — not a fault on our side."""
+
+
+# yt-dlp reports a removed/private/deleted Instagram post with one of these phrases.
+# Recognising them lets the UI show a clean "reject this clip" prompt instead of a
+# generic "Unexpected error". Lowercase for case-insensitive matching. Note that
+# "empty media response" can *also* mean an expired session, so the message hedges
+# toward re-login when many clips fail at once.
+_SOURCE_GONE_MARKERS = (
+    "empty media response",
+    "the post may have been deleted",
+    "content isn't available",
+    "requested content was not found",
+    "video unavailable",
+    "this account is private",
+)
+
+
+def _looks_like_missing_source(message: str) -> bool:
+    lowered = message.lower()
+    return any(marker in lowered for marker in _SOURCE_GONE_MARKERS)
+
+
 def _iso(value: dt.datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
 
@@ -61,9 +87,10 @@ def _derive_status(
     failed_item_ids: set[int],
     scheduled_item_ids: set[int],
     cloud_item_ids: set[int],
+    reopened_item_ids: set[int],
 ) -> str:
-    """Workflow status for the Processing table: posted > failed > scheduled >
-    cloud > pending_review > skipped > exported > draft > new.
+    """Workflow status for the Processing table: posted > failed > cloud >
+    scheduled > pending_review > skipped > exported > draft > new.
 
     ``scheduled``/``cloud`` outrank ``pending_review`` on purpose: auto-distributed
     clips are exported AND queued for a future post in the background while their
@@ -71,16 +98,18 @@ def _derive_status(
     review). The live schedule is the more useful thing to surface, so it wins —
     a clip with no queued post still reads ``pending_review`` as before. ``cloud``
     is the same as ``scheduled`` but handed off to the Cloudflare Worker."""
-    if item.id in posted_item_ids:
+    if item.id in posted_item_ids and item.id not in reopened_item_ids:
         return "posted"
     if item.id in failed_item_ids:
         return "failed"
-    if item.id in scheduled_item_ids:
-        return "scheduled"
     if item.id in cloud_item_ids:
         return "cloud"
+    if item.id in scheduled_item_ids:
+        return "scheduled"
     if item.status == "pending_review":
         return "pending_review"
+    if item.status in {"draft", "exported"}:
+        return item.status
     if (item.review_state or "").lower() in _SKIPPED_REVIEW_STATES:
         return "skipped"
     if item.processed_path:
@@ -95,15 +124,14 @@ def list_items(account_id: int | None = None, limit: int = _LIST_LIMIT) -> list[
     status, and a recency flag. Optionally filtered to one account."""
     with get_session() as session:
         names = {a.id: a.name for a in session.scalars(select(Account)).all()}
-        posted_item_ids = {
-            row
-            for row in session.scalars(
-                select(UploadJob.download_item_id)
+        posted_job_ids: dict[int, int] = {}
+        for job_id, item_id in session.execute(
+            select(UploadJob.id, UploadJob.download_item_id)
                 .where(UploadJob.download_item_id.is_not(None))
                 .where((UploadJob.posted_at.is_not(None)) | (UploadJob.status == "posted"))
-            ).all()
-            if row is not None
-        }
+        ):
+            posted_job_ids[item_id] = max(job_id, posted_job_ids.get(item_id, 0))
+        posted_item_ids = set(posted_job_ids)
         # Items whose publish attempt failed and was never revived — the table
         # must surface these so the user knows to republish.
         failed_item_ids = {
@@ -139,6 +167,20 @@ def list_items(account_id: int | None = None, limit: int = _LIST_LIMIT) -> list[
                 .where(UploadJob.status == "cloud")
             ).all()
             if row is not None
+        }
+        active_job_ids: dict[int, int] = {}
+        for job_id, item_id in session.execute(
+            select(UploadJob.id, UploadJob.download_item_id)
+                .where(UploadJob.download_item_id.is_not(None))
+                .where(UploadJob.posted_at.is_(None))
+                .where(UploadJob.status != "posted")
+        ):
+            active_job_ids[item_id] = max(job_id, active_job_ids.get(item_id, 0))
+        reopened_item_ids = {
+            item_id
+            for item_id, active_job_id in active_job_ids.items()
+            if active_job_id > posted_job_ids.get(item_id, active_job_id)
+            and item_id in posted_job_ids
         }
         query = (
             select(DownloadItem)
@@ -182,7 +224,12 @@ def list_items(account_id: int | None = None, limit: int = _LIST_LIMIT) -> list[
                     "title": row.title,
                     "source_url": row.source_url,
                     "status": _derive_status(
-                        row, posted_item_ids, failed_item_ids, scheduled_item_ids, cloud_item_ids
+                        row,
+                        posted_item_ids,
+                        failed_item_ids,
+                        scheduled_item_ids,
+                        cloud_item_ids,
+                        reopened_item_ids,
                     ),
                     "raw_status": row.status,
                     "review_state": row.review_state,
@@ -303,13 +350,34 @@ def ensure_item_downloaded(item_id: int, *, downloader=None) -> dict:
         account_id = item.account_id
 
     fetch = downloader or download_instagram_url
-    result = fetch(url=source_url, output_dir=downloads_dir() / f"acc_{account_id}")
+    try:
+        result = fetch(url=source_url, output_dir=downloads_dir() / f"acc_{account_id}")
+    except ServiceError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - translate raw downloader failures into a clean, actionable UI message
+        if _looks_like_missing_source(str(exc)):
+            raise SourceUnavailableError(
+                "Instagram returned no media for this clip — the original was most "
+                "likely deleted or made private. Reject it to clear it from the queue. "
+                "(If lots of clips fail to open, your Instagram session may have "
+                "expired — re-login from the dashboard.)"
+            ) from exc
+        raise LibraryError(
+            "Couldn't fetch this clip's original from Instagram. Check your "
+            "connection and Instagram session, then try again — if it keeps "
+            "failing, reject the clip."
+        ) from exc
     file_path = str(result.file_path)
+    # Perceptual fingerprint for cross-repost footage dedup; best-effort so an
+    # unreadable file never blocks opening the clip.
+    content_hash = safe_video_fingerprint(Path(file_path))
     with get_session() as session:
         asset, _ = find_or_register_media_asset(
             session, source_url=source_url, shortcode=shortcode, platform="instagram"
         )
-        mark_media_asset_downloaded(asset, original_download_path=file_path)
+        mark_media_asset_downloaded(
+            asset, original_download_path=file_path, content_hash=content_hash
+        )
         for row in session.scalars(select(DownloadItem).where(DownloadItem.source_url == source_url)).all():
             if row.file_path is None:
                 row.file_path = file_path

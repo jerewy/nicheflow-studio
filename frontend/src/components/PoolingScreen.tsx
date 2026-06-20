@@ -5,9 +5,35 @@ import { Button } from "@/components/ui/button";
 import { DashboardTable } from "@/components/DashboardTable";
 import { formatDate } from "@/lib/format";
 import { bridge } from "@/lib/bridge";
-import type { NicheAccount, PoolSource, PoolSourceClip, PoolingOverview } from "@/types";
+import type {
+  ApifyUsage,
+  NicheAccount,
+  PoolSource,
+  PoolSourceClip,
+  PoolingOverview,
+  ScrapeToPoolResult,
+} from "@/types";
 
-export function PoolingScreen() {
+const SCRAPE_TIMEOUT_MS = 600000;
+
+// Poll a background scrape job until it finishes; resolve with its result or
+// throw its error message. Mirrors ScrapingScreen's poller.
+async function waitForScrapeJob(
+  jobId: string,
+  onProgress?: (value: number, message: string) => void,
+): Promise<unknown> {
+  const deadline = Date.now() + SCRAPE_TIMEOUT_MS;
+  for (;;) {
+    const snapshot = await bridge.getJob(jobId);
+    onProgress?.(snapshot.progress, snapshot.message);
+    if (snapshot.status === "succeeded") return snapshot.result;
+    if (snapshot.status === "failed") throw new Error(snapshot.error ?? "The scrape failed.");
+    if (Date.now() > deadline) throw new Error("The scrape timed out.");
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+}
+
+export function PoolingScreen({ activeAccountId }: { activeAccountId: number }) {
   const [overview, setOverview] = useState<PoolingOverview | null>(null);
   const [niche, setNiche] = useState("history");
   const [sources, setSources] = useState<PoolSource[]>([]);
@@ -21,6 +47,13 @@ export function PoolingScreen() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  const [usage, setUsage] = useState<ApifyUsage | null>(null);
+  const [newSourceUrl, setNewSourceUrl] = useState("");
+  const [scrapeCount, setScrapeCount] = useState(30);
+  const [scraping, setScraping] = useState(false);
+  const [scrapeProgress, setScrapeProgress] = useState<{ value: number; message: string } | null>(
+    null,
+  );
 
   const openClip = (clip: PoolSourceClip) => {
     setSelectedClip(clip);
@@ -39,6 +72,11 @@ export function PoolingScreen() {
       setOverview(nextOverview);
       setSources(nextSources);
       setNicheAccounts(accounts);
+      // Best-effort cost hint; a usage failure must not break the pool screen.
+      bridge
+        .apifyUsage()
+        .then(setUsage)
+        .catch(() => setUsage(null));
       setSource(null);
       setClips([]);
       setSelectedClip(null);
@@ -231,6 +269,49 @@ export function PoolingScreen() {
     0,
   );
 
+  // Scrapes attach a Source to an account, and clips pool by that account's
+  // niche — so the owner must be an account IN the selected niche. Prefer the
+  // globally-active account when it qualifies, else the first niche account.
+  const scrapeOwner =
+    nicheAccounts.find((account) => account.id === activeAccountId) ?? nicheAccounts[0] ?? null;
+
+  // Add a source profile to the niche's owner account and immediately scrape it
+  // into this niche's pool (idempotent: re-adding an existing handle just
+  // refreshes it). Mirrors the Scraping tab so the two stay behaviourally in sync.
+  const addAndScrape = async () => {
+    const url = newSourceUrl.trim();
+    if (!url || !scrapeOwner || scraping) return;
+    if (
+      usage?.over_free_tier &&
+      !window.confirm(
+        "You're over the Apify free tier this month — scraping may incur charges. Continue?",
+      )
+    )
+      return;
+    setScraping(true);
+    setError(null);
+    setMessage(null);
+    setScrapeProgress({ value: 0, message: "Starting…" });
+    try {
+      const created = await bridge.addSource(scrapeOwner.id, url);
+      const { job_id } = await bridge.startSourceScrape(created.id, Math.max(1, scrapeCount));
+      const result = (await waitForScrapeJob(job_id, (value, scrapeMessage) =>
+        setScrapeProgress({ value, message: scrapeMessage }),
+      )) as ScrapeToPoolResult;
+      setNewSourceUrl("");
+      setMessage(
+        `Scraped ${created.label} into ${scrapeOwner.name}: ${result.added} added, ` +
+          `${result.duplicates} duplicate(s) of ${result.scraped} result(s).`,
+      );
+      await load();
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setScraping(false);
+      setScrapeProgress(null);
+    }
+  };
+
   return (
     <section className="space-y-4 rounded-xl border bg-card p-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -336,6 +417,54 @@ export function PoolingScreen() {
         >
           {manualTotal > 0 ? `Distribute now (${manualTotal})` : "Distribute now"}
         </Button>
+      </div>
+      <div className="space-y-2 rounded-md border border-border p-3">
+        <div>
+          <p className="text-sm font-medium">Add source &amp; scrape</p>
+          <p className="text-xs text-muted-foreground">
+            Paste an Instagram profile or hashtag URL to pull its recent posts into this niche&apos;s
+            pool via Apify (deduped). The source is attached to{" "}
+            {scrapeOwner ? <span className="font-medium">{scrapeOwner.name}</span> : "this niche"}.
+            {usage ? ` Apify: ${usage.used} / ${usage.free_cap} used this month.` : ""}
+          </p>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <input
+            type="text"
+            className="h-9 min-w-72 grow rounded-md border border-input bg-background px-3 text-sm text-foreground"
+            placeholder="https://www.instagram.com/<handle>/ or /explore/tags/<tag>"
+            value={newSourceUrl}
+            disabled={scraping || !scrapeOwner}
+            onChange={(event) => setNewSourceUrl(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") void addAndScrape();
+            }}
+          />
+          <label className="flex items-center gap-1 text-xs text-muted-foreground">
+            Posts
+            <input
+              type="number"
+              min={1}
+              className="h-9 w-16 rounded-md border border-input bg-background px-2 text-sm text-foreground"
+              value={scrapeCount}
+              disabled={scraping}
+              onChange={(event) => setScrapeCount(Math.max(1, Number(event.target.value) || 1))}
+            />
+          </label>
+          <Button
+            size="sm"
+            disabled={scraping || !newSourceUrl.trim() || !scrapeOwner}
+            title={!scrapeOwner ? "This niche has no accounts to attach a source to" : undefined}
+            onClick={() => void addAndScrape()}
+          >
+            {scraping ? "Scraping…" : "Add & Scrape"}
+          </Button>
+        </div>
+        {scrapeProgress && (
+          <p className="text-xs text-muted-foreground">
+            {Math.round(scrapeProgress.value * 100)}% · {scrapeProgress.message}
+          </p>
+        )}
       </div>
       <DashboardTable headers={["Source", "Clips", "Newest post"]}>
         {sources.map((row) => (

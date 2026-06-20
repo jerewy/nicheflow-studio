@@ -2,12 +2,36 @@ from __future__ import annotations
 
 import datetime as dt
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, UniqueConstraint, event
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+from nicheflow_studio.core.engagement import source_engagement_rate
 
 
 class Base(DeclarativeBase):
     pass
+
+
+class AccountPostMetric(Base):
+    __tablename__ = "account_post_metrics"
+    __table_args__ = (
+        UniqueConstraint("account_key", "shortcode", name="uq_account_post_metrics_key"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_key: Mapped[str] = mapped_column(String(128))
+    shortcode: Mapped[str] = mapped_column(String(128))
+    caption: Mapped[str | None] = mapped_column(String(65535), nullable=True)
+    timestamp: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reach: Mapped[int] = mapped_column(Integer, default=0)
+    views: Mapped[int] = mapped_column(Integer, default=0)
+    likes: Mapped[int] = mapped_column(Integer, default=0)
+    comments: Mapped[int] = mapped_column(Integer, default=0)
+    saved: Mapped[int] = mapped_column(Integer, default=0)
+    shares: Mapped[int] = mapped_column(Integer, default=0)
+    total_interactions: Mapped[int] = mapped_column(Integer, default=0)
+    conversion_score: Mapped[float] = mapped_column(Float)
+    pulled_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True))
 
 
 class Account(Base):
@@ -206,6 +230,10 @@ class ScrapeCandidate(Base):
     discovery_query: Mapped[str | None] = mapped_column(String(512), nullable=True)
     match_reason: Mapped[str | None] = mapped_column(String(256), nullable=True)
     ranking_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Public engagement per view, (likes+comments)/views, persisted at ingest so
+    # acceptance/distribution can rank without recomputing. Derived by the
+    # before_insert/before_update listener below; legacy rows stay NULL until re-saved.
+    engagement_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
     state: Mapped[str] = mapped_column(String(32), default="candidate")
     queued_download_item_id: Mapped[int | None] = mapped_column(
         ForeignKey("download_items.id"),
@@ -218,6 +246,24 @@ class ScrapeCandidate(Base):
     account: Mapped[Account] = relationship(back_populates="scrape_candidates")
     source: Mapped["Source | None"] = relationship(back_populates="candidates")
     scrape_run: Mapped["ScrapeRun | None"] = relationship(back_populates="candidates")
+
+
+@event.listens_for(ScrapeCandidate, "before_insert")
+@event.listens_for(ScrapeCandidate, "before_update")
+def _populate_scrape_candidate_engagement_rate(
+    _mapper: object, _connection: object, target: ScrapeCandidate
+) -> None:
+    """Keep engagement_rate in sync with the row's own counts on every persist path.
+
+    Covers all construction sites (main_window discovery rows, pool_intake upsert)
+    without threading the value through each caller, and recomputes when counts
+    change on an existing row.
+    """
+    target.engagement_rate = source_engagement_rate(
+        views=target.view_count,
+        likes=target.like_count,
+        comments=target.comment_count,
+    )
 
 
 class Source(Base):
@@ -362,9 +408,7 @@ class PoolItem(Base):
     # Strong evergreen clips may later be reused across more same-niche accounts.
     is_evergreen_candidate: Mapped[int] = mapped_column(Integer, default=0)
     # Explicit capture intent; the clip remains in the shared niche pool.
-    pinned_account_id: Mapped[int | None] = mapped_column(
-        ForeignKey("accounts.id"), nullable=True
-    )
+    pinned_account_id: Mapped[int | None] = mapped_column(ForeignKey("accounts.id"), nullable=True)
 
     media_asset: Mapped[MediaAsset] = relationship(back_populates="pool_items")
     assignments: Mapped[list["Assignment"]] = relationship(back_populates="pool_item")

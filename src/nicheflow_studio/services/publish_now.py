@@ -333,6 +333,10 @@ def _post_and_record(
             if result.posted_url:
                 job.posted_url = result.posted_url
             job.error_message = None
+            if job.download_item_id is not None:
+                item = session.get(DownloadItem, job.download_item_id)
+                if item is not None:
+                    item.status = "posted"
             mark_assignment_posted_for_job(session, job)
         elif result.status == "checkpoint":
             # Instagram flagged the account — retrying makes it worse. Fail the
@@ -367,6 +371,7 @@ def publish_item_now(
     item_id: int,
     *,
     allow_recent: bool = False,
+    force_local: bool = False,
     progress: Callable[[float, str], None] | None = None,
 ) -> dict:
     """Post the item's exported reel to Instagram now (live).
@@ -383,8 +388,9 @@ def publish_item_now(
     is the explicit override.
 
     Cloud-mapped accounts publish via the Cloudflare Worker / Meta Graph API
-    instead of the local browser (see :func:`_publish_item_now_via_cloud`); every
-    other account uses the local Playwright path below.
+    instead of the local browser (see :func:`_publish_item_now_via_cloud`) unless
+    ``force_local`` is True. The force-local path is a manual browser override,
+    not an unattended fallback.
     """
     # Reuse the queue upsert for validation + job creation (raises if the item
     # isn't exported / has no account / is already posted).
@@ -407,7 +413,11 @@ def publish_item_now(
     # so this path never touches the Playwright publish lock.
     from nicheflow_studio.services import cloud_publisher
 
-    if cloud_publisher.is_configured() and cloud_publisher.cloud_account_key_for(account_id):
+    if (
+        not force_local
+        and cloud_publisher.is_configured()
+        and cloud_publisher.cloud_account_key_for(account_id)
+    ):
         return _publish_item_now_via_cloud(item_id, account_id, allow_recent=allow_recent)
 
     # Local Playwright path: serialized, with the recency backstop re-checked

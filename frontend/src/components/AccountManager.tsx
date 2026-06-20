@@ -78,7 +78,10 @@ export function AccountManager({ activeId, onAccountsChanged, onUseAccount }: Ac
   }, [onAccountsChanged]);
 
   useEffect(() => {
-    refreshList();
+    const timer = window.setTimeout(() => {
+      void refreshList();
+    }, 0);
+    return () => window.clearTimeout(timer);
   }, [refreshList]);
 
   const selectAccount = useCallback(async (id: number) => {
