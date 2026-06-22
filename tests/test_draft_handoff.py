@@ -3,7 +3,7 @@ import datetime as dt
 from nicheflow_studio.db.models import AccountPostMetric, Account, DownloadItem
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.processing import smart_drafts
-from nicheflow_studio.services import draft_handoff, draft_revisions
+from nicheflow_studio.services import draft_handoff, draft_revisions, library
 
 
 def _make_item() -> int:
@@ -203,11 +203,14 @@ def test_build_chat_prompt_includes_stored_vision_payload() -> None:
 
 def test_build_account_batch_chat_prompt_has_shared_rules_and_item_delimiters() -> None:
     account_id, item_ids = _make_account_items(2)
+    with get_session() as session:
+        seqs = library.account_sequence_map(session)
 
     prompt = draft_handoff.build_account_batch_chat_prompt(account_id, item_ids)
 
     for index, item_id in enumerate(item_ids, start=1):
-        assert f"===== REEL {index} =====" in prompt
+        # Header echoes the reel number AND the account "#id" import routes by.
+        assert f"===== REEL {index} (#{seqs[item_id]}) =====" in prompt
         assert f"reel_{index}_item{item_id}.jpg" in prompt
     assert prompt.count("On-screen title rules") == 1
     assert prompt.count("Hook framing") == 1
@@ -313,6 +316,58 @@ Caption Option 1: Unknown caption
     assert result["unmatched"] == [third]
     assert draft_revisions.latest_revision(first).title_options == ["First title"]
     assert draft_revisions.latest_revision(second) is None
+
+
+def test_import_account_batch_draft_routes_by_echoed_id_over_reel_number() -> None:
+    # The echoed "(#id)" is more specific than the reel number: when they
+    # disagree (reel numbers crossed), the id wins so each block lands on the
+    # video it was generated for.
+    _account_id, item_ids = _make_account_items(2)
+    first, second = item_ids
+    with get_session() as session:
+        seqs = library.account_sequence_map(session)
+
+    result = draft_handoff.import_account_batch_draft(
+        f"""===== REEL 2 (#{seqs[first]}) =====
+Title Option 1: First title
+Caption Option 1: First caption
+
+===== REEL 1 (#{seqs[second]}) =====
+Title Option 1: Second title
+Caption Option 1: Second caption
+""",
+        item_ids,
+    )
+
+    assert set(result["imported"]) == {first, second}
+    assert result["unmatched"] == []
+    # Routed by #id despite the crossed reel numbers.
+    assert draft_revisions.latest_revision(first).title_options == ["First title"]
+    assert draft_revisions.latest_revision(second).title_options == ["Second title"]
+
+
+def test_import_account_batch_draft_ignores_unknown_id_and_falls_back() -> None:
+    # An echoed id that is not part of this batch (e.g. the model parroted the
+    # frame filename's item id) must be ignored, falling back to the reel number.
+    _account_id, item_ids = _make_account_items(2)
+    first, second = item_ids
+
+    result = draft_handoff.import_account_batch_draft(
+        """===== REEL 1 (#99999) =====
+Title Option 1: First title
+Caption Option 1: First caption
+
+===== REEL 2 (#88888) =====
+Title Option 1: Second title
+Caption Option 1: Second caption
+""",
+        item_ids,
+    )
+
+    assert result["imported"] == [first, second]
+    assert result["unmatched"] == []
+    assert draft_revisions.latest_revision(first).title_options == ["First title"]
+    assert draft_revisions.latest_revision(second).title_options == ["Second title"]
 
 
 def test_parse_pasted_draft_preserves_plain_title_and_recommendation() -> None:

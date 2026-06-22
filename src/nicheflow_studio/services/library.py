@@ -119,6 +119,26 @@ def _derive_status(
     return "new"
 
 
+def account_sequence_map(session) -> dict[int, int]:
+    """Per-account rank of each non-blocked item (oldest = 1), keyed by item id.
+
+    This is the "#N" shown in the Processing/Library table. Computed over ALL
+    items (not a windowed page) so the number is stable, and shared with the
+    batch-draft handoff so a pasted reply that echoes "(#143)" routes to the
+    same video the user saw. Replaces exposing the global, gap-ridden id.
+    """
+    seq_by_item: dict[int, int] = {}
+    account_counters: dict[int | None, int] = {}
+    for seq_id, seq_account_id in session.execute(
+        select(DownloadItem.id, DownloadItem.account_id)
+        .where(DownloadItem.review_state != "blocked")
+        .order_by(DownloadItem.id.asc())
+    ):
+        account_counters[seq_account_id] = account_counters.get(seq_account_id, 0) + 1
+        seq_by_item[seq_id] = account_counters[seq_account_id]
+    return seq_by_item
+
+
 def list_items(account_id: int | None = None, limit: int = _LIST_LIMIT) -> list[dict]:
     """Recent library items (newest first), with account name, derived workflow
     status, and a recency flag. Optionally filtered to one account."""
@@ -192,22 +212,8 @@ def list_items(account_id: int | None = None, limit: int = _LIST_LIMIT) -> list[
         if account_id is not None:
             query = query.where(DownloadItem.account_id == account_id)
         rows = session.scalars(query).all()
-        # Per-account sequence numbers shown as "#N" in the Processing table.
-        # An item's number is its rank among its own account's (non-blocked)
-        # items, oldest = 1, so each niche reads as a clean running count: the
-        # newest item's number == how many clips that account has accumulated.
-        # Computed over ALL items (not just the loaded window) so the number is
-        # stable and accurate even though the list is capped at `limit`. This
-        # replaces exposing the global, gap-ridden primary key.
-        seq_by_item: dict[int, int] = {}
-        account_counters: dict[int | None, int] = {}
-        for seq_id, seq_account_id in session.execute(
-            select(DownloadItem.id, DownloadItem.account_id)
-            .where(DownloadItem.review_state != "blocked")
-            .order_by(DownloadItem.id.asc())
-        ):
-            account_counters[seq_account_id] = account_counters.get(seq_account_id, 0) + 1
-            seq_by_item[seq_id] = account_counters[seq_account_id]
+        # Per-account "#N" shown in the Processing table (see account_sequence_map).
+        seq_by_item = account_sequence_map(session)
         now = dt.datetime.now(dt.timezone.utc)
         items = []
         for row in rows:

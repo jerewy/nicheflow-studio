@@ -41,15 +41,19 @@ _NOTE_LINE = re.compile(r"^option\s*(\d+)\s*:\s*(.*)$", re.IGNORECASE)
 # not selection notes, and because they trail the final block they otherwise
 # bleed into that reel's last note. Drop them when building notes.
 _CITATION_LINE = re.compile(r"^\[\d+\]\s*:|^https?://\S+$", re.IGNORECASE)
-# A reel header line in a pasted batch reply. We route by the REEL NUMBER, not by
-# any database id, because ChatGPT reliably reproduces "Reel 1" / "REEL 2" but
-# routinely mangles or drops an opaque "item 402" tag and the trailing "=====".
-# Tolerant of: leading/trailing "=", markdown (** , ## ), an optional "#", and a
-# trailing "| item N | label" the model may or may not echo. A normal prose line
-# like "Reel 1 of the series" is rejected because the char after the number must
-# be a delimiter (:|)-=#*_ ), not a letter.
+# A reel header line in a pasted batch reply. Primary routing is by the REEL
+# NUMBER (group 1), which models reproduce reliably. The prompt also asks the
+# model to echo the account-relative "(#id)" (group 2); when it survives, import
+# prefers it because it pins the block to a specific video regardless of order.
+# An absent/garbled id just leaves group 2 None and falls back to the reel number
+# — the id never misroutes on its own. Tolerant of: leading/trailing "=", markdown
+# (** , ## ), an optional "#", and a trailing "| item N | label" the model may or
+# may not echo. A normal prose line like "Reel 1 of the series" is rejected
+# because the char after the number must be a delimiter (:|)-=#*_ ), not a letter.
 _REEL_HEADER = re.compile(
-    r"^\s*(?:[*_#=]+\s*)?reel\s*#?\s*(\d+)\s*(?:[:|)\-=#*_].*)?$",
+    r"^\s*(?:[*_#=]+\s*)?reel\s*#?\s*(\d+)"
+    r"(?:\s*\(\s*#?\s*(\d+)\s*\))?"
+    r"\s*(?:[:|)\-=#*_].*)?$",
     re.IGNORECASE,
 )
 
@@ -273,10 +277,14 @@ def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
     )
 
 
-def _batch_item_delimiter(index: int) -> str:
-    # Keep the header to just the reel number. The id and the title (which starts
-    # with a confusing "#NNN") used to live here and the model echoed the wrong
-    # number; routing is by reel number now, so the header carries only that.
+def _batch_item_delimiter(index: int, seq: int | None) -> str:
+    # Header carries the reel number (which models reproduce reliably) plus the
+    # account-relative "#id" the user sees in the list. Import prefers the #id
+    # when it survives and falls back to the reel number otherwise, and it
+    # validates the #id against this batch — so a dropped or garbled id never
+    # misroutes (the failure that retired the older id-in-header scheme).
+    if seq is not None:
+        return f"===== REEL {index} (#{seq}) ====="
     return f"===== REEL {index} ====="
 
 
@@ -332,8 +340,10 @@ def _account_prompt_header(
         "",
         "Return one block per reel, one for every reel, in order.",
         "START each reel's block with its own header line that is exactly:",
-        "===== REEL <n> =====",
-        "using the same reel number shown in that reel's context below (REEL 1, REEL 2, ...).",
+        "===== REEL <n> (#<id>) =====",
+        "copying BOTH the reel number and the (#id) exactly as shown in that reel's "
+        "context below (for example '===== REEL 1 (#143) ====='). The (#id) is how the "
+        "app files each reply to the correct video, so never change, drop, or invent it.",
         "Do not rename, renumber, merge, or skip any reel, even if two clips look similar.",
         "Inside each block, use this exact plain-text format:",
         "Title Option 1:",
@@ -351,12 +361,12 @@ def _account_prompt_header(
     ]
 
 
-def _batch_item_context(index: int, item: DownloadItem) -> list[str]:
+def _batch_item_context(index: int, item: DownloadItem, seq: int | None) -> list[str]:
     transcript = (item.transcript_text or "").strip() or "(none)"
     vision_text = (item.smart_vision_payload or "").strip() or "(none)"
     frame_name = f"reel_{index}_item{item.id}.jpg"
     return [
-        _batch_item_delimiter(index),
+        _batch_item_delimiter(index, seq),
         f"Attach and inspect image file: {frame_name}",
         f"Source title: {item.title or '(none)'}",
         f"Source URL: {item.source_url or '(none)'}",
@@ -393,48 +403,75 @@ def build_account_batch_chat_prompt(
                 f"Item(s) not found for this account: {', '.join(map(str, missing))}."
             )
         ordered = [by_id[item_id] for item_id in ids]
+        # Lazy import: keep draft_handoff free of library's downloader import chain.
+        from nicheflow_studio.services import library
+
+        seq_by_item = library.account_sequence_map(session)
         lines = _account_prompt_header(account, settings=settings, item_ids=ids)
         lines.extend(["", "Reel contexts:"])
         for index, item in enumerate(ordered, start=1):
-            lines.extend(["", *_batch_item_context(index, item)])
+            lines.extend(["", *_batch_item_context(index, item, seq_by_item.get(item.id))])
     return "\n".join(lines)
 
 
-def _split_batch_blocks(text: str) -> dict[int, str]:
-    """Split a pasted reply into blocks keyed by 1-based REEL NUMBER.
+def _split_batch_blocks(text: str) -> dict[int, tuple[int | None, str]]:
+    """Split a pasted reply into blocks keyed by 1-based REEL NUMBER, each paired
+    with the echoed ``(#id)`` from its header (``None`` when the model dropped it).
 
-    A repeated header for the same reel keeps the first block (later headers are
-    treated as continuations of nothing useful and ignored).
+    A repeated header for the same reel keeps the first block and its id (later
+    headers are treated as continuations of nothing useful and ignored).
     """
     blocks: dict[int, list[str]] = {}
+    echoed: dict[int, int | None] = {}
     current_reel: int | None = None
     for line in (text or "").splitlines():
         match = _REEL_HEADER.match(line.strip())
         if match:
             current_reel = int(match.group(1))
-            blocks.setdefault(current_reel, [])
+            if current_reel not in blocks:
+                blocks[current_reel] = []
+                echoed[current_reel] = int(match.group(2)) if match.group(2) else None
             continue
         if current_reel is not None:
             blocks[current_reel].append(line)
-    return {reel: "\n".join(lines).strip() for reel, lines in blocks.items()}
+    return {reel: (echoed[reel], "\n".join(lines).strip()) for reel, lines in blocks.items()}
+
+
+def _batch_seq_to_item(item_ids: list[int]) -> dict[int, int]:
+    """Map {account "#id" -> item_id} for this batch, so a reply that echoes a
+    "(#143)" routes to the exact video. Batch items share one account, so their
+    per-account sequence numbers are unique within the batch."""
+    if not item_ids:
+        return {}
+    # Lazy import: keep draft_handoff free of library's downloader import chain.
+    from nicheflow_studio.services import library
+
+    with get_session() as session:
+        seq_by_item = library.account_sequence_map(session)
+    return {seq_by_item[item_id]: item_id for item_id in item_ids if item_id in seq_by_item}
 
 
 def import_account_batch_draft(text: str, item_ids: list[int]) -> dict:
-    """Import a batch reply, mapping each ``REEL <n>`` block to the n-th requested
-    item. Routing is by reel number (which the model preserves), not by any id the
-    model echoes — so a reordered, re-headed, or id-stripped reply still lands on
-    the right reels."""
+    """Import a batch reply. Each block routes to a specific item by the echoed
+    ``(#id)`` when it names an item in this batch (most reliable — survives
+    reordering and reel-number drift), otherwise by REEL NUMBER position. An
+    ``(#id)`` that is not part of this batch (e.g. the model parroted a frame
+    filename's item id) is ignored and the reel number is used instead, so a
+    garbled id never misroutes."""
     requested = [int(item_id) for item_id in item_ids]
+    seq_to_item = _batch_seq_to_item(requested)
     blocks_by_reel = _split_batch_blocks(text)
     imported: list[int] = []
     failed: list[dict] = []
     seen: set[int] = set()
-    for reel, block in sorted(blocks_by_reel.items()):
-        if reel < 1 or reel > len(requested):
-            continue  # a reel number outside this batch — ignore it
-        item_id = requested[reel - 1]
+    for reel, (echoed_id, block) in sorted(blocks_by_reel.items()):
+        item_id = seq_to_item.get(echoed_id) if echoed_id is not None else None
+        if item_id is None:
+            if reel < 1 or reel > len(requested):
+                continue  # reel number outside this batch and no valid id — ignore it
+            item_id = requested[reel - 1]
         if item_id in seen:
-            continue  # duplicate reel header — first block wins
+            continue  # duplicate target — first block wins
         seen.add(item_id)
         try:
             import_pasted_draft(item_id, block)

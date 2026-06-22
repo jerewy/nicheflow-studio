@@ -202,6 +202,9 @@ export function ProcessingScreen({
   const [preparedBatch, setPreparedBatch] = useState<{ id: number; label: string }[] | null>(
     null,
   );
+  // Ids the user hand-picked (via list checkboxes) for the next batch; empty =
+  // fall back to the auto "first N draftless" window.
+  const [manualBatchIds, setManualBatchIds] = useState<number[]>([]);
   const [workflow, setWorkflow] = useState<WorkflowSettings | null>(null);
   const [finalTitle, setFinalTitle] = useState("");
   const [finalCaption, setFinalCaption] = useState("");
@@ -1026,8 +1029,21 @@ export function ProcessingScreen({
       candidate.review_state !== "rejected",
   );
 
-  const selectedBatchItems = draftableItems.slice(0, Math.max(1, batchSize));
+  // Hand-picked batch: when the user ticks rows, those drive the batch (in list
+  // order) instead of the auto "first N draftless" window — this is what lets
+  // them re-pick an already-drafted reel (e.g. #143) to regenerate it. Derived
+  // from the full `items` so a pick survives search/status filtering.
+  const manualBatchItems = items.filter((candidate) => manualBatchIds.includes(candidate.id));
+  const isManualBatch = manualBatchItems.length > 0;
+  const selectedBatchItems = isManualBatch
+    ? manualBatchItems
+    : draftableItems.slice(0, Math.max(1, batchSize));
   const selectedBatchIds = selectedBatchItems.map((candidate) => candidate.id);
+
+  const toggleBatchSelection = (id: number) =>
+    setManualBatchIds((prev) =>
+      prev.includes(id) ? prev.filter((existing) => existing !== id) : [...prev, id],
+    );
 
   const prepareBatchDraft = async () => {
     if (!selectedBatchIds.length) {
@@ -1052,7 +1068,9 @@ export function ProcessingScreen({
       setPreparedBatch(
         selectedBatchItems.map((candidate) => ({
           id: candidate.id,
-          label: `#${candidate.account_seq ?? candidate.id}`,
+          label: `#${candidate.account_seq ?? candidate.id}${
+            candidate.title ? ` ${candidate.title}` : ""
+          }`,
         })),
       );
       setHandoffMessage(
@@ -1090,6 +1108,7 @@ export function ProcessingScreen({
       // can be re-imported to the same reels; clear it only on a clean import.
       if (!result.failed.length && !result.unmatched.length) {
         setPreparedBatch(null);
+        setManualBatchIds([]);
       }
       refreshItems(activeAccountId);
       if (itemId !== null && result.imported.includes(itemId)) {
@@ -1334,6 +1353,9 @@ export function ProcessingScreen({
             <table className="w-full table-fixed text-left text-sm">
               <thead className="sticky top-0 bg-muted text-xs text-muted-foreground">
                 <tr>
+                  <th className="w-10 px-2 py-2 text-center font-medium" title="Tick to add to batch">
+                    Batch
+                  </th>
                   <th className="w-36 px-3 py-2 font-medium">Status</th>
                   <th className="px-3 py-2 font-medium">Title</th>
                   <th className="w-24 px-3 py-2 font-medium">Added</th>
@@ -1353,6 +1375,18 @@ export function ProcessingScreen({
                       }`}
                       onClick={() => switchItem(candidate.id)}
                     >
+                      <td
+                        className="px-2 py-1 text-center"
+                        onClick={(event) => event.stopPropagation()}
+                      >
+                        <input
+                          type="checkbox"
+                          className="h-4 w-4 cursor-pointer align-middle"
+                          checked={manualBatchIds.includes(candidate.id)}
+                          onChange={() => toggleBatchSelection(candidate.id)}
+                          title="Add this reel to the batch"
+                        />
+                      </td>
                       <td className="px-2 py-1" onClick={(event) => event.stopPropagation()}>
                         <span className="flex items-center gap-1.5">
                           <span className={`h-2.5 w-2.5 shrink-0 rounded-full ${meta.dot}`} />
@@ -1661,23 +1695,48 @@ export function ProcessingScreen({
                   type="number"
                   min="1"
                   max="20"
-                  className="h-9 w-24 rounded-md border border-input bg-transparent px-2 text-sm text-foreground"
+                  className="h-9 w-24 rounded-md border border-input bg-transparent px-2 text-sm text-foreground disabled:opacity-50"
                   value={batchSize}
+                  disabled={isManualBatch}
+                  title={
+                    isManualBatch
+                      ? "Using your ticked selection; batch size applies only to auto mode."
+                      : undefined
+                  }
                   onChange={(event) =>
                     setBatchSize(Math.max(1, Number(event.target.value) || 1))
                   }
                 />
               </label>
             </div>
-            <p className="text-xs text-muted-foreground">
-              {selectedBatchItems.length} selected for the next batch from{" "}
-              {draftableItems.length} draftless reel(s).
-            </p>
+            <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+              {isManualBatch ? (
+                <>
+                  <span>{selectedBatchItems.length} hand-picked reel(s) selected.</span>
+                  <button
+                    type="button"
+                    className="underline hover:text-foreground"
+                    onClick={() => setManualBatchIds([])}
+                  >
+                    Clear selection
+                  </button>
+                </>
+              ) : (
+                <span>
+                  {selectedBatchItems.length} selected for the next batch from{" "}
+                  {draftableItems.length} draftless reel(s). Tick rows in the list to pick
+                  specific reels (including ones that already have a draft).
+                </span>
+              )}
+            </div>
             {selectedBatchItems.length > 0 && (
               <div className="flex flex-wrap gap-1">
                 {selectedBatchItems.map((candidate, index) => (
-                  <Badge key={candidate.id} variant="secondary">
-                    Reel {index + 1}: #{candidate.account_seq ?? candidate.id}
+                  <Badge key={candidate.id} variant="secondary" className="max-w-[18rem]">
+                    <span className="truncate">
+                      Reel {index + 1}: #{candidate.account_seq ?? candidate.id}{" "}
+                      {candidate.title ?? ""}
+                    </span>
                   </Badge>
                 ))}
               </div>
@@ -1690,8 +1749,10 @@ export function ProcessingScreen({
                 </p>
                 <div className="flex flex-wrap gap-1">
                   {preparedBatch.map((entry, index) => (
-                    <Badge key={entry.id} variant="outline">
-                      Reel {index + 1}: {entry.label}
+                    <Badge key={entry.id} variant="outline" className="max-w-[18rem]">
+                      <span className="truncate">
+                        Reel {index + 1}: {entry.label}
+                      </span>
                     </Badge>
                   ))}
                 </div>
