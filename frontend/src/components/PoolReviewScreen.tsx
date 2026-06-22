@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { bridge } from "@/lib/bridge";
@@ -59,6 +59,27 @@ function metricLine(item: PoolReviewItem): string {
 
 const GRID_COLS = "grid-cols-[2.5rem_6rem_minmax(0,1fr)_9rem_10rem_18rem]";
 
+// Render the queue in batches and grow it on scroll. The backend returns every
+// pending row in one query, but rendering hundreds at once (each firing a
+// thumbnail request) is slow and makes the page huge — so the list is windowed.
+const ROW_BATCH = 12;
+
+// Per-row download/approve progress. Presence in the map means the row is busy.
+interface ApproveProgress {
+  value: number;
+  message: string;
+}
+
+// Dependency-free spinner; inherits the surrounding text color via border-current.
+function Spinner() {
+  return (
+    <span
+      className="inline-block h-3 w-3 shrink-0 animate-spin rounded-full border-2 border-current border-t-transparent"
+      aria-hidden
+    />
+  );
+}
+
 export function PoolReviewScreen() {
   const [niche, setNiche] = useState("history");
   const [sourceFilter, setSourceFilter] = useState("");
@@ -68,6 +89,13 @@ export function PoolReviewScreen() {
   const [message, setMessage] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [thumbErrors, setThumbErrors] = useState<Record<number, boolean>>({});
+  // Rows currently downloading-then-approving, keyed by pool_item_id.
+  const [approving, setApproving] = useState<Record<number, ApproveProgress>>({});
+  const [approveErrors, setApproveErrors] = useState<Record<number, string>>({});
+  // Infinite-scroll window: how many rows are rendered, grown by ROW_BATCH as the
+  // bottom sentinel scrolls into view.
+  const [visibleCount, setVisibleCount] = useState(ROW_BATCH);
+  const sentinelRef = useRef<HTMLDivElement | null>(null);
 
   // Preview modal state.
   const [previewItem, setPreviewItem] = useState<PoolReviewItem | null>(null);
@@ -81,6 +109,7 @@ export function PoolReviewScreen() {
     setLoading(true);
     try {
       setItems(await bridge.poolReviewQueue(niche, sourceFilter.trim() || null));
+      setVisibleCount(ROW_BATCH);
       setThumbErrors({});
       setMessage(null);
     } catch (err: unknown) {
@@ -97,6 +126,22 @@ export function PoolReviewScreen() {
     return () => window.clearTimeout(timer);
   }, [load]);
 
+  // Grow the rendered window when the bottom sentinel nears the viewport.
+  useEffect(() => {
+    const node = sentinelRef.current;
+    if (!node) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0]?.isIntersecting) {
+          setVisibleCount((count) => Math.min(count + ROW_BATCH, items.length));
+        }
+      },
+      { rootMargin: "300px" },
+    );
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [items.length, visibleCount]);
+
   const toggle = (poolItemId: number) => {
     setSelected((current) =>
       current.includes(poolItemId)
@@ -105,15 +150,57 @@ export function PoolReviewScreen() {
     );
   };
 
+  // Approving downloads the clip's footage first (so it's on disk and reused at
+  // distribution), then flips the pool item to accepted. Downloads serialize on
+  // the backend, so we process ids sequentially and surface per-row progress.
   const approve = async (ids: number[]) => {
-    try {
-      const result = await bridge.approvePoolItems(ids);
-      setSelected((current) => current.filter((id) => !ids.includes(id)));
-      setMessage(`${result.approved} approved.`);
-      await load();
-    } catch (err: unknown) {
-      setMessage(err instanceof Error ? err.message : String(err));
+    if (!ids.length) return;
+    setApproveErrors((current) => {
+      const next = { ...current };
+      for (const id of ids) delete next[id];
+      return next;
+    });
+    setApproving((current) => {
+      const next = { ...current };
+      for (const id of ids) next[id] = { value: 0, message: "Queued…" };
+      return next;
+    });
+
+    let approved = 0;
+    const failed: number[] = [];
+    for (const id of ids) {
+      try {
+        setApproving((current) => ({ ...current, [id]: { value: 0, message: "Starting…" } }));
+        const { job_id } = await bridge.startPoolItemPreviewDownload(id);
+        await waitForJob(job_id, (value, message) =>
+          setApproving((current) => ({
+            ...current,
+            [id]: { value, message: message || "Downloading…" },
+          })),
+        );
+        await bridge.approvePoolItems([id]);
+        approved += 1;
+      } catch (err: unknown) {
+        failed.push(id);
+        setApproveErrors((current) => ({
+          ...current,
+          [id]: err instanceof Error ? err.message : String(err),
+        }));
+      } finally {
+        setApproving((current) => {
+          const next = { ...current };
+          delete next[id];
+          return next;
+        });
+      }
     }
+
+    setSelected((current) => current.filter((id) => !ids.includes(id)));
+    await load();
+    // load() clears the status line, so set the result message after it.
+    setMessage(
+      failed.length ? `${approved} approved, ${failed.length} failed.` : `${approved} approved.`,
+    );
   };
 
   const reject = async (item: PoolReviewItem) => {
@@ -170,6 +257,8 @@ export function PoolReviewScreen() {
     }
   };
 
+  const bulkApproving = Object.keys(approving).length > 0;
+
   return (
     <div className="mx-auto max-w-6xl space-y-4 p-6">
       <div className="flex flex-wrap items-end justify-between gap-3">
@@ -177,6 +266,10 @@ export function PoolReviewScreen() {
           <h1 className="text-2xl font-semibold tracking-tight">Review</h1>
           <p className="text-sm text-muted-foreground">
             {loading ? "Loading clips…" : `${items.length} pending clip(s)`}
+          </p>
+          <p className="mt-0.5 text-xs text-muted-foreground/80">
+            Ranked by fit score (tier weight × engagement rate × recency). The Tier badge is topic
+            only — it doesn&apos;t set the order, so a high-engagement Tier A can outrank a Tier S.
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -203,8 +296,12 @@ export function PoolReviewScreen() {
           <Button size="sm" variant="outline" disabled={loading} onClick={() => void load()}>
             {loading ? "Refreshing..." : "Refresh"}
           </Button>
-          <Button size="sm" disabled={!selected.length} onClick={() => void approve(selected)}>
-            Approve selected
+          <Button
+            size="sm"
+            disabled={!selected.length || bulkApproving}
+            onClick={() => void approve(selected)}
+          >
+            {bulkApproving ? "Approving…" : "Approve selected"}
           </Button>
         </div>
       </div>
@@ -241,7 +338,7 @@ export function PoolReviewScreen() {
             </div>
           ))}
 
-        {items.map((item) => (
+        {items.slice(0, visibleCount).map((item) => (
           <div
             key={item.pool_item_id}
             className={`grid ${GRID_COLS} items-center gap-0 border-t border-border px-3 py-3`}
@@ -261,6 +358,7 @@ export function PoolReviewScreen() {
                 <img
                   src={item.thumbnail_url}
                   alt=""
+                  loading="lazy"
                   className="h-full w-full object-cover"
                   onError={() =>
                     setThumbErrors((current) => ({ ...current, [item.pool_item_id]: true }))
@@ -291,34 +389,70 @@ export function PoolReviewScreen() {
             </div>
             <div className="space-y-1 text-xs">
               <div className="flex items-center gap-1.5">
-                <span className="rounded-full bg-emerald-500/15 px-2 py-1 font-medium text-emerald-500">
+                <span
+                  className="rounded-full bg-emerald-500/15 px-2 py-1 font-medium text-emerald-500"
+                  title="Topic tier from keyword match (subject only). Does not set the row order."
+                >
                   Tier {item.topic_tier}
                 </span>
-                <span className="uppercase text-muted-foreground">{item.suggested_action}</span>
+                <span
+                  className="uppercase text-muted-foreground"
+                  title="Advisory only. REJECT also flags clips longer than 35s, regardless of tier."
+                >
+                  {item.suggested_action}
+                </span>
               </div>
-              <div className="text-muted-foreground">
+              <div
+                className="text-muted-foreground"
+                title="ER = engagement rate. Fit score = tier weight × ER × recency, and sets the sort order."
+              >
                 ER {(item.source_er * 100).toFixed(1)}% · {item.fit_score.toFixed(3)}
               </div>
             </div>
-            <div className="flex flex-wrap items-center gap-2">
-              <Button size="sm" onClick={() => void approve([item.pool_item_id])}>
-                Approve
-              </Button>
-              <input
-                className="h-8 w-32 rounded-md border border-input bg-transparent px-2 text-xs"
-                placeholder="Reason"
-                value={rejectReasons[item.pool_item_id] ?? ""}
-                onChange={(event) =>
-                  setRejectReasons((current) => ({
-                    ...current,
-                    [item.pool_item_id]: event.target.value,
-                  }))
-                }
-              />
-              <Button size="sm" variant="destructive" onClick={() => void reject(item)}>
-                Reject
-              </Button>
-            </div>
+            {approving[item.pool_item_id] ? (
+              <div className="space-y-1.5">
+                <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <Spinner />
+                  <span className="truncate">
+                    {approving[item.pool_item_id].message} ·{" "}
+                    {Math.round(approving[item.pool_item_id].value * 100)}%
+                  </span>
+                </div>
+                <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+                  <div
+                    className="h-full rounded-full bg-emerald-500 transition-all duration-300"
+                    style={{
+                      width: `${Math.max(Math.round(approving[item.pool_item_id].value * 100), 8)}%`,
+                    }}
+                  />
+                </div>
+              </div>
+            ) : (
+              <div className="space-y-1">
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button size="sm" onClick={() => void approve([item.pool_item_id])}>
+                    Approve
+                  </Button>
+                  <input
+                    className="h-8 w-32 rounded-md border border-input bg-transparent px-2 text-xs"
+                    placeholder="Reason"
+                    value={rejectReasons[item.pool_item_id] ?? ""}
+                    onChange={(event) =>
+                      setRejectReasons((current) => ({
+                        ...current,
+                        [item.pool_item_id]: event.target.value,
+                      }))
+                    }
+                  />
+                  <Button size="sm" variant="destructive" onClick={() => void reject(item)}>
+                    Reject
+                  </Button>
+                </div>
+                {approveErrors[item.pool_item_id] && (
+                  <p className="text-xs text-destructive">{approveErrors[item.pool_item_id]}</p>
+                )}
+              </div>
+            )}
           </div>
         ))}
 
@@ -326,6 +460,18 @@ export function PoolReviewScreen() {
           <p className="border-t border-border px-3 py-8 text-center text-sm text-muted-foreground">
             No pending clips.
           </p>
+        )}
+
+        {!loading && visibleCount < items.length && (
+          <div
+            ref={sentinelRef}
+            className="flex items-center justify-center gap-2 border-t border-border px-3 py-4 text-xs text-muted-foreground"
+          >
+            <Spinner />
+            <span>
+              Showing {visibleCount} of {items.length}…
+            </span>
+          </div>
         )}
       </div>
 
