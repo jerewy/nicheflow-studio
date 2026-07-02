@@ -172,6 +172,7 @@ function SlotActionsPopover({
   onRemove,
   onOpenVideo,
   onEditInProcessing,
+  onForcePublish,
   onClose,
 }: {
   slot: ScheduleCoverageSlot;
@@ -181,6 +182,7 @@ function SlotActionsPopover({
   onRemove: (jobId: number) => void;
   onOpenVideo: (jobId: number) => void;
   onEditInProcessing?: (itemId: number | null, search: string) => void;
+  onForcePublish: (jobId: number) => void;
   onClose: () => void;
 }) {
   const [fillJobId, setFillJobId] = useState("");
@@ -274,6 +276,9 @@ function SlotActionsPopover({
         <p className="truncate text-xs font-medium" title={slot.job_title ?? undefined}>
           {slot.job_title ?? `Job ${jobId}`}
         </p>
+        {slot.state === "cloud" && slot.note && (
+          <p className="text-xs text-amber-500">{slot.note}</p>
+        )}
         <label className="grid gap-1 text-xs text-muted-foreground">
           Change time
           <input
@@ -320,6 +325,26 @@ function SlotActionsPopover({
           Open video
         </Button>
         {editInProcessingButton}
+        {slot.state === "cloud" && (
+          <Button
+            size="sm"
+            variant="outline"
+            className="w-full border-amber-500/50 text-amber-500 hover:bg-amber-500/10"
+            onClick={() => {
+              if (
+                window.confirm(
+                  "This bypasses the account's daily-limit/cooldown safety check and " +
+                    "posts immediately. It increases automation-flag risk. Continue?",
+                )
+              ) {
+                onForcePublish(jobId);
+              }
+              onClose();
+            }}
+          >
+            Force publish now
+          </Button>
+        )}
       </>
     );
   }
@@ -353,6 +378,7 @@ function ScheduleCoveragePanel({
   onRemoveSlot,
   onOpenVideo,
   onEditInProcessing,
+  onForcePublish,
 }: {
   coverage: ScheduleCoverage | null;
   selectedAccountId: number | null;
@@ -363,6 +389,7 @@ function ScheduleCoveragePanel({
   onRemoveSlot: (jobId: number) => void;
   onOpenVideo: (jobId: number) => void;
   onEditInProcessing?: (accountId: number, itemId: number | null, search: string) => void;
+  onForcePublish: (jobId: number) => void;
 }) {
   const [openSlot, setOpenSlot] = useState<string | null>(null);
   // Switching accounts swaps the whole grid; close any stale popover. Resetting
@@ -446,10 +473,11 @@ function ScheduleCoveragePanel({
                       <strong>{slot.slot}</strong>
                       <span className="text-xs font-medium">{slotStatusLabel(slot)}</span>
                     </div>
-                    <p className="mt-1 truncate text-xs opacity-80">
+                    <p className="mt-1 truncate text-xs opacity-80" title={slot.note ?? undefined}>
                       {slot.scheduled_at
                         ? `${new Date(slot.scheduled_at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })} · ${slot.job_title ?? `Job ${slot.job_id}`}`
                         : "No matching job"}
+                      {slot.state === "cloud" && slot.note ? ` — ${slot.note}` : ""}
                     </p>
                   </button>
                   {openSlot === slot.slot_at && (
@@ -466,6 +494,7 @@ function ScheduleCoveragePanel({
                               onEditInProcessing(account.account_id, itemId, search)
                           : undefined
                       }
+                      onForcePublish={onForcePublish}
                       onClose={() => setOpenSlot(null)}
                     />
                   )}
@@ -690,6 +719,12 @@ export function MultiAccountPublish({
           run(() => bridge.dashboardOpenOutput(jobId), "Opened reel output.")
         }
         onEditInProcessing={onOpenInProcessing}
+        onForcePublish={(jobId) =>
+          run(
+            () => bridge.dashboardForcePublishCloudJob(jobId),
+            "Forced publish — bypassing the safety cooldown.",
+          )
+        }
       />
       {queue && (
         <p className="text-sm text-muted-foreground">

@@ -465,7 +465,19 @@ export interface ScheduleCoverageSlot {
   item_id: number | null;
   job_title: string | null;
   scheduled_at: string | null;
+  // Reason the Worker hasn't posted a 'cloud' job yet (e.g. same-account
+  // cooldown), or null when there's nothing to report.
+  note: string | null;
   timing: "on_time" | "late" | null;
+}
+
+export interface CloudAccountSettings {
+  account_key: string;
+  instagram_user_id: string;
+  token_secret_name: string;
+  enabled: boolean;
+  daily_limit: number;
+  min_gap_minutes: number;
 }
 
 export interface ScheduleCoverageAccount {

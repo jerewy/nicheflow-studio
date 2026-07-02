@@ -584,6 +584,28 @@ def _auto_schedule_for_publish(
     return result
 
 
+def force_publish_cloud_job(job_id: int) -> dict:
+    """Bypass the Worker's daily_limit/min_gap safety gate for one cloud job.
+
+    A deliberate manual override for a job stuck 'scheduled' on the Worker
+    because of the account-safety cooldown -- it never touches the account's
+    settings or any other job. Raises :class:`PublishError` if there's no
+    pending Worker job to force (already published, canceled, or never handed
+    off).
+    """
+    from nicheflow_studio.services import cloud_publisher
+
+    if not cloud_publisher.is_configured():
+        raise PublishError("Cloud publisher is not configured.")
+    try:
+        worker = _latest_worker_job_for_local(cloud_publisher.list_jobs().get("jobs", []), job_id)
+        if worker is None or worker.get("status") != "scheduled":
+            raise PublishError("No pending cloud job to force for this item.")
+        return cloud_publisher.force_run_job(worker["id"])
+    except cloud_publisher.CloudPublisherError as exc:
+        raise PublishError(f"Force publish failed: {exc}") from exc
+
+
 def sync_cloud_jobs() -> dict:
     """Pull job states from the Cloudflare Worker and update local ``cloud`` jobs.
 
@@ -633,7 +655,18 @@ def sync_cloud_jobs() -> dict:
                 job.status = "failed"
                 job.error_message = (worker.get("error_message") or f"cloud job {wstatus}")[:512]
                 updated += 1
-            # validated / scheduled / processing -> still 'cloud' (no change yet)
+            elif wstatus in ("scheduled", "processing"):
+                # Still pending, but the Worker may have set a reason it hasn't
+                # posted yet (e.g. daily_limit/min_gap cooldown) -- surface it as
+                # a note so the dashboard doesn't just show blank "Cloud" while
+                # a job silently waits. Status stays 'cloud'; this is never a
+                # failure, so other views (which key error display off
+                # status == 'failed') are unaffected.
+                note = (worker.get("error_message") or "").strip()[:512] or None
+                if note != job.error_message:
+                    job.error_message = note
+                    updated += 1
+            # validated -> still 'cloud' (no change yet)
         if updated:
             session.commit()
     return {"synced": True, "updated": updated}

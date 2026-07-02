@@ -15,6 +15,7 @@ import type {
   ApplyResult,
   BatchDraftImportResult,
   BatchFramesResult,
+  CloudAccountSettings,
   CloudPublisherHealth,
   CropRect,
   DeleteAccountResult,
@@ -242,6 +243,14 @@ interface PywebviewApi {
   dashboard_publish_jobs(): Promise<Envelope<DashboardPublishQueue>>;
   dashboard_schedule_coverage(): Promise<Envelope<ScheduleCoverage>>;
   cloud_publisher_health(): Promise<Envelope<CloudPublisherHealth>>;
+  dashboard_cloud_account_settings(accountId: number): Promise<Envelope<CloudAccountSettings | null>>;
+  dashboard_update_cloud_account_settings(
+    accountId: number,
+    dailyLimit: number,
+    minGapMinutes: number,
+    enabled: boolean,
+  ): Promise<Envelope<CloudAccountSettings>>;
+  dashboard_force_publish_cloud_job(jobId: number): Promise<Envelope<{ id: string; forced: boolean }>>;
   dashboard_account_stats(activeAccountId: number): Promise<Envelope<DashboardAccountStats>>;
   dashboard_mark_ready(jobIds: number[]): Promise<Envelope<{ updated: number }>>;
   dashboard_open_output(jobId: number): Promise<Envelope<{ opened: string }>>;
@@ -859,6 +868,7 @@ export const bridge = {
                     item_id: 101,
                     job_title: "Mock posted reel",
                     scheduled_at: new Date().toISOString(),
+                    note: null,
                     timing: "on_time",
                   },
                   {
@@ -869,6 +879,7 @@ export const bridge = {
                     item_id: 102,
                     job_title: "Mock cloud reel",
                     scheduled_at: new Date(Date.now() + 3_600_000).toISOString(),
+                    note: "same-account cooldown until " + new Date(Date.now() + 3_600_000).toISOString(),
                     timing: "late",
                   },
                 ],
@@ -887,6 +898,7 @@ export const bridge = {
                     item_id: null,
                     job_title: null,
                     scheduled_at: null,
+                    note: null,
                     timing: null,
                   },
                   {
@@ -897,6 +909,7 @@ export const bridge = {
                     item_id: null,
                     job_title: null,
                     scheduled_at: null,
+                    note: null,
                     timing: null,
                   },
                 ],
@@ -934,6 +947,41 @@ export const bridge = {
         },
       });
     return unwrap(window.pywebview!.api.cloud_publisher_health());
+  },
+
+  dashboardCloudAccountSettings(accountId: number): Promise<CloudAccountSettings | null> {
+    if (!hasBridge()) return Promise.resolve(null);
+    return unwrap(window.pywebview!.api.dashboard_cloud_account_settings(accountId));
+  },
+
+  dashboardUpdateCloudAccountSettings(
+    accountId: number,
+    dailyLimit: number,
+    minGapMinutes: number,
+    enabled: boolean,
+  ): Promise<CloudAccountSettings> {
+    if (!hasBridge())
+      return Promise.resolve({
+        account_key: "mock",
+        instagram_user_id: "0",
+        token_secret_name: "IG_TOKEN_MOCK",
+        enabled,
+        daily_limit: dailyLimit,
+        min_gap_minutes: minGapMinutes,
+      });
+    return unwrap(
+      window.pywebview!.api.dashboard_update_cloud_account_settings(
+        accountId,
+        dailyLimit,
+        minGapMinutes,
+        enabled,
+      ),
+    );
+  },
+
+  dashboardForcePublishCloudJob(jobId: number): Promise<{ id: string; forced: boolean }> {
+    if (!hasBridge()) return Promise.resolve({ id: "mock", forced: true });
+    return unwrap(window.pywebview!.api.dashboard_force_publish_cloud_job(jobId));
   },
 
   dashboardAccountStats(activeAccountId: number): Promise<DashboardAccountStats> {

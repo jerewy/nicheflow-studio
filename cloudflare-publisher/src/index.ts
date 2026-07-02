@@ -152,6 +152,15 @@ async function upsertAccount(request: Request, env: Env): Promise<Response> {
   return json({ account_key: accountKey, enabled: Boolean(input.enabled), daily_limit: dailyLimit, min_gap_minutes: minGapMinutes }, 201);
 }
 
+async function listAccounts(env: Env): Promise<Response> {
+  const rows = await env.DB.prepare(
+    `SELECT account_key, instagram_user_id, token_secret_name, enabled,
+            daily_limit, min_gap_minutes, created_at, updated_at
+     FROM accounts ORDER BY account_key`,
+  ).all();
+  return json({ accounts: rows.results });
+}
+
 async function createJob(request: Request, env: Env): Promise<Response> {
   const input = await readJson<JobInput>(request);
   const accountKey = normalizeAccountKey(input.account_key);
@@ -340,6 +349,43 @@ async function cancelJob(env: Env, jobId: string): Promise<Response> {
   return json({ id: jobId, status: "canceled" });
 }
 
+async function forceRunJob(env: Env, jobId: string): Promise<Response> {
+  const now = nowIso();
+  const row = await env.DB.prepare(
+    `SELECT j.*, a.instagram_user_id, a.token_secret_name, a.enabled, a.daily_limit, a.min_gap_minutes
+     FROM publish_jobs j JOIN accounts a ON a.account_key = j.account_key
+     WHERE j.id = ?`,
+  )
+    .bind(jobId)
+    .first<JobRow & AccountRow>();
+  if (!row) return json({ error: "Job not found" }, 404);
+  if (row.status !== "scheduled") {
+    return json({ error: `Only a pending 'scheduled' job can be forced (this job is ${row.status})` }, 409);
+  }
+  const claimed = await env.DB.prepare(
+    "UPDATE publish_jobs SET lease_until = ?, updated_at = ? WHERE id = ? AND (lease_until IS NULL OR lease_until <= ?)",
+  )
+    .bind(addMinutes(now, 2), now, row.id, now)
+    .run();
+  if (!claimed.meta.changes) {
+    return json({ error: "Job is currently being processed; try again in a moment" }, 409);
+  }
+  console.log(`force-run: operator bypassed the safety gate for job ${row.id} (account ${row.account_key})`);
+  try {
+    await processJob(env, row, row, { bypassGate: true });
+  } catch (error) {
+    if (row.status === "scheduled" && !row.meta_container_id && shouldOfferManualLocalPublish(error)) {
+      await markJobForManualLocalPublish(env, row, error);
+    } else if (isRecoverableMetaError(error)) {
+      await deferBlockedJob(env, row, error);
+    } else {
+      await failJob(env, row, error);
+    }
+    return errorResponse(error, 400);
+  }
+  return json({ id: row.id, forced: true });
+}
+
 async function serveMedia(request: Request, env: Env, mediaToken: string): Promise<Response> {
   const placeholders = ACTIVE_MEDIA_STATUSES.map(() => "?").join(",");
   const job = await env.DB.prepare(
@@ -393,21 +439,32 @@ async function graphRequest(env: Env, account: AccountRow, path: string, params:
   return body;
 }
 
-async function accountMayPublish(env: Env, account: AccountRow, now: string): Promise<boolean> {
-  if (!account.enabled) return false;
+interface PublishGate {
+  allowed: boolean;
+  reason?: string;
+}
+
+async function accountMayPublish(env: Env, account: AccountRow, now: string): Promise<PublishGate> {
+  if (!account.enabled) return { allowed: false, reason: "account disabled" };
   const since = addMinutes(now, -24 * 60);
   const count = await env.DB.prepare(
     "SELECT COUNT(*) AS count FROM publish_jobs WHERE account_key = ? AND published_at >= ?",
   )
     .bind(account.account_key, since)
     .first<{ count: number }>();
-  if ((count?.count || 0) >= account.daily_limit) return false;
+  const published = count?.count || 0;
+  if (published >= account.daily_limit) {
+    return { allowed: false, reason: `daily limit reached (${published}/${account.daily_limit} in 24h)` };
+  }
   const latest = await env.DB.prepare(
     "SELECT published_at FROM publish_jobs WHERE account_key = ? AND published_at IS NOT NULL ORDER BY published_at DESC LIMIT 1",
   )
     .bind(account.account_key)
     .first<{ published_at: string }>();
-  return !latest || Date.parse(latest.published_at) + account.min_gap_minutes * 60_000 <= Date.parse(now);
+  if (!latest) return { allowed: true };
+  const eligibleAt = addMinutes(latest.published_at, account.min_gap_minutes);
+  if (Date.parse(eligibleAt) <= Date.parse(now)) return { allowed: true };
+  return { allowed: false, reason: `same-account cooldown until ${eligibleAt}` };
 }
 
 async function failJob(env: Env, job: JobRow, error: unknown): Promise<void> {
@@ -458,14 +515,27 @@ async function markJobForManualLocalPublish(env: Env, job: JobRow, error: unknow
   await env.MEDIA.delete(job.media_key);
 }
 
-async function processJob(env: Env, job: JobRow, account: AccountRow): Promise<void> {
+async function processJob(
+  env: Env,
+  job: JobRow,
+  account: AccountRow,
+  options?: { bypassGate?: boolean },
+): Promise<void> {
   const now = nowIso();
   if (job.status === "scheduled") {
-    if (!(await accountMayPublish(env, account, now))) {
-      await env.DB.prepare("UPDATE publish_jobs SET next_attempt_at = ?, lease_until = NULL, updated_at = ? WHERE id = ?")
-        .bind(addMinutes(now, 15), now, job.id)
-        .run();
-      return;
+    if (!options?.bypassGate) {
+      const gate = await accountMayPublish(env, account, now);
+      if (!gate.allowed) {
+        await env.DB.prepare(
+          "UPDATE publish_jobs SET next_attempt_at = ?, lease_until = NULL, error_message = ?, updated_at = ? WHERE id = ?",
+        )
+          .bind(addMinutes(now, 15), gate.reason ?? "blocked", now, job.id)
+          .run();
+        return;
+      }
+    } else if (!account.enabled) {
+      // bypassGate skips the daily_limit/min_gap cooldown, never the enabled floor.
+      throw new Error("account disabled");
     }
     const baseUrl = env.PUBLIC_BASE_URL.replace(/\/$/, "");
     if (!baseUrl) throw new Error("PUBLIC_BASE_URL is required before validate/live mode");
@@ -639,6 +709,7 @@ async function route(request: Request, env: Env): Promise<Response> {
 
   requireAuth(request, env);
   if (request.method === "PUT" && url.pathname === "/v1/accounts") return upsertAccount(request, env);
+  if (request.method === "GET" && url.pathname === "/v1/accounts") return listAccounts(env);
   if (request.method === "POST" && url.pathname === "/v1/jobs") return createJob(request, env);
   if (request.method === "GET" && url.pathname === "/v1/jobs") return listJobs(env);
   if (request.method === "GET" && url.pathname === "/v1/usage") return usage(env);
@@ -647,6 +718,8 @@ async function route(request: Request, env: Env): Promise<Response> {
   if (request.method === "PUT" && uploadMatch) return uploadMedia(request, env, uploadMatch[1]);
   const cancelMatch = url.pathname.match(/^\/v1\/jobs\/([^/]+)\/cancel$/);
   if (request.method === "POST" && cancelMatch) return cancelJob(env, cancelMatch[1]);
+  const forceRunMatch = url.pathname.match(/^\/v1\/jobs\/([^/]+)\/force-run$/);
+  if (request.method === "POST" && forceRunMatch) return forceRunJob(env, forceRunMatch[1]);
   return json({ error: "Not found" }, 404);
 }
 

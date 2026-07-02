@@ -403,6 +403,7 @@ def schedule_coverage(*, days: int = 2, now: dt.datetime | None = None) -> dict:
                         if job
                         else None,
                         "scheduled_at": matched[0].isoformat() if matched else None,
+                        "note": job.error_message if job else None,
                         "timing": (
                             "on_time"
                             if matched

@@ -223,6 +223,49 @@ def upsert_account(
     )
 
 
+def list_accounts() -> dict:
+    """All accounts registered on the Worker, with their current safety caps."""
+    return _request("GET", "/v1/accounts")
+
+
+def get_account_settings(account_id: int) -> dict | None:
+    """This local account's Worker-side settings, or ``None`` when the account
+    isn't cloud-mapped or hasn't been registered on the Worker yet."""
+    worker_key = cloud_account_key_for(account_id)
+    if not worker_key:
+        return None
+    for row in list_accounts().get("accounts", []):
+        if row.get("account_key") == worker_key:
+            return row
+    return None
+
+
+def update_account_settings(
+    account_id: int, *, daily_limit: int, min_gap_minutes: int, enabled: bool
+) -> dict:
+    """Edit an already-registered account's ``daily_limit``/``min_gap_minutes``.
+
+    Preserves the account's existing ``instagram_user_id``/``token_secret_name``
+    (``upsert_account`` requires both, but this call only means to change the
+    safety caps). Raises if the account isn't cloud-mapped or not yet registered
+    -- run ``scripts/cloudflare_register_account.py`` once first in that case.
+    """
+    current = get_account_settings(account_id)
+    if current is None:
+        raise CloudPublisherError(
+            "This account is not registered on the Worker yet. Run "
+            "scripts/cloudflare_register_account.py for it first."
+        )
+    return upsert_account(
+        account_key=current["account_key"],
+        instagram_user_id=current["instagram_user_id"],
+        token_secret_name=current["token_secret_name"],
+        enabled=enabled,
+        daily_limit=daily_limit,
+        min_gap_minutes=min_gap_minutes,
+    )
+
+
 def list_jobs() -> dict:
     """All publish jobs known to the Worker (and the current publish_mode)."""
     return _request("GET", "/v1/jobs")
@@ -236,6 +279,15 @@ def get_usage() -> dict:
 def cancel_job(job_id: str) -> dict:
     """Cancel a job and delete its R2 media (if not already published/validated)."""
     return _request("POST", f"/v1/jobs/{job_id}/cancel")
+
+
+def force_run_job(job_id: str) -> dict:
+    """Force a pending ``scheduled`` job through immediately, bypassing the
+    Worker's daily_limit/min_gap safety gate for this one job. The Worker still
+    refuses if the account itself is disabled. A deliberate manual override --
+    see :func:`nicheflow_studio.services.publishing.force_publish_cloud_job`.
+    """
+    return _request("POST", f"/v1/jobs/{job_id}/force-run")
 
 
 def run_due() -> dict:

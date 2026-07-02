@@ -6,7 +6,7 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import { bridge } from "@/lib/bridge";
-import type { AccountDetail, AccountSummary } from "@/types";
+import type { AccountDetail, AccountSummary, CloudAccountSettings } from "@/types";
 
 type FormState = Record<string, string>;
 
@@ -49,6 +49,117 @@ function detailToForm(detail: AccountDetail): FormState {
     form[key] = value == null ? "" : String(value);
   }
   return form;
+}
+
+// Worker-side safety caps for a cloud-mapped account (daily_limit / min_gap_minutes,
+// the mechanism that gated resurfacedhistory's 18:00 slot). Renders nothing for an
+// account that isn't cloud-mapped or hasn't been registered on the Worker yet.
+function CloudSafetyPanel({ accountId }: { accountId: number }) {
+  const [settings, setSettings] = useState<CloudAccountSettings | null>(null);
+  const [loaded, setLoaded] = useState(false);
+  const [dailyLimit, setDailyLimit] = useState("");
+  const [minGapMinutes, setMinGapMinutes] = useState("");
+  const [enabled, setEnabled] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [saved, setSaved] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoaded(false);
+    setError(null);
+    setSaved(false);
+    bridge
+      .dashboardCloudAccountSettings(accountId)
+      .then((result) => {
+        if (cancelled) return;
+        setSettings(result);
+        if (result) {
+          setDailyLimit(String(result.daily_limit));
+          setMinGapMinutes(String(result.min_gap_minutes));
+          setEnabled(result.enabled);
+        }
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+      })
+      .finally(() => {
+        if (!cancelled) setLoaded(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [accountId]);
+
+  if (!loaded || !settings) return null;
+
+  const save = async () => {
+    setBusy(true);
+    setError(null);
+    setSaved(false);
+    try {
+      const updated = await bridge.dashboardUpdateCloudAccountSettings(
+        accountId,
+        Number(dailyLimit),
+        Number(minGapMinutes),
+        enabled,
+      );
+      setSettings(updated);
+      setSaved(true);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="space-y-2 rounded-md border border-border p-3">
+      <p className="text-sm font-medium">Cloud publish safety</p>
+      <p className="text-xs text-muted-foreground">
+        Enforced by the Cloudflare Worker on every post — the anti-flagging guard, not
+        a local scheduling preference. Raising these increases automation-flag risk.
+      </p>
+      <div className="grid gap-3 sm:grid-cols-2">
+        <div className="space-y-1">
+          <label className="text-xs font-medium text-muted-foreground">
+            Daily limit (1–20)
+          </label>
+          <Input
+            type="number"
+            min={1}
+            max={20}
+            value={dailyLimit}
+            onChange={(e) => setDailyLimit(e.target.value)}
+          />
+        </div>
+        <div className="space-y-1">
+          <label className="text-xs font-medium text-muted-foreground">
+            Min gap between posts (minutes, ≥30)
+          </label>
+          <Input
+            type="number"
+            min={30}
+            value={minGapMinutes}
+            onChange={(e) => setMinGapMinutes(e.target.value)}
+          />
+        </div>
+      </div>
+      <label className="flex items-center gap-2 text-sm">
+        <input
+          type="checkbox"
+          checked={enabled}
+          onChange={(event) => setEnabled(event.target.checked)}
+        />
+        Cloud publishing enabled for this account
+      </label>
+      {error && <p className="text-xs text-destructive">{error}</p>}
+      {saved && !error && <p className="text-xs text-emerald-600">Saved.</p>}
+      <Button size="sm" variant="outline" onClick={save} disabled={busy}>
+        Save cloud safety settings
+      </Button>
+    </div>
+  );
 }
 
 interface AccountManagerProps {
@@ -286,6 +397,7 @@ export function AccountManager({ activeId, onAccountsChanged, onUseAccount }: Ac
                 />
                 Auto-schedule each reel after export
               </label>
+              {!creating && selectedId !== null && <CloudSafetyPanel accountId={selectedId} />}
               <div className="flex items-center gap-2">
                 <Button onClick={save} disabled={busy}>
                   {creating ? "Create account" : "Save changes"}

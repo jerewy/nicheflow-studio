@@ -374,6 +374,25 @@ class ProcessingBridge:
         return usage
 
     @_guard
+    def dashboard_cloud_account_settings(self, account_id: int) -> dict | None:
+        """This account's Worker-side daily_limit/min_gap_minutes, or None if
+        it isn't cloud-mapped or hasn't been registered on the Worker yet."""
+        return cloud_publisher.get_account_settings(account_id)
+
+    @_guard
+    def dashboard_update_cloud_account_settings(
+        self, account_id: int, daily_limit: int, min_gap_minutes: int, enabled: bool = True
+    ) -> dict:
+        return cloud_publisher.update_account_settings(
+            account_id, daily_limit=daily_limit, min_gap_minutes=min_gap_minutes, enabled=enabled
+        )
+
+    @_guard
+    def dashboard_force_publish_cloud_job(self, job_id: int) -> dict:
+        """Bypass the Worker's safety cooldown for one pending cloud job."""
+        return publishing.force_publish_cloud_job(job_id)
+
+    @_guard
     def dashboard_account_stats(self, active_account_id: int) -> dict:
         return publishing_dashboard.account_stats(active_account_id)
 
