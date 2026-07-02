@@ -5,7 +5,7 @@ import datetime as dt
 import pytest
 
 from nicheflow_studio.db.models import Account, PoolItem
-from nicheflow_studio.db.pools import pool_size
+from nicheflow_studio.db.pools import POOL_STATUS_PENDING_REVIEW, pool_size
 from nicheflow_studio.db.session import get_session, init_db
 from nicheflow_studio.scraper.youtube import ScrapedVideoCandidate
 from nicheflow_studio.services import pool_capture
@@ -72,7 +72,9 @@ def test_capture_instagram_reel_to_pool_fetches_metadata_and_pools(
     assert result["channel_name"] == "historysource"
     assert captured_urls == ["https://www.instagram.com/reel/ABC123/"]
     with get_session() as session:
-        assert pool_size(session, "history") == 1
+        # Candidate-first accepts land in pending_review until the pool approval
+        # gate promotes them (docs/SOURCING_POOLING_PLAN.md §1, §13).
+        assert pool_size(session, "history", status=POOL_STATUS_PENDING_REVIEW) == 1
 
 
 def test_capture_stores_optional_account_pin(monkeypatch) -> None:

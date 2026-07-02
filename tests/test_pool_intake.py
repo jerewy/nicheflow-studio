@@ -4,7 +4,7 @@ import datetime as dt
 
 from nicheflow_studio.db.models import Account, PoolItem, ScrapeCandidate
 from nicheflow_studio.db.pool_intake import ReelMetadata, add_reel_to_pool
-from nicheflow_studio.db.pools import pool_size
+from nicheflow_studio.db.pools import POOL_STATUS_PENDING_REVIEW, pool_size
 from nicheflow_studio.db.session import get_session, init_db
 
 
@@ -33,7 +33,9 @@ def test_add_reel_creates_pool_item_and_saves_metadata():
         result = add_reel_to_pool(session, niche="history", metadata=_meta("DZIAtSVCqCS"))
         session.commit()
         assert result.status == "added"
-        assert pool_size(session, "history") == 1
+        # Candidate-first accepts land in pending_review until the pool approval
+        # gate promotes them (docs/SOURCING_POOLING_PLAN.md §1, §13).
+        assert pool_size(session, "history", status=POOL_STATUS_PENDING_REVIEW) == 1
         candidate = (
             session.query(ScrapeCandidate)
             .filter(ScrapeCandidate.video_id == "DZIAtSVCqCS")
@@ -53,7 +55,8 @@ def test_adding_same_reel_twice_is_deduped():
         session.commit()
         assert result.status == "duplicate"
         assert "skipped" in result.message.lower()
-        assert pool_size(session, "history") == 1  # not double-pooled
+        # not double-pooled (still pending_review, same as the first accept)
+        assert pool_size(session, "history", status=POOL_STATUS_PENDING_REVIEW) == 1
 
 
 def test_duplicate_capture_keeps_first_pin():

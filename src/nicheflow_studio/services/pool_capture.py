@@ -19,7 +19,6 @@ from nicheflow_studio.db.pools import (
     POOL_STATUS_ACCEPTED,
     POOL_STATUS_PENDING_REVIEW,
     VALID_NICHES,
-    pool_size,
 )  # noqa: E501
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.downloader.instagram import instagram_shortcode_from_url
@@ -29,6 +28,22 @@ from nicheflow_studio.scraper.youtube import ScrapedVideoCandidate
 
 class PoolCaptureError(RuntimeError):
     """Raised when a browser capture cannot be added to a pool."""
+
+
+def _captured_video_count(session, niche: str) -> int:
+    """Videos captured into ``niche``'s pool, counting both awaiting-review and
+    already-approved items. This is the extension popup's "did my capture land"
+    confirmation number, so it must not go quiet while a clip sits in the desktop
+    app's pending-review queue — unlike :func:`pool_size`, which defaults to
+    accepted-only for the distribution-facing counts."""
+    return (
+        session.query(PoolItem)
+        .filter(
+            PoolItem.niche == niche,
+            PoolItem.acceptance_status.in_([POOL_STATUS_ACCEPTED, POOL_STATUS_PENDING_REVIEW]),
+        )
+        .count()
+    )
 
 
 def capture_dashboard() -> dict:
@@ -43,7 +58,7 @@ def capture_dashboard() -> dict:
                 .all()
             )
             pools[niche] = {
-                "video_count": pool_size(session, niche),
+                "video_count": _captured_video_count(session, niche),
                 "accounts": [{"id": account.id, "name": account.name} for account in accounts],
             }
     return {"pools": pools, "apify_usage": monthly_apify_usage()}
