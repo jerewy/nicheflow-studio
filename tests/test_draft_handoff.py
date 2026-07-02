@@ -155,6 +155,12 @@ def test_chat_prompts_allow_verified_web_research() -> None:
         assert "Research (chat assistants with web access):" in prompt
         assert "VERIFY it with a quick web search" in prompt
         assert "which facts came from your own" in prompt
+        # QUOTE RULE: a researched specific must carry a verbatim source quote,
+        # or it counts as unverified (caught after a model cited outlets for a
+        # date those outlets never printed).
+        assert "QUOTE RULE for researched specifics" in prompt
+        assert "shortest verbatim quote" in prompt
+        assert "Naming an outlet without a quote does NOT count" in prompt
         assert "Never state a guess you could not verify" in prompt
         assert "safest or most hedged" in prompt
     assert "work ONLY from the signals" not in single

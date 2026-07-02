@@ -250,6 +250,13 @@ _WEB_RESEARCH_LINES = [
     "titles and captions. A verified specific beats a hedged vague line.",
     "- State in that option's selection note which facts came from your own "
     "research rather than the provided signals, so the reviewer can spot-check.",
+    "- QUOTE RULE for researched specifics (HARD RULE): for every name, date, or "
+    "number you add from research, the selection note must give the outlet AND "
+    "the shortest verbatim quote from that source stating the fact, e.g. "
+    "Washington Post: 'uploaded in April 2015'. Naming an outlet without a "
+    "quote does NOT count as verification. If you cannot quote a sentence that "
+    "states the fact, it is unverified: soften it ('years later', 'decades "
+    "ago') or drop it, exactly like an unsupported source claim.",
     "- Never state a guess you could not verify, and never invent names, dates, "
     "places, records, or events that neither the signals nor verified research "
     "support.",
