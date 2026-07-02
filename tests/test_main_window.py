@@ -8573,7 +8573,7 @@ def test_candidate_accept_into_pool_creates_pending_pool_item(qt_app) -> None:
     """Accept → Pool puts the candidate into its account's niche pool without a
     download: pool item exists, asset is pending, candidate is 'pooled'."""
     init_db()
-    from nicheflow_studio.db.pools import pool_size
+    from nicheflow_studio.db.pools import POOL_STATUS_PENDING_REVIEW, pool_size
 
     candidate_id = _seed_instagram_candidate("history", "HISTCAND1")
 
@@ -8594,7 +8594,9 @@ def test_candidate_accept_into_pool_creates_pending_pool_item(qt_app) -> None:
         with get_session() as session:
             candidate_row = session.get(ScrapeCandidate, candidate_id)
             assert candidate_row.state == "pooled"
-            assert pool_size(session, "history") == 1
+            # Candidate-first accepts land in pending_review until the pool
+            # approval gate promotes them (docs/SOURCING_POOLING_PLAN.md §1, §13).
+            assert pool_size(session, "history", status=POOL_STATUS_PENDING_REVIEW) == 1
         assert "Accepted into the history pool." in window._status_label.text()
     finally:
         window._refresh_timer.stop()
