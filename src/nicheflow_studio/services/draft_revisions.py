@@ -452,6 +452,7 @@ def _account_voice(account: Account | None) -> dict | None:
         "banned_phrases": account.banned_phrases,
         "title_style_notes": account.title_style_notes,
         "caption_style_notes": account.caption_style_notes,
+        "auto_schedule_on_export": bool(account.auto_schedule_on_export),
     }
 
 

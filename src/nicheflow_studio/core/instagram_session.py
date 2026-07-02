@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
 from nicheflow_studio.core.paths import data_dir
 
+
+logger = logging.getLogger(__name__)
 
 SESSION_FILE_DIR = Path.home() / ".instagram_scraper"
 _COOKIES_JSON_PATH = data_dir() / "browser-profiles" / "instagram-cookies.json"
@@ -153,6 +157,129 @@ def instagram_yt_dlp_cookie_status() -> InstagramCookieStatus:
         cookiefile=cookiefile,
         has_sessionid=_cookies_txt_has_sessionid(path),
     )
+
+
+def get_instagram_yt_dlp_cookiefile_for_profile(profile_name: str) -> str | None:
+    """Build a yt-dlp Netscape cookies.txt from a logged-in account's Playwright
+    storage-state.
+
+    Preferred over the shared Cookie-Editor export (``instagram-cookies.json``):
+    that export is refreshed by hand and goes stale, after which Instagram answers
+    downloads with an "empty media response" that the library layer mistakes for a
+    deleted post. The per-account storage-state is what the dashboard re-login keeps
+    current. Returns None when the profile has no stored ``sessionid`` so callers can
+    fall back to another source.
+    """
+    cookies = load_playwright_cookies_from_storage_state(profile_name)
+    if not cookies:
+        return None
+    if not any(c.get("name") == "sessionid" and c.get("value") for c in cookies):
+        return None
+    netscape = _json_cookies_to_netscape(cookies)
+    dest = data_dir() / "browser-profiles" / f"instagram-cookies-{profile_name}.txt"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(netscape, encoding="utf-8")
+    return str(dest)
+
+
+def _profiles_by_login_recency() -> list[str]:
+    """Logged-in profile names, most recently refreshed storage-state first."""
+    root = _INSTAGRAM_PROFILES_ROOT
+    if not root.exists():
+        return []
+    entries: list[tuple[float, str]] = []
+    for child in root.iterdir():
+        state = child / "storage-state.json"
+        if child.is_dir() and state.exists():
+            entries.append((state.stat().st_mtime, child.name))
+    entries.sort(reverse=True)
+    return [name for _mtime, name in entries]
+
+
+# Only these IG profiles may authenticate yt-dlp media downloads (the "sourcing"
+# identity). A publishing / important account must NEVER be used for downloads:
+# authenticated reel-fetching as a real account via yt-dlp is exactly the
+# automation Instagram flags ("We suspect automated behavior on your account").
+# Designate throwaway/low-value accounts here. Override at runtime with
+# NICHEFLOW_IG_SOURCING_PROFILES (comma-separated handles).
+_DEFAULT_SOURCING_PROFILES = ("cinemafilesdaily", "memeistsdaily")
+
+
+def _sourcing_profiles() -> tuple[str, ...]:
+    raw = os.environ.get("NICHEFLOW_IG_SOURCING_PROFILES", "").strip()
+    if raw:
+        return tuple(part.strip() for part in raw.split(",") if part.strip())
+    return _DEFAULT_SOURCING_PROFILES
+
+
+def _cookie_value(cookies: list[dict], name: str) -> str | None:
+    for cookie in cookies:
+        if cookie.get("name") == name and cookie.get("value"):
+            return str(cookie["value"])
+    return None
+
+
+def _legacy_export_matches_non_sourcing_profile() -> str | None:
+    """Name of the logged-in NON-sourcing profile whose session the legacy
+    Cookie-Editor export carries, or ``None`` when the export looks safe.
+
+    The export is refreshed by hand, so nothing structurally stops someone from
+    exporting a publishing account's cookies into it. Compare its ``ds_user_id``
+    against every non-allowlisted profile's storage-state to catch that mistake
+    before yt-dlp authenticates as the wrong account.
+    """
+    try:
+        raw = json.loads(_COOKIES_JSON_PATH.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - unreadable export is handled downstream
+        return None
+    if not isinstance(raw, list):
+        return None
+    legacy_user_id = _cookie_value(raw, "ds_user_id")
+    if not legacy_user_id:
+        return None
+    allowed = {name.lower() for name in _sourcing_profiles()}
+    for name in _profiles_by_login_recency():
+        if name.lower() in allowed:
+            continue
+        cookies = load_playwright_cookies_from_storage_state(name)
+        if cookies and _cookie_value(cookies, "ds_user_id") == legacy_user_id:
+            return name
+    return None
+
+
+def best_instagram_yt_dlp_cookiefile(preferred_profile: str | None = None) -> str | None:
+    """Pick a SOURCING-account cookie for yt-dlp Instagram downloads.
+
+    Downloads must never authenticate as a publishing / important account — that
+    automation is what gets accounts flagged. Only profiles in
+    :func:`_sourcing_profiles` are eligible (freshest login first); the
+    ``preferred_profile`` argument (the clip's own account) is intentionally
+    ignored for that reason. Falls back to the shared Cookie-Editor export, else
+    None.
+    """
+    allowed = {name.lower() for name in _sourcing_profiles()}
+    if allowed:
+        for name in _profiles_by_login_recency():
+            if name.lower() not in allowed:
+                continue
+            cookiefile = get_instagram_yt_dlp_cookiefile_for_profile(name)
+            if cookiefile:
+                return cookiefile
+    # Legacy shared sourcing cookie (Cookie-Editor export) — the only
+    # non-allowlisted fallback. Refuse it when it demonstrably belongs to a
+    # logged-in publishing profile: downloading as that account is exactly the
+    # automation footprint that gets accounts flagged.
+    offender = _legacy_export_matches_non_sourcing_profile()
+    if offender is not None:
+        logger.error(
+            "Refusing the legacy Instagram cookie export (instagram-cookies.json): "
+            "it belongs to the non-sourcing profile %r. Re-export it from a "
+            "sourcing account (see NICHEFLOW_IG_SOURCING_PROFILES), or re-login "
+            "a sourcing profile from the dashboard.",
+            offender,
+        )
+        return None
+    return get_instagram_yt_dlp_cookiefile()
 
 
 # ---------------------------------------------------------------------------

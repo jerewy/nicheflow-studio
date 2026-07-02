@@ -10,7 +10,11 @@ from nicheflow_studio.db.assignments import (
 )
 from nicheflow_studio.db.media_library import find_media_asset
 from nicheflow_studio.db.models import Account, ScrapeCandidate
-from nicheflow_studio.db.pools import accept_candidate_into_pool, pool_size
+from nicheflow_studio.db.pools import (
+    POOL_STATUS_ACCEPTED,
+    accept_candidate_into_pool,
+    pool_size,
+)
 from nicheflow_studio.db.session import get_session, init_db
 from nicheflow_studio.queue import download_assigned_pending
 
@@ -42,8 +46,12 @@ def _seed_assigned_pending(session, count: int) -> list[str]:
         )
         session.add(candidate)
         session.flush()
-        accept_candidate_into_pool(session, candidate=candidate, niche="history")
+        item = accept_candidate_into_pool(session, candidate=candidate, niche="history")
+        # Intake now lands clips in pending_review; only reviewed-and-approved
+        # clips distribute, so simulate the review approval here.
+        item.acceptance_status = POOL_STATUS_ACCEPTED
         shortcodes.append(shortcode)
+    session.flush()
     distribute_niche(session, "history", rng=random.Random(1))
     return shortcodes
 
@@ -142,6 +150,66 @@ def test_download_assigned_pending_records_failures(tmp_path) -> None:
     # Assets stay pending so a later run can retry them.
     with get_session() as session:
         assert len(pending_download_assignments(session, niche="history")) == 2
+
+
+def test_download_retires_gone_source_and_distribute_refills(tmp_path) -> None:
+    """A permanently-deleted reel must not stay stuck 'assigned' forever: its
+    asset is retired, pool item removed, assignment released, dedup keys
+    blocklisted — and the next Distribute refills the freed slot."""
+    init_db()
+    with get_session() as session:
+        _seed_assigned_pending(session, 2)
+        session.commit()
+
+    def gone_downloader(url: str) -> _FakeResult:
+        if "SEED0" in url:
+            raise RuntimeError("ERROR: [Instagram] SEED0: The post may have been deleted.")
+        path = tmp_path / f"{url.rstrip('/').rsplit('/', 1)[-1]}.mp4"
+        path.write_bytes(b"v")
+        return _FakeResult(str(path))
+
+    summary = download_assigned_pending(
+        niche="history",
+        downloader=gone_downloader,
+        fingerprinter=lambda path: f"FP-{Path(path).stem}",
+    )
+
+    assert summary.unavailable == 1
+    assert summary.failed == 0
+    assert summary.downloaded == 1
+    assert any("source is gone" in error for error in summary.errors)
+
+    from nicheflow_studio.db.blocklist import is_blocked
+    from nicheflow_studio.db.models import ScrapeCandidate as _SC
+
+    with get_session() as session:
+        asset = find_media_asset(
+            session, source_url="https://www.instagram.com/reel/SEED0/"
+        )
+        assert asset.download_status == "unavailable"
+        # Pool item removed and assignment released -> account reads as short.
+        assert pool_size(session, "history") == 1
+        assert sum(assignment_counts_by_account(session, "history").values()) == 1
+        # Not listed as pending work anymore (no endless retry).
+        assert pending_download_assignments(session, niche="history") == []
+        # Re-scrapes can never pool the dead reel again.
+        assert is_blocked(session, source_url="https://www.instagram.com/reel/SEED0/")
+
+        # A fresh clip + Distribute refills the freed slot.
+        replacement = _SC(
+            scrape_source_url="https://www.instagram.com/src/",
+            source_url="https://www.instagram.com/reel/FRESH1/",
+            video_id="FRESH1",
+            account_id=session.query(Account).first().id,
+        )
+        session.add(replacement)
+        session.flush()
+        fresh = accept_candidate_into_pool(session, candidate=replacement, niche="history")
+        fresh.acceptance_status = POOL_STATUS_ACCEPTED
+        session.flush()
+        distribute_niche(session, "history", rng=random.Random(2))
+        session.commit()
+        assert sum(assignment_counts_by_account(session, "history").values()) == 2
 
 
 def test_download_dedup_replace_flags_duplicate_footage(tmp_path) -> None:

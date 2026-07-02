@@ -220,7 +220,7 @@ def test_distribute_clip_does_not_assign_when_download_fails(
         session.commit()
 
     def fail_download(**_kwargs):
-        raise RuntimeError("Instagram sent an empty media response")
+        raise RuntimeError("Read timed out while fetching media")
 
     monkeypatch.setattr(pooling, "download_instagram_url", fail_download)
 
@@ -230,6 +230,37 @@ def test_distribute_clip_does_not_assign_when_download_fails(
     with get_session() as session:
         assert session.query(Assignment).count() == 0
         assert session.query(DownloadItem).count() == 0
+        # Transient failure: the clip stays in the pool for a later retry.
+        assert session.get(PoolItem, pool_item_id).acceptance_status == "accepted"
+
+
+def test_distribute_clip_retires_pool_item_when_source_is_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deleted/private source is permanent: the clip leaves the pool (and its
+    asset is blocklisted) instead of failing again on every distribute."""
+    account_a, _account_b, pool_item_id = _seed_clip_with_accounts()
+    with get_session() as session:
+        pool_item = session.get(PoolItem, pool_item_id)
+        asset = session.get(MediaAsset, pool_item.media_asset_id)
+        asset.download_status = "pending"
+        asset.original_download_path = None
+        session.commit()
+
+    def fail_download(**_kwargs):
+        raise RuntimeError("Instagram sent an empty media response")
+
+    monkeypatch.setattr(pooling, "download_instagram_url", fail_download)
+
+    with pytest.raises(PoolingError, match="original reel is gone"):
+        pooling.distribute_clip(pool_item_id, [account_a])
+
+    with get_session() as session:
+        assert session.query(Assignment).count() == 0
+        assert session.get(PoolItem, pool_item_id).acceptance_status == "removed"
+        pool_item = session.get(PoolItem, pool_item_id)
+        asset = session.get(MediaAsset, pool_item.media_asset_id)
+        assert asset.download_status == "unavailable"
 
 
 def test_distribute_clip_ignores_out_of_niche_accounts() -> None:

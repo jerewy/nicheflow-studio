@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState, type ReactNode } from "react";
 
 import { DashboardTable } from "@/components/DashboardTable";
 import { Button } from "@/components/ui/button";
+import { useAutoRefresh } from "@/hooks/useAutoRefresh";
 import { bridge } from "@/lib/bridge";
 import { formatDate } from "@/lib/format";
 import type {
@@ -617,6 +618,13 @@ export function MultiAccountPublish({
     return () => window.clearTimeout(timer);
   }, [load, loadCoverage, loadHealth]);
 
+  // Auto-refresh cloud sync + coverage every 30s (and on window focus) so
+  // posted slots flip from "cloud" to "posted" without a manual Refresh click.
+  useAutoRefresh(() => {
+    void load();
+    void loadCoverage();
+  }, 30000);
+
   const run = async (action: () => Promise<unknown>, success: string) => {
     try {
       await action();
@@ -693,6 +701,51 @@ export function MultiAccountPublish({
           ) : null}
           .
         </p>
+      )}
+      {queue && queue.unscheduled_exports.length > 0 && (
+        <div className="space-y-2 rounded-lg border border-amber-500/40 bg-amber-500/5 p-3">
+          <p className="text-sm font-medium text-amber-600">
+            {queue.unscheduled_exports.length} exported reel(s) not scheduled yet
+          </p>
+          {queue.unscheduled_exports.map((item) => (
+            <div
+              key={item.item_id}
+              className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-border bg-background px-3 py-2"
+            >
+              <div className="min-w-0">
+                <p className="truncate text-sm">
+                  <span className="font-medium">{item.account_name}</span> — {item.title}
+                </p>
+                <p className="truncate text-xs text-muted-foreground">
+                  {item.reason} ({item.output_name})
+                </p>
+              </div>
+              <div className="flex shrink-0 items-center gap-2">
+                {onOpenInProcessing && item.account_id !== null && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => onOpenInProcessing(item.account_id!, item.item_id, item.title)}
+                  >
+                    Edit in Processing
+                  </Button>
+                )}
+                <Button
+                  size="sm"
+                  disabled={!item.can_schedule}
+                  onClick={() =>
+                    run(
+                      () => bridge.autoScheduleForPublish(item.item_id),
+                      `Scheduled "${item.title}".`,
+                    )
+                  }
+                >
+                  Schedule now
+                </Button>
+              </div>
+            </div>
+          ))}
+        </div>
       )}
       <div className="flex flex-wrap items-center gap-2">
         <Button size="sm" variant="secondary" onClick={() => void Promise.all([load(), loadCoverage()])}>Refresh</Button>

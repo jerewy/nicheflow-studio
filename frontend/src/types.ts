@@ -72,6 +72,7 @@ export interface AccountVoice {
   banned_phrases: string | null;
   title_style_notes: string | null;
   caption_style_notes: string | null;
+  auto_schedule_on_export: boolean;
 }
 
 export interface ProcessingContext {
@@ -295,6 +296,9 @@ export interface LibraryItem {
   source_url: string;
   status: string; // derived workflow status: new | draft | exported | posted | skipped
   raw_status: string;
+  // True for a posted item that was manually reopened (a newer draft repost exists).
+  // The status dropdown offers "Posted" only for these, to undo the reopen.
+  reopened: boolean;
   review_state: string | null;
   file_path: string | null;
   has_file: boolean;
@@ -430,6 +434,18 @@ export interface DashboardPublishJob {
   processed_path: string;
 }
 
+/** Exported item that never made it into the publish queue (no UploadJob). */
+export interface UnscheduledExport {
+  item_id: number;
+  account_id: number | null;
+  account_name: string;
+  title: string;
+  output_name: string;
+  exported_at: string | null;
+  reason: string;
+  can_schedule: boolean;
+}
+
 export interface DashboardPublishQueue {
   jobs: DashboardPublishJob[];
   due_count: number;
@@ -437,6 +453,7 @@ export interface DashboardPublishQueue {
   ready: number;
   scheduled: number;
   failed: number;
+  unscheduled_exports: UnscheduledExport[];
 }
 
 export interface ScheduleCoverageSlot {

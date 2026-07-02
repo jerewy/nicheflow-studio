@@ -30,6 +30,26 @@ const PUBLISH_TIMEOUT_MS = 480000;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// How many upcoming clips to warm ahead of the user's current position.
+// Set to 0: prefetch is disabled to minimize authenticated download volume to
+// Instagram (account-safety). Raise it again only once downloads no longer ride a
+// real account's session.
+const PREFETCH_AHEAD = 0;
+
+// Warm the next few not-yet-downloaded clips' originals so opening them is instant
+// instead of triggering a live Instagram fetch on click. Best-effort and
+// fire-and-forget: the on-open path still reports real per-clip errors. Only
+// pending-review clips without a downloaded file are worth warming.
+function prefetchUpcoming(ordered: LibraryItem[], afterId: number | null): void {
+  const start = afterId === null ? 0 : ordered.findIndex((c) => c.id === afterId) + 1;
+  const ids = ordered
+    .slice(start)
+    .filter((c) => !c.has_file && c.raw_status === "pending_review")
+    .slice(0, PREFETCH_AHEAD)
+    .map((c) => c.id);
+  if (ids.length > 0) void bridge.prefetchOriginals(ids);
+}
+
 function isPastDate(date: Date): boolean {
   return date.getTime() <= Date.now();
 }
@@ -43,6 +63,7 @@ const STATUS_META: Record<string, { label: string; dot: string }> = {
   scheduled: { label: "Scheduled", dot: "bg-fuchsia-500" },
   cloud: { label: "Cloud", dot: "bg-indigo-500" },
   posted: { label: "Posted", dot: "bg-emerald-500" },
+  rejected: { label: "Rejected", dot: "bg-orange-500" },
   skipped: { label: "Skipped", dot: "bg-zinc-500" },
   failed: { label: "Failed", dot: "bg-red-500" },
 };
@@ -156,6 +177,13 @@ export function ProcessingScreen({
   // Export progress keyed by item id so exports run in the background: the
   // user can switch items mid-export, and a finishing export only updates the
   // screen if its item is still the one being viewed.
+  // Live progress of a first-open original fetch (one at a time; opening a clip
+  // is a user action, not a batch).
+  const [itemDownload, setItemDownload] = useState<{
+    itemId: number;
+    value: number;
+    message: string;
+  } | null>(null);
   const [exportJobs, setExportJobs] = useState<Record<number, { value: number; message: string }>>(
     {},
   );
@@ -226,6 +254,12 @@ export function ProcessingScreen({
   // Ref mirror so async export completions can tell whether the user is still
   // viewing the item they exported (state writes are gated on this).
   const itemIdRef = useRef<number | null>(itemId);
+  // Whether the open recency dialog was triggered by "Publish via Browser"
+  // (force-local) vs "Publish Now" (cloud-allowed). The dialog itself is shared,
+  // so without this the "Post anyway" path would lose the force-local intent and
+  // a cloud-mapped account would silently hand off to the Worker instead of the
+  // local browser.
+  const nowDialogForceLocalRef = useRef(false);
   // Ref mirror of the active niche account. A background job (export, publish)
   // captures the account at call time; if the user switches niche while it runs,
   // its completion must NOT repaint the Videos list with the now-previous
@@ -318,8 +352,8 @@ export function ProcessingScreen({
     [loadRevisionIntoEditor, refreshPublishJobs],
   );
 
-  // Load the active account's videos, then open the first one. Re-runs when the
-  // active niche account changes.
+  // Load the active account's videos, then open the first one that opens. Re-runs
+  // when the active niche account changes.
   useEffect(() => {
     let cancelled = false;
     whenBridgeReady().then(async (ready) => {
@@ -329,19 +363,56 @@ export function ProcessingScreen({
         .canGenerate()
         .then(setCanGenerate)
         .catch(() => setCanGenerate(false));
+
+      let list: LibraryItem[];
       try {
-        const list = await bridge.listLibraryItems(activeAccountId);
-        if (cancelled) return;
-        setItems(list);
-        setItemsLoaded(true);
-        if (list.length > 0) {
-          const ctx = await bridge.getContext(list[0].id);
-          if (!cancelled) applyContext(ctx);
-        } else {
-          setContext(null);
-        }
+        list = await bridge.listLibraryItems(activeAccountId);
       } catch (err: unknown) {
+        // The listing itself failing is the only thing that genuinely blocks the
+        // whole screen.
         if (!cancelled) setLoadError(err instanceof Error ? err.message : String(err));
+        return;
+      }
+      if (cancelled) return;
+      setItems(list);
+      setItemsLoaded(true);
+      if (list.length === 0) {
+        setContext(null);
+        return;
+      }
+
+      // Open the first clip that loads. A single un-openable clip (deleted/private
+      // source) must not take down the whole screen — skip past it so the queue
+      // still works and the user can reject the offender. Bounded so a systemic
+      // failure (e.g. an expired login) still surfaces quickly as a screen error.
+      const MAX_OPEN_ATTEMPTS = 5;
+      let opened = false;
+      let skipped = 0;
+      let lastError: unknown = null;
+      for (const candidate of list.slice(0, MAX_OPEN_ATTEMPTS)) {
+        try {
+          const ctx = await bridge.getContext(candidate.id);
+          if (cancelled) return;
+          applyContext(ctx);
+          opened = true;
+          // Warm the next few clips so sequential review doesn't wait on a fetch.
+          prefetchUpcoming(list, candidate.id);
+          break;
+        } catch (err: unknown) {
+          if (cancelled) return;
+          skipped += 1;
+          lastError = err;
+        }
+      }
+      if (cancelled) return;
+      if (!opened) {
+        setLoadError(lastError instanceof Error ? lastError.message : String(lastError));
+        return;
+      }
+      if (skipped > 0) {
+        setActionError(
+          `Skipped ${skipped} clip${skipped > 1 ? "s" : ""} whose Instagram source couldn't be opened — reject ${skipped > 1 ? "them" : "it"} from the queue.`,
+        );
       }
     });
     return () => {
@@ -356,8 +427,26 @@ export function ProcessingScreen({
     // getContext); reflect that immediately in the list.
     setItems((prev) => prev.map((it) => (it.id === id ? { ...it, is_new: false } : it)));
     try {
+      // A clip with no local file triggers a live Instagram fetch on open.
+      // Run it as a job first so the user sees progress (and retry attempts)
+      // instead of a frozen screen while yt-dlp works.
+      const target = items.find((it) => it.id === id);
+      if (target && !target.has_file) {
+        setItemDownload({ itemId: id, value: 0, message: "Starting download…" });
+        try {
+          const { job_id } = await bridge.startItemDownload(id);
+          await waitForJob(job_id, (value, message) =>
+            setItemDownload({ itemId: id, value, message }),
+          );
+          setItems((prev) => prev.map((it) => (it.id === id ? { ...it, has_file: true } : it)));
+        } finally {
+          setItemDownload(null);
+        }
+      }
       const ctx = await bridge.getContext(id);
       applyContext(ctx);
+      // Warm the clips after this one in the current (filtered) view order.
+      prefetchUpcoming(filteredItems, id);
     } catch (err: unknown) {
       setActionError(err instanceof Error ? err.message : String(err));
     }
@@ -507,6 +596,7 @@ export function ProcessingScreen({
     // (in_progress) — the dialog adapts its options (the in-flight case hides
     // "Post anyway" since two posts can't run at once).
     if (recency.on_cooldown) {
+      nowDialogForceLocalRef.current = false;
       setNowDialog(recency);
       return;
     }
@@ -525,6 +615,7 @@ export function ProcessingScreen({
       .itemPublishRecency(itemId)
       .catch(() => ({ on_cooldown: false }) as PublishRecency);
     if (recency.on_cooldown) {
+      nowDialogForceLocalRef.current = true;
       setNowDialog(recency);
       return;
     }
@@ -551,6 +642,9 @@ export function ProcessingScreen({
     // multi-minute post finishes.
     const publishItemId = itemId;
     const accountLabel = activeAccountName ?? "Account";
+    // Keep the dialog's force-local intent in sync with the actual call, so if the
+    // backend backstop re-opens the recency dialog its "Post anyway" preserves it.
+    nowDialogForceLocalRef.current = forceLocal;
     setNowDialog(null);
     setPublishingItems((m) => ({ ...m, [publishItemId]: "Publishing…" }));
     setActionError(null);
@@ -637,6 +731,15 @@ export function ProcessingScreen({
       if (
         !window.confirm(
           `Change only #${candidate.account_seq ?? candidate.id} from Posted to ${label}? The original post history will be kept and a new publish attempt will be created.`,
+        )
+      )
+        return;
+    } else if (status === "posted") {
+      // Reverting a reopened item: discard the draft repost attempt and return to
+      // Posted. The original post history is kept.
+      if (
+        !window.confirm(
+          `Set #${candidate.account_seq ?? candidate.id} back to Posted? This discards the reopened draft attempt and keeps the original post history.`,
         )
       )
         return;
@@ -968,6 +1071,30 @@ export function ProcessingScreen({
     }
   };
 
+  const restoreClip = async (targetItemId: number) => {
+    if (!targetItemId) return;
+    setBusy(true);
+    setActionError(null);
+    setHandoffMessage(null);
+    try {
+      // Setting status back to pending_review clears the rejected review_state on
+      // the backend (see publish_queue.set_processing_status), so the clip becomes
+      // openable again instead of snapping back to "rejected" on refresh.
+      await bridge.setProcessingStatus(targetItemId, "pending_review");
+      const list = await bridge.listLibraryItems(activeAccountId);
+      setItems(list);
+      setHandoffMessage("Restored to Pending review.");
+      if (targetItemId === itemId) {
+        const ctx = await bridge.getContext(targetItemId);
+        setContext(ctx);
+      }
+    } catch (err: unknown) {
+      setActionError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const rejectGlobally = async () => {
     if (itemId === null) return;
     if (
@@ -1122,6 +1249,25 @@ export function ProcessingScreen({
     }
   };
 
+  // Flip the ACTIVE ACCOUNT's persisted auto-schedule setting from the export
+  // footer, so the choice is visible where the export happens instead of only
+  // in Account Manager. Per account, saved in the DB.
+  const toggleAutoScheduleOnExport = async () => {
+    const voice = context?.account;
+    if (!voice) return;
+    const next = !voice.auto_schedule_on_export;
+    try {
+      await bridge.updateAccount(voice.id, { auto_schedule_on_export: next });
+      setContext((ctx) =>
+        ctx && ctx.account
+          ? { ...ctx, account: { ...ctx.account, auto_schedule_on_export: next } }
+          : ctx,
+      );
+    } catch (err: unknown) {
+      setActionError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
   const exportReel = async () => {
     if (itemId === null) return;
     // Pin the id: the user may select another item while this export runs in
@@ -1137,13 +1283,17 @@ export function ProcessingScreen({
       const result = (await waitForJob(job_id, (value, message) =>
         setExportJobs((jobs) => ({ ...jobs, [exportItemId]: { value, message } })),
       )) as ExportResult;
+      // The scheduling warning must survive the user moving to another item or
+      // niche mid-export: an exported-but-unscheduled reel is otherwise silent.
+      if (result.warning) {
+        setActionError(
+          `Exported successfully, but auto-scheduling needs attention: ${result.warning} ` +
+            `(see "not scheduled yet" on the Publishing Dashboard)`,
+        );
+      }
       if (itemIdRef.current === exportItemId) {
         setExportedPath(result.processed_path);
-        if (result.warning) {
-          setActionError(
-            `Exported successfully, but auto-scheduling needs attention: ${result.warning}`,
-          );
-        } else if (result.scheduled_publish) {
+        if (result.scheduled_publish) {
           const scheduled = result.scheduled_publish.scheduled_at
             ? new Date(result.scheduled_publish.scheduled_at).toLocaleString()
             : "the next open slot";
@@ -1319,6 +1469,7 @@ export function ProcessingScreen({
                 <option value="posted">Posted</option>
                 <option value="failed">Failed</option>
                 <option value="skipped">Skipped</option>
+                <option value="rejected">Rejected</option>
               </select>
               <select
                 className="h-9 rounded-md border border-input bg-transparent px-2 text-sm"
@@ -1415,6 +1566,9 @@ export function ProcessingScreen({
                                 {option.label}
                               </option>
                             ))}
+                            {/* Only a reopened posted item can be set back to Posted
+                                (undoing the reopen); see _revert_reopen_to_posted. */}
+                            {candidate.reopened && <option value="posted">Posted</option>}
                           </select>
                         </span>
                       </td>
@@ -1443,16 +1597,27 @@ export function ProcessingScreen({
                       >
                         {posted ? (
                           <span className="text-xs text-muted-foreground">Posted</span>
+                        ) : rejected ? (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="h-7 px-2 text-xs"
+                            disabled={busy}
+                            title="Restore this clip to Pending review"
+                            onClick={() => void restoreClip(candidate.id)}
+                          >
+                            Restore
+                          </Button>
                         ) : (
                           <Button
                             size="sm"
-                            variant={rejected ? "ghost" : "destructive"}
+                            variant="destructive"
                             className="h-7 px-2 text-xs"
-                            disabled={busy || rejected}
+                            disabled={busy}
                             title={`Reject as ${REVIEW_REASON_LABELS[reviewReason] ?? reviewReason}`}
                             onClick={() => void rejectClip(candidate.id)}
                           >
-                            {rejected ? "Rejected" : "Reject"}
+                            Reject
                           </Button>
                         )}
                       </td>
@@ -1895,6 +2060,24 @@ export function ProcessingScreen({
             </Button>
           )}
           <div className="grow" />
+          {account && (
+            <label
+              className="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground"
+              title={
+                account.auto_schedule_on_export
+                  ? `Exports auto-schedule into ${account.name}'s next open slot. Saved per account.`
+                  : `Exports stay unscheduled; schedule manually from the Publishing Dashboard. Saved per account.`
+              }
+            >
+              <input
+                type="checkbox"
+                checked={account.auto_schedule_on_export}
+                disabled={exporting}
+                onChange={() => void toggleAutoScheduleOnExport()}
+              />
+              Auto-schedule on export
+            </label>
+          )}
           <Button
             variant="secondary"
             onClick={exportReel}
@@ -2013,6 +2196,20 @@ export function ProcessingScreen({
             />
           </div>
           <p className="text-xs text-muted-foreground">{exportProgress.message}</p>
+        </div>
+      )}
+
+      {itemDownload && (
+        <div className="space-y-1">
+          <div className="h-2 w-full overflow-hidden rounded-full bg-secondary">
+            <div
+              className="h-full bg-primary transition-[width] duration-300"
+              style={{ width: `${Math.round(itemDownload.value * 100)}%` }}
+            />
+          </div>
+          <p className="text-xs text-muted-foreground">
+            Fetching original clip — {itemDownload.message}
+          </p>
         </div>
       )}
 
@@ -2138,7 +2335,7 @@ export function ProcessingScreen({
                 setNowDialog(null);
                 void autoScheduleForPublish();
               }}
-              onPublishAnyway={() => void doPublishNow(true)}
+              onPublishAnyway={() => void doPublishNow(true, nowDialogForceLocalRef.current)}
               onCancel={() => setNowDialog(null)}
             />
           )}

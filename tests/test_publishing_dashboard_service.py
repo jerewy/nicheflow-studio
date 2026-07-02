@@ -45,6 +45,76 @@ def test_global_publish_jobs_and_mark_ready(tmp_path: Path) -> None:
     assert next(row for row in updated["jobs"] if row["id"] == job_id)["status"] == "ready"
 
 
+def test_global_publish_jobs_lists_exported_but_unscheduled_items(tmp_path: Path) -> None:
+    """An exported item with no UploadJob (failed/disabled auto-schedule) must
+    surface as an unscheduled export instead of silently disappearing."""
+    output = tmp_path / "orphan.mp4"
+    output.write_bytes(b"video")
+    with get_session() as session:
+        account = Account(
+            name="Past Moments",
+            platform="instagram",
+            upload_schedule_slots="09:00, 18:00",
+            auto_schedule_on_export=True,
+        )
+        session.add(account)
+        session.commit()
+        item = DownloadItem(
+            source_url="https://instagram.com/reel/orphan",
+            title="Orphan reel",
+            title_draft="Final title",
+            processed_path=str(output),
+            account_id=account.id,
+        )
+        session.add(item)
+        session.commit()
+        item_id = item.id
+
+    result = publishing_dashboard.list_global_publish_jobs()
+
+    row = next(r for r in result["unscheduled_exports"] if r["item_id"] == item_id)
+    assert row["account_name"] == "Past Moments"
+    assert row["title"] == "Final title"
+    assert row["can_schedule"] is True
+    assert "Schedule it now" in row["reason"]
+
+
+def test_unscheduled_exports_excludes_items_with_jobs_and_explains_missing_slots(
+    tmp_path: Path,
+) -> None:
+    queued_job_id = _seed_job(tmp_path)  # its item has an UploadJob -> not "unscheduled"
+    with get_session() as session:
+        job = session.get(UploadJob, queued_job_id)
+        queued_item_id = job.download_item_id
+        # Give the queued item an export too: only the missing UploadJob may
+        # qualify an item, never the mere presence of a processed file.
+        session.get(DownloadItem, queued_item_id).processed_path = job.processed_path
+        session.commit()
+    output = tmp_path / "no_slots.mp4"
+    output.write_bytes(b"video")
+    with get_session() as session:
+        account = Account(name="No Slots Yet", platform="instagram")
+        session.add(account)
+        session.commit()
+        item = DownloadItem(
+            source_url="https://instagram.com/reel/noslots",
+            title="Slotless reel",
+            processed_path=str(output),
+            account_id=account.id,
+        )
+        session.add(item)
+        session.commit()
+        item_id = item.id
+
+    result = publishing_dashboard.list_global_publish_jobs()
+
+    listed_ids = [r["item_id"] for r in result["unscheduled_exports"]]
+    assert item_id in listed_ids
+    assert queued_item_id not in listed_ids
+    row = next(r for r in result["unscheduled_exports"] if r["item_id"] == item_id)
+    assert "schedule slots" in row["reason"]
+
+
 def test_global_publish_jobs_keeps_failed_jobs_visible_past_cutoff(tmp_path: Path) -> None:
     job_id = _seed_job(tmp_path, status="failed")
     with get_session() as session:

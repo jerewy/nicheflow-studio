@@ -4,7 +4,7 @@ import pytest
 
 from nicheflow_studio.db.models import Account, DownloadItem, UploadJob
 from nicheflow_studio.db.session import get_session
-from nicheflow_studio.services import publish_queue, publishing
+from nicheflow_studio.services import library, publish_queue, publishing
 from nicheflow_studio.services.publish_queue import PublishQueueError
 
 
@@ -113,7 +113,11 @@ def test_reschedule_hands_cloud_mapped_job_to_worker(monkeypatch: pytest.MonkeyP
 
     job_id = _make_job()
     with get_session() as session:
-        account_id = session.get(UploadJob, job_id).account_id
+        job = session.get(UploadJob, job_id)
+        account_id = job.account_id
+        # The cloud handoff validates finalized draft text before uploading.
+        job.description = "A final caption."
+        session.commit()
     monkeypatch.setenv("CLOUDFLARE_PUBLISHER_URL", "https://worker.example.dev")
     monkeypatch.setenv("CLOUDFLARE_PUBLISHER_API_KEY", "secret")
     monkeypatch.setenv("CLOUDFLARE_PUBLISH_ACCOUNTS", f'{{"{account_id}":"testkey"}}')
@@ -244,9 +248,114 @@ def test_set_processing_status_reopens_only_selected_posted_item() -> None:
         assert session.get(DownloadItem, item_id).status == "posted"
 
 
+def test_set_processing_status_posted_reverts_a_reopened_item() -> None:
+    """Selecting Posted on a reopened item undoes the reopen: the draft repost is
+    discarded, the original posted job is kept, and the derived status returns to
+    posted (the user's "I switched it to Exported by mistake" recovery)."""
+    from nicheflow_studio.services import library
+
+    with get_session() as session:
+        account = Account(name="History", platform="instagram")
+        session.add(account)
+        session.flush()
+        item = DownloadItem(
+            account_id=account.id,
+            source_url="https://instagram.com/reel/revert",
+            file_path="C:/source.mp4",
+            processed_path="C:/history.mp4",
+            title="Source title",
+            status="posted",
+        )
+        session.add(item)
+        session.flush()
+        posted = UploadJob(
+            account_id=account.id,
+            download_item_id=item.id,
+            processed_path=item.processed_path,
+            title="Original title",
+            status="posted",
+            posted_at=publish_queue.dt.datetime(2026, 6, 20, tzinfo=publish_queue.dt.timezone.utc),
+            posted_url="https://instagram.com/p/original",
+        )
+        session.add(posted)
+        session.commit()
+        item_id = item.id
+        posted_job_id = posted.id
+
+    # Reopen it (the mistaken "Exported" click), then revert.
+    reopened = publish_queue.set_processing_status(item_id, "exported")
+    repost_job_id = reopened["repost_job_id"]
+    assert repost_job_id is not None
+    assert library.list_items(account_id=None)[0]["reopened"] is True
+
+    result = publish_queue.set_processing_status(item_id, "posted")
+
+    assert result["status"] == "posted"
+    assert result["repost_job_id"] is None
+    with get_session() as session:
+        assert session.get(UploadJob, repost_job_id) is None  # draft repost discarded
+        original = session.get(UploadJob, posted_job_id)
+        assert original.status == "posted"  # post history kept
+        assert original.posted_url == "https://instagram.com/p/original"
+        assert session.get(DownloadItem, item_id).status == "posted"
+    # Derived status the table shows is back to posted, no longer reopened.
+    view = library.list_items(account_id=None)[0]
+    assert view["status"] == "posted"
+    assert view["reopened"] is False
+
+
+def test_set_processing_status_posted_rejects_never_posted_item() -> None:
+    job_id = _make_job()  # a draft job, no posted history
+    with get_session() as session:
+        job = session.get(UploadJob, job_id)
+        download = DownloadItem(
+            account_id=job.account_id,
+            source_url="https://instagram.com/reel/neverposted",
+            processed_path="C:/out.mp4",
+            status="exported",
+        )
+        session.add(download)
+        session.flush()
+        job.download_item_id = download.id
+        session.commit()
+        download_id = download.id
+    with pytest.raises(PublishQueueError, match="never posted"):
+        publish_queue.set_processing_status(download_id, "posted")
+
+
 def test_set_processing_status_rejects_operational_cloud_status() -> None:
     with pytest.raises(PublishQueueError, match="cannot be set manually"):
         publish_queue.set_processing_status(1, "cloud")
+
+
+def test_set_processing_status_pending_review_clears_rejected_state() -> None:
+    """Reverting a rejected clip to Pending review must clear its review_state, or
+    _derive_status (which reads review_state first) snaps it back to 'rejected' and
+    the change looks like a no-op on the next refresh."""
+    with get_session() as session:
+        account = Account(name="History", platform="instagram")
+        session.add(account)
+        session.flush()
+        download = DownloadItem(
+            account_id=account.id,
+            source_url="https://instagram.com/reel/wasrejected",
+            status="completed",
+            review_state="rejected",
+        )
+        session.add(download)
+        session.commit()
+        download_id = download.id
+        account_id = account.id
+
+    result = publish_queue.set_processing_status(download_id, "pending_review")
+    assert result["status"] == "pending_review"
+
+    with get_session() as session:
+        assert session.get(DownloadItem, download_id).review_state == "pending_review"
+
+    # And the Processing list no longer derives it as rejected.
+    row = next(r for r in library.list_items(account_id) if r["id"] == download_id)
+    assert row["status"] != "rejected"
 
 
 def test_remove_job() -> None:

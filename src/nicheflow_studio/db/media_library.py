@@ -132,6 +132,16 @@ def mark_media_asset_downloaded(
     asset.downloaded_at = dt.datetime.now(dt.timezone.utc)
 
 
+def mark_media_asset_unavailable(asset: MediaAsset) -> None:
+    """Record that the source post is permanently gone (deleted/private).
+
+    ``unavailable`` keeps the asset out of pending-download work while the
+    shortcode/URL dedup keys stay on record, so a dead reel is never re-pooled
+    or endlessly retried.
+    """
+    asset.download_status = "unavailable"
+
+
 def find_content_duplicate(
     session: Session,
     *,

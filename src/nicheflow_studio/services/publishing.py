@@ -38,6 +38,11 @@ _ITEM_LIST_LIMIT = 50
 SAME_ACCOUNT_MIN_GAP_HOURS = 4
 _CLOUD_HANDOFF_LOCKS: dict[int, threading.Lock] = {}
 _CLOUD_HANDOFF_LOCKS_GUARD = threading.Lock()
+# Bulk exports run one JobManager thread per item, so two auto-schedules for the
+# SAME account can read the identical set of occupied slots and both claim it.
+# Serializing slot computation + queue commit per account removes that race.
+_ACCOUNT_SCHEDULE_LOCKS: dict[int, threading.Lock] = {}
+_ACCOUNT_SCHEDULE_LOCKS_GUARD = threading.Lock()
 
 
 class PublishError(ServiceError):
@@ -450,6 +455,11 @@ def queue_for_publish(item_id: int, *, scheduled_at: str | None = None) -> dict:
     return result
 
 
+def _account_schedule_lock(account_id: int) -> threading.Lock:
+    with _ACCOUNT_SCHEDULE_LOCKS_GUARD:
+        return _ACCOUNT_SCHEDULE_LOCKS.setdefault(account_id, threading.Lock())
+
+
 def auto_schedule_for_publish(
     item_id: int,
     *,
@@ -457,6 +467,24 @@ def auto_schedule_for_publish(
     rng: _random.Random | None = None,
 ) -> dict:
     """Queue an exported item in a safe catch-up or next open posting slot."""
+    with get_session() as session:
+        item = session.get(DownloadItem, item_id)
+        if item is None:
+            raise PublishError(f"No download item with id {item_id}.")
+        account_id = item.account_id
+    if account_id is None:
+        # No account -> no slots to race over; the impl raises the precise error.
+        return _auto_schedule_for_publish(item_id, now=now, rng=rng)
+    with _account_schedule_lock(account_id):
+        return _auto_schedule_for_publish(item_id, now=now, rng=rng)
+
+
+def _auto_schedule_for_publish(
+    item_id: int,
+    *,
+    now: dt.datetime | None = None,
+    rng: _random.Random | None = None,
+) -> dict:
     now_local = now or dt.datetime.now().astimezone()
     with get_session() as session:
         item = session.get(DownloadItem, item_id)

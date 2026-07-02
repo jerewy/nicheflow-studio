@@ -6,6 +6,7 @@ import { PoolReviewScreen } from "@/components/PoolReviewScreen";
 import { MultiAccountPublish } from "@/components/MultiAccountPublish";
 import { AccountReadiness } from "@/components/AccountReadiness";
 import { Button } from "@/components/ui/button";
+import { useAutoRefresh } from "@/hooks/useAutoRefresh";
 import { bridge } from "@/lib/bridge";
 import { formatDate } from "@/lib/format";
 import { cn } from "@/lib/utils";
@@ -44,6 +45,9 @@ export function Dashboard({
     const timer = window.setTimeout(loadStats, 0);
     return () => window.clearTimeout(timer);
   }, [loadStats]);
+  // Background exports/publishes land while this screen sits open; keep the
+  // stats table fresh without requiring a tab switch or manual Refresh.
+  useAutoRefresh(loadStats, 30000);
 
   return (
     <div className="mx-auto max-w-5xl space-y-4 p-6">

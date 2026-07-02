@@ -164,6 +164,11 @@ def set_processing_status(item_id: int, status: str) -> dict:
     separate draft attempt so publishing is unblocked for only this item.
     """
     status = str(status or "").strip().lower()
+    # "posted" isn't a hand-set label (the real state is derived from the posted
+    # UploadJob). Selecting it on a reopened item means "undo the reopen" — discard
+    # the draft repost attempt so the derived status falls back to posted.
+    if status == "posted":
+        return _revert_reopen_to_posted(item_id)
     if status not in _EDITABLE_PROCESSING_STATUSES:
         raise PublishQueueError(f"Status {status!r} cannot be set manually.")
     with get_session() as session:
@@ -214,12 +219,67 @@ def set_processing_status(item_id: int, status: str) -> dict:
             repost.error_message = None
 
         item.status = status
+        # A rejected/skipped item carries a review_state that _derive_status treats
+        # as the source of truth — it overrides item.status. Returning it to
+        # "pending_review" must clear that, or the derived status snaps straight
+        # back to "rejected" on the next refresh and the change looks like a no-op.
+        if status == "pending_review":
+            item.review_state = "pending_review"
         session.commit()
         return {
             "item_id": item.id,
             "status": status,
             "repost_job_id": repost.id if repost is not None else None,
             "created": created and repost is not None,
+        }
+
+
+def _revert_reopen_to_posted(item_id: int) -> dict:
+    """Undo a manual reopen: drop the draft repost attempt created when a posted
+    item was switched to draft/exported, so its derived status returns to posted.
+
+    Only valid for items that were genuinely posted (have a posted UploadJob). The
+    posted job — and its post history — is kept; the per-account recency/cooldown
+    math keeps keying off its ``posted_at``.
+    """
+    with get_session() as session:
+        item = session.get(DownloadItem, item_id)
+        if item is None:
+            raise PublishQueueError(f"No Processing item with id {item_id}.")
+        posted = session.scalars(
+            select(UploadJob)
+            .where(UploadJob.download_item_id == item.id)
+            .where((UploadJob.posted_at.is_not(None)) | (UploadJob.status == "posted"))
+            .order_by(UploadJob.id.desc())
+            .limit(1)
+        ).first()
+        if posted is None:
+            raise PublishQueueError("This item was never posted, so it can't be set to Posted.")
+        # The reopen attempt is any non-posted job newer than the posted one — this
+        # is exactly the condition that marks the item "reopened" in the library
+        # status derivation (see services/library.py).
+        reopen_jobs = session.scalars(
+            select(UploadJob)
+            .where(UploadJob.download_item_id == item.id)
+            .where(UploadJob.posted_at.is_(None))
+            .where(UploadJob.status != "posted")
+            .where(UploadJob.id > posted.id)
+        ).all()
+        for job in reopen_jobs:
+            if job.status in {"scheduled", "cloud"}:
+                raise PublishQueueError(
+                    "Cancel the active schedule before setting this back to Posted."
+                )
+        for job in reopen_jobs:
+            session.delete(job)
+        # Mirror the natural posted state a live post writes (publish_now sets this).
+        item.status = "posted"
+        session.commit()
+        return {
+            "item_id": item.id,
+            "status": "posted",
+            "repost_job_id": None,
+            "created": False,
         }
 
 

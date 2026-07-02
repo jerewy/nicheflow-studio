@@ -43,6 +43,9 @@ _SCORE_IN_CHUNK = 500
 # An assignment whose clip turned out to be duplicate footage at download time.
 # Excluded from per-account counts so the next Distribute refills the slot.
 ASSIGNMENT_STATUS_SKIPPED_DUPLICATE = "skipped_duplicate"
+# An assignment whose source reel is permanently gone (deleted/private) —
+# discovered at download time. Also excluded from counts so Distribute refills.
+ASSIGNMENT_STATUS_FAILED_SOURCE = "failed_source"
 ASSIGNMENT_STATUS_ASSIGNED = "assigned"
 ASSIGNMENT_STATUS_POSTED = "posted"
 ASSIGNMENT_STATUS_REJECTED = "rejected"
@@ -390,6 +393,28 @@ def assignment_counts_by_account(session: Session, niche: str) -> dict[int, int]
     return counts
 
 
+def fail_assignments_for_source_gone(session: Session, *, media_asset_id: int) -> int:
+    """Release every active assignment backed by a permanently-gone source.
+
+    ``failed_source`` drops the rows out of :func:`assignment_counts_by_account`,
+    so the next Distribute tops the affected accounts back up with fresh clips.
+    Returns the number of assignments released. Does not commit.
+    """
+    rows = (
+        session.query(Assignment)
+        .join(PoolItem, PoolItem.id == Assignment.pool_item_id)
+        .filter(
+            PoolItem.media_asset_id == media_asset_id,
+            Assignment.status == ASSIGNMENT_STATUS_ASSIGNED,
+        )
+        .all()
+    )
+    for assignment in rows:
+        assignment.status = ASSIGNMENT_STATUS_FAILED_SOURCE
+    session.flush()
+    return len(rows)
+
+
 def _active_assignments_for_item(session: Session, item: DownloadItem) -> list[Assignment]:
     asset = find_media_asset(session, source_url=item.source_url, shortcode=item.video_id)
     if asset is None or item.account_id is None:
@@ -500,7 +525,7 @@ def pending_download_assignments(
         session.query(Assignment.id, Assignment.niche, MediaAsset)
         .join(PoolItem, PoolItem.id == Assignment.pool_item_id)
         .join(MediaAsset, MediaAsset.id == PoolItem.media_asset_id)
-        .filter(MediaAsset.download_status != "downloaded")
+        .filter(MediaAsset.download_status.not_in(("downloaded", "unavailable")))
         .filter(Assignment.status == ASSIGNMENT_STATUS_ASSIGNED)
     )
     if niche is not None:

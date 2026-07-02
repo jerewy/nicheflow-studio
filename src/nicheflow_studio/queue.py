@@ -10,19 +10,24 @@ from typing import Callable
 from nicheflow_studio.core.paths import downloads_dir
 from nicheflow_studio.db.assignments import (
     ASSIGNMENT_STATUS_SKIPPED_DUPLICATE,
+    fail_assignments_for_source_gone,
     pending_download_assignments,
 )
+from nicheflow_studio.db.blocklist import block_asset
 from nicheflow_studio.db.media_library import (
     find_media_asset,
     find_or_register_media_asset,
     mark_media_asset_downloaded,
+    mark_media_asset_unavailable,
 )
 from nicheflow_studio.db.models import Assignment, DownloadItem, MediaAsset
 from nicheflow_studio.db.pools import (
     find_niche_content_duplicate,
     flag_pool_item_duplicate,
+    remove_pool_items_for_asset,
 )
 from nicheflow_studio.db.session import get_session
+from nicheflow_studio.downloader.failures import looks_like_missing_source
 from nicheflow_studio.downloader.instagram import (
     download_instagram_url,
     instagram_shortcode_from_url,
@@ -133,6 +138,9 @@ class AssignmentDownloadSummary:
     failed: int
     duplicates: int
     errors: tuple[str, ...]
+    # Assets whose source post is permanently gone: pulled from pools and their
+    # assignments released so the next Distribute refills the freed slots.
+    unavailable: int = 0
 
 
 def download_assigned_pending(
@@ -160,7 +168,7 @@ def download_assigned_pending(
     with get_session() as session:
         targets = pending_download_assignments(session, niche=niche)
 
-    downloaded = reused = failed = duplicates = 0
+    downloaded = reused = failed = duplicates = unavailable = 0
     errors: list[str] = []
     total = len(targets)
     for index, target in enumerate(targets):
@@ -223,6 +231,23 @@ def download_assigned_pending(
                 session.commit()
             downloaded += 1
         except Exception as exc:  # noqa: BLE001
+            if looks_like_missing_source(str(exc)):
+                # Permanent: the post is deleted/private. Retiring the asset
+                # (instead of leaving the assignment stuck "assigned" forever)
+                # frees the account slot so the next Distribute refills it, and
+                # the blocklist keeps a re-scrape from pooling the dead reel.
+                retire_gone_source(
+                    media_asset_id=target.media_asset_id,
+                    source_url=target.source_url,
+                    shortcode=target.shortcode,
+                    detail=_sanitize_error_message(exc),
+                )
+                unavailable += 1
+                errors.append(
+                    f"{target.shortcode or target.source_url}: source is gone — "
+                    "removed from the pool; re-run Distribute to refill the slot."
+                )
+                continue
             failed += 1
             errors.append(
                 f"{target.shortcode or target.source_url}: {_sanitize_error_message(exc)}"
@@ -235,7 +260,42 @@ def download_assigned_pending(
         failed=failed,
         duplicates=duplicates,
         errors=tuple(errors),
+        unavailable=unavailable,
     )
+
+
+def retire_gone_source(
+    *,
+    media_asset_id: int,
+    source_url: str | None,
+    shortcode: str | None,
+    detail: str,
+) -> None:
+    """Pull a permanently-gone source out of circulation (best-effort).
+
+    Marks the asset unavailable, removes its pool items, releases its active
+    assignments, and blocklists its dedup keys. Never raises: the download loop
+    must keep processing the remaining clips.
+    """
+    try:
+        with get_session() as session:
+            asset = session.get(MediaAsset, media_asset_id)
+            if asset is None:
+                return
+            mark_media_asset_unavailable(asset)
+            remove_pool_items_for_asset(
+                session, media_asset_id=media_asset_id, reason=f"source gone: {detail}"
+            )
+            fail_assignments_for_source_gone(session, media_asset_id=media_asset_id)
+            block_asset(
+                session,
+                source_url=source_url,
+                shortcode=shortcode,
+                reason=f"source gone: {detail}",
+            )
+            session.commit()
+    except Exception:  # noqa: BLE001 - cleanup is best-effort by design
+        _logger.exception("Retiring gone source for asset %s failed", media_asset_id)
 
 
 class QueueManager:

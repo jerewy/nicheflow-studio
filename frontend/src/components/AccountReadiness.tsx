@@ -2,9 +2,10 @@ import { useCallback, useEffect, useState } from "react";
 
 import { DashboardTable } from "@/components/DashboardTable";
 import { Button } from "@/components/ui/button";
+import { useAutoRefresh } from "@/hooks/useAutoRefresh";
 import { formatDate } from "@/lib/format";
 import { bridge } from "@/lib/bridge";
-import type { AccountReadiness as Readiness, JobSnapshot } from "@/types";
+import type { AccountReadiness as Readiness } from "@/types";
 
 export function AccountReadiness() {
   const [data, setData] = useState<Readiness | null>(null);
@@ -23,36 +24,11 @@ export function AccountReadiness() {
     const timer = window.setTimeout(load, 0);
     return () => window.clearTimeout(timer);
   }, [load]);
+  // Session health/queue counts change from background work (publishes,
+  // re-logins in the desktop app); refresh is local-only, so poll cheaply.
+  useAutoRefresh(load, 30000);
 
   const selectedRow = data?.rows.find((row) => row.account_id === selected);
-  const liveCheck = async () => {
-    try {
-      const { job_id } = await bridge.dashboardStartLiveHealthCheck();
-      setMessage("Checking sessions live...");
-      while (true) {
-        const job: JobSnapshot = await bridge.getJob(job_id);
-        setMessage(job.message || "Checking sessions live...");
-        if (job.status === "succeeded") {
-          const result = job.result as { results?: { account_name: string; state: string; label: string; detail: string }[] } | null;
-          if (result?.results) {
-            setData((current) => current && ({
-              ...current,
-              rows: current.rows.map((row) => {
-                const live = result.results?.find((item) => item.account_name === row.account_name);
-                return live ? { ...row, session_state: live.state, session_label: live.label, detail: live.detail } : row;
-              }),
-            }));
-          }
-          break;
-        }
-        if (job.status === "failed") throw new Error(job.error ?? "Live health check failed.");
-        await new Promise((resolve) => window.setTimeout(resolve, 500));
-      }
-      setMessage("Live health check complete.");
-    } catch (err: unknown) {
-      setMessage(err instanceof Error ? err.message : String(err));
-    }
-  };
 
   const relogin = async () => {
     if (selected === null) return;
@@ -68,7 +44,7 @@ export function AccountReadiness() {
     <section className="space-y-4 rounded-xl border bg-card p-5">
       <div>
         <h2 className="text-lg font-semibold">Account Readiness</h2>
-        <p className="text-sm text-muted-foreground">Per-account session health and publish readiness. Local refresh is safe; live checks contact Instagram sequentially.</p>
+        <p className="text-sm text-muted-foreground">Per-account session health and publish readiness. Refresh is local-only and never contacts Instagram (live checks were removed to protect your accounts from automation flags).</p>
       </div>
       {data && <p className="text-sm text-muted-foreground">{data.totals.account_count} account(s) · {data.totals.total_due_now} due now · {data.totals.total_scheduled} scheduled · next post {formatDate(data.totals.next_post_at)}{data.totals.blocked_accounts ? ` · ${data.totals.blocked_accounts} blocked` : ""}</p>}
       <DashboardTable headers={["Account", "Profile", "Session", "Due now", "Scheduled", "Next post", "Detail"]}>
@@ -86,7 +62,6 @@ export function AccountReadiness() {
       </DashboardTable>
       <div className="flex flex-wrap gap-2">
         <Button size="sm" variant="secondary" onClick={load}>Refresh</Button>
-        <Button size="sm" variant="outline" onClick={liveCheck}>Check All (live)</Button>
         <Button size="sm" variant="outline" disabled={!selectedRow?.profile} onClick={relogin}>Re-login</Button>
         <Button size="sm" variant="outline" disabled={!selectedRow?.login_identifier} onClick={() => selectedRow?.login_identifier && navigator.clipboard.writeText(selectedRow.login_identifier)}>Copy Email</Button>
       </div>

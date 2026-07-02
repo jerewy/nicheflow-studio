@@ -111,6 +111,8 @@ interface PywebviewApi {
     payload: Record<string, unknown>,
   ): Promise<Envelope<{ job_id: string }>>;
   start_export(itemId: number): Promise<Envelope<{ job_id: string }>>;
+  start_item_download(itemId: number): Promise<Envelope<{ job_id: string }>>;
+  prefetch_originals(itemIds: number[]): Promise<Envelope<{ job_id: string | null }>>;
   get_job(jobId: string): Promise<Envelope<JobSnapshot>>;
   list_publish_jobs(itemId: number): Promise<Envelope<PublishJob[]>>;
   set_processing_status(
@@ -340,6 +342,12 @@ export const bridge = {
   getContext(itemId?: number | null): Promise<ProcessingContext> {
     if (!hasBridge()) return mock.getContext();
     return unwrap(window.pywebview!.api.get_context(itemId ?? null));
+  },
+
+  // Fire-and-forget: warm upcoming clips' originals so opening them is instant.
+  prefetchOriginals(itemIds: number[]): Promise<{ job_id: string | null }> {
+    if (!hasBridge()) return Promise.resolve({ job_id: null });
+    return unwrap(window.pywebview!.api.prefetch_originals(itemIds));
   },
 
   listPublishJobs(itemId: number): Promise<PublishJob[]> {
@@ -579,6 +587,11 @@ export const bridge = {
     return unwrap(window.pywebview!.api.start_export(itemId));
   },
 
+  startItemDownload(itemId: number): Promise<{ job_id: string }> {
+    if (!hasBridge()) return Promise.resolve({ job_id: "mock-job" });
+    return unwrap(window.pywebview!.api.start_item_download(itemId));
+  },
+
   getJob(jobId: string): Promise<JobSnapshot> {
     if (!hasBridge()) return mock.getJob();
     return unwrap(window.pywebview!.api.get_job(jobId));
@@ -814,7 +827,7 @@ export const bridge = {
 
   dashboardPublishJobs(): Promise<DashboardPublishQueue> {
     if (!hasBridge())
-      return Promise.resolve({ jobs: [], due_count: 0, draft: 0, ready: 0, scheduled: 0, failed: 0 });
+      return Promise.resolve({ jobs: [], due_count: 0, draft: 0, ready: 0, scheduled: 0, failed: 0, unscheduled_exports: [] });
     return unwrap(window.pywebview!.api.dashboard_publish_jobs());
   },
 
@@ -1104,6 +1117,7 @@ const mock = {
         banned_phrases: null,
         title_style_notes: null,
         caption_style_notes: null,
+        auto_schedule_on_export: false,
       },
       latest_revision: mockRevision,
       revision_count: 1,
@@ -1331,6 +1345,7 @@ const mock = {
         source_url: "https://instagram.com/reel/mock",
         status: "draft",
         raw_status: "completed",
+        reopened: false,
         review_state: "new",
         file_path: "C:/clips/mock.mp4",
         has_file: true,

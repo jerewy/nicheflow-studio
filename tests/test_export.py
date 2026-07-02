@@ -18,6 +18,7 @@ def _make_item(
     *,
     file_path: str | None,
     title_draft: str | None = "Chosen title",
+    caption_draft: str | None = "A final caption.",
     auto_schedule_on_export: bool = False,
     upload_schedule_slots: str | None = None,
 ) -> int:
@@ -34,6 +35,9 @@ def _make_item(
             source_url="https://instagram.com/reel/abc",
             title="Source title",
             title_draft=title_draft,
+            # Scheduling validates finalized draft text; exports in these tests
+            # should pass that gate unless a test clears it explicitly.
+            caption_draft=caption_draft,
             file_path=file_path,
             status="completed",
             account_id=account.id,

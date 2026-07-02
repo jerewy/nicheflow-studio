@@ -104,6 +104,10 @@ export function ScrapingScreen({ activeAccountId, activeAccountName }: ScrapingS
   // Set of candidate ids currently being downloaded — lets multiple downloads
   // run concurrently without locking the whole table.
   const [addingIds, setAddingIds] = useState<Set<number>>(new Set());
+  // Per-candidate download progress while "Add to Processing" fetches the clip.
+  const [addProgress, setAddProgress] = useState<
+    Record<number, { value: number; message: string }>
+  >({});
   // Client-side table sort. null key keeps the backend order (newest first).
   const [sortKey, setSortKey] = useState<SortKey | null>(null);
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
@@ -212,7 +216,9 @@ export function ScrapingScreen({ activeAccountId, activeAccountName }: ScrapingS
     setMessage(null);
     try {
       const { job_id } = await bridge.startCandidateDownload(candidate.id);
-      const result = (await waitForJob(job_id)) as {
+      const result = (await waitForJob(job_id, (value, message) =>
+        setAddProgress((prev) => ({ ...prev, [candidate.id]: { value, message } })),
+      )) as {
         item_id: number;
         reused: boolean;
         downloaded: boolean;
@@ -227,6 +233,11 @@ export function ScrapingScreen({ activeAccountId, activeAccountName }: ScrapingS
       setAddingIds((prev) => {
         const next = new Set(prev);
         next.delete(candidate.id);
+        return next;
+      });
+      setAddProgress((prev) => {
+        const next = { ...prev };
+        delete next[candidate.id];
         return next;
       });
     }
@@ -520,9 +531,14 @@ export function ScrapingScreen({ activeAccountId, activeAccountName }: ScrapingS
                             <Button
                               size="sm"
                               disabled={addingIds.has(c.id)}
+                              title={addProgress[c.id]?.message}
                               onClick={() => addToProcessing(c)}
                             >
-                              {addingIds.has(c.id) ? "Adding…" : "Add to Processing"}
+                              {addingIds.has(c.id)
+                                ? addProgress[c.id]
+                                  ? `${Math.round(addProgress[c.id].value * 100)}% — ${addProgress[c.id].message || "Downloading…"}`
+                                  : "Adding…"
+                                : "Add to Processing"}
                             </Button>
                           )}
                           {c.state === "ignored" ? (
@@ -695,7 +711,11 @@ export function ScrapingScreen({ activeAccountId, activeAccountName }: ScrapingS
                 </Button>
               )}
               <Button size="sm" disabled={addingIds.has(selected.id)} onClick={() => addToProcessing(selected)}>
-                {addingIds.has(selected.id) ? "Adding…" : "Add to Processing"}
+                {addingIds.has(selected.id)
+                  ? addProgress[selected.id]
+                    ? `${Math.round(addProgress[selected.id].value * 100)}% — ${addProgress[selected.id].message || "Downloading…"}`
+                    : "Adding…"
+                  : "Add to Processing"}
               </Button>
               <div className="grow" />
               <select

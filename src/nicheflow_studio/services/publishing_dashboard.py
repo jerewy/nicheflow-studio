@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import datetime as dt
 import os
-import random
-import time
 from pathlib import Path
 from typing import Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -13,7 +11,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from sqlalchemy import func, select
 from sqlalchemy.orm import joinedload
 
-from nicheflow_studio.core.account_health import HealthState, live_health, local_health
+from nicheflow_studio.core.account_health import HealthState, local_health
 from nicheflow_studio.core.distribution import DEFAULT_DAILY_POSTS_PER_ACCOUNT
 from nicheflow_studio.core.instagram_profile_pool import ProfilePool
 from nicheflow_studio.core.scheduling import parse_slots
@@ -23,7 +21,7 @@ from nicheflow_studio.core.publishing_dashboard import (
     summarize_dashboard,
 )
 from nicheflow_studio.db.assignments import ASSIGNMENT_STATUS_ASSIGNED
-from nicheflow_studio.db.models import Account, Assignment, UploadJob
+from nicheflow_studio.db.models import Account, Assignment, DownloadItem, UploadJob
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.publisher.instagram_web import launch_instagram_login
 from nicheflow_studio.services.errors import ServiceError
@@ -241,7 +239,65 @@ def list_global_publish_jobs() -> dict:
         key: sum(1 for row in visible if row["status"] == key)
         for key in ("draft", "ready", "scheduled", "failed")
     }
-    return {"jobs": visible, "due_count": sum(1 for row in visible if row["is_due"]), **counts}
+    return {
+        "jobs": visible,
+        "due_count": sum(1 for row in visible if row["is_due"]),
+        "unscheduled_exports": _unscheduled_exports(),
+        **counts,
+    }
+
+
+_UNSCHEDULED_EXPORTS_LIMIT = 20
+
+
+def _unscheduled_exports() -> list[dict]:
+    """Exported items that never made it into the publish queue.
+
+    A failed auto-schedule (or auto-schedule turned off) leaves an item with a
+    ``processed_path`` but NO :class:`UploadJob` — invisible in the queue above.
+    Surfacing them here is what makes a silent scheduling failure recoverable.
+    """
+    with get_session() as session:
+        items = (
+            session.query(DownloadItem)
+            .options(joinedload(DownloadItem.account))
+            .filter(
+                DownloadItem.processed_path.is_not(None),
+                ~select(UploadJob.id)
+                .where(UploadJob.download_item_id == DownloadItem.id)
+                .exists(),
+            )
+            .order_by(DownloadItem.created_at.desc())
+            .limit(_UNSCHEDULED_EXPORTS_LIMIT)
+            .all()
+        )
+        rows = []
+        for item in items:
+            path = Path(item.processed_path or "")
+            if not path.exists():
+                continue
+            account = item.account
+            if account is None:
+                reason = "Assign this item to an account, then schedule it."
+            elif not parse_slots(account.upload_schedule_slots):
+                reason = "Set this account's schedule slots first (e.g. 09:00, 18:00)."
+            elif not account.auto_schedule_on_export:
+                reason = "Auto-schedule on export is off for this account."
+            else:
+                reason = "Auto-scheduling did not complete. Schedule it now."
+            rows.append(
+                {
+                    "item_id": item.id,
+                    "account_id": item.account_id,
+                    "account_name": account.name if account else "Unassigned",
+                    "title": item.title_draft or item.title or path.stem,
+                    "output_name": path.name,
+                    "exported_at": _iso(item.created_at),
+                    "reason": reason,
+                    "can_schedule": account is not None,
+                }
+            )
+        return rows
 
 
 def schedule_coverage(*, days: int = 2, now: dt.datetime | None = None) -> dict:
@@ -541,24 +597,30 @@ def account_readiness() -> dict:
 
 
 def check_all_live(*, progress: Callable[[float, str], None] | None = None) -> dict:
-    """Live-check configured accounts sequentially with gentle spacing."""
+    """Account-safety: live Instagram checks are DISABLED.
+
+    The old implementation used instaloader to hit Instagram's private API as each
+    account ("who am I?"), which contributes to automation flags. This now returns
+    the network-free :func:`local_health` instead (same response shape) so the UI
+    can still refresh status without ever contacting Instagram.
+    """
+    pool = ProfilePool.load()
+    now = dt.datetime.now(dt.timezone.utc)
     with get_session() as session:
         targets = [
-            (a.name, (a.instagram_profile or "").strip(), (a.instagram_handle or "").strip() or None)
+            (a.name, (a.instagram_profile or "").strip())
             for a in session.query(Account).order_by(Account.name.asc()).all()
             if (a.instagram_profile or "").strip()
         ]
     results = []
     total = len(targets)
-    for index, (name, profile, expected) in enumerate(targets):
-        health = live_health(profile, name, expected_username=expected)
+    for index, (name, profile) in enumerate(targets):
+        health = local_health(profile, name, pool=pool, now=now)
         results.append(
             {"account_name": name, "state": health.state, "label": HEALTH_LABELS.get(health.state, health.state), "detail": health.detail}
         )
         if progress:
             progress((index + 1) / max(total, 1), f"Checked {name}")
-        if index + 1 < total:
-            time.sleep(random.uniform(2.0, 4.0))
     return {"results": results}
 
 

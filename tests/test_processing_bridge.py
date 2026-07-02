@@ -408,6 +408,9 @@ def test_bridge_auto_schedule_for_publish() -> None:
     with get_session() as session:
         item = session.get(DownloadItem, item_id)
         item.processed_path = "C:/processed/out.mp4"
+        # Scheduling requires finalized draft text (not raw source labels).
+        item.title_draft = "Chosen title"
+        item.caption_draft = "A caption."
         account = session.get(Account, item.account_id)
         account.upload_schedule_slots = "09:00, 18:00"
         session.commit()

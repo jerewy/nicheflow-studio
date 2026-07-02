@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
 
 from nicheflow_studio.core import instagram_session
 from scripts.instagram_discover_playwright import (
@@ -256,6 +257,187 @@ def test_cookie_status_rejects_cookiefile_without_sessionid(tmp_path, monkeypatc
 
     assert status.cookiefile == str(dest)
     assert status.has_sessionid is False
+
+
+def _write_storage_state(
+    root: Path,
+    profile: str,
+    *,
+    sessionid: str | None = "sid",
+    ds_user_id: str | None = None,
+) -> None:
+    """Create a minimal Playwright storage-state.json for a profile under ``root``."""
+    cookies: list[dict] = []
+    if sessionid is not None:
+        cookies.append(
+            {
+                "name": "sessionid",
+                "value": sessionid,
+                "domain": ".instagram.com",
+                "path": "/",
+                "secure": True,
+                "expires": 1800000000.0,
+            }
+        )
+    if ds_user_id is not None:
+        cookies.append(
+            {
+                "name": "ds_user_id",
+                "value": ds_user_id,
+                "domain": ".instagram.com",
+                "path": "/",
+                "secure": True,
+                "expires": 1800000000.0,
+            }
+        )
+    cookies.append(
+        {
+            "name": "csrftoken",
+            "value": "tok",
+            "domain": ".instagram.com",
+            "path": "/",
+            "secure": True,
+            "expires": 1800000000.0,
+        }
+    )
+    path = root / profile / "storage-state.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"cookies": cookies}), encoding="utf-8")
+
+
+def test_per_profile_cookiefile_built_from_storage_state(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "instagram"
+    monkeypatch.setattr(instagram_session, "_INSTAGRAM_PROFILES_ROOT", root)
+    _write_storage_state(root, "acct1", sessionid="abc")
+
+    cookiefile = instagram_session.get_instagram_yt_dlp_cookiefile_for_profile("acct1")
+
+    assert cookiefile is not None
+    assert "sessionid\tabc" in Path(cookiefile).read_text(encoding="utf-8")
+
+
+def test_per_profile_cookiefile_none_without_sessionid(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "instagram"
+    monkeypatch.setattr(instagram_session, "_INSTAGRAM_PROFILES_ROOT", root)
+    _write_storage_state(root, "acct1", sessionid=None)
+
+    assert instagram_session.get_instagram_yt_dlp_cookiefile_for_profile("acct1") is None
+
+
+def test_best_cookiefile_uses_sourcing_account_never_the_requested(tmp_path, monkeypatch) -> None:
+    """Account-safety: downloads must use a designated sourcing account, never the
+    clip's own publishing account — even when it's passed as preferred_profile."""
+    root = tmp_path / "instagram"
+    monkeypatch.setattr(instagram_session, "_INSTAGRAM_PROFILES_ROOT", root)
+    monkeypatch.setenv("NICHEFLOW_IG_SOURCING_PROFILES", "sourcing_acct")
+    _write_storage_state(root, "publish_acct", sessionid="PUB")
+    _write_storage_state(root, "sourcing_acct", sessionid="SRC")
+
+    cookiefile = instagram_session.best_instagram_yt_dlp_cookiefile(preferred_profile="publish_acct")
+
+    assert cookiefile is not None
+    text = Path(cookiefile).read_text(encoding="utf-8")
+    assert "sessionid\tSRC" in text  # used the sourcing account
+    assert "sessionid\tPUB" not in text  # never the requested publishing account
+
+
+def test_best_cookiefile_never_borrows_a_non_sourcing_account(tmp_path, monkeypatch) -> None:
+    """If no sourcing account is available, downloads must NOT silently borrow some
+    other logged-in (publishing) account — that's the automation risk we removed.
+    With no shared export either, it returns None rather than risk an account."""
+    root = tmp_path / "instagram"
+    monkeypatch.setattr(instagram_session, "_INSTAGRAM_PROFILES_ROOT", root)
+    monkeypatch.setenv("NICHEFLOW_IG_SOURCING_PROFILES", "sourcing_acct")
+    # Only a non-sourcing publishing account is logged in; no sourcing account.
+    _write_storage_state(root, "publish_acct", sessionid="PUB")
+    monkeypatch.setattr(instagram_session, "_COOKIES_JSON_PATH", tmp_path / "missing.json")
+
+    cookiefile = instagram_session.best_instagram_yt_dlp_cookiefile(preferred_profile="publish_acct")
+
+    assert cookiefile is None  # refused to authenticate as the publishing account
+
+
+def test_best_cookiefile_falls_back_to_shared_export(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(instagram_session, "_INSTAGRAM_PROFILES_ROOT", tmp_path / "no_profiles")
+    source = tmp_path / "instagram-cookies.json"
+    dest = tmp_path / "instagram-cookies.txt"
+    source.write_text(
+        json.dumps(
+            [
+                {
+                    "name": "sessionid",
+                    "value": "shared",
+                    "domain": "instagram.com",
+                    "path": "/",
+                    "secure": True,
+                    "expirationDate": 1800000000,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(instagram_session, "_COOKIES_JSON_PATH", source)
+    monkeypatch.setattr(instagram_session, "_COOKIES_TXT_PATH", dest)
+
+    cookiefile = instagram_session.best_instagram_yt_dlp_cookiefile(preferred_profile="missing")
+
+    assert cookiefile == str(dest)
+
+
+def test_best_cookiefile_refuses_legacy_export_of_a_publishing_account(
+    tmp_path, monkeypatch
+) -> None:
+    """If the hand-refreshed Cookie-Editor export carries a logged-in PUBLISHING
+    account's session (matched by ds_user_id), the fallback must refuse it —
+    silently downloading as that account is the automation-flag risk."""
+    root = tmp_path / "instagram"
+    monkeypatch.setattr(instagram_session, "_INSTAGRAM_PROFILES_ROOT", root)
+    monkeypatch.setenv("NICHEFLOW_IG_SOURCING_PROFILES", "sourcing_acct")
+    # Only a publishing profile is logged in; its user id is 111.
+    _write_storage_state(root, "publish_acct", sessionid="PUB", ds_user_id="111")
+
+    source = tmp_path / "instagram-cookies.json"
+    dest = tmp_path / "instagram-cookies.txt"
+    source.write_text(
+        json.dumps(
+            [
+                {"name": "sessionid", "value": "PUB", "domain": ".instagram.com"},
+                {"name": "ds_user_id", "value": "111", "domain": ".instagram.com"},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(instagram_session, "_COOKIES_JSON_PATH", source)
+    monkeypatch.setattr(instagram_session, "_COOKIES_TXT_PATH", dest)
+
+    assert instagram_session.best_instagram_yt_dlp_cookiefile() is None
+
+
+def test_best_cookiefile_accepts_legacy_export_of_an_unknown_account(
+    tmp_path, monkeypatch
+) -> None:
+    """A legacy export whose ds_user_id matches no logged-in publishing profile
+    (e.g. a dedicated throwaway sourcing login) is still accepted."""
+    root = tmp_path / "instagram"
+    monkeypatch.setattr(instagram_session, "_INSTAGRAM_PROFILES_ROOT", root)
+    monkeypatch.setenv("NICHEFLOW_IG_SOURCING_PROFILES", "sourcing_acct")
+    _write_storage_state(root, "publish_acct", sessionid="PUB", ds_user_id="111")
+
+    source = tmp_path / "instagram-cookies.json"
+    dest = tmp_path / "instagram-cookies.txt"
+    source.write_text(
+        json.dumps(
+            [
+                {"name": "sessionid", "value": "OTHER", "domain": ".instagram.com"},
+                {"name": "ds_user_id", "value": "999", "domain": ".instagram.com"},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(instagram_session, "_COOKIES_JSON_PATH", source)
+    monkeypatch.setattr(instagram_session, "_COOKIES_TXT_PATH", dest)
+
+    assert instagram_session.best_instagram_yt_dlp_cookiefile() == str(dest)
 
 
 def test_metadata_script_rate_limit_without_candidates_exits_cleanly(

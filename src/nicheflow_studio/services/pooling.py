@@ -34,8 +34,10 @@ from nicheflow_studio.db.models import (
     ScrapeCandidate,
 )
 from nicheflow_studio.db.session import get_session
+from nicheflow_studio.downloader.failures import looks_like_missing_source
 from nicheflow_studio.downloader.instagram import download_instagram_url
 from nicheflow_studio.services.errors import ServiceError
+from nicheflow_studio import queue as queue_module
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +86,19 @@ def _ensure_pool_item_downloaded(pool_item_id: int) -> None:
         if not file_path.exists():
             raise FileNotFoundError(f"Downloader returned a missing file: {file_path}")
     except Exception as exc:  # noqa: BLE001 - convert to a user-facing service error
+        if looks_like_missing_source(str(exc)):
+            # Permanent: retire the asset so the dead reel leaves the pool and
+            # review queue instead of failing again on every approve/distribute.
+            queue_module.retire_gone_source(
+                media_asset_id=asset_id,
+                source_url=source_url,
+                shortcode=None,
+                detail=_download_error_message(exc),
+            )
+            raise PoolingError(
+                "The original reel is gone (deleted or made private). "
+                "It was removed from the pool; re-run Distribute to refill the slot."
+            ) from exc
         raise PoolingError(
             f"Could not download this clip before distribution: {_download_error_message(exc)}"
         ) from exc

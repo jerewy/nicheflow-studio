@@ -425,6 +425,30 @@ class ProcessingBridge:
         return context
 
     @_guard
+    def start_item_download(self, item_id: int) -> dict:
+        """Fetch a pending item's original as a background job (with progress).
+
+        The Processing screen starts this before ``get_context`` for a clip with
+        no local file yet, so the user sees a live progress bar instead of a
+        silently hanging bridge call.
+        """
+        return {"job_id": self._jobs.start(library_svc.ensure_item_downloaded, item_id)}
+
+    @_guard
+    def prefetch_originals(self, item_ids: list[int] | None = None) -> dict:
+        """Warm upcoming clips' originals in the background so opening them is
+        instant instead of triggering a live Instagram fetch on click.
+
+        Fire-and-forget: returns a job id, but the UI need not poll it — prefetch
+        is best-effort and a failure here never surfaces (the on-open path still
+        reports a real error for the clip the user actually clicks).
+        """
+        ids = [int(i) for i in (item_ids or [])]
+        if not ids:
+            return {"job_id": None}
+        return {"job_id": self._jobs.start(library_svc.prefetch_items, ids)}
+
+    @_guard
     def get_latest_revision(self, item_id: int) -> dict | None:
         """Latest draft revision for an item, or ``None`` when there are none."""
         latest = svc.latest_revision(item_id)

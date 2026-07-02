@@ -491,6 +491,38 @@ def test_auto_schedule_hands_cloud_mapped_job_to_worker(monkeypatch: pytest.Monk
         assert session.get(UploadJob, result["job_id"]).status == "cloud"
 
 
+def test_concurrent_auto_schedule_never_double_books_a_slot() -> None:
+    """Bulk export runs one thread per item; simultaneous auto-schedules for the
+    same account must serialize so no two posts claim the same slot."""
+    first_item = _make_item(processed_path="C:/processed/a.mp4")
+    account_id = _account_id_of(first_item)
+    with get_session() as session:
+        session.get(Account, account_id).upload_schedule_slots = "09:00, 13:00, 18:00"
+        session.commit()
+        item_ids = [first_item]
+        for index in range(3):
+            item = DownloadItem(
+                source_url=f"https://instagram.com/reel/race{index}",
+                title="Source",
+                title_draft="Chosen title",
+                caption_draft="A caption.",
+                file_path="C:/clips/x.mp4",
+                processed_path=f"C:/processed/race{index}.mp4",
+                status="completed",
+                account_id=account_id,
+            )
+            session.add(item)
+            session.commit()
+            item_ids.append(item.id)
+
+    with ThreadPoolExecutor(max_workers=len(item_ids)) as pool:
+        results = list(pool.map(publishing.auto_schedule_for_publish, item_ids))
+
+    scheduled_times = [result["scheduled_at"] for result in results]
+    assert all(scheduled_times)
+    assert len(set(scheduled_times)) == len(item_ids)
+
+
 def test_auto_schedule_keeps_existing_schedule_on_reexport() -> None:
     """Re-running auto-schedule (e.g. after a re-export) must keep the job's
     slot and refresh its content — never silently move the post later."""

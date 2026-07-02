@@ -13,6 +13,8 @@ at the new draft-revision foreign key.
 from __future__ import annotations
 
 import datetime as dt
+import threading
+import time
 from pathlib import Path
 
 from sqlalchemy import or_, select
@@ -38,12 +40,48 @@ from nicheflow_studio.db.pools import reject_candidate as _reject_candidate_db
 from nicheflow_studio.db.assignments import reject_assignments_for_item
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.services.errors import ServiceError
+from nicheflow_studio.downloader.failures import (
+    looks_like_auth_or_rate_limit,
+    looks_like_missing_source,
+)
 from nicheflow_studio.downloader.instagram import download_instagram_url
+from nicheflow_studio.core.instagram_session import best_instagram_yt_dlp_cookiefile
 from nicheflow_studio.core.paths import downloads_dir
 
 _LIST_LIMIT = 100
 # How recently an item must have been added to still read as "New".
 _NEW_WINDOW_HOURS = 24
+# On-demand first-fetches hit Instagram live and occasionally fail on a transient
+# reset, timeout, or rate-limit blip. Retry the whole attempt a few times with a
+# growing backoff before surfacing the error to the user — but never for a gone
+# source, which won't recover. yt-dlp also retries at the network layer (see
+# yt_dlp_sidecar); this outer loop adds the real backoff that helps IG throttling.
+_DOWNLOAD_ATTEMPTS = 3
+_DOWNLOAD_RETRY_BACKOFF = 1.5  # seconds, multiplied by the attempt number
+# Prefetch warms the next few not-yet-downloaded review clips in the background so
+# opening one is instant. Kept small, sequential, and paced — bulk/parallel
+# fetches invite the Instagram throttling we're trying to smooth over.
+_PREFETCH_MAX = 5
+_PREFETCH_GAP = 1.0  # seconds between real network fetches
+# Guards against two background prefetch jobs fetching the same clip at once.
+_prefetch_lock = threading.Lock()
+_prefetching: set[int] = set()
+# Serializes downloads of the *same* clip across all callers (a prefetch job vs the
+# user clicking that clip) so two yt-dlp runs never write the same .part file — on
+# Windows that races into "WinError 32 ... used by another process" and corrupts
+# ffmpeg postprocessing. Keyed by source URL; the output filename derives from the
+# clip, so same URL == same file on disk.
+_download_locks_guard = threading.Lock()
+_download_locks: dict[str, threading.Lock] = {}
+
+
+def _download_lock_for(source_url: str) -> threading.Lock:
+    with _download_locks_guard:
+        lock = _download_locks.get(source_url)
+        if lock is None:
+            lock = threading.Lock()
+            _download_locks[source_url] = lock
+        return lock
 # review_state values that mean the user set the item aside.
 _SKIPPED_REVIEW_STATES = {"ignored", "skipped", "declined", "canceled", "cancelled", "rejected"}
 
@@ -57,24 +95,16 @@ class SourceUnavailableError(LibraryError):
     (deleted, made private, or removed by Instagram) — not a fault on our side."""
 
 
-# yt-dlp reports a removed/private/deleted Instagram post with one of these phrases.
-# Recognising them lets the UI show a clean "reject this clip" prompt instead of a
-# generic "Unexpected error". Lowercase for case-insensitive matching. Note that
-# "empty media response" can *also* mean an expired session, so the message hedges
-# toward re-login when many clips fail at once.
-_SOURCE_GONE_MARKERS = (
-    "empty media response",
-    "the post may have been deleted",
-    "content isn't available",
-    "requested content was not found",
-    "video unavailable",
-    "this account is private",
-)
+class SessionExpiredError(LibraryError):
+    """Instagram blocked the download because the account session is expired or
+    rate-limited — the clip itself is fine, so the user should re-login/wait, not
+    reject it."""
 
 
-def _looks_like_missing_source(message: str) -> bool:
-    lowered = message.lower()
-    return any(marker in lowered for marker in _SOURCE_GONE_MARKERS)
+# Shared with queue.py / pooling.py so every download path classifies failures
+# the same way (transient session trouble vs permanently-gone source).
+_looks_like_auth_or_rate_limit = looks_like_auth_or_rate_limit
+_looks_like_missing_source = looks_like_missing_source
 
 
 def _iso(value: dt.datetime | None) -> str | None:
@@ -90,14 +120,18 @@ def _derive_status(
     reopened_item_ids: set[int],
 ) -> str:
     """Workflow status for the Processing table: posted > failed > cloud >
-    scheduled > pending_review > skipped > exported > draft > new.
+    scheduled > rejected/skipped > pending_review > exported > draft > new.
 
     ``scheduled``/``cloud`` outrank ``pending_review`` on purpose: auto-distributed
     clips are exported AND queued for a future post in the background while their
     ``download_items.status`` is still ``pending_review`` (awaiting the user's
     review). The live schedule is the more useful thing to surface, so it wins —
     a clip with no queued post still reads ``pending_review`` as before. ``cloud``
-    is the same as ``scheduled`` but handed off to the Cloudflare Worker."""
+    is the same as ``scheduled`` but handed off to the Cloudflare Worker.
+
+    The review_state check must come before ``pending_review`` so that a clip
+    rejected while still in ``pending_review`` surfaces as ``rejected``, not
+    ``pending_review``."""
     if item.id in posted_item_ids and item.id not in reopened_item_ids:
         return "posted"
     if item.id in failed_item_ids:
@@ -106,12 +140,13 @@ def _derive_status(
         return "cloud"
     if item.id in scheduled_item_ids:
         return "scheduled"
+    review_state = (item.review_state or "").lower()
+    if review_state in _SKIPPED_REVIEW_STATES:
+        return "rejected" if review_state == "rejected" else "skipped"
     if item.status == "pending_review":
         return "pending_review"
     if item.status in {"draft", "exported"}:
         return item.status
-    if (item.review_state or "").lower() in _SKIPPED_REVIEW_STATES:
-        return "skipped"
     if item.processed_path:
         return "exported"
     if item.title_draft or item.caption_draft:
@@ -238,6 +273,10 @@ def list_items(account_id: int | None = None, limit: int = _LIST_LIMIT) -> list[
                         reopened_item_ids,
                     ),
                     "raw_status": row.status,
+                    # A posted item that was manually reopened (a newer draft repost
+                    # attempt exists). The UI offers "Posted" only for these, to undo
+                    # the reopen — see services/publish_queue._revert_reopen_to_posted.
+                    "reopened": row.id in reopened_item_ids,
                     "review_state": row.review_state,
                     "file_path": row.file_path,
                     "has_file": bool(row.file_path),
@@ -339,57 +378,201 @@ def mark_seen(item_id: int) -> None:
             session.commit()
 
 
-def ensure_item_downloaded(item_id: int, *, downloader=None) -> dict:
-    """Materialize a pending-review item on first real use, globally deduped."""
+def _existing_download_result(session, item_id: int, source_url: str, shortcode) -> dict | None:
+    """Return a ``downloaded: False`` result if this clip is already on disk —
+    directly on the item, or via a previously-downloaded global media asset — else
+    ``None``. Shared by the lock-free fast path and the re-check under the per-clip
+    download lock, so the two stay in sync."""
+    item = session.get(DownloadItem, item_id)
+    if item is None:
+        return None
+    if item.file_path and Path(item.file_path).exists():
+        return {"item_id": item.id, "file_path": item.file_path, "downloaded": False}
+    asset = find_media_asset(session, source_url=source_url, shortcode=shortcode)
+    if asset is not None and asset.original_download_path and Path(asset.original_download_path).exists():
+        item.file_path = asset.original_download_path
+        item.status = "completed"
+        session.commit()
+        return {"item_id": item.id, "file_path": item.file_path, "downloaded": False}
+    return None
+
+
+def _retire_gone_source_for_url(
+    *, source_url: str, shortcode: str | None, detail: str
+) -> None:
+    """Best-effort: pull a permanently-gone source out of pools/assignments.
+
+    Only acts when the URL already has a registered media asset (pooled clips);
+    a plain account-scoped item has nothing to retire.
+    """
+    from nicheflow_studio.queue import retire_gone_source
+
+    try:
+        with get_session() as session:
+            asset = find_media_asset(session, source_url=source_url, shortcode=shortcode)
+            asset_id = asset.id if asset is not None else None
+        if asset_id is not None:
+            retire_gone_source(
+                media_asset_id=asset_id,
+                source_url=source_url,
+                shortcode=shortcode,
+                detail=detail,
+            )
+    except Exception:  # noqa: BLE001 - cleanup must never mask the real error
+        pass
+
+
+def ensure_item_downloaded(item_id: int, *, downloader=None, progress=None) -> dict:
+    """Materialize a pending-review item on first real use, globally deduped.
+
+    Concurrent callers for the same clip (a background prefetch job and the user
+    clicking that same clip) are serialized on a per-clip lock so two yt-dlp runs
+    never write the same .part file — on Windows that races into "WinError 32 ...
+    used by another process" and corrupt ffmpeg postprocessing. The second caller
+    re-checks under the lock and reuses the finished file instead of re-fetching.
+
+    ``progress`` is an optional ``(fraction, message)`` callback (the JobManager
+    injects one) so the UI can show that a live Instagram fetch is running.
+    """
+
+    def report(fraction: float, message: str) -> None:
+        if progress is not None:
+            progress(fraction, message)
+
     with get_session() as session:
         item = _require_item(session, item_id)
-        if item.file_path and Path(item.file_path).exists():
-            return {"item_id": item.id, "file_path": item.file_path, "downloaded": False}
-        asset = find_media_asset(session, source_url=item.source_url, shortcode=item.video_id)
-        if asset is not None and asset.original_download_path and Path(asset.original_download_path).exists():
-            item.file_path = asset.original_download_path
-            item.status = "completed"
-            session.commit()
-            return {"item_id": item.id, "file_path": item.file_path, "downloaded": False}
+        existing = _existing_download_result(session, item_id, item.source_url, item.video_id)
+        if existing is not None:
+            return existing
         source_url = item.source_url
         shortcode = item.video_id
         account_id = item.account_id
 
-    fetch = downloader or download_instagram_url
-    try:
-        result = fetch(url=source_url, output_dir=downloads_dir() / f"acc_{account_id}")
-    except ServiceError:
-        raise
-    except Exception as exc:  # noqa: BLE001 - translate raw downloader failures into a clean, actionable UI message
-        if _looks_like_missing_source(str(exc)):
-            raise SourceUnavailableError(
-                "Instagram returned no media for this clip — the original was most "
-                "likely deleted or made private. Reject it to clear it from the queue. "
-                "(If lots of clips fail to open, your Instagram session may have "
-                "expired — re-login from the dashboard.)"
-            ) from exc
-        raise LibraryError(
-            "Couldn't fetch this clip's original from Instagram. Check your "
-            "connection and Instagram session, then try again — if it keeps "
-            "failing, reject the clip."
-        ) from exc
-    file_path = str(result.file_path)
-    # Perceptual fingerprint for cross-repost footage dedup; best-effort so an
-    # unreadable file never blocks opening the clip.
-    content_hash = safe_video_fingerprint(Path(file_path))
-    with get_session() as session:
-        asset, _ = find_or_register_media_asset(
-            session, source_url=source_url, shortcode=shortcode, platform="instagram"
+    output_dir = downloads_dir() / f"acc_{account_id}"
+
+    def _attempt():
+        if downloader is not None:
+            # Tests inject a full downloader replacement that provides its own
+            # behavior and signature; don't resolve real cookies for it.
+            return downloader(url=source_url, output_dir=output_dir)
+        # Download as a SOURCING account only — never the clip's own publishing
+        # account. Authenticating downloads as a real/important account is what
+        # gets it flagged for automation, so best_instagram_yt_dlp_cookiefile
+        # ignores profile_name and uses the sourcing allowlist instead.
+        return download_instagram_url(
+            url=source_url,
+            output_dir=output_dir,
+            cookiefile=best_instagram_yt_dlp_cookiefile(),
         )
-        mark_media_asset_downloaded(
-            asset, original_download_path=file_path, content_hash=content_hash
-        )
-        for row in session.scalars(select(DownloadItem).where(DownloadItem.source_url == source_url)).all():
-            if row.file_path is None:
-                row.file_path = file_path
-                row.status = "completed"
-        session.commit()
-    return {"item_id": item_id, "file_path": file_path, "downloaded": True}
+
+    report(0.05, "Preparing download…")
+    with _download_lock_for(source_url):
+        # Another thread (e.g. a prefetch job) may have finished this exact clip
+        # while we waited for the lock — reuse it rather than start a second run.
+        with get_session() as session:
+            existing = _existing_download_result(session, item_id, source_url, shortcode)
+            if existing is not None:
+                report(1.0, "Already on disk.")
+                return existing
+
+        result = None
+        for attempt in range(1, _DOWNLOAD_ATTEMPTS + 1):
+            try:
+                report(
+                    0.15 + 0.2 * (attempt - 1),
+                    "Downloading original from Instagram…"
+                    if attempt == 1
+                    else f"Retrying download (attempt {attempt}/{_DOWNLOAD_ATTEMPTS})…",
+                )
+                result = _attempt()
+                break
+            except ServiceError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - translate raw downloader failures into a clean, actionable UI message
+                # A gone source never recovers — surface it immediately, no retry.
+                if _looks_like_missing_source(str(exc)):
+                    _retire_gone_source_for_url(
+                        source_url=source_url, shortcode=shortcode, detail=str(exc)[:200]
+                    )
+                    raise SourceUnavailableError(
+                        "Instagram returned no media for this clip — the original was most "
+                        "likely deleted or made private. Reject it to clear it from the queue. "
+                        "(If lots of clips fail to open, your Instagram session may have "
+                        "expired — re-login from the dashboard.)"
+                    ) from exc
+                # Expired session / rate-limit won't clear within our backoff, and
+                # retrying only adds load — surface it immediately with the right fix.
+                if _looks_like_auth_or_rate_limit(str(exc)):
+                    raise SessionExpiredError(
+                        "Instagram blocked this download — the account's session is likely "
+                        "expired or rate-limited. Re-login this account from the dashboard, "
+                        "or wait a few minutes and try again. Don't reject the clip; it's fine."
+                    ) from exc
+                # Transient (reset/timeout/rate-limit): back off and retry a few times
+                # before giving up so a single network blip doesn't fail the open.
+                if attempt >= _DOWNLOAD_ATTEMPTS:
+                    raise LibraryError(
+                        "Couldn't fetch this clip's original from Instagram. Check your "
+                        "connection and Instagram session, then try again — if it keeps "
+                        "failing, reject the clip."
+                    ) from exc
+                time.sleep(_DOWNLOAD_RETRY_BACKOFF * attempt)
+
+        assert result is not None  # loop returns a result or raises
+        report(0.85, "Saving clip…")
+        file_path = str(result.file_path)
+        # Perceptual fingerprint for cross-repost footage dedup; best-effort so an
+        # unreadable file never blocks opening the clip.
+        content_hash = safe_video_fingerprint(Path(file_path))
+        with get_session() as session:
+            asset, _ = find_or_register_media_asset(
+                session, source_url=source_url, shortcode=shortcode, platform="instagram"
+            )
+            mark_media_asset_downloaded(
+                asset, original_download_path=file_path, content_hash=content_hash
+            )
+            for row in session.scalars(select(DownloadItem).where(DownloadItem.source_url == source_url)).all():
+                if row.file_path is None:
+                    row.file_path = file_path
+                    row.status = "completed"
+            session.commit()
+        report(1.0, "Ready.")
+        return {"item_id": item_id, "file_path": file_path, "downloaded": True}
+
+
+def prefetch_items(item_ids: list[int], *, downloader=None) -> dict:
+    """Best-effort warm upcoming review clips' originals in the background so the
+    next open is instant instead of a live Instagram fetch on click.
+
+    Sequential and paced to stay gentle on Instagram (parallel/bulk fetches invite
+    throttling). Per-item failures are swallowed — the on-open path still surfaces
+    a real error for the clip the user actually clicks. Returns how many clips were
+    freshly downloaded.
+    """
+    ids = [int(i) for i in item_ids][:_PREFETCH_MAX]
+    warmed = 0
+    for index, item_id in enumerate(ids):
+        # Skip a clip another prefetch job is already fetching — don't double-hit
+        # Instagram for the same original.
+        with _prefetch_lock:
+            if item_id in _prefetching:
+                continue
+            _prefetching.add(item_id)
+        fetched = False
+        try:
+            result = ensure_item_downloaded(item_id, downloader=downloader)
+            fetched = bool(result.get("downloaded"))
+            if fetched:
+                warmed += 1
+        except Exception:  # noqa: BLE001 - prefetch is best-effort, never raise
+            fetched = True  # a real attempt happened (and failed) — still pace
+        finally:
+            with _prefetch_lock:
+                _prefetching.discard(item_id)
+        # Pace only real network fetches; a cached clip returns instantly, no wait.
+        if fetched and index + 1 < len(ids):
+            time.sleep(_PREFETCH_GAP)
+    return {"warmed": warmed, "requested": len(ids)}
 
 
 def remove_item_from_pool(item_id: int, reason: str = "manual removal") -> dict:
