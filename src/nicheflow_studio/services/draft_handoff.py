@@ -202,21 +202,36 @@ def _caption_rule_voice(account: Account | None) -> dict[str, str] | None:
 # title rules describe the on-screen title itself as "the long, calm documentary
 # caption that sits at the top of the clip". With a separate Caption Option field
 # in the flat paste format, chat models duplicated the title into the caption
-# slot and dumped the real 80-120 word description under an unparsed
+# slot and dumped the real full-length description under an unparsed
 # "Caption Option N (full):" header, so the importer only saw the one-line copy.
 # Spell the two fields out so the full caption lands in the slot the importer reads.
-_FIELD_DISAMBIGUATION_LINES = [
-    "Title Option and Caption Option are TWO DIFFERENT texts for each option, "
-    "never the same words twice:",
-    "- Title Option N is the on-screen overlay line from the on-screen title "
-    "rules above (one sentence; its length follows the AUTO MIX bands).",
-    "- Caption Option N is the Instagram description from the caption rules "
-    "above: about 80-120 words across two paragraphs. Put that full description "
-    "directly on and below the 'Caption Option N:' line.",
-    "Do NOT copy the title into the caption, do NOT write a one-line caption, and "
-    "do NOT add any extra field such as 'Caption Option N (full):'. There is "
-    "exactly one 'Caption Option N:' per option and its full caption follows it.",
-]
+def _field_disambiguation_lines(caption_style: str | None) -> list[str]:
+    """Spell the two fields apart, echoing the selected style's real length.
+
+    This block used to hardcode "about 80-120 words across two paragraphs"
+    (the historytrails_archive shape) for every style. It sits near the end of
+    the prompt, so its numbers tend to win over the caption rules above: for
+    styles like history_lost_archive (90-150 words, 3 paragraphs + hashtags)
+    the stale spec quietly squeezed captions shorter and could drop the payoff
+    paragraph. Pull the word target from the same source as the caption rules
+    so the two specs can never disagree again, and defer the paragraph shape
+    to those rules instead of restating it.
+    """
+    word_target = smart_drafts._caption_word_target(caption_style)
+    return [
+        "Title Option and Caption Option are TWO DIFFERENT texts for each option, "
+        "never the same words twice:",
+        "- Title Option N is the on-screen overlay line from the on-screen title "
+        "rules above (one sentence; its length follows the AUTO MIX bands).",
+        f"- Caption Option N is the Instagram description from the caption rules "
+        f"above: about {word_target} words, in the exact paragraph structure those "
+        "caption rules specify. Writing toward the upper end of that range beats "
+        "compressing paragraphs together. Put that full description directly on "
+        "and below the 'Caption Option N:' line.",
+        "Do NOT copy the title into the caption, do NOT write a one-line caption, and "
+        "do NOT add any extra field such as 'Caption Option N (full):'. There is "
+        "exactly one 'Caption Option N:' per option and its full caption follows it.",
+    ]
 
 # Verify-then-use: the chat path routes through models that can identify
 # famous clips and check facts with web search — the one capability Groq lacks.
@@ -417,7 +432,7 @@ def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
             "'claude-code' (a short label, never a file path).",
             "- The running Processing screen automatically detects the saved revision. Do not ask the user to paste it manually.",
             "",
-            *_FIELD_DISAMBIGUATION_LINES,
+            *_field_disambiguation_lines(caption_style),
             "",
             "Return format (write every section header exactly as shown, plain text — "
             "never bold or markdown-formatted; '**Title Option 1:**' breaks the importer):",
@@ -522,7 +537,7 @@ def _account_prompt_header(
         "app files each reply to the correct video, so never change, drop, or invent it.",
         "Do not rename, renumber, merge, or skip any reel, even if two clips look similar.",
         "",
-        *_FIELD_DISAMBIGUATION_LINES,
+        *_field_disambiguation_lines(settings.get("caption_style") or None),
         "Inside each block, use this exact plain-text format:",
         "Title Option 1:",
         "Caption Option 1:",

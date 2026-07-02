@@ -178,6 +178,28 @@ def test_chat_prompts_disambiguate_title_vs_caption_and_fact_check() -> None:
         assert "Fact-check pass" in prompt
 
 
+def test_field_disambiguation_echoes_selected_caption_style_word_target() -> None:
+    # Regression: the disambiguation block hardcoded "80-120 words across two
+    # paragraphs" (the historytrails_archive shape) for every style, and since
+    # it sits near the end of the prompt it contradicted and outweighed the
+    # 90-150 word / 3-paragraph history_lost_archive caption rules above it.
+    # It must echo the selected style's own word target and defer the
+    # paragraph shape to the caption rules.
+    item_id = _make_item()
+    account_id, item_ids = _make_account_items(2)
+
+    single = draft_handoff.build_chat_prompt(
+        item_id, {"caption_style": "history_lost_archive"}
+    )
+    batch = draft_handoff.build_account_batch_chat_prompt(
+        account_id, item_ids, {"caption_style": "history_lost_archive"}
+    )
+
+    for prompt in (single, batch):
+        assert "about 90-150 words, in the exact paragraph structure" in prompt
+        assert "80-120 words across two paragraphs" not in prompt
+
+
 def test_build_chat_prompt_uses_same_title_length_rule_as_api_prompt() -> None:
     item_id = _make_item()
 
