@@ -1209,6 +1209,17 @@ def test_history_title_rules_ban_artifact_narration_with_thin_evidence_fallback(
         assert "—" not in joined and "–" not in joined
 
 
+def test_historytrails_archive_skips_meme_caption_examples() -> None:
+    # Regression: the bad/good opener example block was never style-gated for
+    # historytrails_archive, so history prompts carried meme positive examples
+    # ('Bro really thought...', 'POV: ...') that contradict the HISTORYTRAILS
+    # template and history accounts' banned phrases (POV, bro, me when).
+    assert smart_drafts._negative_caption_examples_block("historytrails_archive") == []
+    rules = "\n".join(smart_drafts.effective_caption_rules("historytrails_archive"))
+    assert "Bro really thought" not in rules
+    assert "POV: you spent two hours" not in rules
+
+
 def test_historytrails_archive_caption_rule_bans_recording_meta() -> None:
     # The caption template must forbid narrating the recording ("The footage is
     # brief and low quality...") and confessing what is unknown, steering the

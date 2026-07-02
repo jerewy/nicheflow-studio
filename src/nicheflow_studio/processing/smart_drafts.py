@@ -2267,12 +2267,17 @@ def _negative_caption_examples_block(caption_style: str | None) -> list[str]:
     # news_brief is also intentionally fact-driven — its own examples live
     # in the news_brief caption_style_line and paragraph_rule.
     # cinema_hook body is intentionally encyclopedic film synopsis.
+    # historytrails_archive skips too: its template carries its own in-scene
+    # positive example, and the meme pairs below ('Bro really thought...',
+    # 'POV: ...') contradict both the template and history accounts' banned
+    # phrases (POV, bro, me when).
     if style in {
         "meme_factual",
         "narrative",
         "news_brief",
         "cinema_hook",
         "history_lost_archive",
+        "historytrails_archive",
     }:
         return []
     return [
