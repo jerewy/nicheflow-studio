@@ -218,6 +218,32 @@ _FIELD_DISAMBIGUATION_LINES = [
     "exactly one 'Caption Option N:' per option and its full caption follows it.",
 ]
 
+# Verify-then-use: the chat path routes through models that can identify
+# famous clips and check facts with web search — the one capability Groq lacks.
+# The old instruction ("work ONLY from the signals above... STOP and ask")
+# forced a capable model to treat a recognizable moment as unverifiable and
+# hedge. Measured on the historytrails reference set, name+year titles median
+# 87k views and unlock the top formats, so turning research into verified
+# specifics is the single biggest engagement lever on this path. Invention
+# stays banned: only VERIFIED facts may be used, and their origin must be
+# disclosed in the selection note so the reviewer can spot-check.
+_WEB_RESEARCH_LINES = [
+    "Research (chat assistants with web access):",
+    "- If you recognize the person, event, or moment, or can identify it from "
+    "the source URL, source caption, or attached frame, VERIFY it with a quick "
+    "web search and use the confirmed specifics (names, dates, places) in the "
+    "titles and captions. A verified specific beats a hedged vague line.",
+    "- State in that option's selection note which facts came from your own "
+    "research rather than the provided signals, so the reviewer can spot-check.",
+    "- Never state a guess you could not verify, and never invent names, dates, "
+    "places, records, or events that neither the signals nor verified research "
+    "support.",
+    "- If the subject stays unidentifiable after research, do NOT hedge and do "
+    "NOT describe the recording itself; write from the visible scene per the "
+    "thin-evidence rules above, or ask the user for a one-line description if "
+    "even the scene is unclear.",
+]
+
 # Explicit verify-and-prune step: tighten green-tier (drop/soften unsupported
 # claims, catch source errors) rather than license invented specifics.
 _FACT_CHECK_LINES = [
@@ -334,11 +360,11 @@ def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
             "If you can open local files (Codex, Claude Code): inspect the actual video "
             "frames before writing anything.",
             "If you CANNOT open the local video (chat assistants like ChatGPT or Claude "
-            "web): work ONLY from the signals above — source title, source description, "
-            "visual evidence JSON, and transcript. If those signals do not clearly "
-            "identify the subject of the clip, STOP and ask the user for a one-line "
-            "description of what is on screen instead of generating guesses. Never "
-            "invent names, dates, places, records, or events the signals do not state.",
+            "web): work from the signals above — source title, source description, "
+            "visual evidence JSON, and transcript — plus verified web research per the "
+            "Research rules below.",
+            "",
+            *_WEB_RESEARCH_LINES,
             "",
             *_SOURCE_CAPTION_GUIDANCE,
             "",
@@ -367,7 +393,9 @@ def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
             "Keep display titles plain text. Only use internal **keyword** emphasis when the Cinema Bold Keywords style requires it.",
             "Never write em dashes or double hyphens ('--') in titles or captions; "
             "use a comma, period, or colon instead. Long dashes read as AI-generated copy.",
-            "Recommend the strongest title/caption pair and add one short selection note per option.",
+            "Recommend the strongest title/caption pair and add one short selection note "
+            "per option. Never recommend an option BECAUSE it is the safest or most "
+            "hedged; recommend the one whose specific the clip delivers most strongly.",
             "The recommended title and caption MUST share the same option number: the app "
             "applies title+caption as ONE unit, so rearrange your options before returning "
             "until the strongest pair sits together (never recommend Title 2 + Caption 3).",
@@ -475,12 +503,16 @@ def _account_prompt_header(
         "",
         *_FACT_CHECK_LINES,
         "",
+        *_WEB_RESEARCH_LINES,
+        "",
         "Plain-text rules:",
         "- Keep display titles plain text.",
         "- Do not use markdown formatting in section headers or titles.",
         "- Never write em dashes or double hyphens ('--') in titles or captions.",
         "- Do not invent unsupported facts.",
         "- The recommended title and caption MUST share the same option number.",
+        "- Never recommend an option BECAUSE it is the safest or most hedged; "
+        "recommend the one whose specific the clip delivers most strongly.",
         "",
         "Return one block per reel, one for every reel, in order.",
         "START each reel's block with its own header line that is exactly:",

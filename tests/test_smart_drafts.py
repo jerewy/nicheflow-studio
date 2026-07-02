@@ -1187,6 +1187,39 @@ def test_historytrails_title_rules_require_one_comment_hook_option() -> None:
     assert "—" not in joined and "–" not in joined
 
 
+def test_history_title_rules_ban_artifact_narration_with_thin_evidence_fallback() -> None:
+    # Regression: on clips with no verifiable name/date/place, the model made
+    # the recording the subject ("In this old clip...") and confessed ignorance
+    # ("the story left mostly untold"), and the recommender then picked that
+    # option for being the most hedged. Both history title voices must carry
+    # the artifact ban, the positive visual-specificity fallback, and the
+    # anti-hedging recommender guard.
+    for rules in (
+        smart_drafts._historytrails_title_rules(),
+        smart_drafts._curiosity_open_loop_title_rules(),
+    ):
+        joined = "\n".join(rules)
+        assert "NEVER NARRATE THE RECORDING" in joined
+        assert "in this old clip" in joined
+        assert "the story left untold" in joined
+        assert "THIN-EVIDENCE FALLBACK" in joined
+        assert "VISIBLE specifics" in joined
+        assert "Never choose an option BECAUSE it is the safest or most hedged" in joined
+        # These voices ban em/en dashes, so the rule text itself must stay clean.
+        assert "—" not in joined and "–" not in joined
+
+
+def test_historytrails_archive_caption_rule_bans_recording_meta() -> None:
+    # The caption template must forbid narrating the recording ("The footage is
+    # brief and low quality...") and confessing what is unknown, steering the
+    # model to concrete visible-scene description instead.
+    rule = smart_drafts._caption_paragraph_rule("historytrails_archive")
+
+    assert "The footage is brief" in rule
+    assert "nothing confirms who" in rule
+    assert "describe the visible scene in concrete detail instead" in rule
+
+
 def test_effective_title_rules_comment_hook_reaches_historytrails_style() -> None:
     # The "(History) HistoryTrails" dropdown is historytrails_record; the comment
     # hook must arrive through the shared router that BOTH the live generation

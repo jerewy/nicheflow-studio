@@ -138,6 +138,28 @@ def test_build_account_batch_chat_prompt_carries_shared_caption_rules() -> None:
     assert "HISTORYTRAILS template" in prompt
 
 
+def test_chat_prompts_allow_verified_web_research() -> None:
+    # The chat path routes through models that can identify famous clips and
+    # verify facts with web search — the one capability the Groq path lacks.
+    # The old "work ONLY from the signals... STOP and ask" rule forced them to
+    # treat recognizable moments as unverifiable and hedge. Both chat prompts
+    # must carry the verify-then-use research rules, keep invention banned, and
+    # forbid recommending an option for being the most hedged.
+    item_id = _make_item()
+    account_id, item_ids = _make_account_items(2)
+
+    single = draft_handoff.build_chat_prompt(item_id)
+    batch = draft_handoff.build_account_batch_chat_prompt(account_id, item_ids)
+
+    for prompt in (single, batch):
+        assert "Research (chat assistants with web access):" in prompt
+        assert "VERIFY it with a quick web search" in prompt
+        assert "which facts came from your own" in prompt
+        assert "Never state a guess you could not verify" in prompt
+        assert "safest or most hedged" in prompt
+    assert "work ONLY from the signals" not in single
+
+
 def test_chat_prompts_disambiguate_title_vs_caption_and_fact_check() -> None:
     # Regression: the historytrails title rules call the on-screen title a
     # "documentary caption", so chat models duplicated the title into the

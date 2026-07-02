@@ -1225,7 +1225,12 @@ def _caption_paragraph_rule(caption_style: str | None) -> str:
             "Mysterio stands in the ring as his iconic mask is pulled off...'. Do "
             "NOT open with a short hook, a question, or archive filler ('Opening "
             "the archive', 'A forgotten fact', 'This clip shows'). No 'me when', "
-            "no 'you won't believe'. "
+            "no 'you won't believe'. Never make the recording itself the subject "
+            "or comment on it ('The footage is brief', 'low quality', 'the "
+            "camera', 'in this old clip') and never state what is unknown "
+            "('nothing confirms who', 'the story left untold'); when names or "
+            "dates are unverifiable, describe the visible scene in concrete "
+            "detail instead. "
             "Then a blank line. "
             "Paragraph 2 (SIGNIFICANCE, 2-3 sentences, ~40-55 words): explain who "
             "or what this is and the wider context (when, where, why), then land "
@@ -1597,6 +1602,44 @@ def _cinema_bold_keyword_mode_rules() -> list[str]:
     ]
 
 
+def _thin_evidence_and_artifact_rules() -> list[str]:
+    """Zero-evidence fallback plus artifact-narration ban for history styles.
+
+    Measured on the @historytrails reference set (data/title_analysis/
+    historytrails-ocr): titles with neither a name nor a year are that
+    account's TOP reach class (90k median views vs 65k for the rest) when
+    written as dense visual scene description, while titles that talk about
+    the recording itself carry the worst engagement rate of any group (4.7%
+    vs 5.8%). Earlier prompts demanded a hard specific AND banned inventing
+    one, with no instruction for the no-evidence case, so on thin clips the
+    model resolved the conflict by making the recording the subject ("In this
+    old clip...") and confessing ignorance ("the story left mostly untold").
+    These rules give the model a positive move instead of a dead end.
+    """
+    return [
+        "- NEVER NARRATE THE RECORDING (HARD RULE): the clip, footage, video, "
+        "or camera is never the subject of a title or caption. Banned: 'in "
+        "this old clip', 'in this clip', 'in this footage', 'this video', "
+        "'the footage is', 'caught on camera', 'off camera', any comment on "
+        "recording quality ('brief', 'low quality', 'grainy'), and any "
+        "confession of what is unknown ('the story left untold', 'nothing "
+        "confirms who', 'whatever came before'). Write from inside the scene "
+        "as if the viewer stands in it. Sole exception, matching the real "
+        "account: '<colorized/archival/security camera> footage from <year "
+        "or place> shows...' where the footage word is welded to a hard "
+        "specific.",
+        "- THIN-EVIDENCE FALLBACK (when no name, date, or place is "
+        "verifiable): do NOT hedge and do NOT go meta. Anchor the title on "
+        "dense VISIBLE specifics instead: clothing, colours, objects, "
+        "actions, setting, era look, plus a softened era anchor ('decades "
+        "ago') when the visuals back it. Anonymous clips written this way "
+        "are the account's proven top-reach pattern, e.g. 'The day a "
+        "cockroach got into the room and this paraplegic cat learned to run' "
+        "(structure only, never copy the facts); a title can be unmistakably "
+        "specific without a single name.",
+    ]
+
+
 def _curiosity_open_loop_title_rules(
     few_shot_winners: list[str] | tuple[str, ...] | None = None,
 ) -> list[str]:
@@ -1679,6 +1722,7 @@ def _curiosity_open_loop_title_rules(
         "instead of inventing it. Never add a record, a 'first/last/only', a "
         "rarity, or a secrecy claim the signals do not back. The surprise must "
         "come from a REAL specific, never from fabricating.",
+        *_thin_evidence_and_artifact_rules(),
         "- LENGTH AND FORMAT: two registers are BOTH allowed; pick whichever THIS "
         "clip's story needs, and vary the register across the three options. SHORT "
         "(10-16 words, ~2 lines): a tight title-card fact. STORYTELLING (15-25 "
@@ -1694,7 +1738,8 @@ def _curiosity_open_loop_title_rules(
         "the clip really shows or says.",
         "- RECOMMENDED PICK: choose the option whose specific this clip delivers "
         "most strongly. Justify it with a clip-specific reason, not a restatement "
-        "of these rules.",
+        "of these rules. Never choose an option BECAUSE it is the safest or most "
+        "hedged; hedging is not a virtue, delivered specificity is.",
         "- VOICE GUARD (BANNED, so we never sound like every other history page): "
         "the saturated listicle openers 'Nobody expected', 'Nobody talks about', "
         "'What happened when', 'The moment when', and 'This [person]'s'; meme "
@@ -1802,9 +1847,12 @@ def _historytrails_title_rules(
         "number is not supported, soften it ('decades ago', 'thousands of people') "
         "rather than inventing it. Never add a 'first/last/only', a record, or a "
         "rarity claim the evidence does not back.",
+        *_thin_evidence_and_artifact_rules(),
         "- NO emoji, NO hashtags, NO all-caps lines, sentence case.",
         "- RECOMMENDED PICK: choose the option whose specific this clip delivers "
-        "most strongly, justified with a clip-specific reason.",
+        "most strongly, justified with a clip-specific reason. Never choose an "
+        "option BECAUSE it is the safest or most hedged; hedging is not a "
+        "virtue, delivered specificity is.",
         "- EXAMPLES ILLUSTRATE STRUCTURE ONLY (HARD RULE): never reproduce an "
         "example sentence verbatim and never copy a fact from one clip onto "
         "another. Write a fully original line for THIS clip.",
