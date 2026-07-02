@@ -1323,6 +1323,22 @@ def test_curiosity_open_loop_bans_dashes_and_competitor_openers() -> None:
     assert "–" not in joined
 
 
+def test_curiosity_open_loop_voice_guard_is_opener_anchored() -> None:
+    # Regression: the ban used to be a blanket substring match, so mid-sentence
+    # use like "a question nobody expected" was flagged even though it isn't
+    # the saturated listicle-opener pattern. The rule text must scope the ban
+    # to the OPENING of the title and explicitly carve out mid-sentence use.
+    rules = smart_drafts._title_style_rules("curiosity_open_loop")
+    joined = "\n".join(rules)
+
+    assert "never OPEN a title with" in joined
+    assert "a question nobody expected" in joined
+    # Always-banned items (meme framing, clickbait, emoji, hashtags, dash)
+    # still apply everywhere in the title, not just the opener.
+    assert "always banned" in joined
+    assert "POV:" in joined
+
+
 def test_curiosity_open_loop_renders_measured_winners() -> None:
     winners = ["Measured cinematic winner one", "Measured cinematic winner two"]
 

@@ -1741,11 +1741,14 @@ def _curiosity_open_loop_title_rules(
         "of these rules. Never choose an option BECAUSE it is the safest or most "
         "hedged; hedging is not a virtue, delivered specificity is.",
         "- VOICE GUARD (BANNED, so we never sound like every other history page): "
-        "the saturated listicle openers 'Nobody expected', 'Nobody talks about', "
-        "'What happened when', 'The moment when', and 'This [person]'s'; meme "
-        "framing 'me when', 'POV:', 'bro', 'send this to'; clickbait 'shocking', "
-        "'you won't believe', 'changed history forever', 'this will blow your "
-        "mind'; emoji; hashtags; any dash.",
+        "never OPEN a title with the saturated listicle openers 'Nobody "
+        "expected', 'Nobody talks about', 'What happened when', 'The moment "
+        "when', or 'This [person]'s'; those exact phrases are fine mid-sentence "
+        "where they are not doing the saturated-opener job (e.g. 'a question "
+        "nobody expected' partway through a line is legal). Everywhere in the "
+        "title, always banned: meme framing 'me when', 'POV:', 'bro', 'send "
+        "this to'; clickbait 'shocking', 'you won't believe', 'changed history "
+        "forever', 'this will blow your mind'; emoji; hashtags; any dash.",
         "- EXAMPLES ILLUSTRATE STRUCTURE ONLY (HARD RULE): never reproduce an "
         "example sentence verbatim, and never copy a fact from one clip onto "
         "another. Write a fully original line for THIS clip.",
