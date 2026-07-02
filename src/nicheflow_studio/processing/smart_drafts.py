@@ -1802,11 +1802,13 @@ def _historytrails_title_rules(
         "cannot tell THIS clip from any other by the title alone, add the specific.",
         "- LENGTH AND LAYOUT: the proven sweet spot on this account is a fuller "
         "sentence of about 18-24 words that wraps to FOUR left-aligned overlay "
-        "lines; that length and line count earn the most saves here. A two-line "
-        "title underperforms, so never compress to a short label. Write the full "
-        "narrative WHEN THE CLIP SUPPORTS IT and make every word earn its place; "
-        "do NOT pad a thin clip just to reach the length. Hard range 15-28 words; "
-        "the only ceiling is on-screen readability.",
+        "lines; that length and line count earn the most saves here, so default "
+        "to the full sentence whenever the clip supports it and the TITLE LENGTH "
+        "CONTROL below does not request a shorter band. When the length control "
+        "asks for a SHORT or MEDIUM option, write a tight title-card fact that "
+        "still carries a hard specific, never a vague label. Make every word "
+        "earn its place and do NOT pad a thin clip just to reach a length; the "
+        "only ceiling is on-screen readability.",
         "- SHAPE: lead with the subject or the scene, give the specific action or "
         "context (with the year/place/name), and land the final clause on the "
         "surprising, emotional, or record detail. End on the beat the VIDEO pays "
