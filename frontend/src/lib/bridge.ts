@@ -224,6 +224,10 @@ interface PywebviewApi {
     poolItemId: number,
     reason: string,
   ): Promise<Envelope<{ pool_item_id: number; acceptance_status: string }>>;
+  set_pool_item_rights_confidence(
+    poolItemId: number,
+    rightsConfidence: string,
+  ): Promise<Envelope<{ pool_item_id: number; rights_confidence: string }>>;
   restore_pool_item(
     poolItemId: number,
   ): Promise<Envelope<{ pool_item_id: number; acceptance_status: string }>>;
@@ -809,6 +813,17 @@ export const bridge = {
     return unwrap(window.pywebview!.api.restore_pool_item(poolItemId));
   },
 
+  setPoolItemRightsConfidence(
+    poolItemId: number,
+    rightsConfidence: string,
+  ): Promise<{ pool_item_id: number; rights_confidence: string }> {
+    if (!hasBridge())
+      return Promise.resolve({ pool_item_id: poolItemId, rights_confidence: rightsConfidence });
+    return unwrap(
+      window.pywebview!.api.set_pool_item_rights_confidence(poolItemId, rightsConfidence),
+    );
+  },
+
   poolNicheAccounts(niche: string): Promise<NicheAccount[]> {
     if (!hasBridge()) return Promise.resolve([]);
     return unwrap(window.pywebview!.api.pool_niche_accounts(niche));
@@ -1329,6 +1344,7 @@ const mock = {
         source_er: 0.045,
         topic_tier: "S",
         suggested_action: "accept",
+        rights_confidence: "archival",
         view_count: 56789,
         like_count: 1234,
         comment_count: 42,

@@ -116,6 +116,45 @@ def test_bridge_list_pool_source_clips_passes_include_removed(
     assert calls == [("history", "theanomalists", True)]
 
 
+def test_bridge_set_pool_item_rights_confidence_delegates_to_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[int, str]] = []
+
+    def set_rights_confidence(pool_item_id: int, rights_confidence: str) -> dict:
+        calls.append((pool_item_id, rights_confidence))
+        return {"pool_item_id": pool_item_id, "rights_confidence": rights_confidence}
+
+    monkeypatch.setattr(
+        "nicheflow_studio.app.processing_bridge.pooling.set_pool_item_rights_confidence",
+        set_rights_confidence,
+    )
+
+    result = ProcessingBridge().set_pool_item_rights_confidence(7, "archival")
+
+    assert result == {"ok": True, "data": {"pool_item_id": 7, "rights_confidence": "archival"}}
+    assert calls == [(7, "archival")]
+
+
+def test_bridge_set_pool_item_rights_confidence_surfaces_service_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nicheflow_studio.services.pooling import PoolingError
+
+    def raise_error(pool_item_id: int, rights_confidence: str) -> dict:
+        raise PoolingError("No pool item with id 999.")
+
+    monkeypatch.setattr(
+        "nicheflow_studio.app.processing_bridge.pooling.set_pool_item_rights_confidence",
+        raise_error,
+    )
+
+    result = ProcessingBridge().set_pool_item_rights_confidence(999, "archival")
+
+    assert result["ok"] is False
+    assert "No pool item with id 999" in result["error"]
+
+
 def test_bridge_get_crop_preview_returns_media_url(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

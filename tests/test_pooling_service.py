@@ -462,6 +462,101 @@ def test_review_queue_ranks_by_source_er_and_exposes_advisory_topic_metadata() -
         assert large.acceptance_status == "pending_review"
 
 
+def test_review_queue_exposes_rights_confidence() -> None:
+    with get_session() as session:
+        asset = MediaAsset(
+            platform="instagram",
+            canonical_source_url="https://instagram.com/reel/rights/",
+            source_shortcode="rights",
+            download_status="downloaded",
+        )
+        session.add(asset)
+        session.flush()
+        pool_item = PoolItem(
+            media_asset_id=asset.id,
+            niche="history",
+            acceptance_status="pending_review",
+            rights_confidence="broadcast_sport",
+        )
+        session.add(pool_item)
+        session.commit()
+
+    rows = pooling.review_queue("history")
+
+    assert len(rows) == 1
+    assert rows[0]["rights_confidence"] == "broadcast_sport"
+
+
+def test_review_queue_rights_confidence_defaults_to_none() -> None:
+    with get_session() as session:
+        asset = MediaAsset(
+            platform="instagram",
+            canonical_source_url="https://instagram.com/reel/norights/",
+            source_shortcode="norights",
+            download_status="downloaded",
+        )
+        session.add(asset)
+        session.flush()
+        session.add(
+            PoolItem(media_asset_id=asset.id, niche="history", acceptance_status="pending_review")
+        )
+        session.commit()
+
+    rows = pooling.review_queue("history")
+
+    assert rows[0]["rights_confidence"] is None
+
+
+def test_set_pool_item_rights_confidence_updates_review_row() -> None:
+    with get_session() as session:
+        asset = MediaAsset(
+            platform="instagram",
+            canonical_source_url="https://instagram.com/reel/setrights/",
+            source_shortcode="setrights",
+            download_status="downloaded",
+        )
+        session.add(asset)
+        session.flush()
+        pool_item = PoolItem(
+            media_asset_id=asset.id, niche="history", acceptance_status="pending_review"
+        )
+        session.add(pool_item)
+        session.commit()
+        pool_item_id = pool_item.id
+
+    result = pooling.set_pool_item_rights_confidence(pool_item_id, "archival")
+    assert result == {"pool_item_id": pool_item_id, "rights_confidence": "archival"}
+
+    rows = pooling.review_queue("history")
+    assert rows[0]["rights_confidence"] == "archival"
+
+
+def test_set_pool_item_rights_confidence_invalid_value_raises_pooling_error() -> None:
+    with get_session() as session:
+        asset = MediaAsset(
+            platform="instagram",
+            canonical_source_url="https://instagram.com/reel/badrights/",
+            source_shortcode="badrights",
+            download_status="downloaded",
+        )
+        session.add(asset)
+        session.flush()
+        pool_item = PoolItem(
+            media_asset_id=asset.id, niche="history", acceptance_status="pending_review"
+        )
+        session.add(pool_item)
+        session.commit()
+        pool_item_id = pool_item.id
+
+    with pytest.raises(PoolingError):
+        pooling.set_pool_item_rights_confidence(pool_item_id, "not-a-real-value")
+
+
+def test_set_pool_item_rights_confidence_missing_item_raises_pooling_error() -> None:
+    with pytest.raises(PoolingError):
+        pooling.set_pool_item_rights_confidence(999999, "archival")
+
+
 def test_reject_pool_items_removes_from_review_and_distribution() -> None:
     with get_session() as session:
         session.add(Account(name="History", platform="instagram", niche="history"))

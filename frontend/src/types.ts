@@ -387,6 +387,7 @@ export interface PoolReviewItem {
   source_er: number;
   topic_tier: "S" | "A" | "B" | "C" | "D";
   suggested_action: "accept" | "review" | "reject";
+  rights_confidence: RightsConfidence | null;
   view_count: number | null;
   like_count: number | null;
   comment_count: number | null;
@@ -395,6 +396,15 @@ export interface PoolReviewItem {
   channel_name: string | null;
   published_at: string | null;
 }
+
+// Rights-risk label a reviewer sets on a pool item (docs/SOURCING_POOLING_PLAN.md
+// §2.2). Drives the rights-risk badge in the Review tab.
+export type RightsConfidence =
+  | "archival"
+  | "meme"
+  | "tv_moment"
+  | "broadcast_sport"
+  | "unknown";
 
 export interface PoolItemPreview {
   pool_item_id: number;

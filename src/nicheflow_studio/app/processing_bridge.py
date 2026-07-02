@@ -337,6 +337,10 @@ class ProcessingBridge:
         return pooling.remove_pool_item(pool_item_id, reason)
 
     @_guard
+    def set_pool_item_rights_confidence(self, pool_item_id: int, rights_confidence: str) -> dict:
+        return pooling.set_pool_item_rights_confidence(pool_item_id, rights_confidence)
+
+    @_guard
     def restore_pool_item(self, pool_item_id: int) -> dict:
         return pooling.restore_pool_item(pool_item_id)
 

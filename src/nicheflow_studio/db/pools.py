@@ -765,6 +765,36 @@ def pool_clips_for_source(
     return rows
 
 
+# Rights-confidence values used across the pool review flow (docs/SOURCING_
+# POOLING_PLAN.md §2.2 rights risk). Set at accept time and editable later, once
+# the reviewer has actually looked at the clip.
+VALID_RIGHTS_CONFIDENCE = frozenset(
+    {"archival", "meme", "tv_moment", "broadcast_sport", "unknown"}
+)
+
+
+def set_pool_item_rights_confidence(
+    session: Session, *, pool_item_id: int, rights_confidence: str
+) -> PoolItem | None:
+    """Set the rights-risk label on a pool item at review time.
+
+    Returns the updated :class:`PoolItem`, or ``None`` if no item has that id.
+    Raises :class:`ValueError` for a value outside :data:`VALID_RIGHTS_CONFIDENCE`.
+    Does not commit; the caller owns the transaction.
+    """
+    value = (rights_confidence or "").strip().lower()
+    if value not in VALID_RIGHTS_CONFIDENCE:
+        raise ValueError(
+            f"rights_confidence must be one of {sorted(VALID_RIGHTS_CONFIDENCE)}, got {rights_confidence!r}."
+        )
+    item = session.get(PoolItem, pool_item_id)
+    if item is None:
+        return None
+    item.rights_confidence = value
+    session.flush()
+    return item
+
+
 def move_pool_item_niche(
     session: Session, *, pool_item_id: int, target_niche: str
 ) -> bool:

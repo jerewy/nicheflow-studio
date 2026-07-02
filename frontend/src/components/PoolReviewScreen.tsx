@@ -2,12 +2,36 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { bridge } from "@/lib/bridge";
-import type { PoolReviewItem } from "@/types";
+import { cn } from "@/lib/utils";
+import type { PoolReviewItem, RightsConfidence } from "@/types";
 
 const NICHES = [
   { value: "history", label: "History" },
   { value: "movie", label: "Movie" },
 ];
+
+const RIGHTS_CONFIDENCE_OPTIONS: { value: RightsConfidence; label: string }[] = [
+  { value: "archival", label: "Archival" },
+  { value: "meme", label: "Meme" },
+  { value: "tv_moment", label: "TV moment" },
+  { value: "broadcast_sport", label: "Broadcast sport" },
+  { value: "unknown", label: "Unknown" },
+];
+
+// Rights-risk badge color (docs/SOURCING_POOLING_PLAN.md §2.2): archival is the
+// safest source footage, broadcast sport / TV moments carry the most exposure,
+// meme/unknown sit in between until a reviewer classifies them.
+function rightsBadgeClass(value: RightsConfidence | null): string {
+  switch (value) {
+    case "archival":
+      return "bg-emerald-500/15 text-emerald-500";
+    case "broadcast_sport":
+    case "tv_moment":
+      return "bg-red-500/15 text-red-500";
+    default:
+      return "bg-muted text-muted-foreground";
+  }
+}
 
 // Downloads run via yt-dlp and can take a while on a long reel.
 const PREVIEW_TIMEOUT_MS = 120000;
@@ -57,7 +81,7 @@ function metricLine(item: PoolReviewItem): string {
   ].join(" / ");
 }
 
-const GRID_COLS = "grid-cols-[2.5rem_6rem_minmax(0,1fr)_9rem_10rem_18rem]";
+const GRID_COLS = "grid-cols-[2.5rem_6rem_minmax(0,1fr)_9rem_10rem_10rem_18rem]";
 
 // Render the queue in batches and grow it on scroll. The backend returns every
 // pending row in one query, but rendering hundreds at once (each firing a
@@ -92,6 +116,9 @@ export function PoolReviewScreen() {
   // Rows currently downloading-then-approving, keyed by pool_item_id.
   const [approving, setApproving] = useState<Record<number, ApproveProgress>>({});
   const [approveErrors, setApproveErrors] = useState<Record<number, string>>({});
+  // Rights-confidence edits in flight; used to disable the dropdown mid-save.
+  const [rightsSaving, setRightsSaving] = useState<Record<number, boolean>>({});
+  const [rightsErrors, setRightsErrors] = useState<Record<number, string>>({});
   // Infinite-scroll window: how many rows are rendered, grown by ROW_BATCH as the
   // bottom sentinel scrolls into view.
   const [visibleCount, setVisibleCount] = useState(ROW_BATCH);
@@ -215,6 +242,42 @@ export function PoolReviewScreen() {
     }
   };
 
+  // Optimistic update: flip the row's badge immediately, roll back and show an
+  // error if the save fails (the row itself is never removed here).
+  const updateRightsConfidence = async (poolItemId: number, value: RightsConfidence) => {
+    const previous = items.find((row) => row.pool_item_id === poolItemId)?.rights_confidence ?? null;
+    setItems((current) =>
+      current.map((row) =>
+        row.pool_item_id === poolItemId ? { ...row, rights_confidence: value } : row,
+      ),
+    );
+    setRightsErrors((current) => {
+      const next = { ...current };
+      delete next[poolItemId];
+      return next;
+    });
+    setRightsSaving((current) => ({ ...current, [poolItemId]: true }));
+    try {
+      await bridge.setPoolItemRightsConfidence(poolItemId, value);
+    } catch (err: unknown) {
+      setItems((current) =>
+        current.map((row) =>
+          row.pool_item_id === poolItemId ? { ...row, rights_confidence: previous } : row,
+        ),
+      );
+      setRightsErrors((current) => ({
+        ...current,
+        [poolItemId]: err instanceof Error ? err.message : String(err),
+      }));
+    } finally {
+      setRightsSaving((current) => {
+        const next = { ...current };
+        delete next[poolItemId];
+        return next;
+      });
+    }
+  };
+
   const openPreview = (item: PoolReviewItem) => {
     setPreviewItem(item);
     setPreviewUrl(item.preview_url);
@@ -317,6 +380,7 @@ export function PoolReviewScreen() {
           <span>Clip</span>
           <span>Source</span>
           <span>Score</span>
+          <span>Rights</span>
           <span>Action</span>
         </div>
 
@@ -334,6 +398,7 @@ export function PoolReviewScreen() {
               </div>
               <div className="h-3 w-20 animate-pulse rounded bg-muted" />
               <div className="h-6 w-16 animate-pulse rounded bg-muted" />
+              <div className="h-6 w-20 animate-pulse rounded bg-muted" />
               <div className="h-8 w-full animate-pulse rounded bg-muted" />
             </div>
           ))}
@@ -408,6 +473,37 @@ export function PoolReviewScreen() {
               >
                 ER {(item.source_er * 100).toFixed(1)}% · {item.fit_score.toFixed(3)}
               </div>
+            </div>
+            <div className="space-y-1">
+              <span
+                className={cn(
+                  "inline-flex rounded-full px-2 py-1 text-xs font-medium",
+                  rightsBadgeClass(item.rights_confidence),
+                )}
+                title="Rights risk: archival is lowest risk; broadcast sport / TV moment carry the most exposure."
+              >
+                {item.rights_confidence ?? "unknown"}
+              </span>
+              <select
+                className="h-7 w-full rounded-md border border-input bg-transparent px-1.5 text-xs"
+                value={item.rights_confidence ?? "unknown"}
+                disabled={!!rightsSaving[item.pool_item_id]}
+                onChange={(event) =>
+                  void updateRightsConfidence(
+                    item.pool_item_id,
+                    event.target.value as RightsConfidence,
+                  )
+                }
+              >
+                {RIGHTS_CONFIDENCE_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+              {rightsErrors[item.pool_item_id] && (
+                <p className="text-xs text-destructive">{rightsErrors[item.pool_item_id]}</p>
+              )}
             </div>
             {approving[item.pool_item_id] ? (
               <div className="space-y-1.5">

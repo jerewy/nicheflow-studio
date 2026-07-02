@@ -289,6 +289,11 @@ def review_queue(niche: str, source_label: str | None = None) -> list[dict]:
                     "source_er": signal.source_er,
                     "topic_tier": signal.topic_tier,
                     "suggested_action": signal.suggested_action,
+                    # PoolItem.rights_confidence (docs/SOURCING_POOLING_PLAN.md §2.2).
+                    # Note: PoolItem.topic_tag is NOT a subject label in this codebase —
+                    # it's overwritten with the topic_tier letter above, already exposed
+                    # as "topic_tier", so it isn't duplicated here.
+                    "rights_confidence": item.rights_confidence,
                     "view_count": candidate.view_count if candidate else None,
                     "like_count": candidate.like_count if candidate else None,
                     "comment_count": candidate.comment_count if candidate else None,
@@ -398,6 +403,21 @@ def reject_pool_items(pool_item_ids: list[int], reason: str) -> dict:
                 rejected += 1
         session.commit()
     return {"rejected": rejected}
+
+
+def set_pool_item_rights_confidence(pool_item_id: int, rights_confidence: str) -> dict:
+    """Update a pool item's rights-risk label at review time."""
+    with get_session() as session:
+        try:
+            item = pools.set_pool_item_rights_confidence(
+                session, pool_item_id=pool_item_id, rights_confidence=rights_confidence
+            )
+        except ValueError as exc:
+            raise PoolingError(str(exc)) from exc
+        if item is None:
+            raise PoolingError(f"No pool item with id {pool_item_id}.")
+        session.commit()
+        return {"pool_item_id": pool_item_id, "rights_confidence": item.rights_confidence}
 
 
 def list_pool_items(niche: str) -> list[dict]:

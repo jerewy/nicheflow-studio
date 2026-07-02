@@ -19,6 +19,7 @@ from nicheflow_studio.db.pools import (
     reject_candidate,
     remove_pool_item,
     restore_pool_item,
+    set_pool_item_rights_confidence,
 )
 from nicheflow_studio.db.session import get_session, init_db
 
@@ -454,6 +455,55 @@ def test_remove_missing_pool_item_returns_false(tmp_path) -> None:
     init_db()
     with get_session() as session:
         assert remove_pool_item(session, pool_item_id=99999) is False
+
+
+# ---------------------------------------------------------------------------
+# Rights-confidence editing (review-time reclassification, SOURCING_POOLING_
+# PLAN.md §2.2 rights risk)
+# ---------------------------------------------------------------------------
+
+
+def test_set_pool_item_rights_confidence_persists(tmp_path) -> None:
+    init_db()
+    with get_session() as session:
+        item = accept_into_pool(session, media_asset=_asset(session, "RIGHTS1"), niche="history")
+        session.commit()
+        item_id = item.id
+
+        updated = set_pool_item_rights_confidence(
+            session, pool_item_id=item_id, rights_confidence="broadcast_sport"
+        )
+        session.commit()
+        assert updated is not None
+        assert updated.rights_confidence == "broadcast_sport"
+
+    with get_session() as session:
+        from nicheflow_studio.db.models import PoolItem
+
+        reloaded = session.get(PoolItem, item_id)
+        assert reloaded.rights_confidence == "broadcast_sport"
+
+
+def test_set_pool_item_rights_confidence_rejects_invalid_value(tmp_path) -> None:
+    init_db()
+    with get_session() as session:
+        item = accept_into_pool(session, media_asset=_asset(session, "RIGHTS2"), niche="history")
+        session.commit()
+        with pytest.raises(ValueError):
+            set_pool_item_rights_confidence(
+                session, pool_item_id=item.id, rights_confidence="not-a-real-value"
+            )
+
+
+def test_set_pool_item_rights_confidence_missing_item_returns_none(tmp_path) -> None:
+    init_db()
+    with get_session() as session:
+        assert (
+            set_pool_item_rights_confidence(
+                session, pool_item_id=999999, rights_confidence="archival"
+            )
+            is None
+        )
 
 
 def test_pool_review_rows_lists_active_and_optionally_inactive(tmp_path) -> None:
