@@ -397,7 +397,7 @@ export function PoolReviewScreen() {
                 </span>
                 <span
                   className="uppercase text-muted-foreground"
-                  title="Advisory only. REJECT also flags clips longer than 35s, regardless of tier."
+                  title="Advisory only. A clip over 35s is only flagged REJECT when its engagement rate is also weak; long clips that engage well stay accept."
                 >
                   {item.suggested_action}
                 </span>

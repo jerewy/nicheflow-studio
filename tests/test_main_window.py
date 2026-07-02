@@ -4963,6 +4963,72 @@ def test_processing_copy_chat_prompt_includes_local_file_and_niche_context(
         window.close()
 
 
+def test_processing_copy_chat_prompt_flags_low_context_title_and_degraded_access(
+    monkeypatch,
+    qt_app,
+    tmp_path: Path,
+) -> None:
+    init_db()
+    video_path = tmp_path / "scraped_clip.mp4"
+    video_path.write_bytes(b"video")
+
+    with get_session() as session:
+        account = Account(
+            name="History Trails",
+            platform="instagram",
+            niche_label="history moments",
+        )
+        session.add(account)
+        session.flush()
+        session.add(
+            DownloadItem(
+                # `Video by <handle>` is the junk title the IG scraper writes when
+                # a post has no caption; with no transcript this is low-context.
+                source_url="https://instagram.com/reel/example",
+                title="Video by oldarchives",
+                source_description="A short clip with no usable caption.",
+                status="downloaded",
+                account_id=account.id,
+                file_path=str(video_path),
+                transcript_text="",
+            )
+        )
+        session.commit()
+        account_id = account.id
+
+    monkeypatch.setattr(
+        "nicheflow_studio.app.main_window.probe_video",
+        lambda _: VideoProbe(width=1080, height=1920, duration_seconds=18.0),
+    )
+    qt_app.clipboard().clear()
+
+    window = MainWindow()
+    try:
+        window.show()
+        qt_app.processEvents()
+        account_index = window._current_account_combo.findData(account_id)
+        window._current_account_combo.setCurrentIndex(account_index)
+        window._set_current_page("processing")
+        qt_app.processEvents()
+        # Force the transcript input empty so the junk title is the only grounding.
+        window._processing_transcript_input.setPlainText("")
+
+        window._on_copy_generation_chat_prompt_clicked()
+        prompt = qt_app.clipboard().text()
+
+        # Fix 1: junk source title is labelled so the agent ignores it for titling.
+        assert "Video by oldarchives (generic placeholder, ignore for titling" in prompt
+        # Fix 2: degraded-access rule keeps the actionable different-subject warning.
+        assert "treat any single supplied frame as the" in prompt
+        assert "different moment of the same clip" in prompt
+        assert "different subject entirely" in prompt
+    finally:
+        window._refresh_timer.stop()
+        window._toast_timer.stop()
+        window._hide_toast()
+        window.close()
+
+
 def test_processing_copy_chat_prompt_includes_cinema_visual_style_recommendations(
     monkeypatch,
     qt_app,

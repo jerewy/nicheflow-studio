@@ -533,6 +533,53 @@ def test_pending_review_first_use_downloads_once_and_reuses_globally(tmp_path: P
     assert calls == [source_url]
 
 
+def test_pending_review_download_never_uses_publishing_account_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Account-safety: the download must NEVER authenticate as the clip's own
+    (publishing) account — yt-dlp fetching reels as a real account is what gets it
+    flagged for automation. The cookie source is resolved WITHOUT the clip's
+    profile; best_instagram_yt_dlp_cookiefile picks a sourcing account instead."""
+    with get_session() as session:
+        account = Account(name="A", niche="history", instagram_profile="history_acct")
+        session.add(account)
+        session.flush()
+        session.add(
+            DownloadItem(
+                source_url="https://instagram.com/reel/z/",
+                video_id="z",
+                account_id=account.id,
+                status="pending_review",
+                review_state="pending_review",
+            )
+        )
+        session.commit()
+        item_id = session.query(DownloadItem).one().id
+
+    monkeypatch.setattr(library, "safe_video_fingerprint", lambda _p: "h")
+    seen: dict[str, object] = {}
+
+    def fake_cookiefile(preferred_profile=None):
+        seen["preferred_profile"] = preferred_profile
+        return "cookie::sourcing"
+
+    monkeypatch.setattr(library, "best_instagram_yt_dlp_cookiefile", fake_cookiefile)
+
+    def fake_download(*, url, output_dir, cookiefile=None):
+        seen["cookiefile"] = cookiefile
+        path = tmp_path / "z.mp4"
+        path.write_bytes(b"video")
+        return SimpleNamespace(file_path=path)
+
+    monkeypatch.setattr(library, "download_instagram_url", fake_download)
+
+    library.ensure_item_downloaded(item_id)
+
+    # The clip's own account profile must never be handed to the cookie resolver.
+    assert seen["preferred_profile"] is None
+    assert seen["cookiefile"] == "cookie::sourcing"
+
+
 def test_download_persists_content_hash(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The webview download path must compute and store the perceptual
     fingerprint. Regression: mark_media_asset_downloaded was called without
@@ -572,12 +619,18 @@ def test_download_persists_content_hash(tmp_path: Path, monkeypatch: pytest.Monk
         assert asset.content_hash == "deadbeef,c0ffee"
 
 
-def test_deleted_source_raises_clean_reject_prompt() -> None:
+def test_deleted_source_raises_clean_reject_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
     """A removed/private Instagram post should surface as a clear, rejectable
-    message — not a generic 'Unexpected error' from a raw yt-dlp DownloadError."""
+    message — not a generic 'Unexpected error' from a raw yt-dlp DownloadError.
+    A gone source never recovers, so it must fail on the first attempt without
+    burning the retry budget."""
     item_id = _make_item(file_path=None)
+    monkeypatch.setattr(library.time, "sleep", lambda _seconds: None)
+    calls = 0
 
     def gone_download(*, url, output_dir):
+        nonlocal calls
+        calls += 1
         raise RuntimeError(
             "ERROR: [Instagram] ABC: Instagram sent an empty media response."
         )
@@ -589,20 +642,182 @@ def test_deleted_source_raises_clean_reject_prompt() -> None:
     ).lower()
     # Stays a ServiceError so the bridge shows the message verbatim.
     assert isinstance(excinfo.value, LibraryError)
+    assert calls == 1  # no retry — the source won't come back
 
 
-def test_generic_download_failure_is_translated_not_unexpected() -> None:
-    """Other download failures (network, etc.) become a clean LibraryError rather
-    than leaking a raw exception that the bridge would report generically."""
+def test_transient_download_failure_retries_then_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transient blip (reset/timeout/rate-limit) on the first attempt should be
+    retried, not surfaced to the user, so the clip opens on a later try."""
     item_id = _make_item(file_path=None)
+    monkeypatch.setattr(library.time, "sleep", lambda _seconds: None)
+    calls = 0
+
+    def flaky_then_ok(*, url, output_dir):
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise RuntimeError("Connection reset by peer")
+        path = tmp_path / "ok.mp4"
+        path.write_bytes(b"video")
+        return SimpleNamespace(file_path=path)
+
+    result = library.ensure_item_downloaded(item_id, downloader=flaky_then_ok)
+    assert result["downloaded"] is True
+    assert calls == 3  # failed twice, succeeded on the third attempt
+
+
+def test_generic_download_failure_is_translated_not_unexpected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Other download failures (network, etc.) become a clean LibraryError rather
+    than leaking a raw exception that the bridge would report generically — after
+    exhausting the retry budget."""
+    item_id = _make_item(file_path=None)
+    monkeypatch.setattr(library.time, "sleep", lambda _seconds: None)
+    calls = 0
 
     def flaky_download(*, url, output_dir):
+        nonlocal calls
+        calls += 1
         raise RuntimeError("Connection reset by peer")
 
     with pytest.raises(LibraryError) as excinfo:
         library.ensure_item_downloaded(item_id, downloader=flaky_download)
     assert not isinstance(excinfo.value, library.SourceUnavailableError)
     assert "instagram" in str(excinfo.value).lower()
+    assert calls == library._DOWNLOAD_ATTEMPTS  # retried before giving up
+
+
+def test_rate_limit_or_login_required_tells_user_to_relogin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Instagram's 'rate-limit reached or login required' is a session problem, not
+    a dead clip — surface a re-login/wait message immediately (no retry, no 'reject
+    the clip' advice)."""
+    item_id = _make_item(file_path=None)
+    monkeypatch.setattr(library.time, "sleep", lambda _seconds: None)
+    calls = 0
+
+    def blocked_download(*, url, output_dir):
+        nonlocal calls
+        calls += 1
+        raise RuntimeError(
+            "ERROR: [Instagram] DYha3zWNJo2: Requested content is not available, "
+            "rate-limit reached or login required."
+        )
+
+    with pytest.raises(library.SessionExpiredError) as excinfo:
+        library.ensure_item_downloaded(item_id, downloader=blocked_download)
+    message = str(excinfo.value).lower()
+    assert "re-login" in message or "login" in message
+    assert "reject" in message  # only as "don't reject" guidance
+    assert calls == 1  # no retry — rate-limit won't clear within our backoff
+
+
+def test_prefetch_warms_uncached_skips_cached_and_swallows_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Background prefetch downloads not-yet-cached clips, skips ones already on
+    disk, and a single failing clip never aborts the batch or raises."""
+    monkeypatch.setattr(library.time, "sleep", lambda _seconds: None)
+
+    cached = tmp_path / "cached.mp4"
+    cached.write_bytes(b"video")
+    with get_session() as session:
+        account = Account(name="A", niche="history")
+        session.add(account)
+        session.flush()
+        session.add_all(
+            [
+                DownloadItem(
+                    source_url="https://instagram.com/reel/p1",
+                    video_id="p1",
+                    account_id=account.id,
+                    status="pending_review",
+                    review_state="pending_review",
+                ),
+                DownloadItem(
+                    source_url="https://instagram.com/reel/p2",
+                    video_id="p2",
+                    account_id=account.id,
+                    status="pending_review",
+                    review_state="pending_review",
+                ),
+                DownloadItem(
+                    source_url="https://instagram.com/reel/p3",
+                    video_id="p3",
+                    account_id=account.id,
+                    status="completed",
+                    file_path=str(cached),
+                ),
+            ]
+        )
+        session.commit()
+        ids = [r.id for r in session.scalars(select(DownloadItem)).all()]
+
+    calls: list[str] = []
+
+    def fake_download(*, url, output_dir):
+        calls.append(url)
+        if url.endswith("/p2"):
+            raise RuntimeError("Connection reset by peer")
+        path = tmp_path / "dl.mp4"
+        path.write_bytes(b"video")
+        return SimpleNamespace(file_path=path)
+
+    result = library.prefetch_items(ids, downloader=fake_download)
+
+    assert "https://instagram.com/reel/p1" in calls  # uncached → fetched
+    assert "https://instagram.com/reel/p3" not in calls  # already on disk → skipped
+    assert result["warmed"] == 1  # only p1 succeeded (p2 failed, swallowed)
+    assert result["requested"] == 3
+
+
+def test_concurrent_downloads_of_same_clip_run_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two callers racing on the same clip (a prefetch job vs the user's click)
+    must serialize: only one yt-dlp run happens, the other reuses the finished
+    file. Regression guard for the Windows WinError 32 / corrupt-merge race two
+    concurrent downloads to the same output path caused."""
+    import threading
+
+    item_id = _make_item(file_path=None)
+    entered = threading.Event()
+    release = threading.Event()
+    calls = 0
+    calls_lock = threading.Lock()
+
+    def blocking_download(*, url, output_dir):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+        entered.set()  # signal we're inside the download, holding the per-clip lock
+        assert release.wait(2)
+        path = tmp_path / "race.mp4"
+        path.write_bytes(b"video")
+        return SimpleNamespace(file_path=path)
+
+    results: dict[str, dict] = {}
+
+    def run(tag: str) -> None:
+        results[tag] = library.ensure_item_downloaded(item_id, downloader=blocking_download)
+
+    first = threading.Thread(target=run, args=("first",))
+    first.start()
+    assert entered.wait(2)  # first caller now holds the lock inside the downloader
+    second = threading.Thread(target=run, args=("second",))
+    second.start()
+    release.set()  # let the first finish; the second can only proceed after it
+    first.join(3)
+    second.join(3)
+
+    assert calls == 1  # one real download despite two concurrent callers
+    assert results["first"]["downloaded"] is True
+    assert results["second"]["downloaded"] is False  # reused the finished file
+    assert results["first"]["file_path"] == results["second"]["file_path"]
 
 
 def _row_for(account_id: int, item_id: int):

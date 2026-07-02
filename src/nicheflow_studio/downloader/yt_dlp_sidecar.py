@@ -13,6 +13,17 @@ from nicheflow_studio.core.media_tools import subprocess_run_kwargs
 
 logger = logging.getLogger(__name__)
 
+# Network resilience for live first-fetches (Instagram/YouTube). These downloads
+# hit the network on demand from the review screen and are prone to transient
+# resets, socket timeouts, and rate-limit blips. Cap yt-dlp's own retries (its
+# default is 10, which stacks slow) and bound socket waits so a stalled
+# connection fails fast instead of hanging. Defined here, the base module, so the
+# in-process (youtube._yt_dlp_options) and sidecar paths stay in sync.
+YT_DLP_RETRIES = 3
+YT_DLP_FRAGMENT_RETRIES = 3
+YT_DLP_EXTRACTOR_RETRIES = 3
+YT_DLP_SOCKET_TIMEOUT = 30
+
 
 def yt_dlp_sidecar_path() -> Path | None:
     override = os.environ.get("NICHEFLOW_YT_DLP_PATH")
@@ -98,6 +109,14 @@ def download_with_sidecar(
         str(output_template),
         "--format",
         format_selector,
+        "--retries",
+        str(YT_DLP_RETRIES),
+        "--fragment-retries",
+        str(YT_DLP_FRAGMENT_RETRIES),
+        "--extractor-retries",
+        str(YT_DLP_EXTRACTOR_RETRIES),
+        "--socket-timeout",
+        str(YT_DLP_SOCKET_TIMEOUT),
     ]
     if merge_output_format is not None:
         command.extend(["--merge-output-format", merge_output_format])

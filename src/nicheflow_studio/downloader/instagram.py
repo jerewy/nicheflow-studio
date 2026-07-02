@@ -54,18 +54,21 @@ def validate_instagram_media_url(url: str) -> str | None:
     return None
 
 
-def _download_with_yt_dlp(*, url: str, output_dir: Path) -> InstagramDownloadResult:
+def _download_with_yt_dlp(
+    *, url: str, output_dir: Path, cookiefile: str | None = None
+) -> InstagramDownloadResult:
     shortcode = instagram_shortcode_from_url(url)
     if shortcode is None:
         raise ValueError("Use an Instagram Reel or post URL.")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     ydl_opts = _yt_dlp_options(output_dir)
-    # Instagram now refuses anonymous downloads ("empty media response"), so reuse
-    # the same saved sourcing cookies the Apify/instaloader scrape path already
-    # uses. Without this the download fails even though scraping works.
-    cookie_status = instagram_yt_dlp_cookie_status()
-    cookiefile = cookie_status.cookiefile
+    # Instagram now refuses anonymous downloads ("empty media response"), so attach a
+    # logged-in session's cookies. Callers that know which account the clip belongs to
+    # pass a per-account cookiefile (the freshest session); otherwise fall back to the
+    # shared sourcing-cookie export the scrape path uses.
+    if cookiefile is None:
+        cookiefile = instagram_yt_dlp_cookie_status().cookiefile
     if cookiefile:
         ydl_opts["cookiefile"] = cookiefile
     sidecar = yt_dlp_sidecar_path()
@@ -98,5 +101,7 @@ def _download_with_yt_dlp(*, url: str, output_dir: Path) -> InstagramDownloadRes
     )
 
 
-def download_instagram_url(*, url: str, output_dir: Path) -> InstagramDownloadResult:
-    return _download_with_yt_dlp(url=url, output_dir=output_dir)
+def download_instagram_url(
+    *, url: str, output_dir: Path, cookiefile: str | None = None
+) -> InstagramDownloadResult:
+    return _download_with_yt_dlp(url=url, output_dir=output_dir, cookiefile=cookiefile)

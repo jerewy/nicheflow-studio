@@ -1167,6 +1167,38 @@ def test_history_lost_archive_title_rules_allow_one_controlled_curiosity_gap() -
     assert "first-ever status" in joined
 
 
+def test_historytrails_title_rules_require_one_comment_hook_option() -> None:
+    rules = smart_drafts._historytrails_title_rules()
+    joined = "\n".join(rules)
+
+    # Exactly one of three options must invite a reply, not just a save.
+    assert "COMMENT HOOK" in joined
+    assert "EXACTLY ONE of the three options" in joined
+    # The three sanctioned comment-hook shapes are spelled out.
+    assert "a real question" in joined
+    assert "first-person reaction" in joined
+    assert "nostalgia prompt" in joined
+    # The other two options keep the documentary voice.
+    assert "Keep the other two options in the calm" in joined
+    # Loosening the voice must not loosen fact or clickbait discipline.
+    assert "no invented facts" in joined
+    assert "you won't believe" in joined
+    # These rules ban em-dashes, so the rule text must not contain one itself.
+    assert "—" not in joined and "–" not in joined
+
+
+def test_effective_title_rules_comment_hook_reaches_historytrails_style() -> None:
+    # The "(History) HistoryTrails" dropdown is historytrails_record; the comment
+    # hook must arrive through the shared router that BOTH the live generation
+    # prompt and the Copy Chat Prompt contract use.
+    rules = smart_drafts.effective_title_rules(
+        "historytrails_record",
+        None,
+        "History moments, old clips, strange facts, and forgotten stories",
+    )
+    assert "COMMENT HOOK" in "\n".join(rules)
+
+
 def test_history_lost_archive_title_rules_include_static_winner_examples() -> None:
     joined = "\n".join(smart_drafts._caption_style_title_rules("history_lost_archive"))
 

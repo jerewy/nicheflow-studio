@@ -117,6 +117,30 @@ def test_instagram_downloader_threads_sourcing_cookies(monkeypatch, tmp_path: Pa
     assert _CapturingYoutubeDL.calls[0].get("cookiefile") == str(tmp_path / "cookies.txt")
 
 
+def test_instagram_downloader_prefers_explicit_cookiefile(monkeypatch, tmp_path: Path) -> None:
+    """An explicit per-account cookiefile must win over the shared export default."""
+    from types import SimpleNamespace
+
+    _CapturingYoutubeDL.calls = []
+    _CapturingYoutubeDL._out = str(tmp_path / "Instagram_X1_Video.mp4")
+    monkeypatch.setattr("nicheflow_studio.downloader.instagram.YoutubeDL", _CapturingYoutubeDL)
+    # The shared-export default would return this; the explicit cookiefile should
+    # override it and the default resolver should not even be needed.
+    monkeypatch.setattr(
+        "nicheflow_studio.downloader.instagram.instagram_yt_dlp_cookie_status",
+        lambda: SimpleNamespace(cookiefile=str(tmp_path / "shared.txt"), has_sessionid=True),
+    )
+
+    _download_with_yt_dlp(
+        url="https://www.instagram.com/reel/X1/",
+        output_dir=tmp_path,
+        cookiefile=str(tmp_path / "per-account.txt"),
+    )
+
+    assert _CapturingYoutubeDL.calls
+    assert _CapturingYoutubeDL.calls[0].get("cookiefile") == str(tmp_path / "per-account.txt")
+
+
 def test_instagram_downloader_omits_cookiefile_when_none(monkeypatch, tmp_path: Path) -> None:
     from types import SimpleNamespace
 

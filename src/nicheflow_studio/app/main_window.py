@@ -172,6 +172,7 @@ from nicheflow_studio.processing.smart_drafts import (
     _caption_style_line,
     _caption_word_target,
     _groq_limit_profile,
+    _is_low_context_source_title,
     _profile_style_block,
     can_generate_smart_drafts,
     effective_title_rules,
@@ -7821,9 +7822,16 @@ class MainWindow(QWidget):
             self._chat_prompt_section("Account caption rules", account_voice.get("caption_style")),
             self._chat_prompt_section("Clip premise", account_voice.get("clip_context")),
         ]
-        context_text = self._truncate_chat_prompt_context(
-            self._processing_transcript_input.toPlainText()
-        )
+        transcript_text = self._processing_transcript_input.toPlainText()
+        context_text = self._truncate_chat_prompt_context(transcript_text)
+        # Flag scraped junk titles (`Video by <handle>`, id-like tags) so the agent
+        # does not anchor on-screen titles to a placeholder that carries no signal.
+        source_title_value = (item.title or "").strip()
+        if _is_low_context_source_title(item.title, transcript_text):
+            note = "generic placeholder, ignore for titling; rely on the video and description"
+            source_title_value = (
+                f"{source_title_value} ({note})" if source_title_value else f"({note})"
+            )
         title_style_label = self._processing_prompt_title_style_combo.currentText().strip()
         if self._processing_title_style() is None:
             title_style_label = "Auto (match caption style)"
@@ -7851,7 +7859,7 @@ class MainWindow(QWidget):
                 self._chat_prompt_section("Account", account.name if account else None),
                 self._chat_prompt_section("Platform", account.platform if account else None),
                 self._chat_prompt_section("Niche", account.niche_label if account else None),
-                self._chat_prompt_section("Source title", item.title),
+                self._chat_prompt_section("Source title", source_title_value or None),
                 self._chat_prompt_section("Source URL", item.source_url),
                 self._chat_prompt_section("Source description", item.source_description),
                 self._chat_prompt_section(
@@ -7880,6 +7888,10 @@ class MainWindow(QWidget):
                 "",
                 "Task:",
                 "- Inspect the local video file if possible before writing.",
+                "- If you cannot open the video file, treat any single supplied frame as the "
+                "authoritative visual. Do not flag a mismatch merely because the text describes "
+                "a different moment of the same clip; only flag when the frame shows a different "
+                "subject entirely, and then say so clearly so the clip can be skipped or swapped.",
                 "- Generate 3 on-screen title options and 3 caption options.",
                 "- After the 3 options, recommend the strongest title/caption pair for this account and explain why in 1-2 sentences.",
                 "- Add a short selection note for each option so the user understands when to choose it.",

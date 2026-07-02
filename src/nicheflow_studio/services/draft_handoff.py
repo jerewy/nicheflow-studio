@@ -58,6 +58,32 @@ _REEL_HEADER = re.compile(
 )
 
 
+def _strip_header_emphasis(line: str) -> str:
+    """Unwrap markdown the chat model wraps a SECTION HEADER in.
+
+    Chat models keep bolding headers as ``**Title Option 1:**`` despite the
+    plain-text instruction, and every header regex below is anchored at ``^`` --
+    so a leading ``**`` makes the line fail to match and the whole reply imports
+    as zero sections (the "No 'Title Option' ... found" failure the user hit).
+
+    We unwrap only the label side (before the first colon) plus the closing
+    emphasis that lands right after the colon, and only when the label was
+    actually emphasized, so ``**bold**`` inside a title VALUE is left intact
+    (``join_title`` strips a fully wrapped value separately). The result is used
+    ONLY for header detection; the raw line is still what gets buffered, so a
+    caption body that merely contains a colon is never rewritten.
+    """
+    head, sep, rest = line.strip().partition(":")
+    if not sep:
+        return line
+    head_emphasized = "*" in head or "_" in head or head.lstrip().startswith(("#", ">"))
+    if not head_emphasized:
+        return line
+    cleaned_head = re.sub(r"[*_#>`]+", "", head).strip()
+    cleaned_rest = re.sub(r"^\s*[*_]{1,3}", "", rest)
+    return f"{cleaned_head}:{cleaned_rest}"
+
+
 def parse_pasted_draft(text: str) -> PastedDraft:
     indexed: dict[str, dict[int, list[str]]] = {"title": {}, "caption": {}, "style": {}}
     singleton: dict[str, list[str]] = {"pick": [], "why": [], "notes": []}
@@ -74,8 +100,9 @@ def parse_pasted_draft(text: str) -> PastedDraft:
         buffer = []
 
     for raw_line in (text or "").splitlines():
+        header_line = _strip_header_emphasis(raw_line.strip())
         match_result = next(
-            ((kind, match) for kind, pattern in _HEADERS if (match := pattern.match(raw_line.strip()))),
+            ((kind, match) for kind, pattern in _HEADERS if (match := pattern.match(header_line))),
             None,
         )
         if match_result is None:
@@ -86,6 +113,15 @@ def parse_pasted_draft(text: str) -> PastedDraft:
         if active_kind in indexed:
             active_index = int(match.group(1))
             inline = match.group(2).strip()
+            # A repeated "Title/Caption/Style Option N:" header redefines that
+            # slot rather than appending to it. Chat models (and hand-edits)
+            # sometimes restate an option -- e.g. a leading summary list of all
+            # three titles followed by the same titles interleaved with their
+            # captions -- and flush()'s extend() would otherwise concatenate the
+            # text into itself ("Janet... Michael Janet... Michael"). Clear the
+            # slot so the latest declaration wins; continuation lines are not
+            # headers and never reach here, so multi-paragraph captions are safe.
+            indexed[active_kind].pop(active_index, None)
         else:
             active_index = None
             inline = match.group(1).strip()
@@ -122,7 +158,7 @@ def parse_pasted_draft(text: str) -> PastedDraft:
         note = line.strip()
         if not note or _CITATION_LINE.match(note):
             continue
-        match = _NOTE_LINE.match(note)
+        match = _NOTE_LINE.match(_strip_header_emphasis(note))
         if match:
             last_note_index = int(match.group(1))
             note_map.setdefault(last_note_index, []).append(match.group(2).strip())
@@ -148,6 +184,85 @@ def parse_pasted_draft(text: str) -> PastedDraft:
     )
 
 
+def _caption_rule_voice(account: Account | None) -> dict[str, str] | None:
+    """The minimal account-voice slice the caption rules need.
+
+    ``effective_caption_rules`` only reads ``target_audience`` (to ban the
+    audience-label leak); pass it through so the chat path bans the exact
+    string, matching the live generation prompt. Returns None when there is no
+    audience set, which makes the rule fall back to its generic wording.
+    """
+    if account is None:
+        return None
+    audience = (account.target_audience or "").strip()
+    return {"target_audience": audience} if audience else None
+
+
+# Title Option and Caption Option are different texts, but the historytrails
+# title rules describe the on-screen title itself as "the long, calm documentary
+# caption that sits at the top of the clip". With a separate Caption Option field
+# in the flat paste format, chat models duplicated the title into the caption
+# slot and dumped the real 80-120 word description under an unparsed
+# "Caption Option N (full):" header, so the importer only saw the one-line copy.
+# Spell the two fields out so the full caption lands in the slot the importer reads.
+_FIELD_DISAMBIGUATION_LINES = [
+    "Title Option and Caption Option are TWO DIFFERENT texts for each option, "
+    "never the same words twice:",
+    "- Title Option N is the on-screen overlay line from the on-screen title "
+    "rules above (one sentence; its length follows the AUTO MIX bands).",
+    "- Caption Option N is the Instagram description from the caption rules "
+    "above: about 80-120 words across two paragraphs. Put that full description "
+    "directly on and below the 'Caption Option N:' line.",
+    "Do NOT copy the title into the caption, do NOT write a one-line caption, and "
+    "do NOT add any extra field such as 'Caption Option N (full):'. There is "
+    "exactly one 'Caption Option N:' per option and its full caption follows it.",
+]
+
+# Explicit verify-and-prune step: tighten green-tier (drop/soften unsupported
+# claims, catch source errors) rather than license invented specifics.
+_FACT_CHECK_LINES = [
+    "Fact-check pass (do this BEFORE writing each reel):",
+    "- List the concrete claims you plan to use: names, ages, dates, places, "
+    "numbers, causes, and any first/last/only superlative.",
+    "- Keep a claim only when THIS reel's source title, source description, "
+    "transcript, or visual evidence supports it. If a claim is not supported, "
+    "soften it ('decades ago', 'thousands of people') or drop it; never invent a "
+    "specific just to reach the title length.",
+    "- If a source claim looks wrong or like clickbait ('they never told you', "
+    "'darkest secret', or a year or identity you are confident is mistaken), do "
+    "not repeat it as fact. Drop the clickbait claim, but keep any substantive, "
+    "checkable backstory in the same caption; do not throw out the whole caption. "
+    "Use the supported version or leave the bad claim out.",
+]
+
+
+# Reconciles the "story beneath the clip" accounts (e.g. Beneath History) with
+# the HistoryTrails "anchor to what's on screen" rules: the source caption is a
+# first-class grounding source, so an off-camera backstory the caption supports
+# is usable, and a clickbait opener is no reason to discard the real story under
+# it. Mirrors the live Groq prompt's PRIMARY-CONTEXT framing on the chat path.
+_SOURCE_CAPTION_GUIDANCE = [
+    "How to use the source caption (READ THIS BEFORE WRITING):",
+    "- PRIMARY CONTEXT: when there is no transcript, the source caption is your main "
+    "signal for what this clip is actually about. Identify the specific subject, "
+    "people, event, or backstory it names and build the titles and captions directly "
+    "around it. Do not retreat to a generic description of the footage when the caption "
+    "gives you a real story.",
+    "- SEPARATE THE HOOK FROM THE STORY: clickbait-farm captions often open with an "
+    "unverifiable teaser ('they never told you', 'secret', 'shocking truth') and then "
+    "give a real, substantive backstory underneath. Drop the unverifiable teaser, but "
+    "KEEP and tell the substantive story. Still apply the fact-check and green-tier "
+    "rules to that story (soften or drop any single specific the caption cannot back), "
+    "but never discard the whole caption just because its first line is clickbait.",
+    "- THE CLIP IS THE VISUAL, THE CAPTION IS THE STORY: a clip is often only the visual "
+    "hook for a story the caption tells, and that story may not be visible in the frame. "
+    "The source caption is valid grounding on its own, equal to the visible evidence. A "
+    "fact being off-camera is NOT a reason to drop it; only drop a specific the caption "
+    "does not actually support. Lead with the story and let the footage be the moment "
+    "the viewer watches while you tell it.",
+]
+
+
 def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
     settings = settings or {}
     with get_session() as session:
@@ -160,6 +275,7 @@ def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
         account_key = account.instagram_handle if account is not None else None
         few_shot_winners = top_titles_for_account(account_key) if account_key else []
         caption_outro = draft_generation.caption_outro_for_account(account)
+        caption_voice = _caption_rule_voice(account)
         fields = [
             f"Account: {account.name if account else '(none)'}",
             f"Niche: {niche_label or '(none)'}",
@@ -187,6 +303,13 @@ def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
         title_length=settings.get("title_length") or "long",
     )
     hook_rules = smart_drafts._hook_drama_and_fact_safety_rules()
+    # Same source as the live CAPTION block so caption length/structure can't
+    # drift between the chat path and the API path (titles already share
+    # effective_title_rules above; captions used to be a bare style token here).
+    caption_rules = smart_drafts.effective_caption_rules(
+        caption_style,
+        account_voice=caption_voice,
+    )
     return "\n".join(
         [
             "Please inspect this local NicheFlow video and generate Instagram-ready drafts.",
@@ -217,11 +340,18 @@ def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
             "description of what is on screen instead of generating guesses. Never "
             "invent names, dates, places, records, or events the signals do not state.",
             "",
+            *_SOURCE_CAPTION_GUIDANCE,
+            "",
             "On-screen title rules (follow these exactly):",
             *title_rules,
             "",
             "Hook framing (drama is allowed, overclaiming is not):",
             *hook_rules,
+            "",
+            "Caption rules (follow these exactly):",
+            *caption_rules,
+            "",
+            *_FACT_CHECK_LINES,
             "",
             *(
                 [
@@ -258,6 +388,8 @@ def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
             "provider_label to 'Codex' or 'Claude Code' and source to 'codex' or "
             "'claude-code' (a short label, never a file path).",
             "- The running Processing screen automatically detects the saved revision. Do not ask the user to paste it manually.",
+            "",
+            *_FIELD_DISAMBIGUATION_LINES,
             "",
             "Return format (write every section header exactly as shown, plain text — "
             "never bold or markdown-formatted; '**Title Option 1:**' breaks the importer):",
@@ -305,6 +437,13 @@ def _account_prompt_header(
         title_length=settings.get("title_length") or "long",
     )
     hook_rules = smart_drafts._hook_drama_and_fact_safety_rules()
+    # Same source as the live CAPTION block (see effective_caption_rules); the
+    # batch path used to emit only a bare "Caption style:" token, so the web
+    # model had no length/structure target and returned one-line captions.
+    caption_rules = smart_drafts.effective_caption_rules(
+        settings.get("caption_style") or None,
+        account_voice=_caption_rule_voice(account),
+    )
     return [
         "You are drafting Instagram Reel titles and captions for one NicheFlow account.",
         "This is for ChatGPT or Claude web. The user will attach one still image per reel.",
@@ -331,6 +470,11 @@ def _account_prompt_header(
         "Hook framing (drama is allowed, overclaiming is not):",
         *hook_rules,
         "",
+        "Caption rules (follow these exactly):",
+        *caption_rules,
+        "",
+        *_FACT_CHECK_LINES,
+        "",
         "Plain-text rules:",
         "- Keep display titles plain text.",
         "- Do not use markdown formatting in section headers or titles.",
@@ -345,6 +489,8 @@ def _account_prompt_header(
         "context below (for example '===== REEL 1 (#143) ====='). The (#id) is how the "
         "app files each reply to the correct video, so never change, drop, or invent it.",
         "Do not rename, renumber, merge, or skip any reel, even if two clips look similar.",
+        "",
+        *_FIELD_DISAMBIGUATION_LINES,
         "Inside each block, use this exact plain-text format:",
         "Title Option 1:",
         "Caption Option 1:",

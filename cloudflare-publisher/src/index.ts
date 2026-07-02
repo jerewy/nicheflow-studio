@@ -240,10 +240,12 @@ async function uploadMedia(request: Request, env: Env, jobId: string): Promise<R
 }
 
 async function listJobs(env: Env): Promise<Response> {
+  // DESC so the 200 most recently scheduled jobs are always returned; an ASC
+  // limit would exclude today's jobs once the DB accumulates 200+ older rows.
   const rows = await env.DB.prepare(
     `SELECT id, external_id, account_key, scheduled_at, status, attempts,
             meta_container_id, meta_media_id, error_message, published_at
-     FROM publish_jobs ORDER BY scheduled_at ASC LIMIT 200`,
+     FROM publish_jobs ORDER BY scheduled_at DESC LIMIT 200`,
   ).all();
   return json({ publish_mode: env.PUBLISH_MODE, jobs: rows.results });
 }

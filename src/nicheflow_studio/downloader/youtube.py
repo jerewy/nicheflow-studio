@@ -7,6 +7,10 @@ from yt_dlp import YoutubeDL
 
 from nicheflow_studio.core.media_tools import ffmpeg_binary
 from nicheflow_studio.downloader.yt_dlp_sidecar import (
+    YT_DLP_EXTRACTOR_RETRIES,
+    YT_DLP_FRAGMENT_RETRIES,
+    YT_DLP_RETRIES,
+    YT_DLP_SOCKET_TIMEOUT,
     download_with_sidecar,
     yt_dlp_sidecar_path,
 )
@@ -33,6 +37,11 @@ def _yt_dlp_options(output_dir: Path) -> dict[str, object]:
         "windowsfilenames": True,
         "quiet": True,
         "no_warnings": True,
+        # See yt_dlp_sidecar for the rationale; keep both download paths in sync.
+        "retries": YT_DLP_RETRIES,
+        "fragment_retries": YT_DLP_FRAGMENT_RETRIES,
+        "extractor_retries": YT_DLP_EXTRACTOR_RETRIES,
+        "socket_timeout": YT_DLP_SOCKET_TIMEOUT,
     }
     if _ffmpeg_available():
         # Prefer the highest-quality separate streams when ffmpeg can merge them.

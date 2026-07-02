@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import time
 import urllib.error
 
 import pytest
@@ -195,3 +196,91 @@ def test_unconfigured_request_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CLOUDFLARE_PUBLISHER_API_KEY", raising=False)
     with pytest.raises(CloudPublisherError, match="is not set"):
         cloud_publisher.list_jobs()
+
+
+def test_transient_network_error_retries_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch, _configured
+) -> None:
+    monkeypatch.setattr(cloud_publisher, "_RETRY_BACKOFF_S", 0)
+    calls = {"n": 0}
+
+    def flaky_urlopen(request, timeout=120):  # noqa: ANN001
+        calls["n"] += 1
+        if calls["n"] < cloud_publisher._MAX_ATTEMPTS:
+            raise urllib.error.URLError("The write operation timed out")
+        return _FakeResponse(b'{"processed":1,"mode":"live"}')
+
+    monkeypatch.setattr(cloud_publisher.urllib.request, "urlopen", flaky_urlopen)
+
+    result = cloud_publisher.run_due()
+
+    assert result == {"processed": 1, "mode": "live"}
+    assert calls["n"] == cloud_publisher._MAX_ATTEMPTS
+
+
+def test_transient_network_error_exhausts_retries(
+    monkeypatch: pytest.MonkeyPatch, _configured
+) -> None:
+    monkeypatch.setattr(cloud_publisher, "_RETRY_BACKOFF_S", 0)
+    calls = {"n": 0}
+
+    def always_flaky_urlopen(request, timeout=120):  # noqa: ANN001
+        calls["n"] += 1
+        raise urllib.error.URLError("EOF occurred in violation of protocol (_ssl.c:2406)")
+
+    monkeypatch.setattr(cloud_publisher.urllib.request, "urlopen", always_flaky_urlopen)
+
+    with pytest.raises(CloudPublisherError, match="Cloud publisher unreachable"):
+        cloud_publisher.run_due()
+
+    assert calls["n"] == cloud_publisher._MAX_ATTEMPTS
+
+
+def test_concurrent_uploads_are_serialized(
+    monkeypatch: pytest.MonkeyPatch, _configured, tmp_path
+) -> None:
+    """Two simultaneous schedule_reel calls must not send overlapping requests
+    (the actual root cause of the flaky network errors this module retries)."""
+    import threading
+
+    in_flight = {"count": 0, "max_seen": 0}
+    lock = threading.Lock()
+
+    def fake_urlopen(request, timeout=120):  # noqa: ANN001
+        with lock:
+            in_flight["count"] += 1
+            in_flight["max_seen"] = max(in_flight["max_seen"], in_flight["count"])
+        time.sleep(0.05)
+        with lock:
+            in_flight["count"] -= 1
+        if request.get_method() == "POST":
+            return _FakeResponse(b'{"id":"job1","upload_path":"/v1/jobs/job1/media","status":"awaiting_upload"}')
+        return _FakeResponse(b'{"id":"job1","status":"scheduled"}')
+
+    monkeypatch.setattr(cloud_publisher.urllib.request, "urlopen", fake_urlopen)
+
+    videos = []
+    for name in ("a.mp4", "b.mp4"):
+        video = tmp_path / name
+        video.write_bytes(b"video-bytes")
+        videos.append(video)
+
+    threads = [
+        threading.Thread(
+            target=cloud_publisher.schedule_reel,
+            kwargs={
+                "external_id": f"local-{i}",
+                "account_key": "pastmomentsdaily",
+                "caption": "hi",
+                "scheduled_at": "2026-06-15T02:00:00Z",
+                "video_path": video,
+            },
+        )
+        for i, video in enumerate(videos)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    assert in_flight["max_seen"] == 1

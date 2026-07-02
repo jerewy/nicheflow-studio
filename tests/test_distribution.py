@@ -214,10 +214,18 @@ def test_classify_topic_tier_uses_seed_keywords(text: str, expected: str) -> Non
 
 
 def test_suggested_action_is_advisory_from_tier_er_and_duration() -> None:
+    # Short clips: engagement splits accept vs review.
     assert suggested_action("S", source_er=0.03, duration_seconds=30) == "accept"
     assert suggested_action("A", source_er=0.01, duration_seconds=30) == "review"
-    assert suggested_action("B", source_er=0.03, duration_seconds=36) == "reject"
+    # Tier C/D are always rejected, regardless of engagement or length.
     assert suggested_action("C", source_er=0.20, duration_seconds=20) == "reject"
+    # Long clips (>35s) are only rejected when engagement is also weak; a long
+    # clip that already engages well stays accept (the cap is ER-aware now).
+    assert suggested_action("B", source_er=0.03, duration_seconds=36) == "accept"
+    assert suggested_action("S", source_er=0.10, duration_seconds=120) == "accept"
+    assert suggested_action("S", source_er=0.01, duration_seconds=60) == "reject"
+    # Exactly at the short cap is not "long".
+    assert suggested_action("A", source_er=0.01, duration_seconds=35) == "review"
 
 
 def test_source_fit_score_retains_evergreen_safe_recency_weight() -> None:

@@ -1363,6 +1363,46 @@ def effective_title_rules(
     return [*base_rules, *_title_length_rules(title_length)]
 
 
+def effective_caption_rules(
+    caption_style: str | None,
+    account_voice: dict[str, str] | None = None,
+) -> list[str]:
+    """Pick the caption-body rules for the chat / Copy Chat Prompt path.
+
+    The live generation prompt splits caption guidance across two places: the
+    per-style paragraph template lives in the SYSTEM prompt
+    (``_smart_draft_system_prompt`` -> ``_caption_paragraph_rule``) while the
+    word target, hashtag, and anti-explainer bullets live in the user prompt's
+    CAPTION block. The chat handoff is a single block of text with no system
+    prompt, so this gathers BOTH halves into one ordered list, reusing the same
+    per-style helpers as the live path. The per-style substance (word count,
+    paragraph template, hashtag count) therefore comes from one source and
+    cannot drift between the live API path and the chat path — the same
+    contract ``effective_title_rules`` already provides for titles.
+    """
+    return [
+        f"- Each caption is the Instagram description copy, about "
+        f"{_caption_word_target(caption_style)} words. Stay inside that range.",
+        f"- {_caption_paragraph_rule(caption_style)}",
+        "- Separate every paragraph with one blank line. Never return a caption "
+        "as one dense block of text.",
+        f"- {_caption_style_line(caption_style)}",
+        "- Start with the hook or the concept itself, never with 'This clip', "
+        "'In this video', 'You need to see', 'The clip shows', 'The video "
+        "shows', 'This video features', or 'The interview clip shows'.",
+        "- Do not use video-description framing anywhere in the caption body: "
+        "phrases like 'the clip shows X doing Y' or 'in this video, X discusses "
+        "Y' treat the caption as a synopsis, not a hook. Write as if talking to "
+        "a friend about the moment, not summarising a video for a search engine.",
+        "- Never open a caption with a dictionary-style definition: do not write "
+        "'[Game/show/thing] is a [category] where...' as the first sentence. "
+        "Lead with the feeling, situation, or moment first.",
+        _caption_hashtag_instruction(caption_style),
+        *_anti_explainer_avoid_lines(caption_style, account_voice),
+        *_negative_caption_examples_block(caption_style),
+    ]
+
+
 def _title_length_rules(title_length: str | None) -> list[str]:
     normalized = _normalize_whitespace(title_length or "long").lower()
     if normalized == "short":
@@ -1683,6 +1723,12 @@ def _historytrails_title_rules(
     reached the highest median views) and the paired HistoryTrails Left template
     renders 3-5 left-aligned lines. Title format only; pairs with any
     caption_style.
+
+    One of the three options is a deliberate COMMENT HOOK (question, first-person
+    reaction, or shared-memory prompt). The reference @historytrails set
+    (data/title_analysis/historytrails-ocr) shows the highest-comment posts are
+    written in that reactive voice, while pure museum-label declaratives earn
+    saves but few replies. The other two options stay in the documentary voice.
     """
     measured = tuple(
         cleaned
@@ -1703,7 +1749,7 @@ def _historytrails_title_rules(
         "no selling, no exclamation marks. This is the same restraint as Cinematic "
         "Record, only written out as a complete descriptive sentence.",
         "- BE SPECIFIC (the rule that matters most): anchor every title to at least "
-        "one hard real detail from THIS clip's evidence — a recognizable name, an "
+        "one hard real detail from THIS clip's evidence: a recognizable name, an "
         "exact year or date, a number, or a place. STRANGER TEST: if a stranger "
         "cannot tell THIS clip from any other by the title alone, add the specific.",
         "- LENGTH AND LAYOUT: the proven sweet spot on this account is a fuller "
@@ -1725,8 +1771,25 @@ def _historytrails_title_rules(
         "happened>'; (6) a '<subject> <did X> for the first time ... (year)' "
         "anecdote. At least TWO options must carry a hard specific (date, number, "
         "or real name).",
+        "- COMMENT HOOK (HARD RULE, write EXACTLY ONE of the three options this "
+        "way): the documentary voice earns saves but rarely replies, so make one "
+        "option invite a response, not just a silent save. Measured against this "
+        "account's own comment winners, the highest-comment posts are written as a "
+        "reaction, a question, or a shared-memory prompt, not a museum label. Use "
+        "ONE of these shapes, whichever the clip earns honestly: (1) a real "
+        "question the footage makes a stranger want to answer ('How is he this "
+        "calm under that kind of pressure?'); (2) a first-person reaction that "
+        "takes a gentle stance ('I had never seen this before', 'this is one of "
+        "my favorite moments'); (3) a nostalgia prompt that names the era and asks "
+        "the viewer to confirm they remember it ('Remember <thing> (years)?'). "
+        "This one option may drop the strict third-person distance, but it STILL "
+        "obeys green-tier (no invented facts) and the anti-clickbait ban below: "
+        "never 'you won't believe', never manufactured outrage, never an "
+        "exclamation-point sell. Keep the other two options in the calm "
+        "documentary voice. The comment-hook option may double as the open-loop "
+        "option or be separate.",
         "- OPEN LOOP (use for at most ONE option, only on a visual clip): keep "
-        "everything concrete but withhold the ONE thing the footage reveals — the "
+        "everything concrete but withhold the ONE thing the footage reveals, the "
         "subject OR the outcome, never both.",
         "- ANTI-AI-TELL GUARD (HARD RULE): NEVER use an em-dash, en-dash, or double "
         "hyphen; use a comma or period for any pause. Vary the sentence rhythm "

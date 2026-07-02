@@ -115,6 +115,16 @@ def source_fit_score(
     return TOPIC_TIER_WEIGHTS[tier] * max(0.0, source_er) * recency_weight(published_at, now=now)
 
 
+# Advisory thresholds for suggested_action. A clip past SHORT_MAX_SECONDS is no
+# longer rejected on length alone: only "long AND weakly engaged" is the real
+# reject case. A long clip with strong public engagement is still worth posting
+# (validated on the historytrails pool, where view counts hold and engagement
+# rate rises past 35s). Engagement never forces a reject by itself; within the
+# short cap it only splits accept vs review.
+SHORT_MAX_SECONDS = 35
+STRONG_SOURCE_ER = 0.03
+
+
 def suggested_action(
     tier: TopicTier,
     *,
@@ -124,8 +134,10 @@ def suggested_action(
     """Return an advisory action; callers must not mutate acceptance state."""
     if tier in {"C", "D"}:
         return "reject"
-    if duration_seconds is not None and duration_seconds > 35:
+    strong_engagement = source_er >= STRONG_SOURCE_ER
+    is_long = duration_seconds is not None and duration_seconds > SHORT_MAX_SECONDS
+    # Length only counts against a clip when engagement is also weak; a long clip
+    # that already engages well stays accept.
+    if is_long and not strong_engagement:
         return "reject"
-    if source_er >= 0.03:
-        return "accept"
-    return "review"
+    return "accept" if strong_engagement else "review"

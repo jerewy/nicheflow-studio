@@ -7,6 +7,7 @@ from nicheflow_studio.db.media_library import find_or_register_media_asset
 from nicheflow_studio.db.models import Account, ScrapeCandidate
 from nicheflow_studio.db.pools import (
     CANDIDATE_STATE_POOLED,
+    POOL_STATUS_PENDING_REVIEW,
     CrossNicheError,
     DuplicateContentError,
     accept_candidate_into_pool,
@@ -233,7 +234,8 @@ def test_accept_candidate_creates_pending_asset_and_pool_item(tmp_path) -> None:
         assert item.niche == "history"
         assert item.media_asset.download_status == "pending"  # not downloaded yet
         assert candidate.state == CANDIDATE_STATE_POOLED
-        assert pool_size(session, "history") == 1
+        # Intake lands in pending_review; the manual review gate accepts it later.
+        assert pool_size(session, "history", status=POOL_STATUS_PENDING_REVIEW) == 1
 
 
 def test_accept_candidate_is_idempotent(tmp_path) -> None:
@@ -246,7 +248,7 @@ def test_accept_candidate_is_idempotent(tmp_path) -> None:
         session.commit()
 
         assert first.id == second.id
-        assert pool_size(session, "history") == 1
+        assert pool_size(session, "history", status=POOL_STATUS_PENDING_REVIEW) == 1
 
 
 def test_two_candidates_same_shortcode_pool_once(tmp_path) -> None:
@@ -261,7 +263,7 @@ def test_two_candidates_same_shortcode_pool_once(tmp_path) -> None:
         session.commit()
 
         assert item_a.id == item_b.id
-        assert pool_size(session, "history") == 1
+        assert pool_size(session, "history", status=POOL_STATUS_PENDING_REVIEW) == 1
 
 
 def test_reject_candidate_records_reason_and_creates_no_pool_item(tmp_path) -> None:

@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -34,6 +36,22 @@ _KEY_ENV = "CLOUDFLARE_PUBLISHER_API_KEY"
 # feature is inert until an account is explicitly mapped.
 _ACCOUNTS_ENV = "CLOUDFLARE_PUBLISH_ACCOUNTS"
 _TIMEOUT_S = 120
+
+# Exports/schedules run on one daemon thread per item (see services/jobs.py), so
+# batch actions ("export next 5") can fire several Worker requests at once. Two
+# multi-MB video PUTs sharing the same upload pipe is exactly what produces the
+# "write operation timed out" / "EOF occurred in violation of protocol" errors
+# seen from Windows' socket layer under contention. Serializing every Worker
+# call through this lock makes concurrent exports queue their uploads instead
+# of fighting for bandwidth. GETs (status polling) pay a small, bounded wait
+# behind an in-flight upload, which is harmless.
+_REQUEST_LOCK = threading.Lock()
+# A request that still fails after serialization is most likely a one-off
+# network blip rather than a real outage (confirmed by retries succeeding in
+# practice), so retry transient (connection-level) failures a couple of times
+# before surfacing an error the user has to manually retry.
+_MAX_ATTEMPTS = 3
+_RETRY_BACKOFF_S = 2.0
 
 
 def cloud_publish_map() -> dict[str, str]:
@@ -101,15 +119,21 @@ def _request(
         data = raw_body
         headers["Content-Type"] = content_type or "application/octet-stream"
     request = urllib.request.Request(_base_url() + path, data=data, method=method, headers=headers)
-    try:
-        with urllib.request.urlopen(request, timeout=_TIMEOUT_S) as response:
-            body = response.read().decode("utf-8")
-            return json.loads(body) if body else {}
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise CloudPublisherError(f"Cloud publisher HTTP {exc.code}: {detail}") from exc
-    except urllib.error.URLError as exc:
-        raise CloudPublisherError(f"Cloud publisher unreachable: {exc.reason}") from exc
+    with _REQUEST_LOCK:
+        for attempt in range(1, _MAX_ATTEMPTS + 1):
+            try:
+                with urllib.request.urlopen(request, timeout=_TIMEOUT_S) as response:
+                    body = response.read().decode("utf-8")
+                    return json.loads(body) if body else {}
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")
+                raise CloudPublisherError(f"Cloud publisher HTTP {exc.code}: {detail}") from exc
+            except urllib.error.URLError as exc:
+                if attempt < _MAX_ATTEMPTS:
+                    time.sleep(_RETRY_BACKOFF_S * attempt)
+                    continue
+                raise CloudPublisherError(f"Cloud publisher unreachable: {exc.reason}") from exc
+    raise AssertionError("unreachable")  # loop always returns or raises
 
 
 def create_job(

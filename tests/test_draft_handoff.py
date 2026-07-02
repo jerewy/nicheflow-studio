@@ -107,6 +107,55 @@ def test_build_chat_prompt_carries_title_rules_and_hook_framing() -> None:
     assert "GREEN" in prompt and "YELLOW" in prompt and "RED" in prompt
 
 
+def test_build_chat_prompt_carries_shared_caption_rules() -> None:
+    # Regression: the chat path used to emit only a bare "Caption style:" token
+    # with no length/structure, so chat models returned one-line captions. It
+    # must now share the live prompt's caption rules (effective_caption_rules),
+    # including the per-style paragraph template and word target.
+    item_id = _make_item()
+
+    prompt = draft_handoff.build_chat_prompt(item_id, {"caption_style": "historytrails_archive"})
+    expected_rules = smart_drafts.effective_caption_rules("historytrails_archive")
+
+    assert "Caption rules (follow these exactly):" in prompt
+    assert all(rule in prompt for rule in expected_rules)
+    assert "HISTORYTRAILS template" in prompt
+    assert "Instagram description copy, about" in prompt
+
+
+def test_build_account_batch_chat_prompt_carries_shared_caption_rules() -> None:
+    account_id, item_ids = _make_account_items(2)
+
+    prompt = draft_handoff.build_account_batch_chat_prompt(
+        account_id,
+        item_ids,
+        {"caption_style": "historytrails_archive"},
+    )
+    expected_rules = smart_drafts.effective_caption_rules("historytrails_archive")
+
+    assert prompt.count("Caption rules (follow these exactly):") == 1
+    assert all(rule in prompt for rule in expected_rules)
+    assert "HISTORYTRAILS template" in prompt
+
+
+def test_chat_prompts_disambiguate_title_vs_caption_and_fact_check() -> None:
+    # Regression: the historytrails title rules call the on-screen title a
+    # "documentary caption", so chat models duplicated the title into the
+    # Caption Option slot and dumped the real caption under an unparsed
+    # "Caption Option N (full):" header. Both chat prompts must now spell the
+    # two fields apart, forbid the "(full)" field, and carry the fact-check pass.
+    item_id = _make_item()
+    account_id, item_ids = _make_account_items(2)
+
+    single = draft_handoff.build_chat_prompt(item_id)
+    batch = draft_handoff.build_account_batch_chat_prompt(account_id, item_ids)
+
+    for prompt in (single, batch):
+        assert "TWO DIFFERENT texts" in prompt
+        assert "Caption Option N (full):" in prompt  # named so it's explicitly banned
+        assert "Fact-check pass" in prompt
+
+
 def test_build_chat_prompt_uses_same_title_length_rule_as_api_prompt() -> None:
     item_id = _make_item()
 
@@ -159,6 +208,32 @@ def test_build_chat_prompt_guards_blind_chat_models() -> None:
     assert "CANNOT open the local video" in prompt
     assert "ask the user for a one-line description" in prompt
     assert "never bold or markdown-formatted" in prompt
+
+
+def test_build_chat_prompt_uses_source_caption_as_primary_story() -> None:
+    # A clickbait-farm caption (junk hook + real backstory) must not be discarded
+    # wholesale. The prompt elevates the caption to primary context, tells the model
+    # to drop the teaser but keep the substantive story, and treats an off-camera
+    # backstory as valid grounding. This reconciles "story beneath the clip" accounts
+    # (Beneath History) with the HistoryTrails "anchor to what's visible" rules.
+    item_id = _make_item()
+    with get_session() as session:
+        item = session.get(DownloadItem, item_id)
+        item.source_description = (
+            "They never told you about this secret. Michael Jackson and Chris Tucker "
+            "were close friends, and Tucker appeared in the You Rock My World short film."
+        )
+        session.commit()
+
+    prompt = draft_handoff.build_chat_prompt(item_id)
+
+    assert "How to use the source caption" in prompt
+    assert "PRIMARY CONTEXT" in prompt
+    assert "SEPARATE THE HOOK FROM THE STORY" in prompt
+    assert "THE CLIP IS THE VISUAL, THE CAPTION IS THE STORY" in prompt
+    assert "never discard the whole caption" in prompt
+    # The fact-check pass now keeps substantive backstory instead of all-or-nothing.
+    assert "keep any substantive, checkable backstory" in prompt
 
 
 def test_build_chat_prompt_bans_dashes_and_avoids_pipe_corruption() -> None:
@@ -394,6 +469,32 @@ Option 1: Specific and clear.
     assert parsed.option_notes == ["Specific and clear."]
 
 
+def test_parse_pasted_draft_tolerates_bold_markdown_headers() -> None:
+    # Chat models keep bolding section headers ('**Title Option 1:**') despite
+    # the plain-text instruction. The '^'-anchored header regexes used to reject
+    # the leading '**', so the whole reply imported as zero sections. The parser
+    # must now unwrap the bold header while leaving '**bold**' inside the title
+    # value intact.
+    parsed = draft_handoff.parse_pasted_draft(
+        """**Title Option 1:** The **GOAT** play
+**Caption Option 1:** First paragraph.
+
+Second paragraph.
+
+**Recommended Pick:** Title Option 1 + Caption Option 1
+**Why:** Strongest option.
+**Selection Notes:**
+**Option 1:** Specific and clear.
+"""
+    )
+
+    assert parsed.title_options == ["The **GOAT** play"]
+    assert parsed.caption_options == ["First paragraph.\n\nSecond paragraph."]
+    assert parsed.recommended_title_index == 1
+    assert parsed.recommended_caption_index == 1
+    assert parsed.option_notes == ["Specific and clear."]
+
+
 def test_parse_pasted_draft_drops_trailing_citation_from_notes() -> None:
     # Chat models append a sources block ("[1]: https://...") after the last
     # block; it must not bleed into that reel's final selection note.
@@ -415,6 +516,49 @@ https://example.com/bare-url
     )
 
     assert parsed.option_notes == ["Best fit because it is specific."]
+
+
+def test_parse_pasted_draft_dedupes_repeated_option_headers() -> None:
+    # Models (and hand-edits) sometimes restate options: a leading summary list
+    # of all three titles, then the same titles again interleaved with captions.
+    # flush()'s extend() used to concatenate the repeated title into itself
+    # ("Title... Title..."). A repeated header must redefine the slot, not append.
+    parsed = draft_handoff.parse_pasted_draft(
+        """Title Option 1:
+Janet Jackson's 2009 VMA tribute to Michael
+Title Option 2:
+The night Janet Jackson paid tribute to Michael at the 2009 VMAs
+Title Option 3:
+Janet Jackson took the stage at the 2009 VMAs
+
+Caption Option 1:
+First caption.
+
+Title Option 2:
+The night Janet Jackson paid tribute to Michael at the 2009 VMAs
+Caption Option 2:
+Second caption.
+
+Title Option 3:
+Janet Jackson took the stage at the 2009 VMAs
+Caption Option 3:
+Third caption.
+
+Recommended Pick: Title Option 3 + Caption Option 3
+Why: Strongest anchor.
+"""
+    )
+
+    assert parsed.title_options == [
+        "Janet Jackson's 2009 VMA tribute to Michael",
+        "The night Janet Jackson paid tribute to Michael at the 2009 VMAs",
+        "Janet Jackson took the stage at the 2009 VMAs",
+    ]
+    assert parsed.caption_options == [
+        "First caption.",
+        "Second caption.",
+        "Third caption.",
+    ]
 
 
 def test_import_pasted_draft_saves_revision() -> None:
