@@ -57,15 +57,30 @@ captions change the *post*, not the *originality of the underlying video*.
 - **Accepted consequence:** some or all of these accounts may be reach-limited or
   banned. The network is treated as disposable/replaceable, not as durable IP.
 
-### 2.2 Rights / copyright risk — ACCEPTED for MVP
+### 2.2 Rights / copyright risk — REVISED POSTURE (2026-07-02)
 
 Archival "history" clips and especially **movie scenes** (commercial films) often have
-real owners. The plan defers rights verification.
+real owners. The plan originally deferred rights verification; that changed after
+`pastmomentsdaily` received a copyright removal on 2026-07-02 (Wimbledon broadcast
+clip, Rights Manager match 17 days post-publish).
 
-- **Accepted consequence:** takedown/strike exposure in the interim. Movie accounts
-  are explicitly **secondary / experimental** and must not be the only future
-  monetization inventory (Je note 3 §15.3).
-- Mitigation deferred to "later" per §13.4; not a launch blocker.
+- **New posture:** broadcast sport and recent TV-broadcast moments are **excluded**
+  from sourcing and pooling. Archival/public-domain footage is the preferred lane
+  for history accounts. Movie accounts remain **secondary / experimental** and must
+  not be the only future monetization inventory (Je note 3 §15.3).
+- **Rights classification is mandatory at review time.** `pool_items.rights_confidence`
+  must be set on every item before it leaves the review queue — one of `archival`,
+  `meme`, `tv_moment`, `broadcast_sport`, `unknown`. The Pool Review tab surfaces this
+  as a color-coded badge (archival = lowest risk, broadcast_sport/tv_moment = highest)
+  with an editable dropdown.
+- **Flagged accounts rest, they don't get retired.** `Account.operational_status`
+  (`active` / `resting` / `flagged`) lets an account be pulled out of distribution and
+  publish scheduling — including anything already scheduled for it — without deleting
+  its history or touching assignment code. This is the response lever for the next
+  incident like the Wimbledon strike.
+- Residual accepted consequence: takedown/strike exposure remains for anything
+  classified `unknown` or misclassified at review time — this is a manual dropdown,
+  not automated rights detection, and that's accepted as sufficient at current volume.
 
 ### 2.3 Account-footprint risk — NOTED, mitigate cheaply
 
