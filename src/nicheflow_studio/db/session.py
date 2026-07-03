@@ -296,6 +296,13 @@ def _ensure_compatibility() -> None:
             )
         if "niche" not in account_columns:
             connection.execute(text("ALTER TABLE accounts ADD COLUMN niche VARCHAR(16)"))
+        if "operational_status" not in account_columns:
+            connection.execute(
+                text(
+                    "ALTER TABLE accounts ADD COLUMN operational_status "
+                    "VARCHAR(16) DEFAULT 'active'"
+                )
+            )
 
         if "pool_items" in inspect(connection).get_table_names():
             pool_item_columns = {

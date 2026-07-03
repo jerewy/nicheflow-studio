@@ -1266,6 +1266,7 @@ const mock = {
         niche_label: "movie",
         niche: "movie",
         instagram_handle: "mockmovies",
+        operational_status: "active",
       },
     ];
   },
@@ -1430,6 +1431,7 @@ const mock = {
       niche_label: "movie",
       niche: "movie",
       instagram_handle: "mockmovies",
+      operational_status: "active",
       login_identifier: null,
       instagram_profile: null,
       credential_blob: null,

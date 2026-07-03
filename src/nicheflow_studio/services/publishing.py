@@ -14,6 +14,7 @@ be one click away in an early migration slice.
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import random as _random
 import threading
 import time
@@ -25,9 +26,12 @@ from nicheflow_studio.core.scheduling import (
     most_recent_passed_slot_time,
     next_open_slot_time,
 )
+from nicheflow_studio.db.assignments import ACCOUNT_OPERATIONAL_STATUS_ACTIVE
 from nicheflow_studio.db.models import Account, DownloadItem, UploadJob
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.services.errors import ServiceError
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_TIMEZONE = "Asia/Bangkok"
 _DEFAULT_PRIVACY = "private"
@@ -369,6 +373,17 @@ def queue_for_publish(item_id: int, *, scheduled_at: str | None = None) -> dict:
         account = session.get(Account, item.account_id)
         if account is None:
             raise PublishError("The item's account no longer exists.")
+        if account.operational_status != ACCOUNT_OPERATIONAL_STATUS_ACTIVE:
+            logger.info(
+                "Skipped queuing reel for account '%s' (id=%s): operational_status=%s",
+                account.name,
+                account.id,
+                account.operational_status,
+            )
+            raise PublishError(
+                f"Account '{account.name}' is {account.operational_status}, not active. "
+                "Reactivate it before publishing."
+            )
 
         title = (item.title_draft or item.title or "").strip() or None
         description = item.caption_draft

@@ -269,6 +269,42 @@ def test_due_count_and_publish_due(monkeypatch: pytest.MonkeyPatch) -> None:
     assert publish_now.due_count() == 0  # past job posted; future not due
 
 
+def test_due_jobs_exclude_flagged_account(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A job already scheduled before an account is flagged/rested must not fire --
+    the operational_status gate isn't just a queue-time check."""
+    account_id = _make_account()
+    item_id = _make_exported_item(account_id)
+    past = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)
+    with get_session() as session:
+        session.add(
+            UploadJob(
+                account_id=account_id,
+                download_item_id=item_id,
+                processed_path="C:/out.mp4",
+                description="Cap",
+                status="scheduled",
+                scheduled_at=past,
+            )
+        )
+        session.commit()
+
+    assert publish_now.due_count() == 1
+
+    with get_session() as session:
+        session.get(Account, account_id).operational_status = "flagged"
+        session.commit()
+
+    assert publish_now.due_count() == 0
+    assert publish_now.list_due_jobs() == []
+
+    monkeypatch.setattr(
+        publish_now, "_do_publish_reel", lambda p, v, c: _fake_result("posted", posted_url="https://x/p/1/")
+    )
+    summary = publish_now.publish_due_jobs()
+    assert summary["due"] == 0
+    assert summary["posted"] == 0
+
+
 def _make_due_job(account_id: int, item_id: int, *, path: str = "C:/out.mp4") -> int:
     past = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)
     with get_session() as session:

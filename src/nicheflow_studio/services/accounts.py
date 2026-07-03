@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from sqlalchemy import func, select
 
+from nicheflow_studio.db.assignments import ACCOUNT_OPERATIONAL_STATUSES
 from nicheflow_studio.db.models import (
     Account,
     Assignment,
@@ -76,6 +77,7 @@ def _account_summary(account: Account) -> dict:
         "niche_label": account.niche_label,
         "niche": account.niche,
         "instagram_handle": account.instagram_handle,
+        "operational_status": account.operational_status,
     }
 
 
@@ -128,6 +130,14 @@ def _apply_payload(account: Account, payload: dict, *, partial: bool) -> None:
     if "instagram_handle" in payload or not partial:
         handle = _clean(payload.get("instagram_handle"))
         account.instagram_handle = handle.lstrip("@") if handle else None
+    if "operational_status" in payload or not partial:
+        status = _clean(payload.get("operational_status")) or "active"
+        if status not in ACCOUNT_OPERATIONAL_STATUSES:
+            raise AccountError(
+                f"operational_status must be one of {sorted(ACCOUNT_OPERATIONAL_STATUSES)}, "
+                f"got {status!r}."
+            )
+        account.operational_status = status
     for field in _TEXT_FIELDS:
         if field in payload or not partial:
             setattr(account, field, _clean(payload.get(field)))

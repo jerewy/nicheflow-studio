@@ -232,6 +232,59 @@ def test_init_db_adds_pinned_account_to_existing_pool_items() -> None:
     assert "pinned_account_id" in columns
 
 
+def test_init_db_adds_operational_status_to_existing_accounts() -> None:
+    db_dir = Path.cwd() / "data"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    db_path = db_dir / "nicheflow.db"
+
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at DATETIME,
+                updated_at DATETIME,
+                name VARCHAR(128),
+                platform VARCHAR(32),
+                niche_label VARCHAR(128),
+                login_identifier VARCHAR(256),
+                credential_blob VARCHAR(2048)
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO accounts (name, platform) VALUES ('Pre-existing', 'instagram')"
+        )
+        connection.commit()
+
+    init_db()
+
+    with sqlite3.connect(db_path) as connection:
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(accounts)").fetchall()
+        }
+        status = connection.execute(
+            "SELECT operational_status FROM accounts WHERE name = 'Pre-existing'"
+        ).fetchone()[0]
+
+    assert "operational_status" in columns
+    assert status == "active"
+
+    # Idempotent: a second init_db() (fresh engine, same on-disk DB) must not
+    # error re-adding the column and must not disturb the backfilled value.
+    from nicheflow_studio.db.session import reset_db_state
+
+    reset_db_state()
+    init_db()
+
+    with sqlite3.connect(db_path) as connection:
+        status_again = connection.execute(
+            "SELECT operational_status FROM accounts WHERE name = 'Pre-existing'"
+        ).fetchone()[0]
+    assert status_again == "active"
+
+
 def test_init_db_adds_manual_publish_columns_for_existing_upload_jobs() -> None:
     db_dir = Path.cwd() / "data"
     db_dir.mkdir(parents=True, exist_ok=True)

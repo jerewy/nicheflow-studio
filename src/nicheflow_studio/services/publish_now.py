@@ -28,7 +28,10 @@ from typing import Callable
 from sqlalchemy import select
 
 from nicheflow_studio.db.models import Account, DownloadItem, UploadJob
-from nicheflow_studio.db.assignments import mark_assignment_posted_for_job
+from nicheflow_studio.db.assignments import (
+    ACCOUNT_OPERATIONAL_STATUS_ACTIVE,
+    mark_assignment_posted_for_job,
+)
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.services.errors import ServiceError
 from nicheflow_studio.services.publishing import queue_for_publish
@@ -478,8 +481,11 @@ def _publish_item_now_via_cloud(
 def list_due_jobs() -> list[dict]:
     """Scheduled jobs whose time has passed (status ``scheduled``, time <= now).
 
-    Jobs on an account in checkpoint cooldown are excluded — nothing should
-    post on a flagged account until the cooldown expires.
+    Jobs on an account in checkpoint cooldown, or on an account that isn't
+    ``active`` (resting/flagged via Account.operational_status), are excluded —
+    nothing should post on a flagged account until the cooldown expires or the
+    account is reactivated. This is what makes flagging an account in the UI
+    stop it immediately, even for reels that were already scheduled.
     """
     now = dt.datetime.now(dt.timezone.utc)
     with get_session() as session:
@@ -490,6 +496,12 @@ def list_due_jobs() -> list[dict]:
             .where(UploadJob.scheduled_at.is_not(None))
             .order_by(UploadJob.scheduled_at.asc())
         ).all()
+        inactive_account_ids = {
+            account_id
+            for (account_id,) in session.query(Account.id).filter(
+                Account.operational_status != ACCOUNT_OPERATIONAL_STATUS_ACTIVE
+            )
+        }
         return [
             {
                 "job_id": row.id,
@@ -501,6 +513,7 @@ def list_due_jobs() -> list[dict]:
             if row.scheduled_at is not None
             and _aware(row.scheduled_at) <= now
             and not _account_on_cooldown(row.account_id, now=now)
+            and row.account_id not in inactive_account_ids
         ]
 
 

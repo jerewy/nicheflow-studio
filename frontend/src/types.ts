@@ -193,6 +193,8 @@ export interface WorkflowSettings {
   template_options: WorkflowOption[];
 }
 
+export type AccountOperationalStatus = "active" | "resting" | "flagged";
+
 export interface AccountSummary {
   id: number;
   name: string;
@@ -200,6 +202,7 @@ export interface AccountSummary {
   niche_label: string | null;
   niche: string | null;
   instagram_handle: string | null;
+  operational_status: AccountOperationalStatus;
 }
 
 export interface AccountDetail extends AccountSummary {

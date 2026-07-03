@@ -129,6 +129,28 @@ def test_distribute_prefers_lower_likes_when_source_er_and_tier_are_higher(tmp_p
         assert [assignment.pool_item_id for assignment in created] == [pool_ids["conversion"]]
 
 
+def test_distribute_skips_resting_accounts(tmp_path) -> None:
+    """A resting account receives zero assignments; active accounts still
+    balance the pool between themselves (SOURCING_POOLING_PLAN.md §2.3)."""
+    init_db()
+    with get_session() as session:
+        active_ids = _make_accounts(session, "history", 2)
+        (resting_id,) = _make_accounts(session, "history", 1)
+        session.get(Account, resting_id).operational_status = "resting"
+        _fill_pool(session, "history", 20)
+        session.commit()
+
+        created = distribute_niche(session, "history", rng=random.Random(1))
+        session.commit()
+
+        assert len(created) == 20
+        counts = assignment_counts_by_account(session, "history")
+        assert resting_id not in counts
+        assert set(counts.keys()) == set(active_ids)
+        assert sum(counts.values()) == 20
+        assert set(counts.values()) == {10}  # balanced across the 2 active accounts
+
+
 def test_distribute_is_niche_isolated(tmp_path) -> None:
     init_db()
     with get_session() as session:

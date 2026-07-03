@@ -55,6 +55,12 @@ class Account(Base):
     # movie account and vice versa. Distinct from the free-text niche_label,
     # which stays for display/prompt context. See docs/SOURCING_POOLING_PLAN.md.
     niche: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # Operational health toggle so an account can be rested/flagged without
+    # touching assignment/distribution code: "active" | "resting" | "flagged".
+    # Only "active" accounts are eligible for distribution (db/assignments.py)
+    # and publish scheduling (services/publishing.py). See
+    # docs/SOURCING_POOLING_PLAN.md §2.3 account-footprint risk.
+    operational_status: Mapped[str] = mapped_column(String(16), default="active")
     login_identifier: Mapped[str | None] = mapped_column(String(256), nullable=True)
     instagram_profile: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Expected Instagram @handle for this account. When set, the live health

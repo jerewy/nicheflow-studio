@@ -426,6 +426,20 @@ def test_queue_with_schedule_rejects_placeholder_source_title() -> None:
         publishing.queue_for_publish(item_id, scheduled_at="2026-07-01T20:00:00")
 
 
+def test_queue_skips_resting_account() -> None:
+    item_id = _make_item()
+    account_id = _account_id_of(item_id)
+    with get_session() as session:
+        account = session.get(Account, account_id)
+        account.operational_status = "resting"
+        session.commit()
+
+    with pytest.raises(PublishError, match="resting, not active"):
+        publishing.queue_for_publish(item_id)
+
+    assert publishing.list_publish_jobs(item_id) == []
+
+
 def test_cloud_handoff_fails_stale_job_without_caption(monkeypatch: pytest.MonkeyPatch) -> None:
     from nicheflow_studio.services import cloud_publisher
 

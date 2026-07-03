@@ -50,6 +50,13 @@ ASSIGNMENT_STATUS_ASSIGNED = "assigned"
 ASSIGNMENT_STATUS_POSTED = "posted"
 ASSIGNMENT_STATUS_REJECTED = "rejected"
 
+# Account operational-health states (Account.operational_status). Only "active"
+# accounts are eligible for distribution — "resting"/"flagged" accounts stay in
+# the DB (so history/assignments aren't lost) but are skipped without touching
+# the distribution algorithm itself (core/distribution.py).
+ACCOUNT_OPERATIONAL_STATUSES = frozenset({"active", "resting", "flagged"})
+ACCOUNT_OPERATIONAL_STATUS_ACTIVE = "active"
+
 
 def _validate_niche(niche: str) -> str:
     value = (niche or "").strip().lower()
@@ -72,10 +79,17 @@ def assigned_pool_item_ids(session: Session, niche: str) -> set[int]:
 
 
 def account_ids_for_niche(session: Session, niche: str) -> list[int]:
+    """Account ids eligible for distribution in this niche.
+
+    Excludes accounts that aren't ``active`` (resting/flagged) so a rested or
+    flagged account never receives new assignments without touching the
+    distribution algorithm itself (core/distribution.py).
+    """
     niche = _validate_niche(niche)
     rows = (
         session.query(Account.id)
         .filter(Account.niche == niche)
+        .filter(Account.operational_status == ACCOUNT_OPERATIONAL_STATUS_ACTIVE)
         .order_by(Account.id.asc())
         .all()
     )

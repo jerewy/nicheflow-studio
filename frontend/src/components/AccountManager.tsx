@@ -1,14 +1,31 @@
 import { useCallback, useEffect, useState } from "react";
 
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import { bridge } from "@/lib/bridge";
-import type { AccountDetail, AccountSummary, CloudAccountSettings } from "@/types";
+import type {
+  AccountDetail,
+  AccountOperationalStatus,
+  AccountSummary,
+  CloudAccountSettings,
+} from "@/types";
 
 type FormState = Record<string, string>;
+
+const OPERATIONAL_STATUSES: AccountOperationalStatus[] = ["active", "resting", "flagged"];
+
+const OPERATIONAL_STATUS_BADGE_VARIANT: Record<
+  AccountOperationalStatus,
+  "default" | "secondary" | "destructive"
+> = {
+  active: "default",
+  resting: "secondary",
+  flagged: "destructive",
+};
 
 // Editable fields sent to the backend (credential_blob is intentionally omitted
 // from the UI; a partial update preserves it).
@@ -38,9 +55,10 @@ const MULTI_LINE: { key: string; label: string }[] = [
 
 const ALL_KEYS = [...SINGLE_LINE, ...MULTI_LINE].map((f) => f.key);
 
-const EMPTY_FORM: FormState = Object.fromEntries(
-  ALL_KEYS.map((k) => [k, ""]),
-) as FormState;
+const EMPTY_FORM: FormState = {
+  ...(Object.fromEntries(ALL_KEYS.map((k) => [k, ""])) as FormState),
+  operational_status: "active",
+};
 
 function detailToForm(detail: AccountDetail): FormState {
   const form: FormState = { ...EMPTY_FORM };
@@ -48,6 +66,7 @@ function detailToForm(detail: AccountDetail): FormState {
     const value = (detail as unknown as Record<string, unknown>)[key];
     form[key] = value == null ? "" : String(value);
   }
+  form.operational_status = detail.operational_status ?? "active";
   return form;
 }
 
@@ -315,6 +334,14 @@ export function AccountManager({ activeId, onAccountsChanged, onUseAccount }: Ac
                   {activeId === acc.id && (
                     <span className="text-[10px] font-semibold text-emerald-500">● ACTIVE</span>
                   )}
+                  {acc.operational_status !== "active" && (
+                    <Badge
+                      variant={OPERATIONAL_STATUS_BADGE_VARIANT[acc.operational_status]}
+                      className="px-1.5 py-0 text-[10px] uppercase"
+                    >
+                      {acc.operational_status}
+                    </Badge>
+                  )}
                 </div>
                 <div className="text-xs text-muted-foreground">
                   {acc.platform}
@@ -361,6 +388,26 @@ export function AccountManager({ activeId, onAccountsChanged, onUseAccount }: Ac
               )}
             </CardHeader>
             <CardContent className="space-y-4">
+              <div className="space-y-1">
+                <label className="text-xs font-medium text-muted-foreground">
+                  Operational status
+                </label>
+                <select
+                  className="flex h-9 w-full max-w-xs rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                  value={form.operational_status || "active"}
+                  onChange={(e) => setField("operational_status", e.target.value)}
+                >
+                  {OPERATIONAL_STATUSES.map((status) => (
+                    <option key={status} value={status}>
+                      {status}
+                    </option>
+                  ))}
+                </select>
+                <p className="text-xs text-muted-foreground">
+                  Resting/flagged accounts are skipped by distribution and publish
+                  scheduling without losing their history.
+                </p>
+              </div>
               <div className="grid gap-3 sm:grid-cols-2">
                 {SINGLE_LINE.map((f) => (
                   <div key={f.key} className="space-y-1">
