@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import datetime as dt
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from nicheflow_studio.db.models import Account, DownloadItem, UploadJob
 from nicheflow_studio.db.assignments import mark_assignment_posted_for_job
@@ -335,6 +335,37 @@ def unschedule(job_id: int) -> dict:
         account = session.get(Account, job.account_id)
         session.commit()
         return _job_view(job, account.name if account else None)
+
+
+def unschedule_jobs_for_item(item_id: int) -> list[dict]:
+    """Unschedule every pending (non-posted) publish job for a download item.
+
+    Used when an item is rejected so a clip that was already scheduled — and
+    possibly handed off to the cloud Worker — can't still auto-post. Reuses
+    :func:`unschedule`, so each job's Worker-side cloud job is canceled and the
+    local job drops back to ``draft`` (reversible). Posted jobs are left alone.
+    Fails closed: a cloud cancel that can't be confirmed propagates as
+    :class:`PublishQueueError` rather than silently leaving the cloud copy live.
+    """
+    with get_session() as session:
+        item = session.get(DownloadItem, item_id)
+        conditions = [UploadJob.download_item_id == item_id]
+        processed_path = item.processed_path if item is not None else None
+        if processed_path:
+            # Legacy jobs created before download_item_id was linked still match
+            # on the exported file path.
+            conditions.append(UploadJob.processed_path == processed_path)
+        job_ids = [
+            row[0]
+            for row in session.execute(
+                select(UploadJob.id)
+                .where(or_(*conditions))
+                .where(UploadJob.posted_at.is_(None))
+                .where(UploadJob.status != "posted")
+                .order_by(UploadJob.id.asc())
+            ).all()
+        ]
+    return [unschedule(job_id) for job_id in job_ids]
 
 
 def remove_job(job_id: int) -> dict:

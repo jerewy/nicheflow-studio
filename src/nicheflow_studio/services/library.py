@@ -39,6 +39,7 @@ from nicheflow_studio.db.pools import REJECT_REASONS, remove_pool_items_for_asse
 from nicheflow_studio.db.pools import reject_candidate as _reject_candidate_db
 from nicheflow_studio.db.assignments import reject_assignments_for_item
 from nicheflow_studio.db.session import get_session
+from nicheflow_studio.services import publish_queue
 from nicheflow_studio.services.errors import ServiceError
 from nicheflow_studio.downloader.failures import (
     looks_like_auth_or_rate_limit,
@@ -608,6 +609,14 @@ def reject_item(item_id: int, reason: str = "low_quality") -> dict:
         raise LibraryError(
             f"Unknown reject reason {reason!r}. Use one of {sorted(REJECT_REASONS)}."
         )
+
+    # Stop the reel from posting before touching review state: cancel any pending
+    # schedule/cloud job for this clip so a rejected item can't still auto-post
+    # from the Worker. Fails closed — a cloud cancel that can't be confirmed
+    # aborts the reject rather than leaving the cloud copy live. Reversible: jobs
+    # drop back to 'draft', matching Multi-Account Publish's "Remove from schedule".
+    unscheduled_jobs = publish_queue.unschedule_jobs_for_item(item_id)
+
     with get_session() as session:
         item = _require_item(session, item_id)
 
@@ -633,6 +642,7 @@ def reject_item(item_id: int, reason: str = "low_quality") -> dict:
             "removed_pool_items": removed,
             "review_state": item.review_state,
             "released_assignments": released_assignments,
+            "unscheduled_jobs": len(unscheduled_jobs),
         }
 
 
@@ -646,6 +656,12 @@ def reject_item_globally(item_id: int, reason: str = "globally rejected") -> dic
     footage just won't distribute or re-enter the pool. Returns the counts changed.
     """
     clean_reason = (reason or "globally rejected").strip()[:256]
+
+    # Same as reject_item: kill any pending schedule/cloud job first so a globally
+    # rejected clip can't still auto-post. Fails closed on an unconfirmed cloud
+    # cancel; reversible (jobs drop to 'draft').
+    unscheduled_jobs = publish_queue.unschedule_jobs_for_item(item_id)
+
     with get_session() as session:
         item = _require_item(session, item_id)
 
@@ -689,4 +705,5 @@ def reject_item_globally(item_id: int, reason: str = "globally rejected") -> dic
             "dropped_assignments": dropped_assignments,
             "review_state": "blocked",
             "blocked": True,
+            "unscheduled_jobs": len(unscheduled_jobs),
         }

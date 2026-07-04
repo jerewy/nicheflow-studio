@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -445,6 +446,132 @@ def test_reject_item_unknown_reason_raises() -> None:
     item_id = _make_item(account_id=account_id)
     with pytest.raises(LibraryError):
         library.reject_item(item_id, "nope")
+
+
+def _pending_job_for_item(
+    item_id: int, account_id: int, *, status: str = "scheduled"
+) -> int:
+    """Create a pending publish job linked to an item, as the scheduler would."""
+    with get_session() as session:
+        job = UploadJob(
+            account_id=account_id,
+            download_item_id=item_id,
+            processed_path="C:/out.mp4",
+            title="A reel",
+            status=status,
+            scheduled_at=dt.datetime(2026, 8, 1, 20, 0, tzinfo=dt.timezone.utc),
+        )
+        session.add(job)
+        session.commit()
+        return job.id
+
+
+def test_reject_item_unschedules_pending_local_job() -> None:
+    account_id = _make_account()
+    item_id = _make_item(account_id=account_id)
+    job_id = _pending_job_for_item(item_id, account_id)
+
+    result = library.reject_item(item_id, "low_quality")
+
+    assert result["unscheduled_jobs"] == 1
+    with get_session() as session:
+        job = session.get(UploadJob, job_id)
+        assert job.status == "draft"
+        assert job.scheduled_at is None
+        assert session.get(DownloadItem, item_id).review_state == "rejected"
+
+
+def test_reject_item_cancels_scheduled_cloud_job(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A rejected clip whose reel was handed off to the Worker must have that
+    cloud job canceled so it can't still auto-post."""
+    from nicheflow_studio.services import cloud_publisher
+
+    account_id = _make_account()
+    item_id = _make_item(account_id=account_id)
+    job_id = _pending_job_for_item(item_id, account_id, status="cloud")
+
+    canceled: list[str] = []
+    monkeypatch.setenv("CLOUDFLARE_PUBLISHER_URL", "https://worker.example.dev")
+    monkeypatch.setenv("CLOUDFLARE_PUBLISHER_API_KEY", "secret")
+    monkeypatch.setattr(
+        cloud_publisher,
+        "list_jobs",
+        lambda: {
+            "jobs": [
+                {"id": "worker-active", "external_id": f"nf-{job_id}-300", "status": "scheduled"},
+                {"id": "worker-done", "external_id": f"nf-{job_id}-200", "status": "published"},
+            ]
+        },
+    )
+    monkeypatch.setattr(cloud_publisher, "cancel_job", lambda worker_id: canceled.append(worker_id))
+
+    result = library.reject_item(item_id, "low_quality")
+
+    assert canceled == ["worker-active"]
+    assert result["unscheduled_jobs"] == 1
+    with get_session() as session:
+        assert session.get(UploadJob, job_id).status == "draft"
+        assert session.get(DownloadItem, item_id).review_state == "rejected"
+
+
+def test_reject_item_fails_closed_when_cloud_cancel_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the Worker can't confirm the cancel, reject aborts so the item isn't
+    marked rejected while the cloud copy may still publish."""
+    from nicheflow_studio.services import cloud_publisher
+    from nicheflow_studio.services.cloud_publisher import CloudPublisherError
+    from nicheflow_studio.services.publish_queue import PublishQueueError
+
+    account_id = _make_account()
+    item_id = _make_item(account_id=account_id)
+    job_id = _pending_job_for_item(item_id, account_id, status="cloud")
+    monkeypatch.setenv("CLOUDFLARE_PUBLISHER_URL", "https://worker.example.dev")
+    monkeypatch.setenv("CLOUDFLARE_PUBLISHER_API_KEY", "secret")
+    monkeypatch.setattr(
+        cloud_publisher,
+        "list_jobs",
+        lambda: (_ for _ in ()).throw(CloudPublisherError("worker unreachable")),
+    )
+
+    with pytest.raises(PublishQueueError):
+        library.reject_item(item_id, "low_quality")
+
+    with get_session() as session:
+        assert session.get(UploadJob, job_id).status == "cloud"
+        assert session.get(DownloadItem, item_id).review_state != "rejected"
+
+
+def test_reject_item_globally_cancels_scheduled_cloud_job(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nicheflow_studio.services import cloud_publisher
+
+    account_id = _make_account()
+    item_id = _make_item(account_id=account_id)
+    job_id = _pending_job_for_item(item_id, account_id, status="cloud")
+
+    canceled: list[str] = []
+    monkeypatch.setenv("CLOUDFLARE_PUBLISHER_URL", "https://worker.example.dev")
+    monkeypatch.setenv("CLOUDFLARE_PUBLISHER_API_KEY", "secret")
+    monkeypatch.setattr(
+        cloud_publisher,
+        "list_jobs",
+        lambda: {
+            "jobs": [
+                {"id": "worker-active", "external_id": f"nf-{job_id}-300", "status": "awaiting_upload"}
+            ]
+        },
+    )
+    monkeypatch.setattr(cloud_publisher, "cancel_job", lambda worker_id: canceled.append(worker_id))
+
+    result = library.reject_item_globally(item_id, "ad campaign")
+
+    assert canceled == ["worker-active"]
+    assert result["unscheduled_jobs"] == 1
+    with get_session() as session:
+        assert session.get(UploadJob, job_id).status == "draft"
+        assert session.get(DownloadItem, item_id).review_state == "blocked"
 
 
 def test_pending_review_reject_releases_assignment_without_download(
