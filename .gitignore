@@ -34,6 +34,7 @@ dist/
 # Node tooling / local Codex install artifacts
 node_modules/
 package-lock.json
+pnpm-lock.yaml
 package.json
 !cloudflare-publisher/package.json
 !cloudflare-publisher/pnpm-lock.yaml
