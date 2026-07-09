@@ -5,10 +5,8 @@ from __future__ import annotations
 from dataclasses import asdict
 from urllib.parse import urlparse
 
-from nicheflow_studio.core.apify_usage import (
-    monthly_apify_usage,
-    record_apify_results,
-)  # noqa: E501
+from nicheflow_studio.core.apify_usage import monthly_apify_usage
+from nicheflow_studio.db.blocklist import is_blocked
 from nicheflow_studio.db.media_library import find_media_asset
 from nicheflow_studio.db.models import Account, PoolItem
 from nicheflow_studio.db.pool_intake import (
@@ -18,6 +16,7 @@ from nicheflow_studio.db.pool_intake import (
 from nicheflow_studio.db.pools import (
     POOL_STATUS_ACCEPTED,
     POOL_STATUS_PENDING_REVIEW,
+    POOL_STATUS_REMOVED,
     VALID_NICHES,
 )  # noqa: E501
 from nicheflow_studio.db.session import get_session
@@ -107,7 +106,24 @@ def _normalize_niche(niche: str) -> str:
 
 
 def _existing_pool_result(normalized_url: str, shortcode: str | None) -> dict | None:  # noqa: E501
+    """Pre-pay gate: resolve a capture from what we already know, before it
+    reaches Apify. Everything caught here costs zero Apify results — intake
+    re-checks the blocklist post-fetch, but by then the row is already billed."""
+
+    def _result(status: str, niche: str | None, message: str) -> dict:
+        return {
+            "status": status,
+            "niche": niche,
+            "shortcode": shortcode,
+            "message": message,
+            "source_url": normalized_url,
+            "channel_name": None,
+            "title": None,
+        }
+
     with get_session() as session:
+        if is_blocked(session, source_url=normalized_url, shortcode=shortcode):
+            return _result("blocked", None, "Globally rejected earlier - skipped.")
         asset = find_media_asset(
             session,
             source_url=normalized_url,
@@ -125,17 +141,28 @@ def _existing_pool_result(normalized_url: str, shortcode: str | None) -> dict | 
             )
             .first()
         )
-        if existing is None:
-            return None
-        return {
-            "status": "duplicate",
-            "niche": existing.niche,
-            "shortcode": shortcode,
-            "message": f"Already in the {existing.niche.title()} pool - skipped.",  # noqa: E501
-            "source_url": normalized_url,
-            "channel_name": None,
-            "title": None,
-        }
+        if existing is not None:
+            return _result(
+                "duplicate",
+                existing.niche,
+                f"Already in the {existing.niche.title()} pool - skipped.",
+            )
+        removed = (
+            session.query(PoolItem)
+            .filter(
+                PoolItem.media_asset_id == asset.id,
+                PoolItem.acceptance_status == POOL_STATUS_REMOVED,
+            )
+            .first()
+        )
+        if removed is not None:
+            return _result(
+                "duplicate",
+                removed.niche,
+                f"Removed from the {removed.niche.title()} pool during review - "
+                "skipped. Restore it from the desktop app instead of re-capturing.",
+            )
+        return None
 
 
 def capture_instagram_reels_to_pool(items: list[dict]) -> dict:
@@ -201,12 +228,18 @@ def capture_instagram_reels_to_pool(items: list[dict]) -> dict:
         if pending
         else []
     )
-    record_apify_results(len(candidates))
-    by_shortcode = {
-        candidate.video_id: candidate  # noqa: E501
-        for candidate in candidates
-        if candidate.video_id
-    }  # noqa: E501
+    # Apify sometimes omits shortCode and the candidate's video_id falls back
+    # to a numeric media id; the returned URL tail still carries the shortcode
+    # this batch was keyed by. Index both so a paid row is never dropped as
+    # "no metadata" over a key mismatch.
+    by_shortcode: dict[str, ScrapedVideoCandidate] = {}
+    for candidate in candidates:
+        for key in (
+            candidate.video_id,
+            instagram_shortcode_from_url(candidate.source_url or ""),
+        ):
+            if key:
+                by_shortcode.setdefault(key, candidate)
     with get_session() as session:
         for item in pending:
             candidate = by_shortcode.get(item["shortcode"])
@@ -238,7 +271,12 @@ def capture_instagram_reels_to_pool(items: list[dict]) -> dict:
         "queued": len(items),
         "added": sum(result["status"] == "added" for result in results),
         "duplicates": sum(result["status"] == "duplicate" for result in results),  # noqa: E501
-        "failed": sum(result["status"] == "failed" for result in results),
+        # "blocked" and "no_account" would otherwise vanish from the popup's
+        # "X added, Y duplicate, Z failed" line — count them as failed so
+        # every queued reel is accounted for.
+        "failed": sum(
+            result["status"] in {"failed", "blocked", "no_account"} for result in results
+        ),
         "apify_results": len(candidates),
     }
     return {"summary": summary, "results": results, "dashboard": capture_dashboard()}  # noqa: E501

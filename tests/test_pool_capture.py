@@ -4,8 +4,14 @@ import datetime as dt
 
 import pytest
 
+from nicheflow_studio.core.apify_usage import record_apify_results
+from nicheflow_studio.db.blocklist import block_asset
 from nicheflow_studio.db.models import Account, PoolItem
-from nicheflow_studio.db.pools import POOL_STATUS_PENDING_REVIEW, pool_size
+from nicheflow_studio.db.pools import (
+    POOL_STATUS_PENDING_REVIEW,
+    pool_size,
+    remove_pool_item,
+)
 from nicheflow_studio.db.session import get_session, init_db
 from nicheflow_studio.scraper.youtube import ScrapedVideoCandidate
 from nicheflow_studio.services import pool_capture
@@ -109,11 +115,13 @@ def test_duplicate_capture_skips_metadata_fetch(monkeypatch) -> None:
         )  # noqa: E501
         session.commit()
 
-    monkeypatch.setattr(
-        pool_capture,
-        "scrape_instagram_urls_apify",
-        lambda urls, *, results_limit: [_candidate(urls[0])],
-    )
+    def fake_scrape(urls, *, results_limit):
+        # The real scraper records billed rows itself; mirror that so the
+        # usage assertions below exercise the "duplicate spends nothing" rule.
+        record_apify_results(len(urls))
+        return [_candidate(urls[0])]
+
+    monkeypatch.setattr(pool_capture, "scrape_instagram_urls_apify", fake_scrape)
     first = pool_capture.capture_instagram_reel_to_pool(
         "https://www.instagram.com/reel/ABC123/"
     )  # noqa: E501
@@ -191,3 +199,79 @@ def test_batch_capture_uses_one_metadata_request(monkeypatch) -> None:
     assert len(calls[0]) == 2
     assert batch["summary"]["added"] == 2
     assert batch["summary"]["apify_results"] == 2
+
+
+def _fail_if_called(*args, **kwargs):
+    raise AssertionError("this capture should not spend an Apify request")
+
+
+def test_removed_capture_skips_metadata_fetch_and_hints_restore(monkeypatch) -> None:
+    # A reel pruned during pool review keeps its "removed" row for audit and
+    # restore. Re-capturing it must not re-bill Apify for footage the user
+    # already reviewed — point at the restore path instead.
+    init_db()
+    with get_session() as session:
+        session.add(Account(name="Past Moments Daily", platform="instagram", niche="history"))
+        session.commit()
+
+    monkeypatch.setattr(
+        pool_capture,
+        "scrape_instagram_urls_apify",
+        lambda urls, *, results_limit: [_candidate(urls[0])],
+    )
+    first = pool_capture.capture_instagram_reel_to_pool("https://www.instagram.com/reel/ABC123/")
+    assert first["status"] == "added"
+    with get_session() as session:
+        item = session.query(PoolItem).one()
+        remove_pool_item(session, pool_item_id=item.id)
+        session.commit()
+
+    monkeypatch.setattr(pool_capture, "scrape_instagram_urls_apify", _fail_if_called)
+    second = pool_capture.capture_instagram_reel_to_pool("https://www.instagram.com/reel/ABC123/")
+
+    assert second["status"] == "duplicate"
+    assert "Restore" in second["message"]
+
+
+def test_blocked_capture_skips_metadata_fetch(monkeypatch) -> None:
+    # Globally rejected footage is refused by intake AFTER metadata is fetched;
+    # the capture path must refuse it BEFORE paying Apify, and the popup summary
+    # must not lose it (blocked counts as failed there).
+    init_db()
+    with get_session() as session:
+        session.add(Account(name="Past Moments Daily", platform="instagram", niche="history"))
+        block_asset(session, source_url="https://www.instagram.com/reel/ABC123/")
+        session.commit()
+
+    monkeypatch.setattr(pool_capture, "scrape_instagram_urls_apify", _fail_if_called)
+    batch = pool_capture.capture_instagram_reels_to_pool(
+        [{"url": "https://www.instagram.com/reel/ABC123/", "niche": "history"}]
+    )
+
+    assert batch["results"][0]["status"] == "blocked"
+    assert batch["summary"]["failed"] == 1
+
+
+def test_batch_capture_matches_paid_row_by_url_when_shortcode_missing(monkeypatch) -> None:
+    # Apify sometimes returns a numeric media id instead of the shortCode; the
+    # join must fall back to the shortcode in the returned URL instead of
+    # failing a row that was already paid for.
+    init_db()
+    with get_session() as session:
+        session.add(Account(name="Past Moments Daily", platform="instagram", niche="history"))
+        session.commit()
+
+    def fake_scrape(urls, *, results_limit):
+        return [
+            ScrapedVideoCandidate(
+                **{**_candidate(urls[0]).__dict__, "video_id": "1234567890123"}
+            )
+        ]
+
+    monkeypatch.setattr(pool_capture, "scrape_instagram_urls_apify", fake_scrape)
+    batch = pool_capture.capture_instagram_reels_to_pool(
+        [{"url": "https://www.instagram.com/reel/ABC123/", "niche": "history"}]
+    )
+
+    assert batch["summary"]["added"] == 1
+    assert batch["summary"]["failed"] == 0

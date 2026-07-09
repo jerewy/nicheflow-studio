@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from nicheflow_studio.core.apify_usage import record_apify_results
 from nicheflow_studio.db.models import Account, DownloadItem, PoolItem, ScrapeCandidate, Source
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.scraper.youtube import ScrapedVideoCandidate
@@ -42,7 +43,14 @@ def test_scrape_source_pools_and_dedups(monkeypatch: pytest.MonkeyPatch) -> None
     source_id = _make_source()
     # Third row repeats the first shortcode -> pool-first dedup should skip it.
     fakes = [_fake_candidate("AAA"), _fake_candidate("BBB"), _fake_candidate("AAA")]
-    monkeypatch.setattr(scraping, "scrape_instagram_source_apify", lambda **kwargs: fakes)
+
+    def fake_scrape(**kwargs):
+        # The real scraper records billed dataset rows itself; mirror that so
+        # the usage assertion below reflects the summary the UI reports.
+        record_apify_results(len(fakes))
+        return fakes
+
+    monkeypatch.setattr(scraping, "scrape_instagram_source_apify", fake_scrape)
 
     result = scraping.scrape_source_to_pool(source_id, max_items=10)
 

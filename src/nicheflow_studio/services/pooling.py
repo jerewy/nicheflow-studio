@@ -539,13 +539,51 @@ def niche_accounts(niche: str) -> list[dict]:
         return [{"id": account_id, "name": names.get(account_id, f"#{account_id}")} for account_id in ids]
 
 
-def distribute_clip(pool_item_id: int, account_ids: list[int]) -> dict:
+# Rights-confidence labels that are allowed to distribute but haven't been
+# cleared by a reviewer, so the caller surfaces a soft warning (docs/SOURCING_
+# POOLING_PLAN.md §2.2). None == never labeled.
+_RIGHTS_UNVERIFIED = frozenset({None, "unknown"})
+_RIGHTS_UNVERIFIED_WARNING = "unverified rights — review this clip before publishing"
+
+
+def _rights_gate_for_pool_item(pool_item_id: int, *, allow_risky: bool) -> str | None:
+    """Enforce the rights-risk gate before a clip is assigned to an account.
+
+    Raises :class:`PoolingError` for a ``news_broadcast`` clip (the highest-risk
+    label) unless ``allow_risky`` overrides it; returns a soft warning string for
+    an unlabeled (NULL) or ``unknown`` clip so the caller can surface it; returns
+    ``None`` when the clip's rights are already cleared (docs/SOURCING_POOLING_
+    PLAN.md §2.2).
+    """
+    with get_session() as session:
+        item = session.get(PoolItem, pool_item_id)
+        rights = item.rights_confidence if item is not None else None
+    if rights == pools.RIGHTS_CONFIDENCE_BLOCKED and not allow_risky:
+        raise PoolingError("rights risk: news_broadcast — relabel or skip")
+    if rights in _RIGHTS_UNVERIFIED:
+        return _RIGHTS_UNVERIFIED_WARNING
+    return None
+
+
+def distribute_clip(
+    pool_item_id: int, account_ids: list[int], *, allow_risky: bool = False
+) -> dict:
     """Distribute one pooled clip to the chosen accounts (idempotent, same-niche).
 
+    Rights gate (docs/SOURCING_POOLING_PLAN.md §2.2): a clip labeled
+    ``news_broadcast`` is refused outright (relabel or skip) unless ``allow_risky``
+    overrides it — the frontend does not expose the override yet. An unlabeled
+    (NULL) or ``unknown`` clip distributes but returns a ``warning`` the caller can
+    surface, so unverified-rights footage is never published silently.
+
     Returns how many new assignments were created (accounts that already had the
-    clip are skipped).
+    clip are skipped), plus a ``warning`` string when the clip's rights are
+    unverified.
     """
     cleaned = [int(account_id) for account_id in (account_ids or [])]
+    # Check rights BEFORE materializing the download so a refused clip never
+    # triggers a wasted fetch.
+    warning = _rights_gate_for_pool_item(pool_item_id, allow_risky=allow_risky)
     _ensure_pool_item_downloaded(pool_item_id)
     with get_session() as session:
         try:
@@ -555,7 +593,10 @@ def distribute_clip(pool_item_id: int, account_ids: list[int]) -> dict:
         except ValueError as exc:
             raise PoolingError(str(exc)) from exc
         session.commit()
-        return {"pool_item_id": pool_item_id, "assigned": len(created)}
+        result = {"pool_item_id": pool_item_id, "assigned": len(created)}
+        if warning is not None:
+            result["warning"] = warning
+        return result
 
 
 # Health states that mean an account cannot publish AT ALL — no Instagram

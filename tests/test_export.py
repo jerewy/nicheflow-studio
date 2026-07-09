@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import random
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -21,6 +22,7 @@ def _make_item(
     caption_draft: str | None = "A final caption.",
     auto_schedule_on_export: bool = False,
     upload_schedule_slots: str | None = None,
+    instagram_handle: str | None = None,
 ) -> int:
     with get_session() as session:
         account = Account(
@@ -28,6 +30,7 @@ def _make_item(
             platform="instagram",
             auto_schedule_on_export=auto_schedule_on_export,
             upload_schedule_slots=upload_schedule_slots,
+            instagram_handle=instagram_handle,
         )
         session.add(account)
         session.flush()
@@ -200,6 +203,107 @@ def test_export_with_auto_schedule_and_no_slots_returns_warning(
         assert session.query(UploadJob).count() == 0
 
 
+def test_export_covers_watermark_and_reports_status(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake")
+    item_id = _make_item(file_path=str(source), instagram_handle="@ourbrand")
+    _mock_video(monkeypatch, {})
+
+    captured: dict = {}
+
+    def fake_replace(video_path, *, replacement_text, output_path, **_kwargs):
+        captured["replacement_text"] = replacement_text
+        Path(output_path).write_bytes(b"covered")  # produce a covered file to swap in
+        return SimpleNamespace(
+            output_path=output_path,
+            region=SimpleNamespace(text="@foreignsource"),
+            replacement_text=replacement_text,
+            skipped_reason=None,
+        )
+
+    monkeypatch.setattr(export_svc, "replace_detected_watermark", fake_replace)
+
+    result = export_svc.export_item(item_id)
+
+    # The publishing account's own handle is what stamps over the foreign mark.
+    assert captured["replacement_text"] == "@ourbrand"
+    assert result["watermark_replaced"] is True
+    assert result["watermark_detected_text"] == "@foreignsource"
+    assert result["watermark_skipped_reason"] is None
+    assert result["processed_path"]
+    # The covered file replaced the rendered output at the same path.
+    assert Path(result["processed_path"]).read_bytes() == b"covered"
+
+
+def test_export_reports_skip_when_no_watermark_detected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake")
+    item_id = _make_item(file_path=str(source), instagram_handle="@ourbrand")
+    _mock_video(monkeypatch, {})
+
+    def fake_replace(video_path, *, replacement_text, output_path, **_kwargs):
+        return SimpleNamespace(
+            output_path=None,
+            region=None,
+            replacement_text=replacement_text,
+            skipped_reason="no watermark detected",
+        )
+
+    monkeypatch.setattr(export_svc, "replace_detected_watermark", fake_replace)
+
+    result = export_svc.export_item(item_id)
+
+    assert result["watermark_replaced"] is False
+    assert result["watermark_detected_text"] is None
+    assert result["watermark_skipped_reason"] == "no watermark detected"
+    assert result["processed_path"]
+
+
+def test_export_succeeds_when_watermark_step_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A crash in the OCR/FFmpeg watermark pipeline must never fail the export."""
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake")
+    item_id = _make_item(file_path=str(source), instagram_handle="@ourbrand")
+    _mock_video(monkeypatch, {})
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("tesseract exploded")
+
+    monkeypatch.setattr(export_svc, "replace_detected_watermark", boom)
+
+    result = export_svc.export_item(item_id)
+
+    assert result["processed_path"]  # export still succeeded
+    assert result["watermark_replaced"] is False
+    assert result["watermark_skipped_reason"] == "watermark step failed"
+
+
+def test_export_skips_watermark_when_account_has_no_handle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No account @handle → the (expensive) detection pass is skipped entirely."""
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake")
+    item_id = _make_item(file_path=str(source))  # no instagram_handle
+    _mock_video(monkeypatch, {})
+
+    def fail_if_called(*_args, **_kwargs):
+        pytest.fail("watermark detection must not run without a publishing handle")
+
+    monkeypatch.setattr(export_svc, "replace_detected_watermark", fail_if_called)
+
+    result = export_svc.export_item(item_id)
+
+    assert result["watermark_replaced"] is False
+    assert result["watermark_skipped_reason"] == "no publishing handle set"
+
+
 def test_export_missing_file_path_raises() -> None:
     item_id = _make_item(file_path=None)
     with pytest.raises(ExportError):
@@ -251,7 +355,7 @@ def test_crop_preview_frame_extracts_and_reuses_cached_image(
     item_id = _make_item(file_path=str(source))
     calls: list[tuple[Path, Path]] = []
 
-    def fake_extract(input_path: Path, output_path: Path) -> Path:
+    def fake_extract(input_path: Path, output_path: Path, at_seconds=None) -> Path:
         calls.append((input_path, output_path))
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(b"jpeg")
@@ -265,6 +369,31 @@ def test_crop_preview_frame_extracts_and_reuses_cached_image(
     assert first == second
     assert first.read_bytes() == b"jpeg"
     assert calls == [(source.resolve(), first.resolve())]
+
+
+def test_crop_preview_frame_caches_each_scrubbed_timestamp_separately(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake")
+    item_id = _make_item(file_path=str(source))
+    seen: list[float | None] = []
+
+    def fake_extract(input_path: Path, output_path: Path, at_seconds=None) -> Path:
+        seen.append(at_seconds)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"jpeg")
+        return output_path
+
+    monkeypatch.setattr(video, "extract_video_preview_frame", fake_extract)
+
+    middle = export_svc.crop_preview_frame(item_id)
+    scrubbed = export_svc.crop_preview_frame(item_id, at_seconds=3.0)
+
+    # Distinct files per timestamp, and the timestamp reaches the extractor.
+    assert middle != scrubbed
+    assert scrubbed.name == f"item-{item_id}-t3000.jpg"
+    assert seen == [None, 3.0]
 
 
 def test_save_crop_override_rejects_invalid() -> None:

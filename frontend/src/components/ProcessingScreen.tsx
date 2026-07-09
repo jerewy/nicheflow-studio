@@ -188,6 +188,11 @@ export function ProcessingScreen({
     {},
   );
   const [exportedPath, setExportedPath] = useState<string | null>(null);
+  const [watermarkStatus, setWatermarkStatus] = useState<{
+    replaced: boolean;
+    detected: string | null;
+    skippedReason: string | null;
+  } | null>(null);
   const [items, setItems] = useState<LibraryItem[]>([]);
   const [publishJobs, setPublishJobs] = useState<PublishJob[]>([]);
   const [scheduleAt, setScheduleAt] = useState("");
@@ -332,6 +337,7 @@ export function ProcessingScreen({
       setContext(ctx);
       loadRevisionIntoEditor(ctx.latest_revision);
       setExportedPath(null);
+      setWatermarkStatus(null);
       setPublishMessage(null);
       setPreviewError(null);
       setExportPreviewError(null);
@@ -943,7 +949,7 @@ export function ProcessingScreen({
     setHandoffMessage(null);
     try {
       const { prompt } = await bridge.buildChatPrompt(itemId, workflowPayload(workflow));
-      await navigator.clipboard.writeText(prompt);
+      await bridge.copyTextToClipboard(prompt);
       setHandoffMessage("Chat prompt copied. Paste it into ChatGPT, Claude, Codex, or Claude Code.");
     } catch (err: unknown) {
       setActionError(err instanceof Error ? err.message : String(err));
@@ -1136,7 +1142,7 @@ export function ProcessingScreen({
     setActionError(null);
     setHandoffMessage(null);
     try {
-      const text = await navigator.clipboard.readText();
+      const text = await bridge.readClipboardText();
       if (!text.trim()) throw new Error("Clipboard is empty. Copy the generated draft first.");
       const revision = await bridge.importPastedDraft(itemId, text);
       loadRevisionIntoEditor(revision);
@@ -1182,13 +1188,36 @@ export function ProcessingScreen({
     setBatchResult(null);
     setHandoffMessage(null);
     try {
+      // Reels with no local video file fail crop_preview_frame downstream.
+      // Download them one at a time (never parallel — Instagram throttling)
+      // before handing the batch to prepareAccountBatchFrames.
+      const missing = selectedBatchItems.filter((candidate) => !candidate.has_file);
+      for (const [index, candidate] of missing.entries()) {
+        const label = `#${candidate.account_seq ?? candidate.id}`;
+        try {
+          setHandoffMessage(`Downloading reel ${index + 1}/${missing.length} (${label})...`);
+          const { job_id } = await bridge.startItemDownload(candidate.id);
+          await waitForJob(job_id, (_value, message) =>
+            setHandoffMessage(
+              `Downloading reel ${index + 1}/${missing.length} (${label}): ${message}`,
+            ),
+          );
+        } catch (err: unknown) {
+          throw new Error(
+            `Reel ${label}: ${err instanceof Error ? err.message : String(err)} ` +
+              `Untick it or reject it, then Prepare again.`,
+          );
+        }
+      }
+      if (missing.length) refreshItems(activeAccountId);
+
       const frames = await bridge.prepareAccountBatchFrames(selectedBatchIds);
       const { prompt } = await bridge.buildAccountBatchChatPrompt(
         activeAccountId,
         selectedBatchIds,
         workflowPayload(workflow),
       );
-      await navigator.clipboard.writeText(prompt);
+      await bridge.copyTextToClipboard(prompt);
       await bridge.openBatchFramesFolder(frames.folder);
       // Pin exactly what this prompt was built from so a later Import lands on
       // these reels even if the draftable window shifts in the meantime.
@@ -1224,7 +1253,7 @@ export function ProcessingScreen({
     setActionError(null);
     setHandoffMessage(null);
     try {
-      const text = await navigator.clipboard.readText();
+      const text = await bridge.readClipboardText();
       if (!text.trim()) throw new Error("Clipboard is empty. Copy the ChatGPT or Claude reply first.");
       const result = await bridge.importAccountBatchDraft(text, targetIds);
       setBatchResult(result);
@@ -1276,6 +1305,7 @@ export function ProcessingScreen({
     const exportItemId = itemId;
     setActionError(null);
     setExportedPath(null);
+    setWatermarkStatus(null);
     setExportPreviewError(null);
     setExportJobs((jobs) => ({ ...jobs, [exportItemId]: { value: 0, message: "Starting…" } }));
     try {
@@ -1293,6 +1323,11 @@ export function ProcessingScreen({
       }
       if (itemIdRef.current === exportItemId) {
         setExportedPath(result.processed_path);
+        setWatermarkStatus({
+          replaced: Boolean(result.watermark_replaced),
+          detected: result.watermark_detected_text ?? null,
+          skippedReason: result.watermark_skipped_reason ?? null,
+        });
         if (result.scheduled_publish) {
           const scheduled = result.scheduled_publish.scheduled_at
             ? new Date(result.scheduled_publish.scheduled_at).toLocaleString()
@@ -2216,6 +2251,19 @@ export function ProcessingScreen({
       {exportedPath && !exporting && (
         <p className="text-sm text-emerald-600">Exported: {exportedPath}</p>
       )}
+
+      {watermarkStatus && !exporting && watermarkStatus.replaced && (
+        <p className="text-sm text-emerald-600">
+          Watermark covered: @{(watermarkStatus.detected ?? "").replace(/^@+/, "") || "handle"}
+        </p>
+      )}
+
+      {watermarkStatus &&
+        !exporting &&
+        !watermarkStatus.replaced &&
+        watermarkStatus.skippedReason === "no watermark detected" && (
+          <p className="text-sm text-muted-foreground">No watermark detected</p>
+        )}
 
       {dirty && (
         <p className="text-xs text-muted-foreground">

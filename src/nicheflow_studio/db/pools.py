@@ -769,8 +769,14 @@ def pool_clips_for_source(
 # POOLING_PLAN.md §2.2 rights risk). Set at accept time and editable later, once
 # the reviewer has actually looked at the clip.
 VALID_RIGHTS_CONFIDENCE = frozenset(
-    {"archival", "meme", "tv_moment", "broadcast_sport", "unknown"}
+    {"archival", "meme", "tv_moment", "broadcast_sport", "news_broadcast", "unknown"}
 )
+
+# The highest-risk label: recent news/broadcast footage (presidents, funerals,
+# broadcast interviews) carries live strike exposure after the 2026-07-02
+# Wimbledon removal (docs/SOURCING_POOLING_PLAN.md §2.2). The assignment gate
+# refuses to distribute a clip carrying this label unless explicitly overridden.
+RIGHTS_CONFIDENCE_BLOCKED = "news_broadcast"
 
 
 def set_pool_item_rights_confidence(

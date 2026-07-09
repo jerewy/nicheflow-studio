@@ -77,17 +77,19 @@ def test_next_safe_slot_keeps_gap_from_recent_post() -> None:
 
 def test_account_min_gap_minutes_default_and_override() -> None:
     account = Account(name="Gap", platform="instagram")
-    assert publishing.account_min_gap_minutes(account) == 240  # default 4h
-    account.upload_min_gap_minutes = 210
-    assert publishing.account_min_gap_minutes(account) == 210
+    assert publishing.account_min_gap_minutes(account) == 210  # default 3.5h
+    account.upload_min_gap_minutes = 300
+    assert publishing.account_min_gap_minutes(account) == 300
     account.upload_min_gap_minutes = 0  # invalid -> fall back to default
-    assert publishing.account_min_gap_minutes(account) == 240
+    assert publishing.account_min_gap_minutes(account) == 210
 
 
-def test_per_account_gap_unblocks_exact_4h_slots() -> None:
-    # Slots exactly 4h apart (the 6/day layout). A post at 09:00 sits exactly
-    # 4h from the 13:00 slot, so the default 4h window rejects it (the boundary
-    # is inclusive) — but a 3.5h per-account gap lets 13:00 through.
+def test_default_gap_clears_exact_4h_slots() -> None:
+    # Regression: slots exactly 4h apart (the 6/day layout). A post at 09:00 sits
+    # exactly 4h from the 13:00 slot. The old flat 240-min default rejected 13:00
+    # (inclusive boundary, widened by jitter) and silently halved the cadence to
+    # 3/day. The 210 default now clears the adjacent slot with NO per-account
+    # override, while a wider override can still force posts to spread.
     after = dt.datetime(2026, 6, 13, 9, 30, tzinfo=dt.timezone.utc)
     with get_session() as session:
         account = Account(
@@ -108,19 +110,19 @@ def test_per_account_gap_unblocks_exact_4h_slots() -> None:
         )
         session.commit()
 
-        # Default 4h gap: 13:00 (exactly 4h later) is rejected -> next is 17:00.
+        # Default gap: the adjacent 4h slot (13:00) is now reachable.
         default_slot = publishing.next_safe_slot_for_account(
             session, account, after=after, rng=random.Random(0)
         )
-        assert default_slot.astimezone(dt.timezone.utc).hour == 17
+        assert default_slot.astimezone(dt.timezone.utc).hour == 13
 
-        # 3.5h per-account gap: 13:00 now clears the collision window.
-        account.upload_min_gap_minutes = 210
+        # A wider explicit override still spreads posts past the adjacent slot.
+        account.upload_min_gap_minutes = 300  # 5h
         session.commit()
-        tight_slot = publishing.next_safe_slot_for_account(
+        wide_slot = publishing.next_safe_slot_for_account(
             session, account, after=after, rng=random.Random(0)
         )
-        assert tight_slot.astimezone(dt.timezone.utc).hour == 13
+        assert wide_slot.astimezone(dt.timezone.utc).hour == 17
 
 
 def _account_id_of(item_id: int) -> int:
@@ -319,9 +321,145 @@ def test_sync_cloud_jobs_updates_local(monkeypatch: pytest.MonkeyPatch) -> None:
         posted = session.get(UploadJob, id1)
         assert posted.status == "posted"
         assert posted.posted_at is not None
+        assert posted.cloud_status == "published"
         failed = session.get(UploadJob, id2)
         assert failed.status == "failed"
         assert "boom" in (failed.error_message or "")
+        assert failed.cloud_status == "failed"
+        assert failed.cloud_error == "boom"
+
+
+def test_sync_cloud_jobs_persists_cloud_status_and_error_for_gated_job(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A job blocked by the Worker's daily-limit/cooldown gate stays local status
+    'cloud' (it's still pending, not a failure) but its raw Worker status/error
+    must still be mirrored on every sync so the dashboard can show *why*."""
+    from nicheflow_studio.services import cloud_publisher
+
+    item_id = _make_item()
+    with get_session() as session:
+        account_id = session.get(DownloadItem, item_id).account_id
+        job = UploadJob(
+            account_id=account_id,
+            download_item_id=item_id,
+            processed_path="C:/gated.mp4",
+            status="cloud",
+        )
+        session.add(job)
+        session.commit()
+        job_id = job.id
+
+    monkeypatch.setenv("CLOUDFLARE_PUBLISHER_URL", "https://worker.example.dev")
+    monkeypatch.setenv("CLOUDFLARE_PUBLISHER_API_KEY", "secret")
+    monkeypatch.setattr(
+        cloud_publisher,
+        "list_jobs",
+        lambda: {
+            "jobs": [
+                {
+                    "external_id": f"nf-{job_id}-500",
+                    "status": "scheduled",
+                    "error_message": "daily limit reached (4/4 in 24h)",
+                }
+            ]
+        },
+    )
+
+    result = publishing.sync_cloud_jobs()
+
+    # `updated` counts the pre-existing "note changed" signal (still 'cloud',
+    # not a failure); cloud_status/cloud_error are the new fields this test targets.
+    assert result == {"synced": True, "updated": 1}
+    with get_session() as session:
+        gated = session.get(UploadJob, job_id)
+        assert gated.status == "cloud"
+        assert gated.cloud_status == "scheduled"
+        assert gated.cloud_error == "daily limit reached (4/4 in 24h)"
+        assert gated.error_message == "daily limit reached (4/4 in 24h)"
+
+
+def test_sync_cloud_jobs_persists_cloud_status_change_with_no_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cloud_status must be written even when there's no error to report and the
+    local `note`/status don't change -- e.g. 'scheduled' -> 'processing' with no
+    error_message at all, which the old `updated` counter never tracked."""
+    from nicheflow_studio.services import cloud_publisher
+
+    item_id = _make_item()
+    with get_session() as session:
+        account_id = session.get(DownloadItem, item_id).account_id
+        job = UploadJob(
+            account_id=account_id,
+            download_item_id=item_id,
+            processed_path="C:/processing.mp4",
+            status="cloud",
+            cloud_status="scheduled",
+        )
+        session.add(job)
+        session.commit()
+        job_id = job.id
+
+    monkeypatch.setenv("CLOUDFLARE_PUBLISHER_URL", "https://worker.example.dev")
+    monkeypatch.setenv("CLOUDFLARE_PUBLISHER_API_KEY", "secret")
+    monkeypatch.setattr(
+        cloud_publisher,
+        "list_jobs",
+        lambda: {"jobs": [{"external_id": f"nf-{job_id}-600", "status": "processing"}]},
+    )
+
+    result = publishing.sync_cloud_jobs()
+
+    assert result == {"synced": True, "updated": 0}
+    with get_session() as session:
+        job = session.get(UploadJob, job_id)
+        assert job.status == "cloud"
+        assert job.cloud_status == "processing"
+        assert job.cloud_error is None
+
+
+def test_list_cloud_jobs_joins_account_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    from nicheflow_studio.services import cloud_publisher
+
+    with get_session() as session:
+        account = Account(name="Resurfaced History", platform="instagram")
+        session.add(account)
+        session.commit()
+        account_id = account.id
+
+    _enable_cloud(monkeypatch, account_id, worker_key="resurfacedhistory")
+    monkeypatch.setattr(
+        cloud_publisher,
+        "list_jobs",
+        lambda: {
+            "publish_mode": "live",
+            "jobs": [
+                {
+                    "id": "worker-job-1",
+                    "external_id": "nf-42-100",
+                    "account_key": "resurfacedhistory",
+                    "status": "scheduled",
+                    "scheduled_at": "2026-07-03T02:03:00Z",
+                    "attempts": 0,
+                }
+            ],
+        },
+    )
+
+    result = publishing.list_cloud_jobs()
+
+    assert result["publish_mode"] == "live"
+    assert len(result["jobs"]) == 1
+    job = result["jobs"][0]
+    assert job["account_name"] == "Resurfaced History"
+    assert job["upload_job_id"] == 42
+
+
+def test_list_cloud_jobs_noop_without_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CLOUDFLARE_PUBLISHER_URL", raising=False)
+    monkeypatch.delenv("CLOUDFLARE_PUBLISHER_API_KEY", raising=False)
+    assert publishing.list_cloud_jobs() == {"jobs": [], "publish_mode": None}
 
 
 def test_sync_cloud_jobs_marks_clean_cloud_failure_for_manual_local_override(

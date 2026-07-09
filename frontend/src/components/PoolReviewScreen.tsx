@@ -15,6 +15,7 @@ const RIGHTS_CONFIDENCE_OPTIONS: { value: RightsConfidence; label: string }[] = 
   { value: "meme", label: "Meme" },
   { value: "tv_moment", label: "TV moment" },
   { value: "broadcast_sport", label: "Broadcast sport" },
+  { value: "news_broadcast", label: "News broadcast (high risk)" },
   { value: "unknown", label: "Unknown" },
 ];
 
@@ -27,6 +28,7 @@ function rightsBadgeClass(value: RightsConfidence | null): string {
       return "bg-emerald-500/15 text-emerald-500";
     case "broadcast_sport":
     case "tv_moment":
+    case "news_broadcast":
       return "bg-red-500/15 text-red-500";
     default:
       return "bg-muted text-muted-foreground";

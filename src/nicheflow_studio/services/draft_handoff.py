@@ -15,6 +15,7 @@ from nicheflow_studio.db.session import get_session
 from nicheflow_studio.processing import draft_guard, smart_drafts
 from nicheflow_studio.services import draft_generation, draft_revisions, export as export_svc
 from nicheflow_studio.services.draft_revisions import DraftRevisionDTO, DraftRevisionError
+from nicheflow_studio.services.export import ExportError
 
 
 @dataclass(frozen=True)
@@ -441,8 +442,18 @@ def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
             "",
             *_field_disambiguation_lines(caption_style),
             "",
+            "Niche fit check (MANDATORY): compare the clip's actual subject to the "
+            f"account niche ('{niche_label or 'none set'}'). Before 'Title Option 1:', "
+            "write exactly one line:",
+            "Niche check: fits",
+            "or",
+            "Niche check: OFF-NICHE, <one short reason>",
+            "Flag borderline or unclear fits as OFF-NICHE so the user decides; still "
+            "write the three options either way.",
+            "",
             "Return format (write every section header exactly as shown, plain text — "
             "never bold or markdown-formatted; '**Title Option 1:**' breaks the importer):",
+            "Niche check: <fits | OFF-NICHE, reason>",
             "Title Option 1:",
             "Caption Option 1:",
             "Title Option 2:",
@@ -544,8 +555,18 @@ def _account_prompt_header(
         "app files each reply to the correct video, so never change, drop, or invent it.",
         "Do not rename, renumber, merge, or skip any reel, even if two clips look similar.",
         "",
+        "Niche fit check (per reel, MANDATORY): compare the clip's actual subject to "
+        f"the account niche ('{niche_label or 'none set'}'). Directly under the reel's "
+        "header line, before 'Title Option 1:', write exactly one line:",
+        "Niche check: fits",
+        "or",
+        "Niche check: OFF-NICHE, <one short reason>",
+        "Flag borderline or unclear fits as OFF-NICHE so the user decides. Still "
+        "draft all three options either way; the app imports flagged reels normally.",
+        "",
         *_field_disambiguation_lines(settings.get("caption_style") or None),
         "Inside each block, use this exact plain-text format:",
+        "Niche check: <fits | OFF-NICHE, reason>",
         "Title Option 1:",
         "Caption Option 1:",
         "Title Option 2:",
@@ -614,6 +635,35 @@ def build_account_batch_chat_prompt(
     return "\n".join(lines)
 
 
+# The "==...=REEL" delimiter form appears mid-line when the chat reply glues
+# prose to the first header without a newline ("...verifiable claims.===== REEL
+# 1 (#145) ====="). _REEL_HEADER is line-start anchored so prose like "Reel 1 of
+# the series" can never become a header; this embedded form is safe to search
+# for anywhere in a line because the "==" prefix only comes from the app's own
+# delimiter, never from prose.
+_EMBEDDED_DELIMITER = re.compile(r"={2,}\s*reel\b", re.IGNORECASE)
+
+
+def _split_header_line(line: str) -> tuple[str, re.Match[str] | None]:
+    """Return (content before the header, header match) for one pasted line.
+
+    Without the embedded check, a header glued to the end of a prose line is
+    invisible and that reel's whole block silently lands in the preceding block
+    (or is dropped when it is the first reel) — the "Unmatched" failure with a
+    correctly formatted reply.
+    """
+    stripped = line.strip()
+    match = _REEL_HEADER.match(stripped)
+    if match:
+        return "", match
+    embedded = _EMBEDDED_DELIMITER.search(stripped)
+    if embedded:
+        match = _REEL_HEADER.match(stripped[embedded.start() :])
+        if match:
+            return stripped[: embedded.start()].rstrip(), match
+    return "", None
+
+
 def _split_batch_blocks(text: str) -> dict[int, tuple[int | None, str]]:
     """Split a pasted reply into blocks keyed by 1-based REEL NUMBER, each paired
     with the echoed ``(#id)`` from its header (``None`` when the model dropped it).
@@ -625,8 +675,10 @@ def _split_batch_blocks(text: str) -> dict[int, tuple[int | None, str]]:
     echoed: dict[int, int | None] = {}
     current_reel: int | None = None
     for line in (text or "").splitlines():
-        match = _REEL_HEADER.match(line.strip())
+        head, match = _split_header_line(line)
         if match:
+            if head and current_reel is not None:
+                blocks[current_reel].append(head)
             current_reel = int(match.group(1))
             if current_reel not in blocks:
                 blocks[current_reel] = []
@@ -651,6 +703,29 @@ def _batch_seq_to_item(item_ids: list[int]) -> dict[int, int]:
     return {seq_by_item[item_id]: item_id for item_id in item_ids if item_id in seq_by_item}
 
 
+# "Prepare batch" copies the PROMPT to the clipboard and Import reads the
+# clipboard at click time, so the most common import failure is the user never
+# copying the chat reply over it: the prompt's reel blocks carry the same
+# "===== REEL n (#id) =====" headers but no Title/Caption sections, so every
+# item fails with the generic "No 'Title Option'..." error and no hint at the
+# actual mistake. These lines are emitted only by the prompt builders above; a
+# reply that follows the return format never contains them.
+_PROMPT_PASTE_MARKERS = (
+    "Attach and inspect image file:",
+    "Visual evidence JSON",
+    "Transcript/context excerpt:",
+)
+
+
+def _reject_prompt_paste(text: str) -> None:
+    if any(marker in (text or "") for marker in _PROMPT_PASTE_MARKERS):
+        raise DraftRevisionError(
+            "This is the prepared PROMPT, not the chat reply. The clipboard still "
+            "holds what 'Prepare batch' copied. In ChatGPT or Claude, copy the "
+            "reply (the blocks starting with 'Title Option 1:'), then import again."
+        )
+
+
 def import_account_batch_draft(text: str, item_ids: list[int]) -> dict:
     """Import a batch reply. Each block routes to a specific item by the echoed
     ``(#id)`` when it names an item in this batch (most reliable — survives
@@ -658,6 +733,7 @@ def import_account_batch_draft(text: str, item_ids: list[int]) -> dict:
     ``(#id)`` that is not part of this batch (e.g. the model parroted a frame
     filename's item id) is ignored and the reel number is used instead, so a
     garbled id never misroutes."""
+    _reject_prompt_paste(text)
     requested = [int(item_id) for item_id in item_ids]
     seq_to_item = _batch_seq_to_item(requested)
     blocks_by_reel = _split_batch_blocks(text)
@@ -695,7 +771,10 @@ def batch_frames(item_ids: list[int]) -> dict:
     folder.mkdir(parents=True, exist_ok=True)
     frames: list[dict] = []
     for index, item_id in enumerate(ids, start=1):
-        source = export_svc.crop_preview_frame(item_id)
+        try:
+            source = export_svc.crop_preview_frame(item_id)
+        except ExportError as exc:
+            raise DraftRevisionError(f"Reel {index} (item {item_id}): {exc}") from exc
         target = folder / f"reel_{index}_item{item_id}.jpg"
         shutil.copyfile(source, target)
         frames.append({"item_id": item_id, "path": str(target)})
@@ -703,6 +782,7 @@ def batch_frames(item_ids: list[int]) -> dict:
 
 
 def import_pasted_draft(item_id: int, text: str) -> DraftRevisionDTO:
+    _reject_prompt_paste(text)
     parsed = parse_pasted_draft(text)
     if not any(value.strip() for value in [*parsed.title_options, *parsed.caption_options]):
         raise DraftRevisionError(

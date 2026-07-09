@@ -33,7 +33,11 @@ from nicheflow_studio.db.models import (
     UploadJob,
 )
 from nicheflow_studio.db.media_library import find_media_asset
-from nicheflow_studio.db.pools import VALID_NICHES, pool_items_for_niche
+from nicheflow_studio.db.pools import (
+    RIGHTS_CONFIDENCE_BLOCKED,
+    VALID_NICHES,
+    pool_items_for_niche,
+)
 
 import random as _random
 
@@ -246,6 +250,7 @@ def distribute_niche(
     max_per_account: int | None = None,
     targets_by_account: dict[int, int] | None = None,
     eligible_pool_item_ids: set[int] | None = None,
+    allow_risky: bool = False,
 ) -> list[Assignment]:
     """Distribute the niche's unassigned accepted pool across its accounts.
 
@@ -253,6 +258,11 @@ def distribute_niche(
     re-run: already-assigned pool items are skipped, so a second call only places
     clips added since the first. Returns ``[]`` when there are no accounts or no
     unassigned clips. Does not commit; the caller owns the transaction.
+
+    Rights gate (docs/SOURCING_POOLING_PLAN.md §2.2): clips labeled
+    ``news_broadcast`` are excluded from auto-distribution — they are held back
+    (skipped) rather than hard-blocking the whole backlog — unless ``allow_risky``
+    is set. The rest of the backlog distributes normally.
     """
     niche = _validate_niche(niche)
     account_ids = account_ids_for_niche(session, niche)
@@ -267,6 +277,7 @@ def distribute_niche(
         for item in pool_items_for_niche(session, niche)
         if item.id not in already
         and (eligible_pool_item_ids is None or item.id in eligible_pool_item_ids)
+        and (allow_risky or item.rights_confidence != RIGHTS_CONFIDENCE_BLOCKED)
     ]
     unassigned_ids = [item.id for item in unassigned_items]
     if not unassigned_ids:

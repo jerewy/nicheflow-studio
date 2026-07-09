@@ -236,23 +236,35 @@ def cover_watermark(
     if replacement_text:
         font_arg = _font_arg()
         safe_text = replacement_text.replace("'", "\\'").replace(":", "\\:")
-        # Arial Black, white fill, heavy black outline + drop shadow.
-        # Matches the @clips / Instagram native watermark aesthetic.
+        # Plain white Arial Black, like Instagram's own handle stamp. The pill
+        # underneath is fully opaque black, so an outline or shadow cannot add
+        # contrast — at badge font sizes they only bleed dark fringes into the
+        # glyph antialiasing and make the handle look smudged.
         filters.append(
             f"drawtext={font_arg}text='{safe_text}'"
             f":x={geometry.text_x}:y={geometry.text_y}"
             f":fontsize={geometry.font_size}:fontcolor=white"
-            ":borderw=3:bordercolor=black@0.85"
-            ":shadowx=2:shadowy=2:shadowcolor=black@0.70"
         )
 
+    # Encode settings must mirror export_cropped_video. Left to libx264
+    # defaults, the geq rounded-rect filter promotes the stream to yuv444p
+    # (High 4:4:4 Predictive), which the WebView2 preview and Instagram both
+    # reject or degrade, and the moov atom lands at the end of the file.
+    # Audio is re-encoded (not copied): copying has produced a truncated
+    # final AAC packet that stops playback with a decode error.
     command = [
         str(ffmpeg_path),
         "-hide_banner",
         "-y",
         "-i", str(resolved),
         "-vf", ",".join(filters),
-        "-c:a", "copy",
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "18",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-movflags", "+faststart",
         str(output_path),
     ]
     subprocess.run(
@@ -355,9 +367,10 @@ def _cover_geometry(
     base_font_size = max(18, min(42, int(region.h * 0.80)))
     _GLYPH_WIDTH_FACTOR = 0.72
 
-    # Tight padding — just enough to clear the glyphs and avoid clipping.
-    h_pad = max(5, base_font_size // 6)
-    v_pad = max(3, base_font_size // 8)
+    # Pill padding: roomy enough that the glyphs never touch the rounded
+    # edges — a cramped badge reads as broken text at reel resolution.
+    h_pad = max(8, base_font_size // 3)
+    v_pad = max(4, base_font_size // 6)
 
     # Hard cap: 45% of frame width so long names never run off-screen.
     max_lane_width = int(frame_width * 0.45)

@@ -384,13 +384,14 @@ def test_cover_watermark_with_replacement_text_includes_drawtext(tmp_path):
     vf_arg = command[command.index("-vf") + 1]
     assert "drawtext" in vf_arg
     assert "@meme.ig" in vf_arg
-    # Background is now a rounded-rectangle geq filter (full-black inside,
-    # original pixels untouched outside). Verify the geq is present plus the
-    # text styling matches the @clips-style native watermark aesthetic.
+    # Background is a rounded-rectangle geq filter (full-black inside,
+    # original pixels untouched outside). The handle itself renders as plain
+    # white text: an outline or shadow on an opaque black pill adds no
+    # contrast and smudges the glyph antialiasing at badge font sizes.
     assert "geq=" in vf_arg
-    assert "borderw=3" in vf_arg
-    assert "bordercolor=black@0.85" in vf_arg
-    assert "shadowcolor=black@0.70" in vf_arg
+    assert "fontcolor=white" in vf_arg
+    assert "borderw" not in vf_arg
+    assert "shadow" not in vf_arg
 
 
 def test_cover_geometry_expands_partial_handle_to_watermark_lane() -> None:
@@ -419,7 +420,12 @@ def test_cover_geometry_expands_partial_handle_to_watermark_lane() -> None:
     assert geometry.text_y >= geometry.y
 
 
-def test_cover_watermark_audio_copied(tmp_path):
+def test_cover_watermark_encodes_like_the_export_pipeline(tmp_path):
+    # The cover pass re-encodes the already-rendered reel, so it must mirror
+    # export_cropped_video's settings. Without -pix_fmt the geq filter promotes
+    # the output to yuv444p (High 4:4:4 Predictive), which the WebView2 preview
+    # cannot play and Instagram degrades; audio copy has produced a truncated
+    # final AAC packet, so audio is re-encoded too.
     fake_video = tmp_path / "clip.mp4"
     fake_video.write_bytes(b"x")
     region = WatermarkRegion(x=0, y=0, w=50, h=20, text="@x", corner="bottom-left")
@@ -437,8 +443,13 @@ def test_cover_watermark_audio_copied(tmp_path):
         cover_watermark(fake_video, region)
 
     command = _render_command(captured)
-    assert "-c:a" in command
-    assert "copy" in command
+    assert command[command.index("-pix_fmt") + 1] == "yuv420p"
+    assert command[command.index("-c:v") + 1] == "libx264"
+    assert command[command.index("-crf") + 1] == "18"
+    assert command[command.index("-c:a") + 1] == "aac"
+    assert command[command.index("-b:a") + 1] == "192k"
+    assert command[command.index("-movflags") + 1] == "+faststart"
+    assert "copy" not in command
 
 
 def test_replace_detected_watermark_skips_when_no_watermark(tmp_path):

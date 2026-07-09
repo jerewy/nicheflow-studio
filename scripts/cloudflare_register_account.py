@@ -76,7 +76,15 @@ def _verify_token(user_id: str, token: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("account_key", help="e.g. beneathhistory (lowercase Worker key)")
-    parser.add_argument("--daily-limit", type=int, default=3, help="max posts/24h (default 3)")
+    parser.add_argument(
+        "--daily-limit",
+        type=int,
+        default=4,
+        help=(
+            "max posts/24h (default 4); set to schedule target + 1 "
+            "(headroom lets a delayed queue catch up)"
+        ),
+    )
     parser.add_argument(
         "--min-gap-minutes", type=int, default=240, help="min minutes between posts (default 240)"
     )

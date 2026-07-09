@@ -25,6 +25,7 @@ import threading
 from pathlib import Path
 
 from nicheflow_studio.app.local_media import media_url
+from nicheflow_studio.core import clipboard
 from nicheflow_studio.core.ui_prefs import set_ui_pref
 from nicheflow_studio.db.models import DownloadItem
 from nicheflow_studio.db.session import get_session
@@ -349,8 +350,13 @@ class ProcessingBridge:
         return pooling.niche_accounts(niche)
 
     @_guard
-    def distribute_pool_item(self, pool_item_id: int, account_ids: list[int] | None = None) -> dict:
-        return pooling.distribute_clip(pool_item_id, account_ids or [])
+    def distribute_pool_item(
+        self,
+        pool_item_id: int,
+        account_ids: list[int] | None = None,
+        allow_risky: bool = False,
+    ) -> dict:
+        return pooling.distribute_clip(pool_item_id, account_ids or [], allow_risky=allow_risky)
 
     @_guard
     def distribute_niche(self, niche: str, max_per_account: int | None = None) -> dict:
@@ -395,6 +401,26 @@ class ProcessingBridge:
     def dashboard_force_publish_cloud_job(self, job_id: int) -> dict:
         """Bypass the Worker's safety cooldown for one pending cloud job."""
         return publishing.force_publish_cloud_job(job_id)
+
+    @_guard
+    def dashboard_cloud_jobs(self) -> dict:
+        """All Worker publish jobs, joined to local account names."""
+        return publishing.list_cloud_jobs()
+
+    @_guard
+    def dashboard_cancel_cloud_job(self, worker_job_id: str) -> dict:
+        """Cancel a Worker job and free its R2 media (if not already published)."""
+        return cloud_publisher.cancel_job(worker_job_id)
+
+    @_guard
+    def dashboard_run_cloud_due(self) -> dict:
+        """Ask the Worker to process due jobs immediately."""
+        return cloud_publisher.run_due()
+
+    @_guard
+    def dashboard_cloud_accounts(self) -> dict:
+        """All accounts registered on the Worker (enabled/daily_limit/min_gap)."""
+        return cloud_publisher.list_accounts()
 
     @_guard
     def dashboard_account_stats(self, active_account_id: int) -> dict:
@@ -558,6 +584,26 @@ class ProcessingBridge:
     def import_account_batch_draft(self, text: str, item_ids: list[int]) -> dict:
         return draft_handoff.import_account_batch_draft(text, item_ids)
 
+    # navigator.clipboard requires the webview document to be focused, so a copy
+    # that lands after a long async step (batch prepare, downloads) fails with
+    # "Document is not focused" once the user alt-tabs away. The OS clipboard has
+    # no such requirement, so the React UI copies/pastes through these instead.
+
+    @_guard
+    def set_clipboard_text(self, text: str) -> dict:
+        try:
+            clipboard.set_text(text or "")
+        except clipboard.ClipboardError as exc:
+            raise ServiceError(str(exc)) from exc
+        return {"copied": True}
+
+    @_guard
+    def get_clipboard_text(self) -> dict:
+        try:
+            return {"text": clipboard.get_text()}
+        except clipboard.ClipboardError as exc:
+            raise ServiceError(str(exc)) from exc
+
     @_guard
     def prepare_account_batch_frames(self, item_ids: list[int]) -> dict:
         return draft_handoff.batch_frames(item_ids)
@@ -592,13 +638,23 @@ class ProcessingBridge:
         return export_svc.get_crop_override(item_id)
 
     @_guard
-    def get_crop_preview(self, item_id: int) -> dict:
-        """A still-frame URL for the crop editor; avoids WebView video crashes."""
-        preview_path = export_svc.crop_preview_frame(item_id)
+    def get_crop_preview(self, item_id: int, at_seconds: float | None = None) -> dict:
+        """A still-frame URL for the crop editor; avoids WebView video crashes.
+
+        ``at_seconds`` scrubs to a specific moment. On the initial load (no
+        timestamp) the clip duration is included so the UI can size the scrubber.
+        """
+        preview_path = export_svc.crop_preview_frame(item_id, at_seconds)
         preview_url = media_url(str(preview_path))
         if preview_url is None:
             raise ServiceError("Could not expose the crop preview to the Processing window.")
-        return {"item_id": item_id, "preview_url": preview_url}
+        # Cache-bust so a frame re-extracted at the same timestamp (e.g. after a
+        # re-download) isn't served stale from the WebView image cache.
+        preview_url = _cache_busted(preview_url, str(preview_path))
+        result = {"item_id": item_id, "preview_url": preview_url}
+        if at_seconds is None:
+            result["duration_seconds"] = export_svc.source_duration_seconds(item_id)
+        return result
 
     @_guard
     def save_crop_override(self, item_id: int, payload: dict | None = None) -> dict:

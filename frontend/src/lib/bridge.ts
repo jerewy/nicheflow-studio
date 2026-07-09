@@ -17,6 +17,8 @@ import type {
   BatchFramesResult,
   CloudAccountSettings,
   CloudPublisherHealth,
+  CloudWorkerAccountsResult,
+  CloudWorkerJobsResult,
   CropRect,
   DeleteAccountResult,
   DistributeNicheResult,
@@ -85,6 +87,8 @@ interface PywebviewApi {
     text: string,
     itemIds: number[],
   ): Promise<Envelope<BatchDraftImportResult>>;
+  set_clipboard_text(text: string): Promise<Envelope<{ copied: boolean }>>;
+  get_clipboard_text(): Promise<Envelope<{ text: string }>>;
   prepare_account_batch_frames(itemIds: number[]): Promise<Envelope<BatchFramesResult>>;
   open_batch_frames_folder(folder: string): Promise<Envelope<{ folder: string }>>;
   get_workflow_settings(itemId: number): Promise<Envelope<WorkflowSettings>>;
@@ -99,7 +103,10 @@ interface PywebviewApi {
   ): Promise<Envelope<{ title_draft: string; caption_draft: string }>>;
   open_item_folder(itemId: number): Promise<Envelope<{ folder: string }>>;
   get_crop_override(itemId: number): Promise<Envelope<CropRect | null>>;
-  get_crop_preview(itemId: number): Promise<Envelope<{ item_id: number; preview_url: string }>>;
+  get_crop_preview(
+    itemId: number,
+    atSeconds?: number,
+  ): Promise<Envelope<{ item_id: number; preview_url: string; duration_seconds?: number | null }>>;
   save_crop_override(
     itemId: number,
     payload: CropRect,
@@ -235,7 +242,7 @@ interface PywebviewApi {
   distribute_pool_item(
     poolItemId: number,
     accountIds: number[],
-  ): Promise<Envelope<{ pool_item_id: number; assigned: number }>>;
+  ): Promise<Envelope<{ pool_item_id: number; assigned: number; warning?: string }>>;
   distribute_niche(
     niche: string,
     maxPerAccount?: number | null,
@@ -255,6 +262,10 @@ interface PywebviewApi {
     enabled: boolean,
   ): Promise<Envelope<CloudAccountSettings>>;
   dashboard_force_publish_cloud_job(jobId: number): Promise<Envelope<{ id: string; forced: boolean }>>;
+  dashboard_cloud_jobs(): Promise<Envelope<CloudWorkerJobsResult>>;
+  dashboard_cancel_cloud_job(workerJobId: string): Promise<Envelope<{ id: string; status: string }>>;
+  dashboard_run_cloud_due(): Promise<Envelope<{ processed: number; mode: string }>>;
+  dashboard_cloud_accounts(): Promise<Envelope<CloudWorkerAccountsResult>>;
   dashboard_account_stats(activeAccountId: number): Promise<Envelope<DashboardAccountStats>>;
   dashboard_mark_ready(jobIds: number[]): Promise<Envelope<{ updated: number }>>;
   dashboard_open_output(jobId: number): Promise<Envelope<{ opened: string }>>;
@@ -527,6 +538,31 @@ export const bridge = {
     return unwrap(window.pywebview!.api.import_account_batch_draft(text, itemIds));
   },
 
+  // navigator.clipboard.writeText/readText require the document to be focused,
+  // so a copy that lands after a long async step (batch prepare, downloads)
+  // throws "Document is not focused" once the user alt-tabs away. The desktop
+  // shell goes through the OS clipboard on the Python side instead; the browser
+  // API is only a fallback. The typeof checks guard against a Python host older
+  // than this frontend (a page reload picks up new JS while the running process
+  // keeps its old bridge) — degrade to the browser API instead of throwing
+  // "api.set_clipboard_text is not a function".
+  async copyTextToClipboard(text: string): Promise<void> {
+    const api = hasBridge() ? window.pywebview!.api : undefined;
+    if (typeof api?.set_clipboard_text === "function") {
+      await unwrap(api.set_clipboard_text(text));
+      return;
+    }
+    await navigator.clipboard.writeText(text);
+  },
+
+  readClipboardText(): Promise<string> {
+    const api = hasBridge() ? window.pywebview!.api : undefined;
+    if (typeof api?.get_clipboard_text === "function") {
+      return unwrap(api.get_clipboard_text()).then((data) => data.text);
+    }
+    return navigator.clipboard.readText();
+  },
+
   prepareAccountBatchFrames(itemIds: number[]): Promise<BatchFramesResult> {
     if (!hasBridge())
       return Promise.resolve({
@@ -569,9 +605,17 @@ export const bridge = {
     return unwrap(window.pywebview!.api.get_crop_override(itemId));
   },
 
-  getCropPreview(itemId: number): Promise<{ item_id: number; preview_url: string }> {
+  getCropPreview(
+    itemId: number,
+    atSeconds?: number,
+  ): Promise<{ item_id: number; preview_url: string; duration_seconds?: number | null }> {
     if (!hasBridge()) return Promise.resolve({ item_id: itemId, preview_url: "" });
-    return unwrap(window.pywebview!.api.get_crop_preview(itemId));
+    // Omit the second arg entirely on the initial load so the backend returns
+    // the clip duration; pass it only when scrubbing to a specific moment.
+    if (atSeconds === undefined) {
+      return unwrap(window.pywebview!.api.get_crop_preview(itemId));
+    }
+    return unwrap(window.pywebview!.api.get_crop_preview(itemId, atSeconds));
   },
 
   saveCropOverride(
@@ -832,7 +876,7 @@ export const bridge = {
   distributePoolItem(
     poolItemId: number,
     accountIds: number[],
-  ): Promise<{ pool_item_id: number; assigned: number }> {
+  ): Promise<{ pool_item_id: number; assigned: number; warning?: string }> {
     if (!hasBridge())
       return Promise.resolve({ pool_item_id: poolItemId, assigned: accountIds.length });
     return unwrap(window.pywebview!.api.distribute_pool_item(poolItemId, accountIds));
@@ -884,6 +928,8 @@ export const bridge = {
                     job_title: "Mock posted reel",
                     scheduled_at: new Date().toISOString(),
                     note: null,
+                    cloud_status: "published",
+                    cloud_error: null,
                     timing: "on_time",
                   },
                   {
@@ -895,6 +941,8 @@ export const bridge = {
                     job_title: "Mock cloud reel",
                     scheduled_at: new Date(Date.now() + 3_600_000).toISOString(),
                     note: "same-account cooldown until " + new Date(Date.now() + 3_600_000).toISOString(),
+                    cloud_status: "scheduled",
+                    cloud_error: "same-account cooldown until " + new Date(Date.now() + 3_600_000).toISOString(),
                     timing: "late",
                   },
                 ],
@@ -914,6 +962,8 @@ export const bridge = {
                     job_title: null,
                     scheduled_at: null,
                     note: null,
+                    cloud_status: null,
+                    cloud_error: null,
                     timing: null,
                   },
                   {
@@ -925,6 +975,8 @@ export const bridge = {
                     job_title: null,
                     scheduled_at: null,
                     note: null,
+                    cloud_status: null,
+                    cloud_error: null,
                     timing: null,
                   },
                 ],
@@ -997,6 +1049,26 @@ export const bridge = {
   dashboardForcePublishCloudJob(jobId: number): Promise<{ id: string; forced: boolean }> {
     if (!hasBridge()) return Promise.resolve({ id: "mock", forced: true });
     return unwrap(window.pywebview!.api.dashboard_force_publish_cloud_job(jobId));
+  },
+
+  dashboardCloudJobs(): Promise<CloudWorkerJobsResult> {
+    if (!hasBridge()) return Promise.resolve({ jobs: [], publish_mode: "live" });
+    return unwrap(window.pywebview!.api.dashboard_cloud_jobs());
+  },
+
+  dashboardCancelCloudJob(workerJobId: string): Promise<{ id: string; status: string }> {
+    if (!hasBridge()) return Promise.resolve({ id: workerJobId, status: "canceled" });
+    return unwrap(window.pywebview!.api.dashboard_cancel_cloud_job(workerJobId));
+  },
+
+  dashboardRunCloudDue(): Promise<{ processed: number; mode: string }> {
+    if (!hasBridge()) return Promise.resolve({ processed: 0, mode: "live" });
+    return unwrap(window.pywebview!.api.dashboard_run_cloud_due());
+  },
+
+  dashboardCloudAccounts(): Promise<CloudWorkerAccountsResult> {
+    if (!hasBridge()) return Promise.resolve({ accounts: [] });
+    return unwrap(window.pywebview!.api.dashboard_cloud_accounts());
   },
 
   dashboardAccountStats(activeAccountId: number): Promise<DashboardAccountStats> {

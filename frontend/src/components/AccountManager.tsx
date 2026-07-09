@@ -110,7 +110,34 @@ function CloudSafetyPanel({ accountId }: { accountId: number }) {
     };
   }, [accountId]);
 
-  if (!loaded || !settings) return null;
+  if (!loaded) return null;
+
+  if (error) {
+    return (
+      <div className="space-y-2 rounded-md border border-destructive/50 p-3">
+        <p className="text-sm font-medium">Cloud publish safety</p>
+        <p className="text-xs text-destructive">
+          Could not load Worker settings: {error}
+        </p>
+      </div>
+    );
+  }
+
+  if (!settings) {
+    return (
+      <div className="space-y-2 rounded-md border border-border p-3">
+        <p className="text-sm font-medium">Cloud publish safety</p>
+        <p className="text-xs text-muted-foreground">
+          Not registered on the Worker yet — run{" "}
+          <code className="rounded bg-muted px-1 py-0.5">
+            scripts/cloudflare_register_account.py
+          </code>{" "}
+          for this account (or add its id to <code className="rounded bg-muted px-1 py-0.5">CLOUDFLARE_PUBLISH_ACCOUNTS</code> in
+          .env if it's already registered).
+        </p>
+      </div>
+    );
+  }
 
   const save = async () => {
     setBusy(true);

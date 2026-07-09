@@ -63,7 +63,7 @@ export function AccountReadiness() {
       <div className="flex flex-wrap gap-2">
         <Button size="sm" variant="secondary" onClick={load}>Refresh</Button>
         <Button size="sm" variant="outline" disabled={!selectedRow?.profile} onClick={relogin}>Re-login</Button>
-        <Button size="sm" variant="outline" disabled={!selectedRow?.login_identifier} onClick={() => selectedRow?.login_identifier && navigator.clipboard.writeText(selectedRow.login_identifier)}>Copy Email</Button>
+        <Button size="sm" variant="outline" disabled={!selectedRow?.login_identifier} onClick={() => selectedRow?.login_identifier && void bridge.copyTextToClipboard(selectedRow.login_identifier)}>Copy Email</Button>
       </div>
       {message && <p className="text-sm text-muted-foreground">{message}</p>}
     </section>

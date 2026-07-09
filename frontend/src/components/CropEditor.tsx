@@ -21,6 +21,13 @@ interface DragState {
 
 const clamp = (value: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, value));
 
+const formatTime = (seconds: number): string => {
+  const whole = Math.max(0, Math.floor(seconds));
+  const mins = Math.floor(whole / 60);
+  const secs = whole % 60;
+  return `${mins}:${String(secs).padStart(2, "0")}`;
+};
+
 // Apply a pointer delta (already converted to source fractions) to the rect.
 function applyDrag(drag: DragState, dx: number, dy: number): CropRect {
   const { x, y, w, h } = drag.startRect;
@@ -72,8 +79,15 @@ export function CropEditor({ itemId, onClose, onSaved }: CropEditorProps) {
   const [previewLoading, setPreviewLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Source clip length + the scrubber position, so the user can pick a clearer
+  // frame to draw the crop against instead of the fixed middle frame.
+  const [duration, setDuration] = useState<number | null>(null);
+  const [frameTime, setFrameTime] = useState(0);
+  const [frameLoading, setFrameLoading] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<DragState | null>(null);
+  // Monotonic id so a slow frame fetch can't overwrite a newer one out of order.
+  const frameReqRef = useRef(0);
   // Mirror the rect so a drag can capture the current value without making the
   // pointer-down handler depend on (and re-create with) every rect change.
   const rectRef = useRef(rect);
@@ -89,6 +103,10 @@ export function CropEditor({ itemId, onClose, onSaved }: CropEditorProps) {
         if (cancelled) return;
         if (saved) setRect(saved);
         setPreviewUrl(preview.preview_url);
+        const dur = preview.duration_seconds ?? null;
+        setDuration(dur);
+        // The initial frame is the clip's middle, so start the scrubber there.
+        if (dur && dur > 0) setFrameTime(dur / 2);
       })
       .catch((err: unknown) => {
         if (!cancelled) setError(err instanceof Error ? err.message : String(err));
@@ -140,6 +158,35 @@ export function CropEditor({ itemId, onClose, onSaved }: CropEditorProps) {
     };
   }, []);
 
+  // Re-extract the still at a chosen moment. Stale responses (an earlier, slower
+  // fetch resolving after a newer one) are dropped via the request-id guard.
+  const loadFrameAt = useCallback(
+    async (seconds: number) => {
+      const reqId = ++frameReqRef.current;
+      setFrameLoading(true);
+      try {
+        const preview = await bridge.getCropPreview(itemId, seconds);
+        if (frameReqRef.current === reqId) setPreviewUrl(preview.preview_url);
+      } catch (err: unknown) {
+        if (frameReqRef.current === reqId) {
+          setError(err instanceof Error ? err.message : String(err));
+        }
+      } finally {
+        if (frameReqRef.current === reqId) setFrameLoading(false);
+      }
+    },
+    [itemId],
+  );
+
+  // Fetch on release (pointer/touch/keyboard), not on every onChange tick, so a
+  // drag across the slider doesn't fire an ffmpeg extract per pixel.
+  const commitFrame = useCallback(
+    (event: React.SyntheticEvent<HTMLInputElement>) => {
+      void loadFrameAt(Number(event.currentTarget.value));
+    },
+    [loadFrameAt],
+  );
+
   const save = async () => {
     setBusy(true);
     setError(null);
@@ -184,7 +231,8 @@ export function CropEditor({ itemId, onClose, onSaved }: CropEditorProps) {
             <h2 className="text-base font-semibold">Adjust source crop for next export</h2>
             <p className="text-sm text-muted-foreground">
               Drag inside the box to move it, or drag any edge or corner to resize.
-              The title and layout are applied after this crop.
+              Scrub the slider to preview a clearer frame — the crop still applies
+              to the whole clip. The title and layout are applied after this crop.
             </p>
           </div>
           <Button size="sm" variant="ghost" onClick={onClose}>
@@ -294,6 +342,29 @@ export function CropEditor({ itemId, onClose, onSaved }: CropEditorProps) {
             />
           </div>
         </div>
+
+        {duration != null && duration > 0 && (
+          <div className="flex items-center gap-3 px-1">
+            <span className="shrink-0 text-xs text-muted-foreground">Frame</span>
+            <input
+              type="range"
+              min={0}
+              max={duration}
+              step={0.1}
+              value={frameTime}
+              onChange={(event) => setFrameTime(Number(event.target.value))}
+              onMouseUp={commitFrame}
+              onTouchEnd={commitFrame}
+              onKeyUp={commitFrame}
+              className="grow accent-white"
+              aria-label="Preview frame time"
+            />
+            <span className="w-24 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
+              {formatTime(frameTime)} / {formatTime(duration)}
+              {frameLoading ? " …" : ""}
+            </span>
+          </div>
+        )}
 
         <p className="text-center text-xs text-muted-foreground">
           Keeping x {Math.round(rect.x * 100)}% | y {Math.round(rect.y * 100)}% | w{" "}

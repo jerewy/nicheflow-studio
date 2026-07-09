@@ -30,6 +30,7 @@ import logging
 import os
 from typing import Iterable
 
+from nicheflow_studio.core.apify_usage import record_apify_results
 from nicheflow_studio.scraper.youtube import (
     DiscoveryWeights,
     ScrapedVideoCandidate,
@@ -245,6 +246,10 @@ def scrape_instagram_source_apify(
 
     dataset_id = run["defaultDatasetId"]
     items = list(client.dataset(dataset_id).iterate_items())  # type: ignore[attr-defined]
+    # Apify bills per dataset row, including rows the filters below drop —
+    # record here, where the billed count is known, so the free-tier warning
+    # stays honest no matter what callers do with the candidates.
+    record_apify_results(len(items))
 
     cutoff: dt.datetime | None = None
     if max_age_days is not None:
@@ -356,6 +361,10 @@ def scrape_instagram_urls_apify(
 
     dataset_id = run["defaultDatasetId"]
     items = list(client.dataset(dataset_id).iterate_items())  # type: ignore[attr-defined]
+    # Apify bills per dataset row, including unusable/error rows and rows whose
+    # parse fails below — record here, where the billed count is known, even
+    # when this function goes on to raise.
+    record_apify_results(len(items))
 
     candidates: list[ScrapedVideoCandidate] = []
     for item in items:

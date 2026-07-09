@@ -288,6 +288,69 @@ def test_distribute_clip_unknown_item_raises() -> None:
         pooling.distribute_clip(999999, [1])
 
 
+def test_distribute_clip_blocks_news_broadcast_rights() -> None:
+    """The rights gate refuses a news_broadcast clip outright (docs/SOURCING_
+    POOLING_PLAN.md §2.2) — no assignment, no wasted download."""
+    account_a, _account_b, pool_item_id = _seed_clip_with_accounts()
+    with get_session() as session:
+        session.get(PoolItem, pool_item_id).rights_confidence = "news_broadcast"
+        session.commit()
+
+    with pytest.raises(PoolingError, match="news_broadcast"):
+        pooling.distribute_clip(pool_item_id, [account_a])
+
+    with get_session() as session:
+        assert session.query(Assignment).count() == 0
+
+
+def test_distribute_clip_warns_on_unverified_rights() -> None:
+    """An unlabeled (NULL) clip still distributes but carries a soft warning so
+    unverified-rights footage is never published silently."""
+    account_a, _account_b, pool_item_id = _seed_clip_with_accounts()
+
+    result = pooling.distribute_clip(pool_item_id, [account_a])
+
+    assert result["assigned"] == 1
+    assert "review" in result["warning"].lower()
+    with get_session() as session:
+        assert session.query(Assignment).count() == 1
+
+
+def test_distribute_clip_allow_risky_overrides_news_broadcast_block() -> None:
+    """allow_risky is the future override path: a news_broadcast clip distributes
+    when explicitly forced (the frontend does not expose this yet)."""
+    account_a, _account_b, pool_item_id = _seed_clip_with_accounts()
+    with get_session() as session:
+        session.get(PoolItem, pool_item_id).rights_confidence = "news_broadcast"
+        session.commit()
+
+    result = pooling.distribute_clip(pool_item_id, [account_a], allow_risky=True)
+
+    assert result["assigned"] == 1
+    # A blocked-but-overridden clip is risky, not merely unverified — no soft warning.
+    assert "warning" not in result
+    with get_session() as session:
+        assert session.query(Assignment).count() == 1
+
+
+def test_distribute_niche_excludes_news_broadcast_from_backlog() -> None:
+    """Bulk auto-distribution holds back news_broadcast clips (soft gate) without
+    hard-blocking the rest of the backlog (docs/SOURCING_POOLING_PLAN.md §2.2)."""
+    _seed_history_network(accounts=1, clips=2)
+    with get_session() as session:
+        risky = session.query(PoolItem).first()
+        risky.rights_confidence = "news_broadcast"
+        risky_id = risky.id
+        session.commit()
+
+    result = pooling.distribute_niche("history", max_per_account=5)
+
+    assert result["assigned"] == 1  # only the unlabeled clip distributes
+    with get_session() as session:
+        assigned_pool_ids = {a.pool_item_id for a in session.query(Assignment).all()}
+        assert risky_id not in assigned_pool_ids
+
+
 def _seed_history_network(*, accounts: int, clips: int) -> None:
     """N history accounts + M accepted, unassigned pool clips (no metadata)."""
     with get_session() as session:

@@ -2,11 +2,14 @@ import { useCallback, useEffect, useState, type ReactNode } from "react";
 
 import { DashboardTable } from "@/components/DashboardTable";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { useAutoRefresh } from "@/hooks/useAutoRefresh";
 import { bridge } from "@/lib/bridge";
 import { formatDate } from "@/lib/format";
 import type {
   CloudPublisherHealth,
+  CloudWorkerAccount,
+  CloudWorkerJob,
   DashboardPublishJob,
   DashboardPublishQueue,
   PublishQueueJob,
@@ -141,6 +144,242 @@ function CloudPublisherHealthPanel({
   );
 }
 
+const CLOUD_JOB_ACTIVE_STATUSES = new Set(["awaiting_upload", "scheduled", "processing"]);
+
+// Pending / past-due jobs first, then everything else, both oldest-scheduled first.
+function sortCloudJobs(jobs: CloudWorkerJob[]): CloudWorkerJob[] {
+  const now = Date.now();
+  return [...jobs].sort((a, b) => {
+    const aActive = CLOUD_JOB_ACTIVE_STATUSES.has(a.status);
+    const bActive = CLOUD_JOB_ACTIVE_STATUSES.has(b.status);
+    const aPastDue = aActive && new Date(a.scheduled_at).getTime() <= now;
+    const bPastDue = bActive && new Date(b.scheduled_at).getTime() <= now;
+    if (aPastDue !== bPastDue) return aPastDue ? -1 : 1;
+    if (aActive !== bActive) return aActive ? -1 : 1;
+    return new Date(a.scheduled_at).getTime() - new Date(b.scheduled_at).getTime();
+  });
+}
+
+function AccountSettingsRow({
+  account,
+  slotsPerDay,
+  onSave,
+}: {
+  account: CloudWorkerAccount;
+  slotsPerDay: number | null;
+  onSave: (payload: { dailyLimit: number; minGapMinutes: number; enabled: boolean }) => Promise<void>;
+}) {
+  const [dailyLimit, setDailyLimit] = useState(String(account.daily_limit));
+  const [minGapMinutes, setMinGapMinutes] = useState(String(account.min_gap_minutes));
+  const [enabled, setEnabled] = useState(account.enabled);
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+
+  const noHeadroom =
+    slotsPerDay !== null && Number.isFinite(Number(dailyLimit)) && Number(dailyLimit) <= slotsPerDay;
+
+  const save = async () => {
+    setBusy(true);
+    setMessage(null);
+    try {
+      await onSave({
+        dailyLimit: Number(dailyLimit),
+        minGapMinutes: Number(minGapMinutes),
+        enabled,
+      });
+      setMessage("Saved.");
+    } catch (err: unknown) {
+      setMessage(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <tr className="border-t border-border align-top">
+      <td className="whitespace-nowrap px-3 py-2 font-medium">{account.account_key}</td>
+      <td className="px-3 py-2">
+        <label className="flex items-center gap-2">
+          <input
+            type="checkbox"
+            checked={enabled}
+            onChange={(event) => setEnabled(event.target.checked)}
+          />
+          <span className="text-xs text-muted-foreground">enabled</span>
+        </label>
+      </td>
+      <td className="px-3 py-2">
+        <Input
+          type="number"
+          min={1}
+          max={20}
+          className="h-8 w-20"
+          value={dailyLimit}
+          onChange={(event) => setDailyLimit(event.target.value)}
+        />
+        {noHeadroom && (
+          <p className="mt-1 max-w-40 text-xs font-medium text-amber-500">
+            No headroom — delays become permanent.
+          </p>
+        )}
+      </td>
+      <td className="px-3 py-2">
+        <Input
+          type="number"
+          min={30}
+          className="h-8 w-24"
+          value={minGapMinutes}
+          onChange={(event) => setMinGapMinutes(event.target.value)}
+        />
+      </td>
+      <td className="px-3 py-2">
+        <Button size="sm" variant="outline" disabled={busy} onClick={save}>
+          Save
+        </Button>
+        {message && <p className="mt-1 text-xs text-muted-foreground">{message}</p>}
+      </td>
+    </tr>
+  );
+}
+
+function CloudPublisherControlPanel({
+  jobs,
+  jobsError,
+  accounts,
+  accountsError,
+  loading,
+  slotsPerDayByKey,
+  onRefresh,
+  onRunDue,
+  onForcePublish,
+  onCancel,
+  onSaveAccountSettings,
+}: {
+  jobs: CloudWorkerJob[];
+  jobsError: string | null;
+  accounts: CloudWorkerAccount[];
+  accountsError: string | null;
+  loading: boolean;
+  slotsPerDayByKey: Map<string, number>;
+  onRefresh: () => Promise<void>;
+  onRunDue: () => Promise<void>;
+  onForcePublish: (job: CloudWorkerJob) => Promise<void>;
+  onCancel: (job: CloudWorkerJob) => Promise<void>;
+  onSaveAccountSettings: (
+    accountKey: string,
+    payload: { dailyLimit: number; minGapMinutes: number; enabled: boolean },
+  ) => Promise<void>;
+}) {
+  const sorted = sortCloudJobs(jobs);
+
+  return (
+    <div className="space-y-4 rounded-lg border border-border bg-background/50 p-4">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <h3 className="font-semibold">Cloud Publisher Control</h3>
+          <p className="text-xs text-muted-foreground">
+            Worker-side job queue and account safety caps — direct control over the Cloudflare
+            publisher, separate from local scheduling.
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={loading}
+            onClick={() =>
+              void (async () => {
+                if (
+                  window.confirm(
+                    "Ask the Worker to process all due jobs right now (bypasses waiting for the next cron tick)?",
+                  )
+                ) {
+                  await onRunDue();
+                }
+              })()
+            }
+          >
+            Run due now
+          </Button>
+          <Button size="sm" variant="outline" disabled={loading} onClick={onRefresh}>
+            {loading ? "Refreshing..." : "Refresh"}
+          </Button>
+        </div>
+      </div>
+
+      {jobsError && <p className="text-sm text-red-500">Job queue unavailable: {jobsError}</p>}
+      <DashboardTable headers={["Account", "Slot (local)", "Worker status", "Attempts", "Gate / error", "Actions"]}>
+        {sorted.map((job) => (
+          <tr key={job.id} className="border-t border-border">
+            <td className="whitespace-nowrap px-3 py-2">{job.account_name ?? job.account_key}</td>
+            <td className="whitespace-nowrap px-3 py-2">{formatDate(job.scheduled_at)}</td>
+            <td className="px-3 py-2">{job.status}</td>
+            <td className="px-3 py-2">{job.attempts}</td>
+            <td className="max-w-xs truncate px-3 py-2" title={job.error_message ?? undefined}>
+              {job.error_message ?? "-"}
+            </td>
+            <td className="whitespace-nowrap px-3 py-2">
+              <div className="flex gap-2">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-7 px-2 text-xs"
+                  disabled={job.status !== "scheduled"}
+                  onClick={() => {
+                    if (
+                      window.confirm(
+                        "This bypasses the account's daily-limit/cooldown safety check and posts " +
+                          "immediately. It increases automation-flag risk. Continue?",
+                      )
+                    ) {
+                      void onForcePublish(job);
+                    }
+                  }}
+                >
+                  Force publish
+                </Button>
+                <Button
+                  size="sm"
+                  variant="destructive"
+                  className="h-7 px-2 text-xs"
+                  disabled={["published", "validated", "canceled"].includes(job.status)}
+                  onClick={() => {
+                    if (window.confirm("Cancel this job and delete its queued media?")) {
+                      void onCancel(job);
+                    }
+                  }}
+                >
+                  Cancel
+                </Button>
+              </div>
+            </td>
+          </tr>
+        ))}
+      </DashboardTable>
+      {!sorted.length && !jobsError && (
+        <p className="text-sm text-muted-foreground">No jobs on the Worker queue.</p>
+      )}
+
+      {accountsError && (
+        <p className="text-sm text-red-500">Worker accounts unavailable: {accountsError}</p>
+      )}
+      <DashboardTable headers={["Account", "Enabled", "Daily limit", "Min gap (min)", ""]}>
+        {accounts.map((account) => (
+          <AccountSettingsRow
+            key={account.account_key}
+            account={account}
+            slotsPerDay={slotsPerDayByKey.get(account.account_key) ?? null}
+            onSave={(payload) => onSaveAccountSettings(account.account_key, payload)}
+          />
+        ))}
+      </DashboardTable>
+      {!accounts.length && !accountsError && (
+        <p className="text-sm text-muted-foreground">No accounts registered on the Worker yet.</p>
+      )}
+    </div>
+  );
+}
+
 const SLOT_STATE_STYLE: Record<string, string> = {
   cloud: "border-indigo-500/40 bg-indigo-500/10 text-indigo-400",
   scheduled: "border-fuchsia-500/40 bg-fuchsia-500/10 text-fuchsia-400",
@@ -162,6 +401,25 @@ function slotStateLabel(slot: ScheduleCoverageSlot) {
 function slotStatusLabel(slot: ScheduleCoverageSlot) {
   const state = slotStateLabel(slot);
   return slot.timing === "late" ? `${state} · Late` : state;
+}
+
+// Short "Cloud · <reason>" hint for a gated/processing cloud slot; the full
+// Worker message stays available via the `title` attribute (see slotGateTitle).
+function slotGateHint(slot: ScheduleCoverageSlot): string | null {
+  if (slot.state !== "cloud") return null;
+  const status = (slot.cloud_status ?? "").toLowerCase();
+  const error = (slot.cloud_error ?? slot.note ?? "").toLowerCase();
+  if (status === "processing") return "Cloud · processing";
+  if (error.includes("daily limit")) return "Cloud · gated: daily limit";
+  if (error.includes("cooldown")) return "Cloud · gated: cooldown";
+  if (error.includes("disabled")) return "Cloud · gated: account disabled";
+  if (error) return "Cloud · gated";
+  if (status === "scheduled" || status === "validated") return "Cloud · queued";
+  return null;
+}
+
+function slotGateTitle(slot: ScheduleCoverageSlot): string | undefined {
+  return slot.cloud_error ?? slot.note ?? undefined;
 }
 
 function SlotActionsPopover({
@@ -473,12 +731,16 @@ function ScheduleCoveragePanel({
                       <strong>{slot.slot}</strong>
                       <span className="text-xs font-medium">{slotStatusLabel(slot)}</span>
                     </div>
-                    <p className="mt-1 truncate text-xs opacity-80" title={slot.note ?? undefined}>
+                    <p className="mt-1 truncate text-xs opacity-80" title={slotGateTitle(slot)}>
                       {slot.scheduled_at
                         ? `${new Date(slot.scheduled_at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })} · ${slot.job_title ?? `Job ${slot.job_id}`}`
                         : "No matching job"}
-                      {slot.state === "cloud" && slot.note ? ` — ${slot.note}` : ""}
                     </p>
+                    {slotGateHint(slot) && (
+                      <p className="truncate text-xs font-medium opacity-90" title={slotGateTitle(slot)}>
+                        {slotGateHint(slot)}
+                      </p>
+                    )}
                   </button>
                   {openSlot === slot.slot_at && (
                     <SlotActionsPopover
@@ -587,6 +849,11 @@ export function MultiAccountPublish({
   const [selectedAccountId, setSelectedAccountId] = useState<number | null>(() =>
     readStoredAccountId(),
   );
+  const [cloudJobs, setCloudJobs] = useState<CloudWorkerJob[]>([]);
+  const [cloudJobsError, setCloudJobsError] = useState<string | null>(null);
+  const [cloudAccounts, setCloudAccounts] = useState<CloudWorkerAccount[]>([]);
+  const [cloudAccountsError, setCloudAccountsError] = useState<string | null>(null);
+  const [cloudControlLoading, setCloudControlLoading] = useState(false);
 
   const syncCloudJobs = useCallback(async () => {
     try {
@@ -638,20 +905,42 @@ export function MultiAccountPublish({
       setMessage(err instanceof Error ? err.message : String(err));
     }
   }, [syncCloudJobs]);
+  const loadCloudControl = useCallback(async () => {
+    setCloudControlLoading(true);
+    try {
+      const result = await bridge.dashboardCloudJobs();
+      setCloudJobs(result.jobs);
+      setCloudJobsError(null);
+    } catch (err: unknown) {
+      setCloudJobsError(err instanceof Error ? err.message : String(err));
+    }
+    try {
+      const result = await bridge.dashboardCloudAccounts();
+      setCloudAccounts(result.accounts);
+      setCloudAccountsError(null);
+    } catch (err: unknown) {
+      setCloudAccountsError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setCloudControlLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     const timer = window.setTimeout(() => {
       void load();
       void loadHealth();
       void loadCoverage();
+      void loadCloudControl();
     }, 0);
     return () => window.clearTimeout(timer);
-  }, [load, loadCoverage, loadHealth]);
+  }, [load, loadCloudControl, loadCoverage, loadHealth]);
 
   // Auto-refresh cloud sync + coverage every 30s (and on window focus) so
   // posted slots flip from "cloud" to "posted" without a manual Refresh click.
   useAutoRefresh(() => {
     void load();
     void loadCoverage();
+    void loadCloudControl();
   }, 30000);
 
   const run = async (action: () => Promise<unknown>, success: string) => {
@@ -683,6 +972,22 @@ export function MultiAccountPublish({
         )
       : [];
 
+  // Worker account_key -> configured slots/day, joined via account_name (the same
+  // name-matching convention already used above for `visibleJobs`/`fillableJobs`) --
+  // the Worker itself has no notion of "slots/day", only local Account.upload_schedule_slots.
+  const slotsPerDayByKey = new Map<string, number>();
+  if (coverage) {
+    for (const cloudJob of cloudJobs) {
+      if (!cloudJob.account_name || slotsPerDayByKey.has(cloudJob.account_key)) continue;
+      const match = coverage.accounts.find(
+        (account) => account.account_name === cloudJob.account_name,
+      );
+      if (match) {
+        slotsPerDayByKey.set(cloudJob.account_key, match.daily_target);
+      }
+    }
+  }
+
   return (
     <section className="space-y-4 rounded-xl border bg-card p-5">
       <div>
@@ -696,6 +1001,62 @@ export function MultiAccountPublish({
         error={healthError}
         loading={healthLoading}
         onRefresh={loadHealth}
+      />
+      <CloudPublisherControlPanel
+        jobs={cloudJobs}
+        jobsError={cloudJobsError}
+        accounts={cloudAccounts}
+        accountsError={cloudAccountsError}
+        loading={cloudControlLoading}
+        slotsPerDayByKey={slotsPerDayByKey}
+        onRefresh={loadCloudControl}
+        onRunDue={async () => {
+          try {
+            await bridge.dashboardRunCloudDue();
+            setMessage("Asked the Worker to process due jobs.");
+          } catch (err: unknown) {
+            setMessage(err instanceof Error ? err.message : String(err));
+          }
+          await Promise.all([loadCloudControl(), load(), loadCoverage()]);
+        }}
+        onForcePublish={async (job) => {
+          if (job.upload_job_id === null) {
+            setMessage("This job has no linked local reel to force-publish.");
+            return;
+          }
+          await run(
+            () => bridge.dashboardForcePublishCloudJob(job.upload_job_id!),
+            "Forced publish — bypassing the safety cooldown.",
+          );
+          await loadCloudControl();
+        }}
+        onCancel={async (job) => {
+          await run(() => bridge.dashboardCancelCloudJob(job.id), "Job canceled.");
+          await loadCloudControl();
+        }}
+        onSaveAccountSettings={async (accountKey, payload) => {
+          // The Worker only knows `account_key`; resolve it back to a local
+          // account id via the account name shared with a job for this key (the
+          // same name-matching convention used for slotsPerDayByKey above).
+          const accountName = cloudJobs.find((job) => job.account_key === accountKey)?.account_name;
+          const localAccountId = accountName
+            ? coverage?.accounts.find((candidate) => candidate.account_name === accountName)
+                ?.account_id
+            : undefined;
+          if (localAccountId === undefined) {
+            throw new Error(
+              "Could not resolve this Worker account to a local account id " +
+                "(no recent job to match by name yet). Edit it from Account Manager instead.",
+            );
+          }
+          await bridge.dashboardUpdateCloudAccountSettings(
+            localAccountId,
+            payload.dailyLimit,
+            payload.minGapMinutes,
+            payload.enabled,
+          );
+          await loadCloudControl();
+        }}
       />
       <ScheduleCoveragePanel
         coverage={coverage}

@@ -180,6 +180,13 @@ def account_stats(active_account_id: int, *, now: dt.datetime | None = None) -> 
     return {"niche": accounts[0].niche, "accounts": rows}
 
 
+# Review states set by the two Reject actions in Processing (reject_item ->
+# "rejected", reject_item_globally -> "blocked"). A rejected clip must never
+# reappear as publishable — reject leaves its UploadJob row intact, so filter on
+# the item's review_state here instead.
+_REJECTED_REVIEW_STATES = {"rejected", "blocked"}
+
+
 def list_global_publish_jobs() -> dict:
     """Recent exported jobs plus every ready/scheduled job, matching PyQt."""
     now = dt.datetime.now(dt.timezone.utc)
@@ -199,6 +206,11 @@ def list_global_publish_jobs() -> dict:
         visible = []
         seen_paths: set[str] = set()
         for job in jobs:
+            # A clip rejected in Processing keeps its UploadJob row, so drop it
+            # here — otherwise it reappears in the queue and the slot-fill picker.
+            item = job.download_item
+            if item is not None and (item.review_state or "").lower() in _REJECTED_REVIEW_STATES:
+                continue
             path = Path(job.processed_path)
             status = (job.status or "").lower()
             created = _aware(job.created_at)
@@ -404,6 +416,12 @@ def schedule_coverage(*, days: int = 2, now: dt.datetime | None = None) -> dict:
                         else None,
                         "scheduled_at": matched[0].isoformat() if matched else None,
                         "note": job.error_message if job else None,
+                        # Raw Worker job status/error (see
+                        # services/publishing.sync_cloud_jobs), synced on every
+                        # poll -- lets the UI show a short "Cloud · <reason>"
+                        # gate hint distinct from the local job status/note.
+                        "cloud_status": job.cloud_status if job else None,
+                        "cloud_error": job.cloud_error if job else None,
                         "timing": (
                             "on_time"
                             if matched

@@ -5,7 +5,7 @@ import threading
 
 import pytest
 
-from nicheflow_studio.app import webview_app
+from nicheflow_studio.app import processing_bridge, webview_app
 from nicheflow_studio.app.processing_bridge import ProcessingBridge
 from nicheflow_studio.db.models import Account, DownloadItem
 from nicheflow_studio.db.session import get_session
@@ -164,13 +164,22 @@ def test_bridge_get_crop_preview_returns_media_url(
     monkeypatch.setenv("NICHEFLOW_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setattr(
         "nicheflow_studio.app.processing_bridge.export_svc.crop_preview_frame",
-        lambda _item_id: preview,
+        lambda _item_id, _at=None: preview,
+    )
+    monkeypatch.setattr(
+        "nicheflow_studio.app.processing_bridge.export_svc.source_duration_seconds",
+        lambda _item_id: 12.0,
     )
 
     result = ProcessingBridge().get_crop_preview(1)
 
     assert result["ok"] is True
-    assert result["data"]["preview_url"].endswith("/processed/crop-previews/item-1.jpg")
+    # URL carries a ?v=<mtime> cache-buster, so match the path portion.
+    assert result["data"]["preview_url"].split("?")[0].endswith(
+        "/processed/crop-previews/item-1.jpg"
+    )
+    # Initial load (no timestamp) returns the clip duration for the scrubber.
+    assert result["data"]["duration_seconds"] == 12.0
 
 
 def test_bridge_save_then_get_latest_revision() -> None:
@@ -517,6 +526,69 @@ def test_bridge_start_auto_schedule_for_publish_runs_in_background(
     assert snapshot["status"] == "succeeded"
     assert snapshot["result"]["status"] == "cloud"
     assert calls == [12]
+
+
+# --------------------------------------------------------------------------- #
+# OS clipboard (navigator.clipboard needs document focus; the bridge does not)
+# --------------------------------------------------------------------------- #
+
+
+def test_bridge_set_clipboard_text_writes_os_clipboard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, str] = {}
+    monkeypatch.setattr(
+        processing_bridge.clipboard, "set_text", lambda text: captured.__setitem__("text", text)
+    )
+    bridge = ProcessingBridge()
+
+    result = bridge.set_clipboard_text("prompt ✨\nline two")
+
+    assert result == {"ok": True, "data": {"copied": True}}
+    assert captured["text"] == "prompt ✨\nline two"
+
+
+def test_bridge_set_clipboard_text_none_becomes_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, str] = {}
+    monkeypatch.setattr(
+        processing_bridge.clipboard, "set_text", lambda text: captured.__setitem__("text", text)
+    )
+    bridge = ProcessingBridge()
+
+    result = bridge.set_clipboard_text(None)
+
+    assert result["ok"] is True
+    assert captured["text"] == ""
+
+
+def test_bridge_get_clipboard_text_reads_os_clipboard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(processing_bridge.clipboard, "get_text", lambda: "pasted reply")
+    bridge = ProcessingBridge()
+
+    result = bridge.get_clipboard_text()
+
+    assert result == {"ok": True, "data": {"text": "pasted reply"}}
+
+
+def test_bridge_clipboard_error_surfaces_as_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def boom(_text: str) -> None:
+        raise processing_bridge.clipboard.ClipboardError(
+            "The Windows clipboard is busy. Try again."
+        )
+
+    monkeypatch.setattr(processing_bridge.clipboard, "set_text", boom)
+    bridge = ProcessingBridge()
+
+    result = bridge.set_clipboard_text("x")
+
+    assert result["ok"] is False
+    assert "busy" in result["error"]
 
 
 # --------------------------------------------------------------------------- #

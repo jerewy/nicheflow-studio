@@ -134,6 +134,21 @@ def test_global_publish_jobs_keeps_failed_jobs_visible_past_cutoff(tmp_path: Pat
     assert result["failed"] == 1
 
 
+def test_global_publish_jobs_hides_rejected_items(tmp_path: Path) -> None:
+    """A clip rejected in Processing keeps its UploadJob row; it must not reappear
+    in the queue or the slot-fill picker that reads from it (both reject states)."""
+    for state in ("rejected", "blocked"):
+        job_id = _seed_job(tmp_path)
+        with get_session() as session:
+            job = session.get(UploadJob, job_id)
+            session.get(DownloadItem, job.download_item_id).review_state = state
+            session.commit()
+
+        result = publishing_dashboard.list_global_publish_jobs()
+
+        assert all(row["id"] != job_id for row in result["jobs"]), state
+
+
 def test_mark_ready_clears_failure_state(tmp_path: Path) -> None:
     job_id = _seed_job(tmp_path, status="failed")
     with get_session() as session:
@@ -255,6 +270,42 @@ def test_schedule_coverage_counts_late_job_before_next_slot_as_filled() -> None:
     assert account["filled"] == 1
     assert slot["state"] == "cloud"
     assert slot["timing"] == "late"
+
+
+def test_schedule_coverage_slot_exposes_cloud_status_and_error() -> None:
+    """A gate-blocked cloud job's raw Worker status/error (synced by
+    services/publishing.sync_cloud_jobs) must be exposed on its slot so the UI
+    can show why it's stuck instead of a blank 'Cloud' chip."""
+    now = dt.datetime(2026, 6, 15, 8, 0, tzinfo=dt.timezone.utc)
+    with get_session() as session:
+        account = Account(
+            name="History",
+            platform="instagram",
+            upload_timezone="Asia/Jakarta",
+            upload_schedule_slots="09:00, 13:00",
+        )
+        session.add(account)
+        session.flush()
+        session.add(
+            UploadJob(
+                account_id=account.id,
+                processed_path="C:/gated.mp4",
+                status="cloud",
+                cloud_status="scheduled",
+                cloud_error="daily limit reached (4/4 in 24h)",
+                scheduled_at=dt.datetime(2026, 6, 15, 6, 9),
+            )
+        )
+        session.commit()
+        account_id = account.id
+
+    result = publishing_dashboard.schedule_coverage(days=1, now=now)
+
+    account = next(row for row in result["accounts"] if row["account_id"] == account_id)
+    slot = account["days"][0]["slots"][1]
+    assert slot["state"] == "cloud"
+    assert slot["cloud_status"] == "scheduled"
+    assert slot["cloud_error"] == "daily limit reached (4/4 in 24h)"
 
 
 def test_schedule_coverage_slot_exposes_library_item_id() -> None:

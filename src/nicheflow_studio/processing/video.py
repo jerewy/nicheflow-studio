@@ -1049,8 +1049,15 @@ def sample_video_frame_data_urls(input_path: Path, *, max_frames: int = 5) -> li
     return sampled_urls
 
 
-def extract_video_preview_frame(input_path: Path, output_path: Path) -> Path:
-    """Extract a middle-frame JPEG suitable for lightweight UI previews."""
+def extract_video_preview_frame(
+    input_path: Path, output_path: Path, at_seconds: float | None = None
+) -> Path:
+    """Extract a still JPEG suitable for lightweight UI previews.
+
+    Defaults to the middle frame; pass ``at_seconds`` to grab a specific moment
+    (used by the crop editor's scrubber). The timestamp is clamped inside the
+    clip so an out-of-range request still yields a frame instead of failing.
+    """
     resolved_input = input_path.expanduser().resolve()
     resolved_output = output_path.expanduser().resolve()
     ffmpeg_path = ffmpeg_binary()
@@ -1060,8 +1067,14 @@ def extract_video_preview_frame(input_path: Path, output_path: Path) -> Path:
         raise FileNotFoundError(f"Video file not found: {resolved_input}")
 
     probe = probe_video(resolved_input)
-    timestamps = _sample_timestamps(probe, count=1)
-    timestamp = timestamps[0] if timestamps else 0.0
+    if at_seconds is None:
+        timestamps = _sample_timestamps(probe, count=1)
+        timestamp = timestamps[0] if timestamps else 0.0
+    else:
+        # Stop just short of EOF; seeking exactly to the end can yield no frame.
+        duration = probe.duration_seconds
+        upper = max(duration - 0.05, 0.0) if duration else max(at_seconds, 0.0)
+        timestamp = min(max(at_seconds, 0.0), upper)
     resolved_output.parent.mkdir(parents=True, exist_ok=True)
     _extract_frame_image(ffmpeg_path, resolved_input, timestamp, resolved_output)
     return resolved_output

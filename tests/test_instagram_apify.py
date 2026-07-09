@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 
+from nicheflow_studio.core import apify_usage
 from nicheflow_studio.scraper import instagram_apify
 
 
@@ -64,7 +65,10 @@ def test_scrape_instagram_urls_apify_reads_actor_dataset(monkeypatch) -> None:
                         "likesCount": 120,
                         "commentsCount": 12,
                         "videoDuration": 9,
-                    }
+                    },
+                    # An error stub: no shortCode, no URL. Unusable as a
+                    # candidate but still a billed dataset row.
+                    {"error": "Post not found"},
                 ]
             )
 
@@ -95,6 +99,8 @@ def test_scrape_instagram_urls_apify_reads_actor_dataset(monkeypatch) -> None:
     assert candidates[0].view_count == 1000
     assert candidates[0].like_count == 120
     assert candidates[0].comment_count == 12
+    # Usage is recorded per billed dataset row (2), not per usable candidate (1).
+    assert apify_usage.monthly_apify_usage()["used"] == 2
 
 
 def test_scrape_instagram_source_apify_uses_since_and_rewrites_source_url(monkeypatch) -> None:
@@ -174,3 +180,5 @@ def test_scrape_instagram_source_apify_uses_since_and_rewrites_source_url(monkey
     assert candidates[0].source_url == "https://www.instagram.com/reel/SOURCE1/"
     assert candidates[0].video_id == "SOURCE1"
     assert candidates[0].view_count == 1000
+    # Both rows were billed even though the age filter dropped the old one.
+    assert apify_usage.monthly_apify_usage()["used"] == 2

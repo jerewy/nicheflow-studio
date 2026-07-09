@@ -91,9 +91,10 @@ class Account(Base):
     upload_default_privacy: Mapped[str | None] = mapped_column(String(32), nullable=True)
     upload_schedule_slots: Mapped[str | None] = mapped_column(String(512), nullable=True)
     # Minimum minutes between two posts on THIS account, used by the scheduler's
-    # collision guard. None -> the module default (SAME_ACCOUNT_MIN_GAP_HOURS, 4h).
-    # Lower it (e.g. 210) for accounts running 6/day whose slots sit exactly 4h
-    # apart, so jitter doesn't push an adjacent slot inside the 4h window.
+    # collision guard. None -> the module default
+    # (DEFAULT_SAME_ACCOUNT_MIN_GAP_MINUTES, 210 = 3.5h), which already clears a
+    # 4h-apart 6/day layout; set an explicit override only for non-standard
+    # spacing.
     upload_min_gap_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     daily_posts_target: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Rolling distribution backlog kept ready per account: auto-distribute / the
@@ -202,6 +203,11 @@ class UploadJob(Base):
     posted_shares: Mapped[int | None] = mapped_column(Integer, nullable=True)
     content_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error_message: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    # Raw Worker job status/error, synced on every poll (see
+    # services/publishing.sync_cloud_jobs) so the dashboard can show *why* a
+    # gate-blocked job is still 'cloud' instead of looking frozen.
+    cloud_status: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    cloud_error: Mapped[str | None] = mapped_column(String(1024), nullable=True)
 
     account: Mapped[Account] = relationship(back_populates="upload_jobs")
     download_item: Mapped[DownloadItem | None] = relationship(back_populates="upload_jobs")

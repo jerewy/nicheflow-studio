@@ -1,9 +1,12 @@
 import datetime as dt
 
+import pytest
+
 from nicheflow_studio.db.models import AccountPostMetric, Account, DownloadItem
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.processing import smart_drafts
 from nicheflow_studio.services import draft_handoff, draft_revisions, library
+from nicheflow_studio.services.draft_revisions import DraftRevisionError
 
 
 def _make_item() -> int:
@@ -370,6 +373,53 @@ def test_build_account_batch_chat_prompt_uses_measured_winners_and_title_length(
     assert "Option 1 SHORT" in prompt
 
 
+def test_build_chat_prompt_requires_niche_fit_check() -> None:
+    item_id = _make_item()
+
+    prompt = draft_handoff.build_chat_prompt(item_id)
+
+    assert "Niche fit check" in prompt
+    assert "account niche ('history')" in prompt
+    assert "Niche check: OFF-NICHE, <one short reason>" in prompt
+
+
+def test_build_account_batch_chat_prompt_requires_niche_fit_check() -> None:
+    account_id, item_ids = _make_account_items(2)
+
+    prompt = draft_handoff.build_account_batch_chat_prompt(account_id, item_ids)
+
+    assert "Niche fit check (per reel, MANDATORY)" in prompt
+    assert "account niche ('history')" in prompt
+    assert "Niche check: OFF-NICHE, <one short reason>" in prompt
+
+
+def test_import_account_batch_draft_ignores_niche_check_lines() -> None:
+    # The prompt asks the model to prepend "Niche check: ..." to every block;
+    # the importer must treat it as preamble, never as title/caption content.
+    _account_id, item_ids = _make_account_items(2)
+    first, second = item_ids
+
+    result = draft_handoff.import_account_batch_draft(
+        """===== REEL 1 =====
+Niche check: fits
+Title Option 1: First title
+Caption Option 1: First caption
+
+===== REEL 2 =====
+Niche check: OFF-NICHE, soccer manufacturing is not history
+Title Option 1: Second title
+Caption Option 1: Second caption
+""",
+        item_ids,
+    )
+
+    assert result == {"imported": [first, second], "failed": [], "unmatched": []}
+    assert draft_revisions.latest_revision(first).title_options == ["First title"]
+    second_revision = draft_revisions.latest_revision(second)
+    assert second_revision.title_options == ["Second title"]
+    assert second_revision.caption_options == ["Second caption"]
+
+
 def test_import_account_batch_draft_routes_by_reel_number_when_shuffled() -> None:
     _account_id, item_ids = _make_account_items(2)
     first, second = item_ids
@@ -441,6 +491,76 @@ Caption Option 1: Unknown caption
     assert result["unmatched"] == [third]
     assert draft_revisions.latest_revision(first).title_options == ["First title"]
     assert draft_revisions.latest_revision(second) is None
+
+
+def test_import_account_batch_draft_finds_header_glued_to_preamble() -> None:
+    # Real reply shape: the model glued its intro sentence to the first
+    # delimiter with no newline ("...verifiable claims.===== REEL 1 (#145)
+    # ====="). A line-start-only header match misses it and the first reel
+    # silently comes back as "unmatched" despite a correctly formatted block.
+    _account_id, item_ids = _make_account_items(2)
+    first, second = item_ids
+
+    result = draft_handoff.import_account_batch_draft(
+        """I'll fact-check each reel before drafting.===== REEL 1 =====
+Title Option 1: First title
+Caption Option 1: First caption
+
+===== REEL 2 =====
+Title Option 1: Second title
+Caption Option 1: Second caption
+""",
+        item_ids,
+    )
+
+    assert result == {"imported": [first, second], "failed": [], "unmatched": []}
+    assert draft_revisions.latest_revision(first).title_options == ["First title"]
+    assert draft_revisions.latest_revision(second).title_options == ["Second title"]
+
+
+def test_import_account_batch_draft_rejects_the_prepared_prompt() -> None:
+    # The real failure: Import reads the clipboard, and the clipboard still held
+    # the PROMPT that "Prepare batch" copied (the user never copied the reply).
+    # The prompt's reel headers route every item to a block with no
+    # Title/Caption sections, so without the guard each item fails with the
+    # generic "No 'Title Option'..." error and no hint at the actual mistake.
+    account_id, item_ids = _make_account_items(2)
+
+    prompt = draft_handoff.build_account_batch_chat_prompt(account_id, item_ids, {})
+
+    with pytest.raises(DraftRevisionError) as excinfo:
+        draft_handoff.import_account_batch_draft(prompt, item_ids)
+
+    message = str(excinfo.value)
+    assert "PROMPT" in message
+    assert "reply" in message
+
+
+def test_import_pasted_draft_rejects_the_prepared_prompt() -> None:
+    # Same clipboard mistake on the single-item "Paste Draft" path.
+    item_id = _make_item()
+
+    prompt = draft_handoff.build_chat_prompt(item_id)
+
+    with pytest.raises(DraftRevisionError) as excinfo:
+        draft_handoff.import_pasted_draft(item_id, prompt)
+
+    assert "PROMPT" in str(excinfo.value)
+
+
+def test_batch_frames_names_the_reel_when_a_video_file_is_missing() -> None:
+    _account_id, item_ids = _make_account_items(1)
+    (only,) = item_ids
+    with get_session() as session:
+        item = session.get(DownloadItem, only)
+        item.file_path = None
+        session.commit()
+
+    with pytest.raises(DraftRevisionError) as excinfo:
+        draft_handoff.batch_frames(item_ids)
+
+    assert f"Reel 1 (item {only})" in str(excinfo.value)
+    assert "no downloaded video file" in str(excinfo.value)
 
 
 def test_import_account_batch_draft_routes_by_echoed_id_over_reel_number() -> None:

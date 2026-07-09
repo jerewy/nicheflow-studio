@@ -15,6 +15,7 @@ will feed them when the React style controls land.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Callable
 
@@ -22,9 +23,12 @@ from nicheflow_studio.core.paths import processed_dir
 from nicheflow_studio.db.models import Account, DownloadItem
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.processing import video
+from nicheflow_studio.processing.watermark import replace_detected_watermark
 from nicheflow_studio.services import publishing, library
 from nicheflow_studio.services.errors import ServiceError
 from nicheflow_studio.services.processing_workflow import render_config
+
+logger = logging.getLogger(__name__)
 
 ProgressFn = Callable[[float, str], None]
 
@@ -99,8 +103,13 @@ def get_crop_override(item_id: int) -> dict | None:
         return _parse_crop_override(item.crop_override)
 
 
-def crop_preview_frame(item_id: int) -> Path:
-    """Return a cached still frame used by the manual crop editor."""
+def crop_preview_frame(item_id: int, at_seconds: float | None = None) -> Path:
+    """Return a cached still frame used by the manual crop editor.
+
+    ``at_seconds`` picks a specific moment (the crop editor's scrubber); ``None``
+    keeps the default middle frame. Each timestamp caches to its own file so
+    scrubbing back and forth stays cheap.
+    """
     with get_session() as session:
         item = session.get(DownloadItem, item_id)
         if item is None:
@@ -112,13 +121,35 @@ def crop_preview_frame(item_id: int) -> Path:
     if not input_path.exists():
         raise ExportError(f"Video file not found: {input_path}")
 
-    preview_path = processed_dir() / "crop-previews" / f"item-{item_id}.jpg"
+    if at_seconds is None:
+        name = f"item-{item_id}.jpg"
+    else:
+        name = f"item-{item_id}-t{int(max(at_seconds, 0.0) * 1000)}.jpg"
+    preview_path = processed_dir() / "crop-previews" / name
     if not preview_path.exists() or preview_path.stat().st_mtime < input_path.stat().st_mtime:
         try:
-            video.extract_video_preview_frame(input_path, preview_path)
+            video.extract_video_preview_frame(input_path, preview_path, at_seconds)
         except Exception as exc:  # noqa: BLE001 - surface FFmpeg/probe failures as UI errors
             raise ExportError(f"Could not create crop preview: {exc}") from exc
     return preview_path
+
+
+def source_duration_seconds(item_id: int) -> float | None:
+    """Duration of an item's source clip, for the crop editor's scrubber range.
+
+    Returns ``None`` when the item has no downloaded file yet or the duration
+    can't be probed, so the UI simply hides the scrubber instead of failing.
+    """
+    with get_session() as session:
+        item = session.get(DownloadItem, item_id)
+        if item is None:
+            raise ExportError(f"No download item with id {item_id}.")
+        if not item.file_path:
+            return None
+        input_path = Path(item.file_path).expanduser().resolve()
+    if not input_path.exists():
+        return None
+    return video.probe_video(input_path).duration_seconds
 
 
 def save_crop_override(item_id: int, rect: dict) -> dict:
@@ -142,6 +173,45 @@ def clear_crop_override(item_id: int) -> dict:
         item.crop_override = None
         session.commit()
         return {"item_id": item_id, "crop_override": None}
+
+
+def _replace_watermark_best_effort(output_path: Path, replacement_handle: str) -> dict:
+    """Cover a foreign @handle watermark on the rendered reel with the publishing
+    account's own handle.
+
+    Best-effort, mirroring the legacy PyQt integration in
+    ``app/main_window.py``: any failure — no detection, missing handle, an
+    exception in the OCR/FFmpeg pipeline — leaves the rendered file untouched and
+    only reports why, so watermarking NEVER fails an export. When a covered file
+    is produced it atomically replaces the rendered output at the same path.
+    """
+    status = {
+        "watermark_replaced": False,
+        "watermark_detected_text": None,
+        "watermark_skipped_reason": None,
+    }
+    if not replacement_handle:
+        # No account handle to stamp — skip before the (expensive) detection pass.
+        status["watermark_skipped_reason"] = "no publishing handle set"
+        return status
+    try:
+        temp_output = output_path.with_stem(output_path.stem + "_watermark")
+        replacement = replace_detected_watermark(
+            output_path,
+            replacement_text=replacement_handle,
+            output_path=temp_output,
+        )
+        status["watermark_skipped_reason"] = replacement.skipped_reason
+        status["watermark_detected_text"] = (
+            replacement.region.text if replacement.region is not None else None
+        )
+        if replacement.output_path is not None:
+            Path(replacement.output_path).replace(output_path)
+            status["watermark_replaced"] = True
+    except Exception:  # noqa: BLE001 - watermarking is a best-effort extra
+        logger.exception("Watermark replacement failed for %s", output_path)
+        status["watermark_skipped_reason"] = "watermark step failed"
+    return status
 
 
 def export_item(item_id: int, *, progress: ProgressFn | None = None) -> dict:
@@ -175,6 +245,9 @@ def export_item(item_id: int, *, progress: ProgressFn | None = None) -> dict:
         input_path = Path(item.file_path)
         title_text = (item.title_draft or item.title or "").strip() or None
         override = _parse_crop_override(item.crop_override)
+        # The publishing account's own @handle stamps over any foreign watermark.
+        account = session.get(Account, item.account_id) if item.account_id is not None else None
+        watermark_handle = (account.instagram_handle or "").strip() if account is not None else ""
 
     resolved_input = input_path.expanduser()
     if not resolved_input.exists():
@@ -210,6 +283,9 @@ def export_item(item_id: int, *, progress: ProgressFn | None = None) -> dict:
         title_line_gap_scale=render.get("line_gap_scale"),
     )
 
+    report(0.85, "Covering watermark…")
+    watermark_status = _replace_watermark_best_effort(result_path, watermark_handle)
+
     report(0.9, "Saving…")
     auto_schedule_on_export = False
     with get_session() as session:
@@ -220,7 +296,7 @@ def export_item(item_id: int, *, progress: ProgressFn | None = None) -> dict:
             account = session.get(Account, item.account_id) if item.account_id is not None else None
             auto_schedule_on_export = bool(account and account.auto_schedule_on_export)
 
-    result = {"item_id": item_id, "processed_path": str(result_path)}
+    result = {"item_id": item_id, "processed_path": str(result_path), **watermark_status}
     if auto_schedule_on_export:
         try:
             result["scheduled_publish"] = publishing.auto_schedule_for_publish(item_id)

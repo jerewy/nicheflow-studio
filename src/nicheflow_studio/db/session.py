@@ -330,6 +330,10 @@ def _ensure_compatibility() -> None:
             connection.execute(text("ALTER TABLE upload_jobs ADD COLUMN posted_shares INTEGER"))
         if "content_type" not in upload_job_columns:
             connection.execute(text("ALTER TABLE upload_jobs ADD COLUMN content_type VARCHAR(64)"))
+        if "cloud_status" not in upload_job_columns:
+            connection.execute(text("ALTER TABLE upload_jobs ADD COLUMN cloud_status VARCHAR(64)"))
+        if "cloud_error" not in upload_job_columns:
+            connection.execute(text("ALTER TABLE upload_jobs ADD COLUMN cloud_error VARCHAR(1024)"))
 
         candidate_columns = {
             column["name"] for column in inspect(connection).get_columns("scrape_candidates")

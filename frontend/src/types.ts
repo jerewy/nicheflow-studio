@@ -106,6 +106,12 @@ export interface ExportResult {
   item_id: number;
   processed_path: string;
   warning?: string;
+  // Best-effort watermark cover (docs/SOURCING_POOLING_PLAN.md): a foreign
+  // @handle found on the rendered reel is covered with the account's own handle.
+  // Never fails the export; when nothing is covered these report why.
+  watermark_replaced?: boolean;
+  watermark_detected_text?: string | null;
+  watermark_skipped_reason?: string | null;
   scheduled_publish?: QueueResult & {
     schedule_path?: string;
     message?: string;
@@ -407,6 +413,7 @@ export type RightsConfidence =
   | "meme"
   | "tv_moment"
   | "broadcast_sport"
+  | "news_broadcast"
   | "unknown";
 
 export interface PoolItemPreview {
@@ -481,6 +488,11 @@ export interface ScheduleCoverageSlot {
   // Reason the Worker hasn't posted a 'cloud' job yet (e.g. same-account
   // cooldown), or null when there's nothing to report.
   note: string | null;
+  // Raw Worker job status/error, synced on every poll (services/publishing.
+  // sync_cloud_jobs) -- lets a 'cloud' slot show a short gate reason distinct
+  // from `note` (same underlying value, kept for backward compatibility).
+  cloud_status: string | null;
+  cloud_error: string | null;
   timing: "on_time" | "late" | null;
 }
 
@@ -537,6 +549,45 @@ export interface CloudPublisherHealth {
     scheduled_past_due: number;
     oldest_scheduled_at: string | null;
   };
+}
+
+/** One Worker publish job (Cloudflare `publish_jobs` row), joined to the local
+ * account name where the account is cloud-mapped and registered. */
+export interface CloudWorkerJob {
+  id: string;
+  external_id: string;
+  account_key: string;
+  account_name: string | null;
+  scheduled_at: string;
+  status: string;
+  attempts: number;
+  meta_container_id: string | null;
+  meta_media_id: string | null;
+  error_message: string | null;
+  published_at: string | null;
+  // Local UploadJob.id parsed from `external_id` (`nf-<id>-...`), or null for
+  // jobs that don't follow that convention.
+  upload_job_id: number | null;
+}
+
+export interface CloudWorkerJobsResult {
+  jobs: CloudWorkerJob[];
+  publish_mode: "disabled" | "validate" | "live" | null;
+}
+
+export interface CloudWorkerAccount {
+  account_key: string;
+  instagram_user_id: string;
+  token_secret_name: string;
+  enabled: boolean;
+  daily_limit: number;
+  min_gap_minutes: number;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface CloudWorkerAccountsResult {
+  accounts: CloudWorkerAccount[];
 }
 
 export interface DashboardAccountStatsRow {

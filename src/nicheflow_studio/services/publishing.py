@@ -40,6 +40,12 @@ _ITEM_LIST_LIMIT = 50
 # auto-scheduling a new post and when deferring a due post that would otherwise
 # land too soon after the account's last post (reach cannibalization / bot tell).
 SAME_ACCOUNT_MIN_GAP_HOURS = 4
+# Default gap when an account sets no override. Deliberately below a 4h slot
+# spacing (240): the collision guard is inclusive and jitter-widened, so a flat
+# 240 default rejects the *adjacent* slot of a 6/day-at-4h account and silently
+# halves its cadence. 210 (3.5h) clears a 4h slot with room for the 15m jitter
+# while still rejecting genuinely-too-close slots (e.g. a 2h gap stays blocked).
+DEFAULT_SAME_ACCOUNT_MIN_GAP_MINUTES = 210
 _CLOUD_HANDOFF_LOCKS: dict[int, threading.Lock] = {}
 _CLOUD_HANDOFF_LOCKS_GUARD = threading.Lock()
 # Bulk exports run one JobManager thread per item, so two auto-schedules for the
@@ -118,13 +124,16 @@ def account_min_gap_minutes(account: Account) -> int:
     """Minimum minutes between two posts on THIS account.
 
     Uses the account's ``upload_min_gap_minutes`` override when set, otherwise the
-    module default (``SAME_ACCOUNT_MIN_GAP_HOURS``). Accounts running 6/day with
-    slots exactly 4h apart need this below 240 (e.g. 210) so the scheduler's
-    collision guard doesn't reject an adjacent slot once jitter is applied.
+    module default (``DEFAULT_SAME_ACCOUNT_MIN_GAP_MINUTES``). The default sits
+    below a 4h slot spacing on purpose: an account running 6/day with slots
+    exactly 4h apart would otherwise have every adjacent slot rejected by the
+    scheduler's (inclusive, jitter-widened) collision guard and silently post at
+    half cadence. It still comfortably rejects genuinely-too-close slots (e.g. a
+    2h gap), preserving the reach-cannibalization / bot-tell guard.
     """
     value = account.upload_min_gap_minutes
     if value is None or value <= 0:
-        return SAME_ACCOUNT_MIN_GAP_HOURS * 60
+        return DEFAULT_SAME_ACCOUNT_MIN_GAP_MINUTES
     return int(value)
 
 
@@ -621,6 +630,52 @@ def force_publish_cloud_job(job_id: int) -> dict:
         raise PublishError(f"Force publish failed: {exc}") from exc
 
 
+def list_cloud_jobs() -> dict:
+    """All Worker publish jobs, joined to local account names for display.
+
+    Thin wrapper over :func:`cloud_publisher.list_jobs` for the Cloud Publisher
+    Control panel -- adds ``account_name`` (via :func:`cloud_publisher.
+    cloud_publish_map`, local account id -> Worker ``account_key``) and, when the
+    job's ``external_id`` matches this app's ``nf-<local id>-...`` convention, the
+    local ``upload_job_id`` so the panel can offer force-publish/cancel actions.
+    """
+    from nicheflow_studio.services import cloud_publisher
+
+    if not cloud_publisher.is_configured():
+        return {"jobs": [], "publish_mode": None}
+    key_to_name: dict[str, str] = {}
+    with get_session() as session:
+        accounts = session.scalars(select(Account)).all()
+        id_to_name = {account.id: account.name for account in accounts}
+    for local_id, worker_key in cloud_publisher.cloud_publish_map().items():
+        try:
+            account_name = id_to_name.get(int(local_id))
+        except ValueError:
+            account_name = None
+        if account_name:
+            key_to_name[worker_key] = account_name
+    try:
+        payload = cloud_publisher.list_jobs()
+    except cloud_publisher.CloudPublisherError as exc:
+        raise PublishError(f"Could not list cloud jobs: {exc}") from exc
+    jobs = []
+    for worker in payload.get("jobs", []):
+        external_id = worker.get("external_id") or ""
+        upload_job_id: int | None = None
+        if external_id.startswith("nf-"):
+            candidate = external_id.removeprefix("nf-").split("-", 1)[0]
+            if candidate.isdigit():
+                upload_job_id = int(candidate)
+        jobs.append(
+            {
+                **worker,
+                "account_name": key_to_name.get(worker.get("account_key"), worker.get("account_key")),
+                "upload_job_id": upload_job_id,
+            }
+        )
+    return {"jobs": jobs, "publish_mode": payload.get("publish_mode")}
+
+
 def sync_cloud_jobs() -> dict:
     """Pull job states from the Cloudflare Worker and update local ``cloud`` jobs.
 
@@ -631,6 +686,11 @@ def sync_cloud_jobs() -> dict:
     local ``failed`` (with the Worker's error). ``validated``/``scheduled``/
     ``processing`` stay ``cloud`` (still pending a real post). No-op when cloud
     publishing isn't configured or the Worker is unreachable.
+
+    Every synced job also gets its raw ``cloud_status``/``cloud_error`` mirrored
+    from the Worker on every poll (not just when the local ``status`` flips), so
+    the dashboard can always show *why* a gate-blocked job hasn't posted yet
+    instead of looking frozen.
     """
     from nicheflow_studio.services import cloud_publisher
 
@@ -641,6 +701,7 @@ def sync_cloud_jobs() -> dict:
     except cloud_publisher.CloudPublisherError:
         return {"synced": False, "updated": 0}
     updated = 0
+    dirty = False
     with get_session() as session:
         local_jobs = session.scalars(select(UploadJob).where(UploadJob.status == "cloud")).all()
         for job in local_jobs:
@@ -648,6 +709,13 @@ def sync_cloud_jobs() -> dict:
             if worker is None:
                 continue
             wstatus = (worker.get("status") or "").lower()
+            werror = (worker.get("error_message") or "").strip()[:1024] or None
+            if wstatus != (job.cloud_status or ""):
+                job.cloud_status = wstatus or None
+                dirty = True
+            if werror != job.cloud_error:
+                job.cloud_error = werror
+                dirty = True
             if wstatus == "published":
                 job.status = "posted"
                 job.posted_at = _parse_iso(worker.get("published_at")) or dt.datetime.now(
@@ -682,6 +750,6 @@ def sync_cloud_jobs() -> dict:
                     job.error_message = note
                     updated += 1
             # validated -> still 'cloud' (no change yet)
-        if updated:
+        if updated or dirty:
             session.commit()
     return {"synced": True, "updated": updated}

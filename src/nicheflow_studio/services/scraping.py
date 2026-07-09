@@ -17,7 +17,7 @@ import datetime as dt
 from pathlib import Path
 from typing import Callable
 
-from nicheflow_studio.core.apify_usage import monthly_apify_usage, record_apify_results
+from nicheflow_studio.core.apify_usage import monthly_apify_usage
 from nicheflow_studio.core.paths import downloads_dir
 from nicheflow_studio.db.media_library import (
     find_media_asset,
@@ -99,9 +99,8 @@ def scrape_source_to_pool(
         _record_run(source_id, ok=False, error=str(exc))
         raise ScrapingError(f"Apify scrape failed: {exc}") from exc
 
-    # Apify bills per returned result — record it before pooling so usage is
-    # tracked even if pooling hiccups.
-    record_apify_results(len(results))
+    # Usage is recorded inside the Apify scraper itself (per billed dataset
+    # row, not per usable candidate), so nothing to record here.
 
     if progress:
         progress(0.5, f"Pooling {len(results)} result(s)…")
