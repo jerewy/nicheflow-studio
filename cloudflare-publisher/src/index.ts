@@ -442,19 +442,29 @@ async function graphRequest(env: Env, account: AccountRow, path: string, params:
 interface PublishGate {
   allowed: boolean;
   reason?: string;
+  // Exact moment the gate is expected to clear, when known. Lets the caller
+  // retry right at eligibility instead of a flat delay that either lags behind
+  // (daily-window jobs can wait a full extra cycle) or wastes cron ticks.
+  retryAt?: string;
 }
 
 async function accountMayPublish(env: Env, account: AccountRow, now: string): Promise<PublishGate> {
   if (!account.enabled) return { allowed: false, reason: "account disabled" };
   const since = addMinutes(now, -24 * 60);
-  const count = await env.DB.prepare(
-    "SELECT COUNT(*) AS count FROM publish_jobs WHERE account_key = ? AND published_at >= ?",
+  const oldestInWindow = await env.DB.prepare(
+    "SELECT COUNT(*) AS count, MIN(published_at) AS oldest FROM publish_jobs WHERE account_key = ? AND published_at >= ?",
   )
     .bind(account.account_key, since)
-    .first<{ count: number }>();
-  const published = count?.count || 0;
+    .first<{ count: number; oldest: string | null }>();
+  const published = oldestInWindow?.count || 0;
   if (published >= account.daily_limit) {
-    return { allowed: false, reason: `daily limit reached (${published}/${account.daily_limit} in 24h)` };
+    // The window frees up 24h after its oldest counted publish ages out.
+    const retryAt = oldestInWindow?.oldest ? addMinutes(oldestInWindow.oldest, 24 * 60) : undefined;
+    return {
+      allowed: false,
+      reason: `daily limit reached (${published}/${account.daily_limit} in 24h)`,
+      retryAt,
+    };
   }
   const latest = await env.DB.prepare(
     "SELECT published_at FROM publish_jobs WHERE account_key = ? AND published_at IS NOT NULL ORDER BY published_at DESC LIMIT 1",
@@ -464,7 +474,7 @@ async function accountMayPublish(env: Env, account: AccountRow, now: string): Pr
   if (!latest) return { allowed: true };
   const eligibleAt = addMinutes(latest.published_at, account.min_gap_minutes);
   if (Date.parse(eligibleAt) <= Date.parse(now)) return { allowed: true };
-  return { allowed: false, reason: `same-account cooldown until ${eligibleAt}` };
+  return { allowed: false, reason: `same-account cooldown until ${eligibleAt}`, retryAt: eligibleAt };
 }
 
 async function failJob(env: Env, job: JobRow, error: unknown): Promise<void> {
@@ -526,10 +536,17 @@ async function processJob(
     if (!options?.bypassGate) {
       const gate = await accountMayPublish(env, account, now);
       if (!gate.allowed) {
+        // Prefer the gate's computed eligibility moment (never earlier than 1 min
+        // out, to avoid hammering); fall back to the flat +15 min when the gate
+        // didn't return one (e.g. "account disabled" has no known clear time).
+        const fallback = addMinutes(now, 15);
+        const nextAttemptAt = gate.retryAt
+          ? new Date(Math.max(Date.parse(gate.retryAt), Date.parse(addMinutes(now, 1)))).toISOString()
+          : fallback;
         await env.DB.prepare(
           "UPDATE publish_jobs SET next_attempt_at = ?, lease_until = NULL, error_message = ?, updated_at = ? WHERE id = ?",
         )
-          .bind(addMinutes(now, 15), gate.reason ?? "blocked", now, job.id)
+          .bind(nextAttemptAt, gate.reason ?? "blocked", now, job.id)
           .run();
         return;
       }
