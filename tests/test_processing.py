@@ -1521,9 +1521,9 @@ def test_fit_title_band_historytrails_uses_consistent_size_and_wider_lines() -> 
 
     assert font_size == 46
     assert wrapped.splitlines() == [
-        "That time Princess Diana stepped out in",
-        "the revenge dress after Charles admitted",
-        "his affair.",
+        "That time Princess Diana stepped out in the",
+        "revenge dress after Charles admitted his",
+        "affair.",
     ]
 
 
@@ -1538,9 +1538,9 @@ def test_fit_title_band_historytrails_wraps_each_line_by_rendered_width() -> Non
 
     assert font_size == 46
     assert wrapped.splitlines() == [
-        "That time Tom Cruise ran through an",
-        "empty Times Square for Vanilla Sky, after",
-        "the city briefly went silent",
+        "That time Tom Cruise ran through an empty",
+        "Times Square for Vanilla Sky, after the city",
+        "briefly went silent",
     ]
 
 
@@ -1568,7 +1568,7 @@ def test_fit_title_band_historytrails_expands_long_title_without_overflow() -> N
             font_size=font_size,
             title_font_name="arial",
         )
-        <= 888
+        <= 932
         for line in lines
     )
     assert band_height == 449
@@ -1840,9 +1840,9 @@ def test_title_band_insets_historytrails_left_content_width() -> None:
         title_line_gap_scale=0.20,
     )
 
-    assert "scale=888:" in filter_string
-    assert ":96:0:color=black[content]" in filter_string
-    assert "x=96:" in filter_string
+    assert "scale=932:" in filter_string
+    assert ":74:0:color=black[content]" in filter_string
+    assert "x=74:" in filter_string
 
 
 def test_title_band_moves_long_historytrails_composition_down_40px() -> None:
@@ -1863,7 +1863,7 @@ def test_title_band_moves_long_historytrails_composition_down_40px() -> None:
         title_line_gap_scale=0.20,
     )
 
-    assert "[block]pad=1080:1920:(ow-iw)/2:360:color=black[vout]" in filter_string
+    assert "[block]pad=1080:1920:(ow-iw)/2:350:color=black[vout]" in filter_string
 
 
 def test_title_band_centers_single_line_historytrails_title() -> None:

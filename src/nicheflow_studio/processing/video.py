@@ -2553,7 +2553,10 @@ _CINEMA_SIDE_MARGIN_PX = 56  # exact pixels on EACH side — left == right by co
 # Bumped from 32 to 56 (~5% of a 1080 canvas) so the footage sits a little
 # further from the frame edges and stops getting clipped on smaller phone
 # screens with rounded corners / safe-area insets.
-_HISTORYTRAILS_SIDE_MARGIN_PX = 96
+# Measured from 43 real historytrails reels (2026-07): footage margins cluster
+# at 72-77px with median 74, so 74 reproduces their layout exactly (932px
+# content width on the 1080 canvas).
+_HISTORYTRAILS_SIDE_MARGIN_PX = 74
 _TITLE_SAFE_SIDE_MARGIN_PX = 72
 
 
