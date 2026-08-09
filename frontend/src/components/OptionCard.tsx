@@ -8,14 +8,18 @@ import { cn } from "@/lib/utils";
 interface OptionCardProps {
   optionNumber: number; // 1-based
   title: string;
-  caption: string;
+  /**
+   * Omitted when every option shares one caption: the caption is then edited
+   * once below the grid instead of being repeated identically in each card.
+   */
+  caption?: string;
   note?: string;
   tier?: string;
   recommended?: boolean;
   applied?: boolean;
   busy?: boolean;
   onTitleChange: (value: string) => void;
-  onCaptionChange: (value: string) => void;
+  onCaptionChange?: (value: string) => void;
   onApply: () => void;
 }
 
@@ -72,17 +76,19 @@ export function OptionCard({
             placeholder="On-screen title"
           />
         </div>
-        <div className="space-y-1">
-          <label className="text-xs font-medium text-muted-foreground">
-            Caption
-          </label>
-          <Textarea
-            value={caption}
-            rows={5}
-            onChange={(e) => onCaptionChange(e.target.value)}
-            placeholder="Caption"
-          />
-        </div>
+        {caption !== undefined && onCaptionChange && (
+          <div className="space-y-1">
+            <label className="text-xs font-medium text-muted-foreground">
+              Caption
+            </label>
+            <Textarea
+              value={caption}
+              rows={5}
+              onChange={(e) => onCaptionChange(e.target.value)}
+              placeholder="Caption"
+            />
+          </div>
+        )}
         {note && <p className="text-xs text-muted-foreground italic">{note}</p>}
       </CardContent>
     </Card>

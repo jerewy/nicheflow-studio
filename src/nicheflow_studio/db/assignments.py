@@ -12,6 +12,7 @@ import datetime as dt
 from dataclasses import dataclass
 from pathlib import Path
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from nicheflow_studio.core.distribution import plan_first_cycle, ranked_clip_order
@@ -27,6 +28,7 @@ from nicheflow_studio.db.models import (
     Account,
     Assignment,
     DownloadItem,
+    DraftRevision,
     MediaAsset,
     PoolItem,
     ScrapeCandidate,
@@ -80,6 +82,40 @@ def assigned_pool_item_ids(session: Session, niche: str) -> set[int]:
         session.query(Assignment.pool_item_id).filter(Assignment.niche == niche).all()
     )
     return {row[0] for row in rows}
+
+
+def posted_media_asset_ids(session: Session) -> set[int]:
+    """Media assets whose footage was already published by ANY account.
+
+    Publish history is read from the download items behind posted upload jobs,
+    keyed by shortcode with a slash-insensitive URL fallback — NOT from
+    assignment rows. Posts made before the pooling layer existed have no
+    assignments, and stored URLs drift on trailing slashes, so matching on
+    either of those alone lets already-posted footage back into distribution.
+    """
+    rows = (
+        session.query(DownloadItem.video_id, DownloadItem.source_url)
+        .outerjoin(UploadJob, UploadJob.download_item_id == DownloadItem.id)
+        .filter(
+            (DownloadItem.status == "posted")
+            | (UploadJob.posted_at.is_not(None))
+            | (UploadJob.status == "posted")
+        )
+        .distinct()
+        .all()
+    )
+    shortcodes = {shortcode for shortcode, _ in rows if shortcode}
+    urls = {(url or "").rstrip("/") for _, url in rows}
+    urls.discard("")
+    if not shortcodes and not urls:
+        return set()
+    posted: set[int] = set()
+    for asset_id, shortcode, url in session.query(
+        MediaAsset.id, MediaAsset.source_shortcode, MediaAsset.canonical_source_url
+    ).all():
+        if (shortcode and shortcode in shortcodes) or (url or "").rstrip("/") in urls:
+            posted.add(asset_id)
+    return posted
 
 
 def account_ids_for_niche(session: Session, niche: str) -> list[int]:
@@ -215,9 +251,21 @@ def _create_pending_review_item(
     asset = session.get(MediaAsset, pool_item.media_asset_id) if pool_item is not None else None
     if asset is None:
         return
-    if session.query(DownloadItem.id).filter(
-        DownloadItem.account_id == account_id,
-        DownloadItem.source_url == asset.canonical_source_url,
+    # Match the account's existing rows by shortcode as well as both URL forms:
+    # legacy rows store the reel URL with a trailing slash while canonical URLs
+    # drop it, and that one-character drift used to let the same reel back into
+    # Processing for an account that already handled it.
+    url = (asset.canonical_source_url or "").rstrip("/")
+    existing_filter = DownloadItem.source_url.in_([url, url + "/"]) if url else None
+    if asset.source_shortcode:
+        shortcode_filter = DownloadItem.video_id == asset.source_shortcode
+        existing_filter = (
+            shortcode_filter
+            if existing_filter is None
+            else existing_filter | shortcode_filter
+        )
+    if existing_filter is not None and session.query(DownloadItem.id).filter(
+        DownloadItem.account_id == account_id, existing_filter
     ).first() is not None:
         return
     candidate = (
@@ -251,6 +299,7 @@ def distribute_niche(
     targets_by_account: dict[int, int] | None = None,
     eligible_pool_item_ids: set[int] | None = None,
     allow_risky: bool = False,
+    existing_counts: dict[int, int] | None = None,
 ) -> list[Assignment]:
     """Distribute the niche's unassigned accepted pool across its accounts.
 
@@ -327,7 +376,12 @@ def distribute_niche(
     # re-running "Distribute" only tops up accounts below target and never piles
     # a second full batch onto accounts that already reached it. With
     # max_per_account=None this has no effect (uncapped fill).
-    existing_counts = assignment_counts_by_account(session, niche)
+    #
+    # Which backlog counts is the caller's choice: the manual button measures
+    # "reels still needing a draft" (the default here), while the automatic
+    # top-up passes total-unposted counts so it refills only as posts go out.
+    if existing_counts is None:
+        existing_counts = undrafted_item_counts_by_account(session, niche)
     plan = plan_first_cycle(
         ranked_ids,
         account_ids,
@@ -397,6 +451,106 @@ def assign_pool_item_to_accounts(
         created.append(assignment)
     session.flush()
     return created
+
+
+def open_item_counts_by_account(session: Session, niche: str) -> dict[int, int]:
+    """How many unposted reels each account holds IN TOTAL, whatever the stage.
+
+    Pending review, drafted, exported, scheduled, handed to the cloud Worker —
+    everything that has not actually posted (or been rejected/blocked/skipped)
+    counts. This is the measure for the AUTOMATIC top-up tick: it must refill
+    only as posts genuinely go out. Measuring the tick by "undrafted" instead
+    made it refill the moment a batch import created draft revisions — six
+    fresh clips arrived before the six just drafted had even been exported, so
+    the backlog grew by a full batch every drafting session.
+
+    The manual Distribute button intentionally uses the narrower
+    :func:`undrafted_item_counts_by_account` — "give me N reels to draft" —
+    which is the session-size question, not the backlog question.
+    """
+    niche = _validate_niche(niche)
+    # Lazy import, same reason as undrafted_item_counts_by_account below.
+    from nicheflow_studio.services.library import already_posted_item_ids
+
+    posted = already_posted_item_ids(session)
+    account_ids = [
+        row[0] for row in session.query(Account.id).filter(Account.niche == niche).all()
+    ]
+    if not account_ids:
+        return {}
+    counts: dict[int, int] = {}
+    for item_id, account_id in (
+        session.query(DownloadItem.id, DownloadItem.account_id)
+        .filter(DownloadItem.account_id.in_(account_ids))
+        .filter(DownloadItem.status.notin_(["posted", "skipped"]))
+        .filter(
+            or_(
+                DownloadItem.review_state.is_(None),
+                DownloadItem.review_state.notin_(["rejected", "blocked"]),
+            )
+        )
+        .all()
+    ):
+        if item_id not in posted:
+            counts[account_id] = counts.get(account_id, 0) + 1
+    return counts
+
+
+def undrafted_item_counts_by_account(session: Session, niche: str) -> dict[int, int]:
+    """How many reels each account still needs a DRAFT for.
+
+    This is what the distribute target measures — "keep N reels ready to work
+    on" — and it deliberately matches what the Batch Drafts screen offers, since
+    that is where the user counts them.
+
+    Counting :class:`Assignment` rows instead was wrong in two ways: rows whose
+    clip never materialised held slots containing no reel at all, and rows left
+    ``assigned`` after their clip posted kept finished work against the cap.
+    Counting every open item was wrong in a third: a reel already drafted is no
+    longer work the account needs more of, so accounts sat "at target" with 9
+    items but only 5 the user could actually draft.
+
+    A reel still downloading DOES count. Its file lands shortly and it becomes
+    draftable, so ignoring it would let each top-up tick pile on more clips for
+    work already on its way.
+    """
+    niche = _validate_niche(niche)
+    # Lazy import: db must not pull in services/library's downloader chain, and
+    # library imports this module. Shared so "already posted" and "already out
+    # elsewhere in the network" keep ONE definition each.
+    from nicheflow_studio.services.library import (
+        already_posted_item_ids,
+        posted_source_video_ids,
+    )
+
+    posted = already_posted_item_ids(session)
+    posted_videos = posted_source_video_ids(session)
+    drafted = {
+        row[0]
+        for row in session.query(DraftRevision.download_item_id).distinct().all()
+    }
+    account_ids = [
+        row[0] for row in session.query(Account.id).filter(Account.niche == niche).all()
+    ]
+    if not account_ids:
+        return {}
+    counts: dict[int, int] = {}
+    for item_id, account_id, video_id in (
+        session.query(DownloadItem.id, DownloadItem.account_id, DownloadItem.video_id)
+        .filter(DownloadItem.account_id.in_(account_ids))
+        .filter(DownloadItem.status.notin_(["posted", "skipped"]))
+        .filter(
+            or_(
+                DownloadItem.review_state.is_(None),
+                DownloadItem.review_state.notin_(["rejected", "blocked"]),
+            )
+        )
+        .all()
+    ):
+        if item_id in posted or item_id in drafted or (video_id or "") in posted_videos:
+            continue
+        counts[account_id] = counts.get(account_id, 0) + 1
+    return counts
 
 
 def assignment_counts_by_account(session: Session, niche: str) -> dict[int, int]:

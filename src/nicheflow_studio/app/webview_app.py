@@ -28,7 +28,7 @@ from nicheflow_studio.app.local_media import install_windows_mapping
 from nicheflow_studio.app.processing_bridge import ProcessingBridge
 from nicheflow_studio.core.env import load_dotenv
 from nicheflow_studio.core.logging import configure_logging
-from nicheflow_studio.core.paths import ensure_data_dirs
+from nicheflow_studio.core.paths import data_dir, ensure_data_dirs
 from nicheflow_studio.db.session import init_db
 from nicheflow_studio.services.auto_publish_loop import AutoPublishLoop
 from nicheflow_studio.services.db_backup import run_startup_backup
@@ -42,6 +42,38 @@ _DEFAULT_DEV_URL = "http://localhost:5173"
 _BOOTSTRAP_HTML = """<!doctype html>
 <html><body style="margin:0;background:#fff"></body></html>
 """
+
+# pywebview serves the built UI from its own HTTP server and picks a random port
+# unless told otherwise. localStorage is partitioned by ORIGIN, and the origin
+# includes the port, so a random port hands the UI an empty store on every
+# launch — every remembered choice (batch account chips, auto-distribute toggle,
+# last publish account) silently resets. Pin the port so the origin is stable.
+# Override with NICHEFLOW_WEBVIEW_PORT if something else already holds it.
+_DEFAULT_HTTP_PORT = 17325
+
+
+def _webview_http_port() -> int:
+    raw = os.environ.get("NICHEFLOW_WEBVIEW_PORT", "").strip()
+    if not raw:
+        return _DEFAULT_HTTP_PORT
+    try:
+        port = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"NICHEFLOW_WEBVIEW_PORT must be a port number, got {raw!r}."
+        ) from exc
+    if not 1 <= port <= 65535:
+        raise ValueError(f"NICHEFLOW_WEBVIEW_PORT must be 1-65535, got {port}.")
+    return port
+
+
+def webview_storage_path() -> Path:
+    """Where the webview keeps cookies/localStorage between runs.
+
+    Kept under the app's own data dir so it is gitignored and travels with a
+    packaged build's per-user data, rather than landing in a temp folder.
+    """
+    return data_dir() / "webview-storage"
 
 
 def _frontend_dist_index() -> Path:
@@ -117,7 +149,16 @@ def _run_started_webview() -> None:
         window.load_url(entry)
 
     window.events.loaded += install_mapping_and_open_app
-    webview.start()
+    storage_path = webview_storage_path()
+    storage_path.mkdir(parents=True, exist_ok=True)
+    # private_mode defaults to True, which throws away localStorage on exit — so
+    # remembered UI choices never survived a restart even before the random-port
+    # problem. Both have to be fixed together for anything to persist.
+    webview.start(
+        private_mode=False,
+        storage_path=str(storage_path),
+        http_port=_webview_http_port(),
+    )
 
 
 if __name__ == "__main__":

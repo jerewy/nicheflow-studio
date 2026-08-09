@@ -34,7 +34,10 @@ from nicheflow_studio.db.models import (
     ScrapeCandidate,
 )
 from nicheflow_studio.db.session import get_session
-from nicheflow_studio.downloader.failures import looks_like_missing_source
+from nicheflow_studio.downloader.failures import (
+    looks_like_missing_source,
+    looks_like_offline,
+)
 from nicheflow_studio.downloader.instagram import download_instagram_url
 from nicheflow_studio.services.errors import ServiceError
 from nicheflow_studio import queue as queue_module
@@ -59,6 +62,8 @@ def _asset_is_downloaded(asset: MediaAsset) -> bool:
 
 
 def _download_error_message(exc: Exception) -> str:
+    if looks_like_offline(str(exc)):
+        return "no internet connection (DNS lookup failed)"
     message = next((line.strip() for line in str(exc).splitlines() if line.strip()), "")
     return message.removeprefix("ERROR:").strip()[:200] or exc.__class__.__name__
 
@@ -123,6 +128,11 @@ def _ensure_pool_item_downloaded(pool_item_id: int) -> None:
 def _unassigned_pool_item_ids(niche: str) -> list[int]:
     """Currently unassigned accepted pool item ids for a niche (no download).
 
+    Excludes clips whose footage was already published by any account
+    (:func:`assignments_db.posted_media_asset_ids`): posts made before the
+    pooling layer existed have no assignment rows, so without this check
+    distribution keeps re-serving videos the network already posted.
+
     Distribution ranks and assigns from these immediately; the chosen clips'
     footage is fetched off the request path by :func:`_start_background_download`
     so the screen never blocks on downloads.
@@ -130,10 +140,11 @@ def _unassigned_pool_item_ids(niche: str) -> list[int]:
     try:
         with get_session() as session:
             already = assignments_db.assigned_pool_item_ids(session, niche)
+            posted_assets = assignments_db.posted_media_asset_ids(session)
             return [
                 item.id
                 for item in pools.pool_items_for_niche(session, niche)
-                if item.id not in already
+                if item.id not in already and item.media_asset_id not in posted_assets
             ]
     except ValueError as exc:
         raise PoolingError(str(exc)) from exc
@@ -187,6 +198,8 @@ def overview() -> dict:
         niches = []
         for niche in NICHES:
             stats = pools.niche_pool_stats(session, niche)
+            # Stays row-based: this field is literally "assignments_by_account".
+            # The distribute decisions use undrafted_item_counts_by_account instead.
             counts = assignments_db.assignment_counts_by_account(session, niche)
             per_account = [
                 {
@@ -525,18 +538,33 @@ def restore_pool_item(pool_item_id: int) -> dict:
 
 
 def niche_accounts(niche: str) -> list[dict]:
-    """Accounts in a niche (id + name), for the per-clip distribute picker."""
-    with get_session() as session:
-        try:
-            ids = assignments_db.account_ids_for_niche(session, niche)
-        except ValueError as exc:
-            raise PoolingError(str(exc)) from exc
-        names = (
-            {a.id: a.name for a in session.query(Account).filter(Account.id.in_(ids)).all()}
-            if ids
-            else {}
+    """Accounts in a niche (id + name + operational_status), for the distribute pickers.
+
+    Returns ALL accounts in the niche — including resting/flagged ones — so the
+    UI can render a non-active account disabled with its status instead of
+    silently omitting it. Only "active" accounts ever receive assignments
+    (db/assignments.account_ids_for_niche); the status here is display-only.
+    """
+    value = (niche or "").strip().lower()
+    if value not in pools.VALID_NICHES:
+        raise PoolingError(
+            f"niche must be one of {sorted(pools.VALID_NICHES)}, got {niche!r}."
         )
-        return [{"id": account_id, "name": names.get(account_id, f"#{account_id}")} for account_id in ids]
+    with get_session() as session:
+        accounts = (
+            session.query(Account)
+            .filter(Account.niche == value)
+            .order_by(Account.id.asc())
+            .all()
+        )
+        return [
+            {
+                "id": account.id,
+                "name": account.name,
+                "operational_status": account.operational_status or "active",
+            }
+            for account in accounts
+        ]
 
 
 # Rights-confidence labels that are allowed to distribute but haven't been
@@ -671,6 +699,17 @@ def distribute_niche(
             )
             for account in accounts
         }
+        # The automatic top-up measures the TOTAL unposted backlog, so it only
+        # refills as posts actually go out. The manual button keeps the narrower
+        # "reels still needing a draft" measure (the DB layer's default): a user
+        # asking for 6 wants 6 to draft in this session. Without this split the
+        # tick refilled the moment a batch import created drafts — six fresh
+        # clips before the six just drafted had even been exported.
+        auto_backlog_counts = (
+            assignments_db.open_item_counts_by_account(session, niche)
+            if publish_ready_only
+            else None
+        )
         try:
             created = assignments_db.distribute_niche(
                 session,
@@ -682,6 +721,7 @@ def distribute_niche(
                     targets if (max_per_account is None or publish_ready_only) else None
                 ),
                 eligible_pool_item_ids=eligible_pool_item_ids,
+                existing_counts=auto_backlog_counts,
             )
         except ValueError as exc:  # unknown niche from _validate_niche
             raise PoolingError(str(exc)) from exc
@@ -696,7 +736,14 @@ def distribute_niche(
             elif not targets:
                 reason = "no_ready_accounts"
             else:
-                existing = assignments_db.assignment_counts_by_account(session, niche)
+                # Must be the same measure distribute_niche topped up against,
+                # or "all at cap" gets reported for accounts that are actually
+                # empty in Processing.
+                existing = (
+                    auto_backlog_counts
+                    if auto_backlog_counts is not None
+                    else assignments_db.undrafted_item_counts_by_account(session, niche)
+                )
                 reason = (
                     "all_at_cap"
                     if all(existing.get(a, 0) >= target for a, target in targets.items())
@@ -775,7 +822,10 @@ def auto_top_up(niches: tuple[str, ...] | None = None) -> list[dict]:
             accounts = _publishable_accounts(accounts)
             if not accounts:
                 continue
-            counts = assignments_db.assignment_counts_by_account(session, niche)
+            # TOTAL unposted backlog, the same measure the auto path distributes
+            # against: the tick fires only as posts actually go out, never
+            # because a batch import just turned reels into drafts.
+            counts = assignments_db.open_item_counts_by_account(session, niche)
             below_target = any(
                 counts.get(account.id, 0)
                 < (account.distribute_daily_target or DEFAULT_DISTRIBUTE_DAILY_TARGET)
@@ -988,7 +1038,10 @@ def distribute_niche_explicit(niche: str, targets_by_account: dict[int, int]) ->
     }
     eligible_pool_item_ids = _unassigned_pool_item_ids(niche)
     with get_session() as session:
-        existing = assignments_db.assignment_counts_by_account(session, niche)
+        # "Distribute now" counts are ADDITIONAL clips, so the base has to be the
+        # same one distribute_niche measures against. Reading a different number
+        # here would turn "add 3" into "top up to (other number) + 3".
+        existing = assignments_db.undrafted_item_counts_by_account(session, niche)
         total_targets = {
             account_id: existing.get(account_id, 0) + count
             for account_id, count in requested.items()

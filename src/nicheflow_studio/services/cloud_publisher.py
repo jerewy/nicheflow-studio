@@ -18,6 +18,7 @@ surface a handled message.
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import threading
@@ -128,11 +129,19 @@ def _request(
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")
                 raise CloudPublisherError(f"Cloud publisher HTTP {exc.code}: {detail}") from exc
-            except urllib.error.URLError as exc:
+            except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError) as exc:
+                # urlopen only wraps CONNECT-phase failures in URLError. A timeout
+                # or reset while READING the response body surfaces as a raw
+                # TimeoutError/ConnectionResetError (OSError), a server hangup as
+                # http.client.HTTPException, and a truncated body as a JSON
+                # ValueError. All are the same transient transport class, so they
+                # retry and wrap identically — a raw TimeoutError here used to
+                # escape unwrapped and strand local jobs mid-cloud-handoff.
                 if attempt < _MAX_ATTEMPTS:
                     time.sleep(_RETRY_BACKOFF_S * attempt)
                     continue
-                raise CloudPublisherError(f"Cloud publisher unreachable: {exc.reason}") from exc
+                reason = getattr(exc, "reason", None) or exc
+                raise CloudPublisherError(f"Cloud publisher unreachable: {reason}") from exc
     raise AssertionError("unreachable")  # loop always returns or raises
 
 
@@ -174,7 +183,15 @@ def schedule_reel(
     video_path: str | Path,
     content_type: str = "video/mp4",
 ) -> dict:
-    """Create the job then upload the video in one call. Returns the created job."""
+    """Create the job then upload the video in one call. Returns the created job.
+
+    Create + upload is not atomic on the Worker: ``create_job`` leaves the job in
+    ``awaiting_upload`` and only a successful ``upload_media`` flips it to
+    ``scheduled``. If the upload fails (e.g. a multi-MB video PUT times out), cancel
+    the just-created job so it does not strand in ``awaiting_upload`` -- an orphan
+    the Worker never publishes and never auto-cleans, which trips the stale-upload
+    health alert. Best-effort cleanup: the original upload error is always raised.
+    """
     path = Path(video_path)
     if not path.is_file():
         raise CloudPublisherError(f"video not found: {path}")
@@ -186,10 +203,19 @@ def schedule_reel(
         file_name=path.name,
         content_type=content_type,
     )
-    upload_path = created.get("upload_path")
-    if not upload_path:
-        raise CloudPublisherError(f"Worker returned no upload_path: {created}")
-    upload_media(upload_path, path, content_type=content_type)
+    try:
+        upload_path = created.get("upload_path")
+        if not upload_path:
+            raise CloudPublisherError(f"Worker returned no upload_path: {created}")
+        upload_media(upload_path, path, content_type=content_type)
+    except CloudPublisherError:
+        job_id = created.get("id")
+        if job_id:
+            try:
+                cancel_job(job_id)
+            except CloudPublisherError:
+                pass  # Worker unreachable; leave the orphan for the health check.
+        raise
     return created
 
 

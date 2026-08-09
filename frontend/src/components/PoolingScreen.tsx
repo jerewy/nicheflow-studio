@@ -3,6 +3,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { DashboardTable } from "@/components/DashboardTable";
+import { useRevisitRefresh } from "@/hooks/useKeepAlive";
 import { formatDate } from "@/lib/format";
 import { bridge } from "@/lib/bridge";
 import type {
@@ -33,7 +34,14 @@ async function waitForScrapeJob(
   }
 }
 
-export function PoolingScreen({ activeAccountId }: { activeAccountId: number }) {
+export function PoolingScreen({
+  activeAccountId,
+  active = true,
+}: {
+  activeAccountId: number;
+  // False while the screen is kept alive but hidden behind another (sub-)tab.
+  active?: boolean;
+}) {
   const [overview, setOverview] = useState<PoolingOverview | null>(null);
   const [niche, setNiche] = useState("history");
   const [sources, setSources] = useState<PoolSource[]>([]);
@@ -44,6 +52,9 @@ export function PoolingScreen({ activeAccountId }: { activeAccountId: number }) 
   const [nicheAccounts, setNicheAccounts] = useState<NicheAccount[]>([]);
   const [distributeSel, setDistributeSel] = useState<Set<number>>(new Set());
   const [manualTargets, setManualTargets] = useState<Record<number, number>>({});
+  // Uniform "keep this many ready per account" for Auto-distribute. Blank falls
+  // back to each account's own distribute_daily_target.
+  const [autoTarget, setAutoTarget] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
@@ -89,6 +100,11 @@ export function PoolingScreen({ activeAccountId }: { activeAccountId: number }) 
     const timer = window.setTimeout(load, 0);
     return () => window.clearTimeout(timer);
   }, [load]);
+
+  // Kept alive behind the sub-tab bar; reload on revisit like a remount did.
+  // `load` resets the source drill-down (same as the old remount) while any
+  // in-flight distribute/scrape job keeps its progress state.
+  useRevisitRefresh(active, () => void load());
 
   // Success banners read as transient alerts: clear them after a few seconds so
   // an old "distributed N" doesn't linger as if it just happened. Errors stay
@@ -178,11 +194,22 @@ export function PoolingScreen({ activeAccountId }: { activeAccountId: number }) 
   // Engagement-rank the whole niche pool and spread the strongest undistributed
   // clips across its accounts (each clip to one account, volume-balanced).
   const autoDistribute = async () => {
+    // Blank = each account's own distribute_daily_target. A number here is a
+    // uniform TOTAL target, so an account holding 3 of 6 receives 3 more, not 6.
+    const target = autoTarget.trim() === "" ? null : Number(autoTarget);
+    if (target !== null && (!Number.isInteger(target) || target < 1)) {
+      setError("Reels per account must be a whole number of at least 1.");
+      return;
+    }
     if (
       !window.confirm(
         `Auto-distribute the ${niche} pool?\n\nThis ranks undistributed clips by engagement ` +
           `(likes + recency) and assigns the strongest ones across this niche's accounts — ` +
-          `each clip to a single account, balanced and capped per account.`,
+          `each clip to a single account, balanced and capped per account.` +
+          (target === null
+            ? "\n\nEach account tops up to its own daily target."
+            : `\n\nEach account tops up TO ${target} clip(s) total — one already holding ` +
+              `${target - 1} receives 1 more, not ${target}.`),
       )
     )
       return;
@@ -190,7 +217,7 @@ export function PoolingScreen({ activeAccountId }: { activeAccountId: number }) 
     setError(null);
     setMessage(null);
     try {
-      const result = await bridge.distributeNiche(niche);
+      const result = await bridge.distributeNiche(niche, target);
       // Refresh the pool/overview first — load() clears banners, so the
       // confirmation must be set afterwards or it would be wiped immediately.
       await load();
@@ -198,7 +225,10 @@ export function PoolingScreen({ activeAccountId }: { activeAccountId: number }) 
         const reasonMessages: Record<string, string> = {
           no_accounts: `No accounts are set to the "${niche}" niche — assign accounts first in Account settings.`,
           no_ready_accounts: `No "${niche}" accounts are currently ready to publish.`,
-          all_at_cap: "All accounts already hold their daily backlog target. They'll auto-top-up as posts drain the backlog — or use Distribute now to add more on top.",
+          all_at_cap:
+            target === null
+              ? "All accounts already hold their daily backlog target. Raise \"Reels per account\" to top them up further, or use Distribute now to add more on top."
+              : `All accounts already hold ${target} clip(s) or more. Raise "Reels per account" to top them up further, or use Distribute now to add more on top.`,
           pool_empty: "Pool is fully distributed — no unused clips remain.",
         };
         setMessage(reasonMessages[result.reason ?? ""] ?? "Nothing to distribute.");
@@ -269,11 +299,19 @@ export function PoolingScreen({ activeAccountId }: { activeAccountId: number }) 
     0,
   );
 
+  // Only "active" accounts can receive assignments; resting/flagged ones are
+  // listed so they can be shown disabled instead of silently missing.
+  const activeNicheAccounts = nicheAccounts.filter(
+    (account) => account.operational_status === "active",
+  );
+
   // Scrapes attach a Source to an account, and clips pool by that account's
-  // niche — so the owner must be an account IN the selected niche. Prefer the
-  // globally-active account when it qualifies, else the first niche account.
+  // niche — so the owner must be an active account IN the selected niche.
+  // Prefer the globally-active account when it qualifies, else the first one.
   const scrapeOwner =
-    nicheAccounts.find((account) => account.id === activeAccountId) ?? nicheAccounts[0] ?? null;
+    activeNicheAccounts.find((account) => account.id === activeAccountId) ??
+    activeNicheAccounts[0] ??
+    null;
 
   // Add a source profile to the niche's owner account and immediately scrape it
   // into this niche's pool (idempotent: re-adding an existing handle just
@@ -361,6 +399,20 @@ export function PoolingScreen({ activeAccountId }: { activeAccountId: number }) 
         </select>
         {stats && <p className="text-sm text-muted-foreground">{stats.pooled} pooled · {stats.assigned} assigned · {stats.unused} unused · {stats.rejected} rejected</p>}
         <div className="grow" />
+        <label className="text-sm text-muted-foreground" htmlFor="auto-target">
+          Reels per account
+        </label>
+        <input
+          id="auto-target"
+          type="number"
+          min={1}
+          className="h-9 w-20 rounded-md border border-input px-2 text-sm"
+          placeholder="auto"
+          value={autoTarget}
+          disabled={busy}
+          onChange={(event) => setAutoTarget(event.target.value)}
+          title="How many unposted clips to keep ready per account. Blank uses each account's own daily target. This is a TOTAL, so an account already holding some receives only the difference."
+        />
         <Button
           size="sm"
           disabled={busy}
@@ -380,33 +432,51 @@ export function PoolingScreen({ activeAccountId }: { activeAccountId: number }) 
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
-          {nicheAccounts.map((account) => (
-            <label key={account.id} className="flex items-center gap-2 rounded-md border border-border px-2 py-1 text-xs">
-              <input
-                type="checkbox"
-                checked={(manualTargets[account.id] ?? 0) > 0}
-                onChange={(event) =>
-                  setManualTargets((current) => ({
-                    ...current,
-                    [account.id]: event.target.checked ? Math.max(current[account.id] ?? 1, 1) : 0,
-                  }))
+          {nicheAccounts.map((account) => {
+            const inactive = account.operational_status !== "active";
+            return (
+              <label
+                key={account.id}
+                className={`flex items-center gap-2 rounded-md border border-border px-2 py-1 text-xs ${inactive ? "opacity-60" : ""}`}
+                title={
+                  inactive
+                    ? `${account.name} is ${account.operational_status} — set it to Active in Account settings to distribute to it.`
+                    : undefined
                 }
-              />
-              {account.name}
-              <input
-                type="number"
-                min={0}
-                className="h-7 w-16 rounded border border-input px-1"
-                value={manualTargets[account.id] ?? 0}
-                onChange={(event) =>
-                  setManualTargets((current) => ({
-                    ...current,
-                    [account.id]: Math.max(0, Number(event.target.value) || 0),
-                  }))
-                }
-              />
-            </label>
-          ))}
+              >
+                <input
+                  type="checkbox"
+                  disabled={inactive}
+                  checked={(manualTargets[account.id] ?? 0) > 0}
+                  onChange={(event) =>
+                    setManualTargets((current) => ({
+                      ...current,
+                      [account.id]: event.target.checked ? Math.max(current[account.id] ?? 1, 1) : 0,
+                    }))
+                  }
+                />
+                {account.name}
+                {inactive && (
+                  <span className="text-[10px] uppercase text-amber-500">
+                    {account.operational_status}
+                  </span>
+                )}
+                <input
+                  type="number"
+                  min={0}
+                  disabled={inactive}
+                  className="h-7 w-16 rounded border border-input px-1"
+                  value={manualTargets[account.id] ?? 0}
+                  onChange={(event) =>
+                    setManualTargets((current) => ({
+                      ...current,
+                      [account.id]: Math.max(0, Number(event.target.value) || 0),
+                    }))
+                  }
+                />
+              </label>
+            );
+          })}
         </div>
         <Button
           size="sm"
@@ -637,21 +707,32 @@ export function PoolingScreen({ activeAccountId }: { activeAccountId: number }) 
                 <div className="flex flex-wrap gap-2">
                   {nicheAccounts.map((account) => {
                     const already = selectedClip.distributed_to.includes(account.name);
+                    const inactive = account.operational_status !== "active";
                     return (
                       <label
                         key={account.id}
                         className={`flex items-center gap-1.5 rounded-md border border-border px-2 py-1 text-xs ${
-                          already ? "opacity-60" : "cursor-pointer hover:bg-accent"
+                          already || inactive ? "opacity-60" : "cursor-pointer hover:bg-accent"
                         }`}
+                        title={
+                          inactive
+                            ? `${account.name} is ${account.operational_status} — set it to Active in Account settings to distribute to it.`
+                            : undefined
+                        }
                       >
                         <input
                           type="checkbox"
                           checked={already || distributeSel.has(account.id)}
-                          disabled={already || busy}
+                          disabled={already || inactive || busy}
                           onChange={(event) => toggleDistribute(account.id, event.target.checked)}
                         />
                         {account.name}
                         {already && <span className="text-[10px] text-emerald-500">✓ has it</span>}
+                        {!already && inactive && (
+                          <span className="text-[10px] uppercase text-amber-500">
+                            {account.operational_status}
+                          </span>
+                        )}
                       </label>
                     );
                   })}

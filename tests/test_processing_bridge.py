@@ -608,3 +608,73 @@ def test_resolve_entry_missing_build_raises(
     monkeypatch.setattr(webview_app, "_frontend_dist_index", lambda: tmp_path / "nope.html")
     with pytest.raises(FileNotFoundError):
         webview_app.resolve_entry()
+
+
+def test_ui_settings_round_trip_through_the_bridge() -> None:
+    """The path the UI actually uses to remember its choices.
+
+    These used to live in localStorage, which pywebview discards on every
+    restart (private mode + a per-launch port), so the batch screen forgot its
+    account exclusions each time the app reopened.
+    """
+    bridge = ProcessingBridge()
+
+    # The @_guard decorator wraps every bridge result in an {ok, data} envelope.
+    unset = bridge.get_ui_settings(["batchDrafts.niche"])
+    assert unset["ok"] is True
+    assert unset["data"] == {"batchDrafts.niche": None}
+
+    assert bridge.set_ui_setting("batchDrafts.niche", "history")["ok"] is True
+    bridge.set_ui_setting("batchDrafts.excludedAccountIds", [4, 5, 8])
+    bridge.set_ui_setting("batchDrafts.autoDistributeOnReject", True)
+
+    stored = bridge.get_ui_settings(
+        [
+            "batchDrafts.niche",
+            "batchDrafts.excludedAccountIds",
+            "batchDrafts.autoDistributeOnReject",
+        ]
+    )
+    assert stored["ok"] is True
+    assert stored["data"] == {
+        "batchDrafts.niche": "history",
+        "batchDrafts.excludedAccountIds": [4, 5, 8],
+        "batchDrafts.autoDistributeOnReject": True,
+    }
+
+
+def test_webview_http_port_is_fixed_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The UI's origin must not change between launches.
+
+    pywebview picks a random port when http_port is unset, and localStorage is
+    partitioned by origin (port included), so a random port silently emptied
+    every remembered UI choice on each restart.
+    """
+    monkeypatch.delenv("NICHEFLOW_WEBVIEW_PORT", raising=False)
+    assert webview_app._webview_http_port() == webview_app._DEFAULT_HTTP_PORT
+    # Stable across calls — the point of the whole thing.
+    assert webview_app._webview_http_port() == webview_app._webview_http_port()
+
+
+def test_webview_http_port_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("NICHEFLOW_WEBVIEW_PORT", "18999")
+    assert webview_app._webview_http_port() == 18999
+
+
+@pytest.mark.parametrize("value", ["nope", "0", "99999", "-1"])
+def test_webview_http_port_rejects_bad_values(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    """Fail loudly at startup rather than falling back to a random port, which
+    would resurrect the silent-reset bug."""
+    monkeypatch.setenv("NICHEFLOW_WEBVIEW_PORT", value)
+    with pytest.raises(ValueError):
+        webview_app._webview_http_port()
+
+
+def test_webview_storage_path_lives_under_the_data_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Persistent webview storage must be gitignored app data, not a temp dir."""
+    monkeypatch.setenv("NICHEFLOW_DATA_DIR", str(tmp_path))
+    assert webview_app.webview_storage_path() == tmp_path / "webview-storage"

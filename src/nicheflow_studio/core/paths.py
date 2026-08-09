@@ -48,8 +48,19 @@ def logs_dir() -> Path:
     return data_dir() / "logs"
 
 
+def account_headers_dir() -> Path:
+    """Profile pictures used by the burned-in post header, one per account.
+
+    Drop `<instagram_handle>.png` (or .jpg/.jpeg/.webp) here; the export picks
+    it up by filename. Kept out of the DB so swapping an account's avatar is a
+    file copy, not a migration.
+    """
+    return data_dir() / "account_headers"
+
+
 def ensure_data_dirs() -> None:
     downloads_dir().mkdir(parents=True, exist_ok=True)
     processed_dir().mkdir(parents=True, exist_ok=True)
     backups_dir().mkdir(parents=True, exist_ok=True)
     logs_dir().mkdir(parents=True, exist_ok=True)
+    account_headers_dir().mkdir(parents=True, exist_ok=True)

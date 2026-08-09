@@ -486,7 +486,23 @@ def list_due_jobs() -> list[dict]:
     nothing should post on a flagged account until the cooldown expires or the
     account is reactivated. This is what makes flagging an account in the UI
     stop it immediately, even for reels that were already scheduled.
+
+    Jobs on cloud-mapped accounts are excluded too: a locally-'scheduled' job
+    there is a stray whose Worker push hasn't landed yet (the cloud sync sweep
+    re-pushes it), and these accounts publish via the Graph API only — the
+    local browser posting one is exactly the automation tell that got an
+    account flagged. The explicit force-local Publish Now override remains
+    available for deliberate manual use.
     """
+    from nicheflow_studio.services import cloud_publisher
+
+    cloud_mapped_ids: set[int] = set()
+    if cloud_publisher.is_configured():
+        for account_id in cloud_publisher.cloud_publish_map():
+            try:
+                cloud_mapped_ids.add(int(account_id))
+            except ValueError:
+                continue
     now = dt.datetime.now(dt.timezone.utc)
     with get_session() as session:
         rows = session.scalars(
@@ -514,6 +530,7 @@ def list_due_jobs() -> list[dict]:
             and _aware(row.scheduled_at) <= now
             and not _account_on_cooldown(row.account_id, now=now)
             and row.account_id not in inactive_account_ids
+            and row.account_id not in cloud_mapped_ids
         ]
 
 

@@ -13,6 +13,8 @@ be one click away in an early migration slice.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import datetime as dt
 import logging
 import random as _random
@@ -26,7 +28,10 @@ from nicheflow_studio.core.scheduling import (
     most_recent_passed_slot_time,
     next_open_slot_time,
 )
-from nicheflow_studio.db.assignments import ACCOUNT_OPERATIONAL_STATUS_ACTIVE
+from nicheflow_studio.db.assignments import (
+    ACCOUNT_OPERATIONAL_STATUS_ACTIVE,
+    mark_assignment_posted_for_job,
+)
 from nicheflow_studio.db.models import Account, DownloadItem, UploadJob
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.services.errors import ServiceError
@@ -282,7 +287,13 @@ def _handoff_scheduled_job_to_cloud(job_id: int) -> str | None:
     replaces the cloud job (with its new time) instead of silently no-op'ing
     against a stale one. Returns ``"cloud"`` when handed off (so the local publish
     loop, which only acts on ``status == "scheduled"``, skips it), or ``None`` when
-    no handoff applies. A hard failure marks the job ``failed`` and raises.
+    no handoff applies.
+
+    Failure semantics: bad metadata marks the job ``failed`` (retrying can't fix
+    it; the user must). A push failure (Worker unreachable, upload timeout) keeps
+    the job ``scheduled`` with the error recorded and raises — the
+    :func:`sync_cloud_jobs` stray sweep re-pushes it automatically, so a network
+    blip during a bulk export can no longer strand a reel locally.
     """
     from nicheflow_studio.services import cloud_publisher
 
@@ -320,14 +331,18 @@ def _handoff_scheduled_job_to_cloud(job_id: int) -> str | None:
             scheduled_at=scheduled_iso,
             video_path=video,
         )
-    except cloud_publisher.CloudPublisherError as exc:
+    except Exception as exc:  # noqa: BLE001 - any push failure must leave a retryable trace
+        # Deliberately NOT marked failed: the schedule itself is valid, only the
+        # push didn't land. Keeping it 'scheduled' with the error recorded makes
+        # the sync sweep retry it until the Worker takes it.
         with get_session() as session:
             job = session.get(UploadJob, job_id)
-            if job is not None:
-                job.status = "failed"
-                job.error_message = f"Cloud handoff failed: {exc}"[:512]
+            if job is not None and job.status == "scheduled":
+                job.error_message = f"Cloud handoff failed (auto-retrying): {exc}"[:512]
                 session.commit()
-        raise PublishError(f"Cloud handoff failed: {exc}") from exc
+        raise PublishError(
+            f"Cloud handoff failed: {exc} — kept scheduled locally and will retry automatically."
+        ) from exc
 
     with get_session() as session:
         job = session.get(UploadJob, job_id)
@@ -336,6 +351,65 @@ def _handoff_scheduled_job_to_cloud(job_id: int) -> str | None:
             job.error_message = None
             session.commit()
     return "cloud"
+
+
+# Strays being re-pushed in the background right now (video uploads take
+# minutes; the sync poll must neither block on them nor start duplicates).
+_HANDOFF_RETRY_INFLIGHT: set[int] = set()
+_HANDOFF_RETRY_GUARD = threading.Lock()
+
+
+def _spawn_handoff_retry(job_id: int) -> None:
+    """Re-push one stray scheduled job to the Worker on a daemon thread."""
+    with _HANDOFF_RETRY_GUARD:
+        if job_id in _HANDOFF_RETRY_INFLIGHT:
+            return
+        _HANDOFF_RETRY_INFLIGHT.add(job_id)
+
+    def _run() -> None:
+        try:
+            handoff_scheduled_job_to_cloud(job_id)
+        except Exception:  # noqa: BLE001 - recorded on the job; next sweep retries
+            logger.exception("Background cloud handoff retry failed for job %s", job_id)
+        finally:
+            with _HANDOFF_RETRY_GUARD:
+                _HANDOFF_RETRY_INFLIGHT.discard(job_id)
+
+    threading.Thread(
+        target=_run, name=f"nicheflow-cloud-handoff-{job_id}", daemon=True
+    ).start()
+
+
+# Set by batch exports (services/batch_finish) so queue_for_publish hands the
+# minutes-long video upload to a background thread instead of blocking. Rendering
+# is CPU-bound and uploading is network-bound, so overlapping reel N's upload with
+# reel N+1's render cuts a batch's wall clock to roughly max(render, upload)
+# instead of their sum.
+#
+# This is a pipeline, NOT parallel uploads: cloud_publisher._REQUEST_LOCK still
+# serializes every Worker call, which is what keeps concurrent multi-MB PUTs from
+# tripping Windows' "write operation timed out". A ContextVar (not a global) so
+# the flag can't leak into unrelated threads -- a new thread starts with an empty
+# context and therefore reads the default False.
+_DEFER_CLOUD_HANDOFF: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "nicheflow_defer_cloud_handoff", default=False
+)
+
+
+@contextlib.contextmanager
+def deferred_cloud_handoff():
+    """Within this block, ``queue_for_publish`` pushes to the Worker in the background.
+
+    The job stays locally ``scheduled`` until the upload lands and then flips to
+    ``cloud``, so a caller that needs the final status back synchronously must
+    not use this. A push that fails leaves the same retryable trace the blocking
+    path leaves, and :func:`sync_cloud_jobs`'s stray sweep re-pushes it.
+    """
+    token = _DEFER_CLOUD_HANDOFF.set(True)
+    try:
+        yield
+    finally:
+        _DEFER_CLOUD_HANDOFF.reset(token)
 
 
 def cancel_cloud_handoff(job_id: int) -> int:
@@ -473,9 +547,17 @@ def queue_for_publish(item_id: int, *, scheduled_at: str | None = None) -> dict:
     # account is pushed to the Worker and flips to status 'cloud' so the local
     # publish loop skips it. Inert (returns None) unless the account is mapped.
     if status == "scheduled":
-        cloud_status = handoff_scheduled_job_to_cloud(result["job_id"])
-        if cloud_status:
-            result["status"] = cloud_status
+        if _DEFER_CLOUD_HANDOFF.get():
+            # Pipelined batch export: don't block the render loop on the upload.
+            # The job stays 'scheduled' here and flips to 'cloud' once the push
+            # lands. _spawn_handoff_retry's in-flight guard and per-job handoff
+            # lock keep this from racing the sync_cloud_jobs stray sweep.
+            _spawn_handoff_retry(result["job_id"])
+            result["cloud_handoff"] = "deferred"
+        else:
+            cloud_status = handoff_scheduled_job_to_cloud(result["job_id"])
+            if cloud_status:
+                result["status"] = cloud_status
     return result
 
 
@@ -691,6 +773,12 @@ def sync_cloud_jobs() -> dict:
     from the Worker on every poll (not just when the local ``status`` flips), so
     the dashboard can always show *why* a gate-blocked job hasn't posted yet
     instead of looking frozen.
+
+    Also reconciles strays: local ``scheduled`` jobs on cloud-mapped accounts
+    (a handoff that crashed mid-push, or an app exit before the 'cloud' flip
+    committed) are adopted when the Worker already holds a live copy, or
+    re-pushed in the background otherwise — so every scheduled reel on a
+    cloud-mapped account eventually reaches the Worker.
     """
     from nicheflow_studio.services import cloud_publisher
 
@@ -725,6 +813,10 @@ def sync_cloud_jobs() -> dict:
                     item = session.get(DownloadItem, job.download_item_id)
                     if item is not None:
                         item.status = "posted"
+                # Close the originating assignment like the local publish paths
+                # do; without this every cloud post leaves its assignment stuck
+                # 'assigned', inflating backlog counts and starving top-up.
+                mark_assignment_posted_for_job(session, job)
                 job.error_message = None
                 updated += 1
             elif wstatus in ("manual_local_available", "local_fallback"):
@@ -750,6 +842,46 @@ def sync_cloud_jobs() -> dict:
                     job.error_message = note
                     updated += 1
             # validated -> still 'cloud' (no change yet)
+
+        # Stray sweep: a job that should live on the Worker but is still locally
+        # 'scheduled' (its handoff crashed mid-push, or the app closed before the
+        # flip to 'cloud' committed). Adopt it when the Worker already holds a
+        # live copy — pushing again would double-book the slot — otherwise
+        # re-push it in the background. This loop is what turns "auto-schedule
+        # in cloud" from best-effort into eventually-guaranteed.
+        retry_ids: list[int] = []
+        stray_cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=48)
+        strays = session.scalars(
+            select(UploadJob)
+            .where(UploadJob.status == "scheduled")
+            .where(UploadJob.scheduled_at.is_not(None))
+            .where(UploadJob.posted_at.is_(None))
+        ).all()
+        for job in strays:
+            if not cloud_publisher.cloud_account_key_for(job.account_id):
+                continue
+            # Ancient strays stay local and visible as Missed — auto-pushing a
+            # weeks-old backlog would surprise-post stale content.
+            if _aware(job.scheduled_at) < stray_cutoff:
+                continue
+            worker = _latest_worker_job_for_local(worker_jobs, job.id)
+            wstatus = (worker.get("status") or "").lower() if worker else ""
+            if wstatus in ("scheduled", "processing", "validated", "published"):
+                # The push DID land; only the local flip was lost. 'published'
+                # is adopted too (the next sweep marks it posted) so the local
+                # publish loop can never double-post it.
+                job.status = "cloud"
+                job.cloud_status = wstatus
+                job.error_message = None
+                updated += 1
+            else:
+                # No live Worker copy ('awaiting_upload' orphans count as dead:
+                # the handoff cancels them before pushing fresh).
+                retry_ids.append(job.id)
         if updated or dirty:
             session.commit()
+    # Spawned outside the session: each retry uploads a video (minutes) and the
+    # per-job handoff lock serializes it against any concurrent re-export.
+    for job_id in retry_ids:
+        _spawn_handoff_retry(job_id)
     return {"synced": True, "updated": updated}

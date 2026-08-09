@@ -518,3 +518,30 @@ class DraftRevision(Base):
     applied_caption_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     download_item: Mapped["DownloadItem"] = relationship()
+
+
+class UiSetting(Base):
+    """A single remembered UI preference, keyed by a dotted string.
+
+    The webview stores nothing reliably: pywebview runs the window in private
+    mode by default and serves the built UI on a port that changes per launch,
+    and localStorage is partitioned by origin — so browser-side persistence
+    silently reset on every restart. Preferences live here instead, in the same
+    SQLite file as everything else, where they are independent of webview
+    storage settings and can actually be tested.
+
+    ``value`` holds JSON so a preference can be a scalar, a list (excluded
+    account ids) or an object without needing its own column.
+
+    New table, so ``Base.metadata.create_all`` adds it to existing databases.
+    """
+
+    __tablename__ = "ui_settings"
+
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    value: Mapped[str] = mapped_column(String(8192))
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: dt.datetime.now(dt.timezone.utc),
+        onupdate=lambda: dt.datetime.now(dt.timezone.utc),
+    )

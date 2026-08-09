@@ -331,3 +331,83 @@ def test_space_caption_outro_keeps_existing_readable_spacing() -> None:
     caption = f"Context paragraph.\n\n{outro}\n\n#history"
 
     assert draft_generation._space_caption_outro(caption, outro) == caption
+
+
+def _vision_pass(payload: dict | None, error: str | None = None) -> smart_drafts.VisionPass:
+    return smart_drafts.VisionPass(
+        payload=payload,
+        response=None,
+        error=error,
+        attempted=True,
+        retry_attempted=False,
+        frame_count=5,
+        model="test-vision",
+    )
+
+
+def test_ensure_batch_vision_stops_after_a_provider_level_failure(monkeypatch, tmp_path) -> None:
+    # A missing vision model 404s identically for every reel. Paying that
+    # round-trip once per item added ~3s x batch size to "Prepare batch".
+    items = [_make_item() for _ in range(4)]
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"fake")
+    with get_session() as session:
+        for item_id in items:
+            session.get(DownloadItem, item_id).file_path = str(video)
+        session.commit()
+
+    calls: list[int] = []
+
+    def fake_describe(path, **kwargs):
+        calls.append(1)
+        return _vision_pass(None, error="request failed: 404 model_not_found")
+
+    monkeypatch.setattr(smart_drafts, "describe_video_frames", fake_describe)
+
+    result = draft_generation.ensure_batch_vision_payloads(items)
+
+    assert len(calls) == 1, "only the first reel should pay the failing round-trip"
+    assert result["described"] == []
+    assert "404" in result["unavailable"]
+    assert len(result["skipped"]) == 4
+
+
+def test_ensure_batch_vision_keeps_going_after_a_transient_failure(monkeypatch, tmp_path) -> None:
+    # A rate limit is per-key and transient, so the batch must not give up.
+    items = [_make_item() for _ in range(3)]
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"fake")
+    with get_session() as session:
+        for item_id in items:
+            session.get(DownloadItem, item_id).file_path = str(video)
+        session.commit()
+
+    calls: list[int] = []
+
+    def fake_describe(path, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            return _vision_pass(None, error="429 rate_limit_exceeded")
+        return _vision_pass({"main_subject": "a clip"})
+
+    monkeypatch.setattr(smart_drafts, "describe_video_frames", fake_describe)
+
+    result = draft_generation.ensure_batch_vision_payloads(items)
+
+    assert len(calls) == 3
+    assert result["described"] == items[1:]
+    assert result["unavailable"] is None
+
+
+def test_ensure_vision_payload_reuses_stored_evidence(monkeypatch) -> None:
+    item_id = _make_item()
+    with get_session() as session:
+        session.get(DownloadItem, item_id).smart_vision_payload = '{"main_subject": "a bridge"}'
+        session.commit()
+
+    def fail(*args, **kwargs):
+        raise AssertionError("stored evidence must not trigger a vision call")
+
+    monkeypatch.setattr(smart_drafts, "describe_video_frames", fail)
+
+    assert draft_generation.ensure_vision_payload(item_id) == {"main_subject": "a bridge"}

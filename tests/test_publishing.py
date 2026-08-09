@@ -9,7 +9,14 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 from sqlalchemy import select
 
-from nicheflow_studio.db.models import Account, DownloadItem, UploadJob
+from nicheflow_studio.db.models import (
+    Account,
+    Assignment,
+    DownloadItem,
+    MediaAsset,
+    PoolItem,
+    UploadJob,
+)
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.services import publishing
 from nicheflow_studio.services.publishing import PublishError
@@ -163,6 +170,61 @@ def test_scheduled_job_hands_off_to_cloud_when_mapped(monkeypatch: pytest.Monkey
         assert session.get(UploadJob, result["job_id"]).status == "cloud"
 
 
+def test_deferred_handoff_pushes_in_the_background_instead_of_blocking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Batch exports pipeline the upload against the next render, so the push must
+    # be spawned rather than awaited -- the job stays 'scheduled' until it lands.
+    from nicheflow_studio.services import cloud_publisher
+
+    item_id = _make_item()
+    _enable_cloud(monkeypatch, _account_id_of(item_id))
+    monkeypatch.setattr(
+        cloud_publisher,
+        "schedule_reel",
+        lambda **_kwargs: pytest.fail("the upload must not run on the calling thread"),
+    )
+    spawned: list[int] = []
+    monkeypatch.setattr(publishing, "_spawn_handoff_retry", spawned.append)
+
+    with publishing.deferred_cloud_handoff():
+        result = publishing.queue_for_publish(item_id, scheduled_at="2026-06-16T02:00:00+00:00")
+
+    assert spawned == [result["job_id"]]
+    assert result["cloud_handoff"] == "deferred"
+    assert result["status"] == "scheduled"
+    with get_session() as session:
+        assert session.get(UploadJob, result["job_id"]).status == "scheduled"
+
+
+def test_deferred_handoff_does_not_leak_past_its_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An export outside a batch must still get its final 'cloud' status back
+    # synchronously, including after a batch raised partway through.
+    from nicheflow_studio.services import cloud_publisher
+
+    item_id = _make_item()
+    _enable_cloud(monkeypatch, _account_id_of(item_id))
+    monkeypatch.setattr(cloud_publisher, "list_jobs", lambda: {"jobs": []})
+    monkeypatch.setattr(
+        cloud_publisher, "schedule_reel", lambda **_kwargs: {"id": "w", "status": "scheduled"}
+    )
+    monkeypatch.setattr(
+        publishing,
+        "_spawn_handoff_retry",
+        lambda job_id: pytest.fail("handoff must be synchronous outside the block"),
+    )
+
+    with pytest.raises(RuntimeError):
+        with publishing.deferred_cloud_handoff():
+            raise RuntimeError("batch blew up mid-loop")
+
+    result = publishing.queue_for_publish(item_id, scheduled_at="2026-06-16T02:00:00+00:00")
+
+    assert result["status"] == "cloud"
+
+
 def test_scheduled_job_stays_local_when_account_not_mapped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -184,7 +246,12 @@ def test_scheduled_job_stays_local_when_account_not_mapped(
         assert session.get(UploadJob, result["job_id"]).status == "scheduled"
 
 
-def test_cloud_handoff_failure_marks_job_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cloud_handoff_push_failure_keeps_job_scheduled_for_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A push failure (Worker unreachable, upload timeout) must NOT mark the job
+    failed: the schedule is valid, only the push didn't land. It stays
+    'scheduled' with the error recorded so the sync stray sweep re-pushes it."""
     from nicheflow_studio.services import cloud_publisher
     from nicheflow_studio.services.cloud_publisher import CloudPublisherError
 
@@ -202,8 +269,33 @@ def test_cloud_handoff_failure_marks_job_failed(monkeypatch: pytest.MonkeyPatch)
 
     with get_session() as session:
         job = session.scalars(select(UploadJob)).first()
-        assert job.status == "failed"
-        assert "Cloud handoff failed" in (job.error_message or "")
+        assert job.status == "scheduled"
+        assert "auto-retrying" in (job.error_message or "")
+
+
+def test_cloud_handoff_raw_network_error_keeps_job_scheduled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: a raw TimeoutError escaping the Worker client (read timeout
+    during list_jobs) used to bypass all handling — the job silently stayed
+    local 'scheduled' with no error and the whole export job crashed."""
+    from nicheflow_studio.services import cloud_publisher
+
+    item_id = _make_item()
+    _enable_cloud(monkeypatch, _account_id_of(item_id))
+
+    def raw_timeout():
+        raise TimeoutError("The read operation timed out")
+
+    monkeypatch.setattr(cloud_publisher, "list_jobs", raw_timeout)
+
+    with pytest.raises(PublishError, match="Cloud handoff failed"):
+        publishing.queue_for_publish(item_id, scheduled_at="2026-06-16T02:00:00+00:00")
+
+    with get_session() as session:
+        job = session.scalars(select(UploadJob)).first()
+        assert job.status == "scheduled"
+        assert "auto-retrying" in (job.error_message or "")
 
 
 def test_cloud_handoff_replaces_existing_worker_job(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -329,6 +421,68 @@ def test_sync_cloud_jobs_updates_local(monkeypatch: pytest.MonkeyPatch) -> None:
         assert failed.cloud_error == "boom"
 
 
+def test_sync_cloud_jobs_marks_assignment_posted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A cloud-published job closes its originating assignment, exactly like the
+    local publish paths. Stuck 'assigned' rows inflate the per-account backlog
+    count, so top-up stops feeding accounts that publish via the Worker."""
+    from nicheflow_studio.services import cloud_publisher
+
+    item_id = _make_item()
+    with get_session() as session:
+        item = session.get(DownloadItem, item_id)
+        account_id = item.account_id
+        asset = MediaAsset(
+            platform="instagram",
+            canonical_source_url=item.source_url,
+            download_status="downloaded",
+        )
+        session.add(asset)
+        session.flush()
+        pool_item = PoolItem(media_asset_id=asset.id, niche="history", acceptance_status="accepted")
+        session.add(pool_item)
+        session.flush()
+        assignment = Assignment(
+            pool_item_id=pool_item.id,
+            account_id=account_id,
+            niche="history",
+            status="assigned",
+        )
+        session.add(assignment)
+        job = UploadJob(
+            account_id=account_id,
+            download_item_id=item_id,
+            processed_path="C:/a.mp4",
+            status="cloud",
+        )
+        session.add(job)
+        session.commit()
+        job_id, assignment_id = job.id, assignment.id
+
+    monkeypatch.setenv("CLOUDFLARE_PUBLISHER_URL", "https://worker.example.dev")
+    monkeypatch.setenv("CLOUDFLARE_PUBLISHER_API_KEY", "secret")
+    monkeypatch.setattr(
+        cloud_publisher,
+        "list_jobs",
+        lambda: {
+            "jobs": [
+                {
+                    "external_id": f"nf-{job_id}-100",
+                    "status": "published",
+                    "published_at": "2026-06-16T02:00:00Z",
+                }
+            ]
+        },
+    )
+
+    result = publishing.sync_cloud_jobs()
+
+    assert result == {"synced": True, "updated": 1}
+    with get_session() as session:
+        refreshed = session.get(Assignment, assignment_id)
+        assert refreshed.status == "posted"
+        assert refreshed.upload_job_id == job_id
+
+
 def test_sync_cloud_jobs_persists_cloud_status_and_error_for_gated_job(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -417,6 +571,104 @@ def test_sync_cloud_jobs_persists_cloud_status_change_with_no_error(
         assert job.status == "cloud"
         assert job.cloud_status == "processing"
         assert job.cloud_error is None
+
+
+def _make_stray_scheduled_job(
+    item_id: int, *, scheduled_at: dt.datetime | None = None
+) -> int:
+    """A local 'scheduled' job on a cloud-mapped account whose push never landed."""
+    with get_session() as session:
+        job = UploadJob(
+            account_id=_account_id_of(item_id),
+            download_item_id=item_id,
+            processed_path="C:/processed/out.mp4",
+            title="Chosen title",
+            description="A caption.",
+            status="scheduled",
+            scheduled_at=scheduled_at
+            or (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=4)),
+        )
+        session.add(job)
+        session.commit()
+        return job.id
+
+
+def test_sync_cloud_jobs_adopts_stray_with_live_worker_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Crash AFTER the push landed but BEFORE the local 'cloud' flip committed:
+    the sweep must adopt the stray (not re-push — that would double-book)."""
+    from nicheflow_studio.services import cloud_publisher
+
+    item_id = _make_item()
+    _enable_cloud(monkeypatch, _account_id_of(item_id))
+    job_id = _make_stray_scheduled_job(item_id)
+
+    monkeypatch.setattr(
+        cloud_publisher,
+        "list_jobs",
+        lambda: {"jobs": [{"external_id": f"nf-{job_id}-100", "status": "scheduled"}]},
+    )
+    spawned: list[int] = []
+    monkeypatch.setattr(publishing, "_spawn_handoff_retry", spawned.append)
+
+    result = publishing.sync_cloud_jobs()
+
+    assert result == {"synced": True, "updated": 1}
+    assert spawned == []
+    with get_session() as session:
+        job = session.get(UploadJob, job_id)
+        assert job.status == "cloud"
+        assert job.cloud_status == "scheduled"
+
+
+def test_sync_cloud_jobs_repushes_stray_without_worker_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Crash BEFORE the push landed (e.g. the read-timeout strand): the sweep
+    re-pushes the stray in the background so it still reaches the Worker."""
+    from nicheflow_studio.services import cloud_publisher
+
+    item_id = _make_item()
+    _enable_cloud(monkeypatch, _account_id_of(item_id))
+    job_id = _make_stray_scheduled_job(item_id)
+
+    monkeypatch.setattr(cloud_publisher, "list_jobs", lambda: {"jobs": []})
+    spawned: list[int] = []
+    monkeypatch.setattr(publishing, "_spawn_handoff_retry", spawned.append)
+
+    publishing.sync_cloud_jobs()
+
+    assert spawned == [job_id]
+    with get_session() as session:
+        assert session.get(UploadJob, job_id).status == "scheduled"  # until the push lands
+
+
+def test_sync_cloud_jobs_leaves_old_and_unmapped_strays_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No auto-push for (a) strays older than the 48h cutoff (stale content must
+    not surprise-post) and (b) jobs on accounts that aren't cloud-mapped."""
+    from nicheflow_studio.services import cloud_publisher
+
+    stale_item = _make_item()
+    _enable_cloud(monkeypatch, _account_id_of(stale_item))
+    stale_id = _make_stray_scheduled_job(
+        stale_item, scheduled_at=dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=5)
+    )
+    unmapped_item = _make_item()  # separate account, not in the cloud map
+    unmapped_id = _make_stray_scheduled_job(unmapped_item)
+
+    monkeypatch.setattr(cloud_publisher, "list_jobs", lambda: {"jobs": []})
+    spawned: list[int] = []
+    monkeypatch.setattr(publishing, "_spawn_handoff_retry", spawned.append)
+
+    publishing.sync_cloud_jobs()
+
+    assert spawned == []
+    with get_session() as session:
+        assert session.get(UploadJob, stale_id).status == "scheduled"
+        assert session.get(UploadJob, unmapped_id).status == "scheduled"
 
 
 def test_list_cloud_jobs_joins_account_name(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -5,8 +5,10 @@ import random
 import re
 import subprocess
 import tempfile
+import threading
 import base64
 import av
+from collections.abc import Iterable
 from dataclasses import dataclass
 from statistics import median
 from pathlib import Path
@@ -19,6 +21,21 @@ from nicheflow_studio.core.media_tools import (
     windows_emoji_font_file,
     windows_font_file,
 )
+from nicheflow_studio.processing.post_header import (
+    TOP_PAD_PX as HEADER_TOP_PAD_PX,
+    PostHeader,
+    header_block_height,
+    render_post_header_image,
+)
+
+
+class RenderCanceled(RuntimeError):
+    """Raised when :func:`export_cropped_video` is interrupted mid-render.
+
+    Signalled via the caller-supplied ``cancel_event``; the FFmpeg subprocess is
+    killed and this is raised so the export service can abort cleanly instead of
+    treating it as a render failure.
+    """
 
 
 @dataclass(frozen=True)
@@ -1430,6 +1447,43 @@ def has_audio_stream(file_path: Path) -> bool:
     return bool(result.stdout.strip())
 
 
+def _run_render(command: list[str], cancel_event: "threading.Event | None") -> None:
+    """Run the FFmpeg render, honoring a cooperative ``cancel_event``.
+
+    Without an event this is a plain blocking run. With one, the process is
+    polled while it renders and killed the moment cancellation is requested,
+    raising :class:`RenderCanceled`. ``communicate`` drains stdout/stderr on
+    every poll so a chatty FFmpeg can't deadlock on a full pipe buffer, and a
+    retried ``communicate`` after ``TimeoutExpired`` keeps that output.
+    """
+    kwargs = subprocess_run_kwargs()
+    if cancel_event is None:
+        subprocess.run(command, check=True, capture_output=True, text=True, **kwargs)
+        return
+    if cancel_event.is_set():
+        raise RenderCanceled("Export canceled before rendering started.")
+    proc = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        **kwargs,
+    )
+    while True:
+        try:
+            stdout, stderr = proc.communicate(timeout=0.5)
+            break
+        except subprocess.TimeoutExpired:
+            if cancel_event.is_set():
+                proc.kill()
+                proc.communicate()
+                raise RenderCanceled("Export canceled during rendering.")
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(
+            proc.returncode, command, output=stdout, stderr=stderr
+        )
+
+
 def export_cropped_video(
     *,
     input_path: Path,
@@ -1444,8 +1498,10 @@ def export_cropped_video(
     enable_bold_keywords: bool = False,
     title_align: str = "center",
     title_line_gap_scale: float | None = None,
+    post_header: PostHeader | None = None,
     audio_mode: str = "keep",
     audio_alter_params: AudioAlterParams | None = None,
+    cancel_event: "threading.Event | None" = None,
 ) -> Path:
     resolved_input = input_path.expanduser().resolve()
     resolved_output = output_path.expanduser().resolve()
@@ -1504,6 +1560,7 @@ def export_cropped_video(
                     enable_bold=keep_bold_markers,
                     title_align=title_align,
                     title_line_gap_scale=title_line_gap_scale,
+                    post_header=post_header,
                 )
             elif _text_has_emoji(normalized_title) and emoji_font_path is not None:
                 # Overlay layout with emoji needs filter_complex too — the
@@ -1578,13 +1635,227 @@ def export_cropped_video(
                 str(resolved_output),
             ]
         )
-        subprocess.run(
-            command,
-            check=True,
-            capture_output=True,
-            text=True,
-            **subprocess_run_kwargs(),
+        _run_render(command, cancel_event)
+    return resolved_output
+
+
+# --- Vertical clipping (campaign / clip-and-repost workflow) ----------------
+# Cut a segment out of a long landscape source (e.g. a YouTube talk-show
+# episode) and reframe it into a 1080x1920 vertical short for Reels / Shorts /
+# TikTok. This is the render primitive the "Clip Studio" workflow is built on:
+# it does NOT crop-to-fit (which would throw away half of a two-person talk
+# show); it keeps the whole source frame centered and fills the vertical
+# letterbox with either a blurred copy of the frame or flat black.
+VERTICAL_CLIP_WIDTH = 1080
+VERTICAL_CLIP_HEIGHT = 1920
+VERTICAL_CLIP_BLUR_SIGMA = 20.0
+# Campaign floor for a compliant post (The Next Move / Clip Money requires a
+# 7s minimum). Exposed for callers/UI to validate against; the render primitive
+# itself stays duration-agnostic so it can also cut sub-7s previews.
+MIN_CLIP_SECONDS = 7.0
+_VALID_CLIP_BACKGROUNDS = {"blur", "black"}
+
+
+@dataclass(frozen=True)
+class SubtitleCue:
+    """A single burn-in caption line in absolute source-video seconds."""
+
+    start: float
+    end: float
+    text: str
+
+
+def build_vertical_reframe_filter(
+    *,
+    background: str = "blur",
+    blur_sigma: float = VERTICAL_CLIP_BLUR_SIGMA,
+    subtitles_path: Path | None = None,
+    subtitle_style: str | None = None,
+    width: int = VERTICAL_CLIP_WIDTH,
+    height: int = VERTICAL_CLIP_HEIGHT,
+) -> str:
+    """Build the ``filter_complex`` graph that turns ``[0:v]`` into ``[vout]``.
+
+    ``blur`` fills the 9:16 canvas with a scaled, blurred copy of the frame and
+    centers the full frame on top (nothing is cropped away — the standard
+    clipper look for landscape talk-show footage). ``black`` uses flat pillar/
+    letterbox bars instead. Optional ``subtitles_path`` burns an SRT into the
+    result; the SRT must be authored 0-based (see :func:`write_clip_srt`) so it
+    aligns with the seeked clip whose first frame is t=0.
+    """
+    if background not in _VALID_CLIP_BACKGROUNDS:
+        raise ValueError(
+            f"Unknown background {background!r}; expected one of {sorted(_VALID_CLIP_BACKGROUNDS)}."
         )
+
+    subtitle_suffix = ""
+    if subtitles_path is not None:
+        escaped = _escape_ffmpeg_path(subtitles_path.expanduser().resolve())
+        subtitle_suffix = f",subtitles='{escaped}'"
+        if subtitle_style:
+            subtitle_suffix += f":force_style='{subtitle_style}'"
+
+    if background == "black":
+        return (
+            f"[0:v]scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black"
+            f"{subtitle_suffix}[vout]"
+        )
+
+    return (
+        f"[0:v]split=2[clipbg][clipfg];"
+        f"[clipbg]scale={width}:{height}:force_original_aspect_ratio=increase,"
+        f"crop={width}:{height},gblur=sigma={blur_sigma}[bg];"
+        f"[clipfg]scale={width}:{height}:force_original_aspect_ratio=decrease[fg];"
+        f"[bg][fg]overlay=(W-w)/2:(H-h)/2{subtitle_suffix}[vout]"
+    )
+
+
+def render_vertical_clip(
+    *,
+    input_path: Path,
+    output_path: Path,
+    start_seconds: float,
+    end_seconds: float,
+    background: str = "blur",
+    blur_sigma: float = VERTICAL_CLIP_BLUR_SIGMA,
+    subtitles_path: Path | None = None,
+    subtitle_style: str | None = None,
+    audio_mode: str = "keep",
+    audio_alter_params: AudioAlterParams | None = None,
+    cancel_event: "threading.Event | None" = None,
+) -> Path:
+    """Cut ``[start_seconds, end_seconds)`` out of ``input_path`` and render a
+    1080x1920 vertical clip.
+
+    The segment is taken with input seeking (``-ss``/``-t``), so the output's
+    first frame is t=0 and any ``subtitles_path`` must be 0-based. ``audio_mode``
+    reuses the same subtle per-copy alteration as :func:`export_cropped_video`
+    so N accounts can receive non-identical files from the same moment.
+    """
+    resolved_input = input_path.expanduser().resolve()
+    resolved_output = output_path.expanduser().resolve()
+    if background not in _VALID_CLIP_BACKGROUNDS:
+        raise ValueError(
+            f"Unknown background {background!r}; expected one of {sorted(_VALID_CLIP_BACKGROUNDS)}."
+        )
+    if audio_mode not in _VALID_AUDIO_MODES:
+        raise ValueError(
+            f"Unknown audio_mode {audio_mode!r}; expected one of {sorted(_VALID_AUDIO_MODES)}."
+        )
+    if start_seconds < 0:
+        raise ValueError("start_seconds cannot be negative.")
+    duration = end_seconds - start_seconds
+    if duration <= 0:
+        raise ValueError("end_seconds must be greater than start_seconds.")
+
+    ffmpeg_path = ffmpeg_binary()
+    if ffmpeg_path is None:
+        raise RuntimeError("ffmpeg is not installed.")
+    if not resolved_input.exists():
+        raise FileNotFoundError(f"Video file not found: {resolved_input}")
+    if subtitles_path is not None and not subtitles_path.expanduser().resolve().exists():
+        raise FileNotFoundError(f"Subtitle file not found: {subtitles_path}")
+
+    graph = build_vertical_reframe_filter(
+        background=background,
+        blur_sigma=blur_sigma,
+        subtitles_path=subtitles_path,
+        subtitle_style=subtitle_style,
+    )
+
+    audio_filter: str | None = None
+    if audio_mode == "alter":
+        resolved_audio_params = audio_alter_params or random_audio_alter_params()
+        if has_audio_stream(resolved_input):
+            audio_filter = build_audio_filter(resolved_audio_params)
+
+    if audio_filter is not None:
+        graph = f"{graph};[0:a]{audio_filter}[aout]"
+        audio_map = ["-map", "[aout]"]
+    else:
+        audio_map = ["-map", "0:a?"]
+
+    resolved_output.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        str(ffmpeg_path),
+        "-y",
+        "-ss",
+        f"{start_seconds:.3f}",
+        "-t",
+        f"{duration:.3f}",
+        "-i",
+        str(resolved_input),
+        "-filter_complex",
+        graph,
+        "-map",
+        "[vout]",
+        *audio_map,
+        "-c:v",
+        "libx264",
+        "-preset",
+        "fast",
+        "-crf",
+        "18",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-movflags",
+        "+faststart",
+        str(resolved_output),
+    ]
+    _run_render(command, cancel_event)
+    return resolved_output
+
+
+def _format_srt_timestamp(seconds: float) -> str:
+    millis_total = int(round(max(seconds, 0.0) * 1000))
+    hours, millis_total = divmod(millis_total, 3_600_000)
+    minutes, millis_total = divmod(millis_total, 60_000)
+    secs, millis = divmod(millis_total, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def write_clip_srt(
+    cues: Iterable[SubtitleCue],
+    output_path: Path,
+    *,
+    clip_start: float,
+    clip_end: float,
+) -> Path:
+    """Write a 0-based SRT for the ``[clip_start, clip_end)`` window.
+
+    Absolute-time cues (e.g. a whisper transcript over the whole episode) are
+    clipped to the window and shifted so the clip's first frame is t=0 — the
+    timing :func:`render_vertical_clip` expects after input seeking. Cues that
+    fall entirely outside the window, or whose text is blank, are dropped.
+    """
+    resolved_output = output_path.expanduser().resolve()
+    resolved_output.parent.mkdir(parents=True, exist_ok=True)
+
+    blocks: list[str] = []
+    index = 1
+    for cue in cues:
+        text = cue.text.strip()
+        if not text:
+            continue
+        overlap_start = max(cue.start, clip_start)
+        overlap_end = min(cue.end, clip_end)
+        if overlap_end <= overlap_start:
+            continue
+        start_ts = _format_srt_timestamp(overlap_start - clip_start)
+        end_ts = _format_srt_timestamp(overlap_end - clip_start)
+        blocks.append(f"{index}\n{start_ts} --> {end_ts}\n{text}")
+        index += 1
+
+    # Trailing newline keeps the file valid when it has at least one cue.
+    resolved_output.write_text(
+        "\n\n".join(blocks) + ("\n" if blocks else ""),
+        encoding="utf-8",
+    )
     return resolved_output
 
 
@@ -2048,6 +2319,16 @@ def _fit_within(
     return (width - width % 2, height - height % 2)
 
 
+# On-device Reels chrome (measured from 2026-07 pastmomentsdaily screenshots,
+# scaled to the 1920 canvas): the status bar + "Reels"/back header reach
+# ~228px from the top, and Instagram maps the video edge-to-edge on tall
+# phones, so anything above that line renders underneath the app UI.
+_TITLE_TEXT_MIN_TOP_PX = 240
+# Minimum black margin kept under the footage block so pushing the block down
+# for the title gap can never leave the footage cut off at the canvas bottom.
+_BLOCK_MIN_BOTTOM_GAP_PX = 140
+
+
 def _title_band_filter_complex(
     text: str,
     *,
@@ -2063,6 +2344,7 @@ def _title_band_filter_complex(
     enable_bold: bool = False,
     title_align: str = "center",
     title_line_gap_scale: float | None = None,
+    post_header: PostHeader | None = None,
 ) -> str:
     canvas_width = 1080
     canvas_height = 1920
@@ -2094,10 +2376,6 @@ def _title_band_filter_complex(
         else None
     )
     dialogue_title = _is_dialogue_meme_title(wrapped_text)
-    # libx264 needs even dimensions; keep every stacked region even so the title
-    # band, the content area, and their vstack all stay encodable.
-    title_band_height -= title_band_height % 2
-    video_height = canvas_height - title_band_height
     # Keep blank lines as positional placeholders so a Template B title
     # (``Them: X\n\nMe when Y:``) reserves the visual gap between its two
     # paragraphs. ``raw_lines`` drives line_count / y-positions; the
@@ -2115,7 +2393,31 @@ def _title_band_filter_complex(
         if _is_cinema_title_font(title_font_name)
         else max(14, min(28, int(font_size * 0.34)))
     )
-    start_y = max(16, title_band_height - text_block_height - bottom_gap)
+    if post_header is not None:
+        # Header-anchored: the title hangs a fixed gap below the identity row
+        # rather than floating at the band bottom, so the header-to-title
+        # spacing matches a real feed post no matter how many lines the title
+        # wraps to. The band becomes exactly as tall as its content needs,
+        # which also means it ignores the ``_fit_title_band`` height caps.
+        start_y = header_block_height()
+        title_band_height = start_y + text_block_height + bottom_gap
+    else:
+        start_y = max(16, title_band_height - text_block_height - bottom_gap)
+    # libx264 needs even dimensions; keep every stacked region even so the title
+    # band, the content area, and their vstack all stay encodable.
+    title_band_height -= title_band_height % 2
+    # Instagram's Reels UI covers the top of the frame (status bar + "Reels"
+    # header reach ~228px on the 1920 canvas of a tall phone) and a
+    # caption/actions stack sits along the bottom edge. Tall footage used to
+    # collapse block_y to 0, putting the first title line under the app chrome
+    # and the footage flush with the canvas bottom. Reserve the chrome zones
+    # up front so the content area shrinks instead of the block overflowing.
+    # With a post header the avatar row, not the title text, is the topmost
+    # drawn element, so the chrome clearance is measured from its top pad.
+    top_element_y = HEADER_TOP_PAD_PX if post_header is not None else start_y
+    min_block_y = max(0, _TITLE_TEXT_MIN_TOP_PX - top_element_y)
+    video_height = canvas_height - title_band_height - min_block_y - _BLOCK_MIN_BOTTOM_GAP_PX
+    video_height -= video_height % 2
     escaped_font = _escape_ffmpeg_path(font_path)
     font_color = _ffmpeg_drawtext_color(title_color)
     title_duration = max(float(duration_seconds or 1.0), 0.1)
@@ -2172,7 +2474,11 @@ def _title_band_filter_complex(
             f"scale={content_width}:{content_height},setsar=1,format=yuv420p,"
             f"pad={canvas_width}:{content_height}:{content_x}:0:color=black[content]"
         )
-    block_y = max(0, ((canvas_height - content_height) // 2) - title_band_height)
+    # Center the footage, but never above the title-text floor and never so
+    # low that the footage bottom crosses the reserved bottom margin.
+    max_block_y = canvas_height - _BLOCK_MIN_BOTTOM_GAP_PX - title_band_height - content_height
+    block_y = ((canvas_height - content_height) // 2) - title_band_height
+    block_y = max(min_block_y, min(block_y, max_block_y))
     if (
         _is_historytrails_title_font(
             title_font_name,
@@ -2180,12 +2486,32 @@ def _title_band_filter_complex(
         )
         and line_count >= 5
     ):
-        max_block_y = max(0, canvas_height - title_band_height - content_height)
         block_y = min(max_block_y, block_y + 40)
     titlebase = (
         f"color=c=black:s={canvas_width}x{title_band_height}:"
         f"r=30:d={title_duration:.3f}[titlebase]"
     )
+
+    # The header PNG spans the full band so it composites at 0:0 exactly like
+    # the PIL title image. When present, the title chain terminates at
+    # [titlebody] and the header overlay is what produces the final [title].
+    header_chains: list[str] = []
+    title_label = "title"
+    if post_header is not None:
+        header_png = title_text_dir / "post-header.png"
+        render_post_header_image(
+            post_header,
+            canvas_width=canvas_width,
+            canvas_height=title_band_height,
+            left_x=max(content_x, _TITLE_SAFE_SIDE_MARGIN_PX),
+            font_path=windows_font_file("arial_bold") or font_path,
+            output_path=header_png,
+        )
+        title_label = "titlebody"
+        header_chains = [
+            f"movie='{_escape_ffmpeg_path(header_png)}'[headerimg]",
+            "[titlebody][headerimg]overlay=0:0:format=auto,format=yuv420p[title]",
+        ]
 
     if use_pil_path:
         # PIL renders the whole title (text + emoji + bold keywords) onto a
@@ -2200,6 +2526,9 @@ def _title_band_filter_complex(
                 requested_font_size=requested_font_size,
             )
             and line_count == 1
+            # A post header is an inherently left-aligned block; centering a
+            # one-line title under it leaves the two visibly out of column.
+            and post_header is None
         )
         left_aligned = (title_align == "left" or dialogue_title) and not center_single_line
         align_value: str | int = (
@@ -2236,13 +2565,16 @@ def _title_band_filter_complex(
         # needed — using ``loop=-1`` here instead would make the secondary
         # stream infinite and ffmpeg would write an unbounded output.
         movie_chain = f"movie='{escaped_png}'[titletext]"
-        overlay_chain = "[titlebase][titletext]overlay=0:0:format=auto,format=yuv420p[title]"
+        overlay_chain = (
+            f"[titlebase][titletext]overlay=0:0:format=auto,format=yuv420p[{title_label}]"
+        )
         return ";".join(
             [
                 content_chain,
                 titlebase,
                 movie_chain,
                 overlay_chain,
+                *header_chains,
                 "[title][content]vstack=inputs=2[block]",
                 (
                     f"[block]pad={canvas_width}:{canvas_height}:"
@@ -2257,6 +2589,9 @@ def _title_band_filter_complex(
             requested_font_size=requested_font_size,
         )
         and line_count == 1
+        # A post header is an inherently left-aligned block; centering a
+        # one-line title under it leaves the two visibly out of column.
+        and post_header is None
     )
     left_aligned = (title_align == "left" or dialogue_title) and not center_single_line
     text_x = (
@@ -2281,7 +2616,9 @@ def _title_band_filter_complex(
         # contiguous and don't reference a skipped index.
         y_value = start_y + (original_index * (font_size + line_spacing))
         input_label = "titlebase" if chain_index == 0 else f"title{chain_index - 1}"
-        output_label = "title" if chain_index == len(visible_lines) - 1 else f"title{chain_index}"
+        output_label = (
+            title_label if chain_index == len(visible_lines) - 1 else f"title{chain_index}"
+        )
         filter_parts.append(
             f"[{input_label}]drawtext="
             f"fontfile='{escaped_font}':"
@@ -2291,6 +2628,7 @@ def _title_band_filter_complex(
             f"x={text_x}:"
             f"y={y_value}[{output_label}]"
         )
+    filter_parts.extend(header_chains)
     filter_parts.append("[title][content]vstack=inputs=2[block]")
     filter_parts.append(
         f"[block]pad={canvas_width}:{canvas_height}:(ow-iw)/2:{block_y}:color=black[vout]"

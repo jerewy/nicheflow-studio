@@ -47,6 +47,66 @@ def test_mark_posted_sets_status_url_and_metrics() -> None:
     assert result["posted_likes"] == 90
 
 
+def test_mark_posted_marks_the_originating_assignment_posted() -> None:
+    """The third publish path must free the account's slot like the other two.
+
+    publish_now and the cloud sync each have their own coverage for this. When
+    mark_posted didn't, assignments for clips posted this way stayed 'assigned'
+    forever, so the account counted finished work against its distribute target
+    and every later Distribute reported "all at cap" and placed nothing.
+    """
+    from nicheflow_studio.db.assignments import (
+        assignment_counts_by_account,
+        distribute_niche,
+    )
+    from nicheflow_studio.db.media_library import find_or_register_media_asset
+    from nicheflow_studio.db.models import Assignment, PoolItem
+    from nicheflow_studio.db.pools import accept_into_pool
+
+    with get_session() as session:
+        account = Account(name="HistoryQueue", platform="instagram", niche="history")
+        session.add(account)
+        session.commit()
+        account_id = account.id
+
+        asset, _ = find_or_register_media_asset(
+            session, source_url="https://instagram.com/reel/queued", shortcode="queued"
+        )
+        accept_into_pool(session, media_asset=asset, niche="history")
+        session.commit()
+        assert len(distribute_niche(session, "history", max_per_account=1)) == 1
+        session.commit()
+
+        pool_item = session.query(PoolItem).one()
+        item = DownloadItem(
+            source_url=pool_item.media_asset.canonical_source_url,
+            video_id=pool_item.media_asset.source_shortcode,
+            account_id=account_id,
+            file_path="C:/clips/queued.mp4",
+            processed_path="C:/out/queued.mp4",
+            status="exported",
+        )
+        session.add(item)
+        session.commit()
+        job = UploadJob(
+            account_id=account_id,
+            download_item_id=item.id,
+            processed_path="C:/out/queued.mp4",
+            status="scheduled",
+        )
+        session.add(job)
+        session.commit()
+        job_id = job.id
+        assert assignment_counts_by_account(session, "history").get(account_id, 0) == 1
+
+    publish_queue.mark_posted(job_id, {})
+
+    with get_session() as session:
+        assert session.query(Assignment).one().status == "posted"
+        # Slot freed, so the next Distribute can top this account back up.
+        assert assignment_counts_by_account(session, "history").get(account_id, 0) == 0
+
+
 def test_mark_posted_bad_metric_raises() -> None:
     job_id = _make_job()
     with pytest.raises(PublishQueueError):

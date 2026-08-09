@@ -234,6 +234,14 @@ def save_revision(
         raise DraftRevisionError("title_options must contain at least one non-empty title.")
     if not captions:
         raise DraftRevisionError("caption_options must contain at least one non-empty caption.")
+    # One caption for several titles is the shared-caption shape (the chat
+    # handoff asks for three titles and a single caption that works under any
+    # of them). Fan it out here so the paired invariant the rest of the app
+    # relies on holds no matter which caller produced the revision: apply_revision
+    # indexes titles and captions with the SAME option number, so an unpadded
+    # list would apply an empty caption for options 2 and 3.
+    if len(captions) == 1 and len(titles) > 1:
+        captions = captions * len(titles)
 
     source_value = (source or "codex").strip() or "codex"
     # Agents occasionally misread "source" as the source VIDEO and send a file

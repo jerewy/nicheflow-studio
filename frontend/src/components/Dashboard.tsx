@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
+import { BatchDraftsScreen } from "@/components/BatchDraftsScreen";
 import { DashboardTable } from "@/components/DashboardTable";
 import { PoolingScreen } from "@/components/PoolingScreen";
 import { PoolReviewScreen } from "@/components/PoolReviewScreen";
@@ -7,16 +8,21 @@ import { MultiAccountPublish } from "@/components/MultiAccountPublish";
 import { AccountReadiness } from "@/components/AccountReadiness";
 import { Button } from "@/components/ui/button";
 import { useAutoRefresh } from "@/hooks/useAutoRefresh";
+import { usePauseHiddenMedia, useRevisitRefresh } from "@/hooks/useKeepAlive";
 import { bridge } from "@/lib/bridge";
 import { formatDate } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import type { DashboardAccountStats } from "@/types";
 
-type Sub = "review" | "pool" | "publish" | "readiness";
+type Sub = "review" | "pool" | "drafts" | "publish" | "readiness";
 
+// Ordered by the workflow: review the pool, distribute it, draft across
+// accounts, then publish. Batch Drafts sits directly before Multi-Account
+// Publish because finishing a batch is what fills that screen's queue.
 const SUBS: { id: Sub; label: string }[] = [
   { id: "review", label: "Review" },
   { id: "pool", label: "Pool & Distribute" },
+  { id: "drafts", label: "Batch Drafts" },
   { id: "publish", label: "Multi-Account Publish" },
   { id: "readiness", label: "Account Readiness" },
 ];
@@ -24,13 +30,25 @@ const SUBS: { id: Sub; label: string }[] = [
 export function Dashboard({
   activeAccountId,
   onOpenInProcessing,
+  active = true,
 }: {
   activeAccountId: number;
   onOpenInProcessing?: (accountId: number, itemId: number | null, search: string) => void;
+  // False while the screen is kept alive but hidden behind another tab.
+  active?: boolean;
 }) {
   const [sub, setSub] = useState<Sub>("pool");
   const [stats, setStats] = useState<DashboardAccountStats | null>(null);
   const [statsError, setStatsError] = useState<string | null>(null);
+  // Sub-screens follow the same keep-alive pattern as the main tabs: switching
+  // between Pool & Distribute and Multi-Account Publish must not kill an
+  // in-flight distribute/schedule job's progress UI. Updated from the sub-tab
+  // click handler, the only place `sub` changes.
+  const [visitedSubs, setVisitedSubs] = useState<ReadonlySet<Sub>>(() => new Set(["pool"]));
+  const subsHostRef = useRef<HTMLDivElement | null>(null);
+
+  usePauseHiddenMedia(subsHostRef, sub);
+  const isSubMounted = (s: Sub) => sub === s || visitedSubs.has(s);
 
   const loadStats = useCallback(async () => {
     try {
@@ -48,6 +66,8 @@ export function Dashboard({
   // Background exports/publishes land while this screen sits open; keep the
   // stats table fresh without requiring a tab switch or manual Refresh.
   useAutoRefresh(loadStats, 30000);
+  // Kept alive across main-tab switches; refresh stats promptly on revisit.
+  useRevisitRefresh(active, loadStats);
 
   return (
     <div className="mx-auto max-w-5xl space-y-4 p-6">
@@ -94,7 +114,10 @@ export function Dashboard({
         {SUBS.map((s) => (
           <button
             key={s.id}
-            onClick={() => setSub(s.id)}
+            onClick={() => {
+              setVisitedSubs((prev) => (prev.has(s.id) ? prev : new Set(prev).add(s.id)));
+              setSub(s.id);
+            }}
             className={cn(
               "rounded-t-md px-3 py-1.5 text-sm font-medium transition-colors",
               sub === s.id
@@ -107,10 +130,36 @@ export function Dashboard({
         ))}
       </div>
 
-      {sub === "review" && <PoolReviewScreen />}
-      {sub === "pool" && <PoolingScreen activeAccountId={activeAccountId} />}
-      {sub === "publish" && <MultiAccountPublish onOpenInProcessing={onOpenInProcessing} />}
-      {sub === "readiness" && <AccountReadiness />}
+      <div ref={subsHostRef}>
+        {isSubMounted("review") && (
+          <div hidden={sub !== "review"}>
+            <PoolReviewScreen active={active && sub === "review"} />
+          </div>
+        )}
+        {isSubMounted("pool") && (
+          <div hidden={sub !== "pool"}>
+            <PoolingScreen activeAccountId={activeAccountId} active={active && sub === "pool"} />
+          </div>
+        )}
+        {isSubMounted("drafts") && (
+          <div hidden={sub !== "drafts"}>
+            <BatchDraftsScreen
+              active={active && sub === "drafts"}
+              onOpenInProcessing={onOpenInProcessing}
+            />
+          </div>
+        )}
+        {isSubMounted("publish") && (
+          <div hidden={sub !== "publish"}>
+            <MultiAccountPublish onOpenInProcessing={onOpenInProcessing} />
+          </div>
+        )}
+        {isSubMounted("readiness") && (
+          <div hidden={sub !== "readiness"}>
+            <AccountReadiness />
+          </div>
+        )}
+      </div>
     </div>
   );
 }

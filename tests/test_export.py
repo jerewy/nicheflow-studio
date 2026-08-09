@@ -90,6 +90,59 @@ def test_export_sets_processed_path_and_reports_progress(
     assert events[-1][0] == 1.0
 
 
+def test_export_translates_render_cancel_to_job_cancel(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import threading
+
+    from nicheflow_studio.services.jobs import JobCanceled
+
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake")
+    item_id = _make_item(file_path=str(source))
+
+    monkeypatch.setattr(video, "probe_video", lambda _p: object())
+    monkeypatch.setattr(
+        video, "suggest_title_replacement_crop", lambda _p, _probe: video.CropSettings()
+    )
+
+    def canceled_render(**_kwargs):
+        raise video.RenderCanceled("Export canceled during rendering.")
+
+    monkeypatch.setattr(video, "export_cropped_video", canceled_render)
+
+    # A killed render surfaces as JobCanceled (a clean cancel), not ExportError,
+    # and never persists a processed_path for the half-rendered clip.
+    with pytest.raises(JobCanceled):
+        export_svc.export_item(item_id, cancel_event=threading.Event())
+
+    with get_session() as session:
+        item = session.get(DownloadItem, item_id)
+        assert item.processed_path is None
+
+
+def test_export_aborts_before_rendering_when_already_canceled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import threading
+
+    from nicheflow_studio.services.jobs import JobCanceled
+
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake")
+    item_id = _make_item(file_path=str(source))
+
+    def fail_if_called(**_kwargs):
+        raise AssertionError("render must not start once cancellation is requested")
+
+    monkeypatch.setattr(video, "export_cropped_video", fail_if_called)
+
+    event = threading.Event()
+    event.set()
+    with pytest.raises(JobCanceled):
+        export_svc.export_item(item_id, cancel_event=event)
+
+
 def test_export_auto_schedules_next_open_slot_when_flag_on(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -430,3 +483,133 @@ def test_export_uses_crop_override_over_auto(
 
     assert captured["crop"] == export_svc.crop_from_override(rect, probe)
     assert captured["crop"] != sentinel
+
+
+# --- Burned-in post header ------------------------------------------------- #
+
+
+def _use_post_header_template(item_id: int, **prefs: object) -> None:
+    """Point the item's account at the post-header template, with header prefs."""
+    import json
+
+    with get_session() as session:
+        item = session.get(DownloadItem, item_id)
+        account = session.get(Account, item.account_id)
+        account.processing_preferences = json.dumps(
+            {"template": "historytrails_post_header", **prefs}
+        )
+        session.commit()
+
+
+def test_export_sends_no_post_header_for_a_plain_template(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake")
+    item_id = _make_item(file_path=str(source))
+    captured: dict = {}
+    _mock_video(monkeypatch, captured)
+
+    export_svc.export_item(item_id)
+
+    assert captured["post_header"] is None
+
+
+def test_export_sends_the_account_post_header_for_the_header_template(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake")
+    item_id = _make_item(file_path=str(source), instagram_handle="pastmomentsdaily")
+    _use_post_header_template(item_id, header_display_name="Past Moments Daily")
+
+    headers_dir = tmp_path / "account_headers"
+    headers_dir.mkdir()
+    avatar = headers_dir / "pastmomentsdaily.png"
+    avatar.write_bytes(b"not a real png, only the path is read here")
+    monkeypatch.setattr(export_svc, "account_headers_dir", lambda: headers_dir)
+
+    captured: dict = {}
+    _mock_video(monkeypatch, captured)
+
+    export_svc.export_item(item_id)
+
+    header = captured["post_header"]
+    assert header is not None
+    assert header.display_name == "Past Moments Daily"
+    assert header.avatar_path == avatar
+    assert header.verified is True
+
+
+def test_post_header_falls_back_to_the_account_name_without_an_avatar(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake")
+    item_id = _make_item(file_path=str(source))
+    _use_post_header_template(item_id, header_verified=False)
+    monkeypatch.setattr(export_svc, "account_headers_dir", lambda: tmp_path / "missing")
+
+    captured: dict = {}
+    _mock_video(monkeypatch, captured)
+
+    export_svc.export_item(item_id)
+
+    header = captured["post_header"]
+    assert header.display_name == "Export Account"
+    assert header.avatar_path is None
+    assert header.verified is False
+
+
+def test_post_header_avatar_matches_a_versioned_variant(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake")
+    item_id = _make_item(file_path=str(source), instagram_handle="beneathhistory")
+    _use_post_header_template(item_id)
+
+    headers_dir = tmp_path / "account_headers"
+    headers_dir.mkdir()
+    # Real-world naming: no bare `<handle>.png`, mixed case, version suffixes,
+    # and a different account whose handle starts with the same letters.
+    (headers_dir / "BeneathHistory_pfp.png").write_bytes(b"older")
+    newest = headers_dir / "beneathhistory2_pfp.png"
+    newest.write_bytes(b"newer")
+    (headers_dir / "beneathhistoryclub.png").write_bytes(b"different account")
+    import os
+    import time
+
+    os.utime(headers_dir / "BeneathHistory_pfp.png", (time.time() - 600, time.time() - 600))
+    os.utime(headers_dir / "beneathhistoryclub.png", (time.time() + 600, time.time() + 600))
+    monkeypatch.setattr(export_svc, "account_headers_dir", lambda: headers_dir)
+
+    captured: dict = {}
+    _mock_video(monkeypatch, captured)
+
+    export_svc.export_item(item_id)
+
+    assert captured["post_header"].avatar_path == newest
+
+
+def test_post_header_prefers_the_exact_handle_filename(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake")
+    item_id = _make_item(file_path=str(source), instagram_handle="vaultedhistory")
+    _use_post_header_template(item_id)
+
+    headers_dir = tmp_path / "account_headers"
+    headers_dir.mkdir()
+    exact = headers_dir / "vaultedhistory.png"
+    exact.write_bytes(b"exact")
+    (headers_dir / "vaultedhistory_pp4.png").write_bytes(b"variant")
+    monkeypatch.setattr(export_svc, "account_headers_dir", lambda: headers_dir)
+
+    captured: dict = {}
+    _mock_video(monkeypatch, captured)
+
+    export_svc.export_item(item_id)
+
+    assert captured["post_header"].avatar_path == exact

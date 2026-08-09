@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,6 +14,7 @@ from nicheflow_studio.db.models import (
     MediaAsset,
     PoolItem,
     ScrapeCandidate,
+    UploadJob,
 )
 from nicheflow_studio.db.pool_intake import ReelMetadata, add_reel_to_pool
 from nicheflow_studio.db.session import get_session
@@ -161,6 +163,35 @@ def test_niche_accounts_lists_accounts() -> None:
     account_id, _ = _seed_history_pool()
     accounts = pooling.niche_accounts("history")
     assert any(a["id"] == account_id for a in accounts)
+
+
+def test_niche_accounts_includes_non_active_with_status() -> None:
+    """Resting/flagged accounts must be listed (with their status) so the UI
+    can show them disabled instead of silently omitting them."""
+    account_id, _ = _seed_history_pool()
+    with get_session() as session:
+        resting = Account(
+            name="Fresh Account",
+            platform="instagram",
+            niche="history",
+            operational_status="resting",
+        )
+        session.add(resting)
+        session.commit()
+        resting_id = resting.id
+
+    accounts = {a["id"]: a for a in pooling.niche_accounts("history")}
+    assert accounts[account_id]["operational_status"] == "active"
+    assert accounts[resting_id]["operational_status"] == "resting"
+
+    # Display-only: distribution itself still excludes the resting account.
+    with get_session() as session:
+        assert resting_id not in assignments_db.account_ids_for_niche(session, "history")
+
+
+def test_niche_accounts_unknown_niche_raises() -> None:
+    with pytest.raises(PoolingError):
+        pooling.niche_accounts("gaming")
 
 
 def test_distribute_clip_assigns_to_chosen_accounts() -> None:
@@ -431,6 +462,55 @@ def test_pending_review_clip_is_not_unassigned_or_distributed() -> None:
     assert pooling.distribute_niche("history", max_per_account=1)["assigned"] == 0
     with get_session() as session:
         assert session.query(Assignment).count() == 0
+
+
+def test_already_posted_footage_is_not_redistributed() -> None:
+    """A clip the network already published never re-enters distribution.
+
+    Posts made before the pooling layer existed have DownloadItem + posted
+    UploadJob rows but NO Assignment row, and legacy rows store the reel URL
+    with a trailing slash while the pool's canonical URL drops it. Both used to
+    let distribution re-serve an already-posted video (the "same video again"
+    bug: same reel re-assigned to the account that posted it a month earlier).
+    """
+    _seed_history_network(accounts=1, clips=2)
+    with get_session() as session:
+        account = session.query(Account).one()
+        # Legacy post of net0: trailing-slash URL, no assignment row.
+        legacy_item = DownloadItem(
+            source_url="https://instagram.com/reel/net0/",
+            video_id="net0",
+            title="posted last month",
+            status="completed",
+            account_id=account.id,
+        )
+        session.add(legacy_item)
+        session.flush()
+        session.add(
+            UploadJob(
+                account_id=account.id,
+                download_item_id=legacy_item.id,
+                processed_path="C:/processed/net0_cropped.mp4",
+                status="posted",
+                posted_at=dt.datetime.now(dt.timezone.utc),
+            )
+        )
+        session.commit()
+        posted_pool_item_id = (
+            session.query(PoolItem.id)
+            .join(MediaAsset, MediaAsset.id == PoolItem.media_asset_id)
+            .filter(MediaAsset.source_shortcode == "net0")
+            .scalar()
+        )
+
+    assert posted_pool_item_id not in pooling._unassigned_pool_item_ids("history")
+
+    result = pooling.distribute_niche("history", max_per_account=5)
+
+    assert result["assigned"] == 1  # only net1 — net0 was already posted
+    with get_session() as session:
+        assigned_pool_ids = {a.pool_item_id for a in session.query(Assignment).all()}
+        assert posted_pool_item_id not in assigned_pool_ids
 
 
 def test_approve_pool_items_makes_clip_distributable() -> None:
@@ -902,16 +982,18 @@ def test_auto_top_up_refills_only_below_target(monkeypatch) -> None:
         lambda niche, **kwargs: calls.append(niche) or {"niche": niche, "assigned": 0},
     )
 
-    # Backlog exactly at target (15): already topped up, no refill.
+    # Backlog exactly at target (15): already topped up, no refill. The tick
+    # measures the TOTAL unposted backlog (drafted and scheduled reels
+    # included), so that is what gets stubbed here.
     monkeypatch.setattr(
-        assignments_db, "assignment_counts_by_account", lambda session, niche: {account_id: 15}
+        assignments_db, "open_item_counts_by_account", lambda session, niche: {account_id: 15}
     )
     assert pooling.auto_top_up(("history",)) == []
     assert calls == []
 
     # One below target: the niche is refilled via the ranked distribution.
     monkeypatch.setattr(
-        assignments_db, "assignment_counts_by_account", lambda session, niche: {account_id: 14}
+        assignments_db, "open_item_counts_by_account", lambda session, niche: {account_id: 14}
     )
     results = pooling.auto_top_up(("history",))
     assert calls == ["history"]
@@ -922,6 +1004,73 @@ def test_auto_top_up_skips_niches_without_accounts() -> None:
     from nicheflow_studio.services import pooling
 
     assert pooling.auto_top_up(("movie",)) == []
+
+
+def test_auto_path_does_not_refill_on_top_of_drafted_unposted_reels(
+    monkeypatch,
+) -> None:
+    """The over-distribution bug, replayed end to end.
+
+    A batch import turns an account's reels into drafts without posting
+    anything. The undrafted count drops to zero, but the pipeline is still
+    full — so the automatic path must place nothing, while the manual button
+    (deliberately measured on "reels to draft") still refills a session.
+    """
+    from nicheflow_studio.db import assignments as assignments_db
+    from nicheflow_studio.db.models import DraftRevision
+
+    with get_session() as session:
+        account = Account(
+            name="Backlog Hist",
+            platform="instagram",
+            niche="history",
+            distribute_daily_target=3,
+            instagram_profile="backlog-hist",
+        )
+        session.add(account)
+        session.flush()
+        account_id = account.id
+        for i in range(12):
+            asset = MediaAsset(
+                platform="instagram",
+                canonical_source_url=f"https://instagram.com/reel/backlog{i}/",
+                source_shortcode=f"backlog{i}",
+            )
+            session.add(asset)
+            session.flush()
+            session.add(
+                PoolItem(media_asset_id=asset.id, niche="history", acceptance_status="accepted")
+            )
+        session.commit()
+
+    _make_profile_ready(monkeypatch, "backlog-hist")
+
+    # Fill to target, then "import a batch": every distributed reel gets a
+    # draft revision but no export and no job — exactly the state after
+    # Import pasted reply and before Finish batch.
+    pooling.distribute_niche("history", publish_ready_only=True)
+    with get_session() as session:
+        items = (
+            session.query(DownloadItem)
+            .filter(DownloadItem.account_id == account_id)
+            .all()
+        )
+        assert len(items) == 3
+        for item in items:
+            session.add(DraftRevision(download_item_id=item.id, revision_number=1))
+        session.commit()
+        assert assignments_db.undrafted_item_counts_by_account(session, "history") == {}
+        assert assignments_db.open_item_counts_by_account(session, "history") == {account_id: 3}
+
+    # The tick sees a full backlog and must not top up...
+    assert pooling.auto_top_up(("history",)) == []
+    auto = pooling.distribute_niche("history", publish_ready_only=True)
+    assert auto["assigned"] == 0
+    assert auto["reason"] == "all_at_cap"
+
+    # ...while the manual button still hands the user a drafting session.
+    manual = pooling.distribute_niche("history", max_per_account=3)
+    assert manual["assigned"] == 3
 
 
 def _seed_topup_accounts_and_clips(clips: int) -> tuple[int, int, int]:

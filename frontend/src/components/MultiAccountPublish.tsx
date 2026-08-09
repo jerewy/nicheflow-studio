@@ -22,6 +22,11 @@ import type {
 // dashboard restores it instead of snapping back to the first account.
 const SELECTED_ACCOUNT_STORAGE_KEY = "nicheflow.multiAccountPublish.selectedAccountId";
 
+// Sentinel for the coverage picker's "All accounts" overview. Negative so it can
+// never collide with a real Account.id, and still round-trips through the
+// integer-only localStorage helpers below.
+const ALL_ACCOUNTS_ID = -1;
+
 function readStoredAccountId(): number | null {
   if (typeof window === "undefined") return null;
   try {
@@ -626,6 +631,115 @@ function SlotActionsPopover({
   );
 }
 
+function slotPillTitle(slot: ScheduleCoverageSlot): string {
+  return (
+    slotGateTitle(slot) ??
+    slot.job_title ??
+    `${slot.slot} slot is ${slotStateLabel(slot).toLowerCase()}`
+  );
+}
+
+// Read-only cross-account roll-up: every account's two-day slot strip at once,
+// so a gap anywhere in the network is visible without cycling the picker. Slot
+// editing stays in the per-account grid, which is one click away via the name.
+function AllAccountsCoverage({
+  accounts,
+  onSelectAccount,
+}: {
+  accounts: ScheduleCoverageAccount[];
+  onSelectAccount: (accountId: number) => void;
+}) {
+  const filled = accounts.reduce((sum, account) => sum + account.filled, 0);
+  const total = accounts.reduce((sum, account) => sum + account.total, 0);
+  const covered = accounts.filter(
+    (account) => account.total > 0 && account.filled === account.total,
+  ).length;
+  const unconfigured = accounts.filter((account) => account.total === 0).length;
+
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap gap-x-5 gap-y-1 text-sm">
+        <span>
+          <strong>{filled} / {total}</strong>{" "}
+          <span className="text-muted-foreground">slots filled network-wide</span>
+        </span>
+        <span
+          className={
+            covered === accounts.length
+              ? "font-medium text-emerald-500"
+              : "font-medium text-amber-500"
+          }
+        >
+          {covered} / {accounts.length} account(s) fully covered
+        </span>
+        {unconfigured > 0 && (
+          <span className="text-muted-foreground">
+            {unconfigured} account(s) have no slots configured
+          </span>
+        )}
+      </div>
+      <div className="space-y-2">
+        {accounts.map((account) => {
+          const complete = account.total > 0 && account.filled === account.total;
+          return (
+            <div
+              key={account.account_id}
+              className="grid gap-2 rounded-md border border-border p-3 lg:grid-cols-[minmax(11rem,15rem)_1fr] lg:items-start"
+            >
+              <div className="space-y-0.5">
+                <button
+                  type="button"
+                  onClick={() => onSelectAccount(account.account_id)}
+                  className="text-left font-medium underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  title="Open this account's slot grid"
+                >
+                  {account.account_name}
+                </button>
+                <p className="text-xs">
+                  <span
+                    className={
+                      complete ? "font-medium text-emerald-500" : "font-medium text-amber-500"
+                    }
+                  >
+                    {account.filled}/{account.total} filled
+                  </span>
+                  <span className="text-muted-foreground">
+                    {" "}
+                    · {account.daily_target}/day · {account.timezone}
+                  </span>
+                </p>
+              </div>
+              <div className="space-y-1">
+                {account.days.map((day) => (
+                  <div key={day.date} className="flex flex-wrap items-center gap-1">
+                    <span className="w-20 shrink-0 text-xs text-muted-foreground">
+                      {day.is_today ? "Today" : "Tomorrow"}
+                    </span>
+                    {day.slots.map((slot) => (
+                      <span
+                        key={slot.slot_at}
+                        className={`rounded border px-1.5 py-0.5 text-xs ${SLOT_STATE_STYLE[slot.state] ?? SLOT_STATE_STYLE.open}`}
+                        title={slotPillTitle(slot)}
+                      >
+                        {slot.slot} · {slotStatusLabel(slot)}
+                      </span>
+                    ))}
+                    {!day.slots.length && (
+                      <span className="text-xs text-muted-foreground">
+                        No schedule slots configured.
+                      </span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function ScheduleCoveragePanel({
   coverage,
   selectedAccountId,
@@ -657,43 +771,59 @@ function ScheduleCoveragePanel({
     setLastAccountId(selectedAccountId);
     setOpenSlot(null);
   }
-  const account =
-    coverage?.accounts.find((candidate) => candidate.account_id === selectedAccountId) ??
-    coverage?.accounts[0] ??
-    null;
-  if (!coverage?.accounts.length || !account) {
+  const allMode = selectedAccountId === ALL_ACCOUNTS_ID;
+  const account = allMode
+    ? null
+    : coverage?.accounts.find((candidate) => candidate.account_id === selectedAccountId) ??
+      coverage?.accounts[0] ??
+      null;
+  if (!coverage?.accounts.length || (!allMode && !account)) {
     return (
       <div className="rounded-lg border border-border bg-background/50 p-4 text-sm text-muted-foreground">
         No account schedule slots configured yet.
       </div>
     );
   }
-  const complete = account.total > 0 && account.filled === account.total;
+  const complete = account !== null && account.total > 0 && account.filled === account.total;
+
+  const header = (
+    <div className="flex flex-wrap items-end justify-between gap-3">
+      <div>
+        <h3 className="font-semibold">Account Schedule Coverage</h3>
+        <p className="text-xs text-muted-foreground">
+          Configured slots for today and tomorrow. Off-slot jobs remain in the queue below.
+        </p>
+      </div>
+      <label className="grid gap-1 text-xs text-muted-foreground">
+        Account
+        <select
+          className="h-9 min-w-60 rounded-md border border-input bg-background px-3 text-sm text-foreground"
+          value={account?.account_id ?? ALL_ACCOUNTS_ID}
+          onChange={(event) => onSelectAccount(Number(event.target.value))}
+        >
+          <option value={ALL_ACCOUNTS_ID}>All accounts ({coverage.accounts.length})</option>
+          {coverage.accounts.map((candidate) => (
+            <option key={candidate.account_id} value={candidate.account_id}>
+              {candidate.account_name}
+            </option>
+          ))}
+        </select>
+      </label>
+    </div>
+  );
+
+  if (allMode || account === null) {
+    return (
+      <div className="space-y-4 rounded-lg border border-border bg-background/50 p-4">
+        {header}
+        <AllAccountsCoverage accounts={coverage.accounts} onSelectAccount={onSelectAccount} />
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-4 rounded-lg border border-border bg-background/50 p-4">
-      <div className="flex flex-wrap items-end justify-between gap-3">
-        <div>
-          <h3 className="font-semibold">Account Schedule Coverage</h3>
-          <p className="text-xs text-muted-foreground">
-            Configured slots for today and tomorrow. Off-slot jobs remain in the queue below.
-          </p>
-        </div>
-        <label className="grid gap-1 text-xs text-muted-foreground">
-          Account
-          <select
-            className="h-9 min-w-60 rounded-md border border-input bg-background px-3 text-sm text-foreground"
-            value={account.account_id}
-            onChange={(event) => onSelectAccount(Number(event.target.value))}
-          >
-            {coverage.accounts.map((candidate) => (
-              <option key={candidate.account_id} value={candidate.account_id}>
-                {candidate.account_name}
-              </option>
-            ))}
-          </select>
-        </label>
-      </div>
+      {header}
       <div className="flex flex-wrap gap-x-5 gap-y-1 text-sm">
         <span>
           <strong>{account.filled} / {account.total}</strong>{" "}
@@ -897,7 +1027,8 @@ export function MultiAccountPublish({
       const result = await bridge.dashboardScheduleCoverage();
       setCoverage(result);
       setSelectedAccountId((current) =>
-        current !== null && result.accounts.some((account) => account.account_id === current)
+        current === ALL_ACCOUNTS_ID ||
+        (current !== null && result.accounts.some((account) => account.account_id === current))
           ? current
           : result.accounts[0]?.account_id ?? null,
       );

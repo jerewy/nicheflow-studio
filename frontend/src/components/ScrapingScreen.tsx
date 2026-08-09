@@ -4,6 +4,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { useRevisitRefresh } from "@/hooks/useKeepAlive";
 import { bridge } from "@/lib/bridge";
 import type { ApifyUsage, ScrapeCandidate, ScrapeToPoolResult, SourceProfile } from "@/types";
 
@@ -29,6 +30,8 @@ async function waitForJob(
 interface ScrapingScreenProps {
   activeAccountId: number;
   activeAccountName: string | null;
+  // False while the screen is kept alive but hidden behind another tab.
+  active?: boolean;
 }
 
 const CANDIDATE_FILTERS = [
@@ -76,7 +79,11 @@ function sortValue(c: ScrapeCandidate, key: SortKey): string | number {
   }
 }
 
-export function ScrapingScreen({ activeAccountId, activeAccountName }: ScrapingScreenProps) {
+export function ScrapingScreen({
+  activeAccountId,
+  activeAccountName,
+  active = true,
+}: ScrapingScreenProps) {
   const [sources, setSources] = useState<SourceProfile[]>([]);
   const [candidates, setCandidates] = useState<ScrapeCandidate[]>([]);
   // Scraping auto-pools every clip it pulls, so the meaningful review surface is
@@ -177,6 +184,14 @@ export function ScrapingScreen({ activeAccountId, activeAccountName }: ScrapingS
     const timer = window.setTimeout(loadUsage, 0);
     return () => window.clearTimeout(timer);
   }, [loadUsage]);
+
+  // The screen stays mounted across tab switches (so scrape/download jobs keep
+  // their progress UI); refresh the lists on revisit like a remount used to.
+  useRevisitRefresh(active, () => {
+    void loadSources();
+    void loadCandidates();
+    void loadUsage();
+  });
 
   const run = async (
     fn: () => Promise<unknown>,

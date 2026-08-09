@@ -410,26 +410,41 @@ def _generate_ollama_smart_drafts(
     )
 
 
-def _generate_groq_smart_drafts(
+@dataclass(frozen=True)
+class VisionPass:
+    """Outcome of one Groq vision pass over a clip's sampled frames.
+
+    ``payload`` is the parsed visual-evidence JSON (None when vision was
+    disabled, had no frames, or failed); the rest is the provenance the
+    generation_meta panel reports.
+    """
+
+    payload: dict[str, object] | None
+    response: dict[str, object] | None
+    error: str | None
+    attempted: bool
+    retry_attempted: bool
+    frame_count: int
+    model: str
+
+
+def run_vision_pass(
     *,
     api_key: str,
-    reasoning_model: str,
     transcript_text: str,
     source_title: str | None,
     source_description: str | None,
     niche_label: str | None,
     visual_frame_urls: list[str],
-    account_voice: dict[str, str],
-    prompt_profile: str | None,
-    caption_style: str | None,
-    recent_titles: list[str] | None,
-    recent_captions: list[str] | None,
-    few_shot_winners: list[str] | None = None,
-    caption_outro: str | None = None,
     low_context: bool = False,
-    title_style: str | None = None,
-    title_length: str | None = None,
-) -> SmartDrafts:
+) -> VisionPass:
+    """Describe sampled clip frames with the Groq vision model.
+
+    Split out of the draft-generation path so callers that only need visual
+    evidence (the chat/batch handoff, which hands the JSON to an external
+    assistant instead of the Groq writer) can run vision on its own without
+    paying for a writer completion.
+    """
     vision_model = os.environ.get("GROQ_VISION_MODEL") or DEFAULT_GROQ_VISION_MODEL
     vision_payload: dict[str, object] | None = None
     vision_response: dict[str, object] | None = None
@@ -503,6 +518,85 @@ def _generate_groq_smart_drafts(
                 vision_error = f"{vision_error or 'vision failed'} | retry failed: {exc}"
                 vision_payload = None
                 vision_response = None
+
+    return VisionPass(
+        payload=vision_payload,
+        response=vision_response,
+        error=vision_error,
+        attempted=vision_attempted,
+        retry_attempted=vision_retry_attempted,
+        frame_count=primary_frame_count,
+        model=vision_model,
+    )
+
+
+def describe_video_frames(
+    input_path: Path,
+    *,
+    transcript_text: str = "",
+    source_title: str | None = None,
+    source_description: str | None = None,
+    niche_label: str | None = None,
+) -> VisionPass:
+    """Sample frames from a local video and run the vision pass over them.
+
+    Convenience entry point for callers holding a file path rather than
+    pre-sampled data URLs. Frame sampling failures degrade to an empty frame
+    list, which ``run_vision_pass`` reports as "not attempted" rather than an
+    error, so a missing ffmpeg never raises here.
+    """
+    try:
+        frame_urls = sample_video_frame_data_urls(input_path, max_frames=_groq_max_frames())
+    except Exception:  # noqa: BLE001 - ffmpeg/probe failures are non-fatal here
+        frame_urls = []
+    keys = _all_groq_keys()
+    return run_vision_pass(
+        api_key=keys[0] if keys else "",
+        transcript_text=transcript_text,
+        source_title=source_title,
+        source_description=source_description,
+        niche_label=niche_label,
+        visual_frame_urls=frame_urls,
+        low_context=_is_low_context_source_title(source_title, transcript_text or None),
+    )
+
+
+def _generate_groq_smart_drafts(
+    *,
+    api_key: str,
+    reasoning_model: str,
+    transcript_text: str,
+    source_title: str | None,
+    source_description: str | None,
+    niche_label: str | None,
+    visual_frame_urls: list[str],
+    account_voice: dict[str, str],
+    prompt_profile: str | None,
+    caption_style: str | None,
+    recent_titles: list[str] | None,
+    recent_captions: list[str] | None,
+    few_shot_winners: list[str] | None = None,
+    caption_outro: str | None = None,
+    low_context: bool = False,
+    title_style: str | None = None,
+    title_length: str | None = None,
+) -> SmartDrafts:
+    vision = run_vision_pass(
+        api_key=api_key,
+        transcript_text=transcript_text,
+        source_title=source_title,
+        source_description=source_description,
+        niche_label=niche_label,
+        visual_frame_urls=visual_frame_urls,
+        low_context=low_context,
+    )
+    vision_model = vision.model
+    vision_payload = vision.payload
+    vision_response = vision.response
+    vision_error = vision.error
+    vision_attempted = vision.attempted
+    vision_retry_attempted = vision.retry_attempted
+    primary_frame_count = vision.frame_count
 
     writer_response = _perform_chat_completion_request(
         endpoint=GROQ_CHAT_COMPLETIONS_URL,

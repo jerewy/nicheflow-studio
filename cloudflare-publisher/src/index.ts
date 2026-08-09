@@ -576,6 +576,14 @@ async function processJob(
   if (job.status === "processing" && job.meta_container_id) {
     const snapshot = await graphRequest(env, account, job.meta_container_id, { fields: "status_code,status" });
     const status = String(snapshot.status_code || "");
+    if (status === "PUBLISHED") {
+      // A previous media_publish call landed server-side even though its HTTP
+      // response failed (Meta can 500 AFTER the publish took effect). Without
+      // this branch such a job re-polls forever or ends "failed" while the
+      // reel is live. The media id was lost with that failed response.
+      await recordPublished(env, job, "", now);
+      return;
+    }
     if (status === "FINISHED") {
       if (env.PUBLISH_MODE === "validate") {
         await env.DB.prepare(
@@ -586,13 +594,18 @@ async function processJob(
         await env.MEDIA.delete(job.media_key);
         return;
       }
-      const published = await graphRequest(env, account, `${account.instagram_user_id}/media_publish`, { creation_id: job.meta_container_id }, "POST");
-      await env.DB.prepare(
-        "UPDATE publish_jobs SET status = 'published', media_size_bytes = 0, meta_media_id = ?, published_at = ?, lease_until = NULL, updated_at = ? WHERE id = ?",
-      )
-        .bind(String(published.id || ""), now, now, job.id)
-        .run();
-      await env.MEDIA.delete(job.media_key);
+      let published: Record<string, unknown>;
+      try {
+        published = await graphRequest(env, account, `${account.instagram_user_id}/media_publish`, { creation_id: job.meta_container_id }, "POST");
+      } catch (error) {
+        // The publish may have succeeded despite the error response — check the
+        // container before counting a failure, so the job can never read
+        // "failed" while the reel is actually live.
+        const verify = await graphRequest(env, account, job.meta_container_id, { fields: "status_code" }).catch(() => null);
+        if (!verify || String(verify.status_code || "") !== "PUBLISHED") throw error;
+        published = {};
+      }
+      await recordPublished(env, job, String(published.id || ""), now);
       return;
     }
     if (["ERROR", "EXPIRED"].includes(status)) throw new Error(`Meta container ended with ${status}`);
@@ -600,6 +613,15 @@ async function processJob(
       .bind(addMinutes(now, 1), now, job.id)
       .run();
   }
+}
+
+async function recordPublished(env: Env, job: JobRow, metaMediaId: string, now: string): Promise<void> {
+  await env.DB.prepare(
+    "UPDATE publish_jobs SET status = 'published', media_size_bytes = 0, meta_media_id = ?, published_at = ?, lease_until = NULL, updated_at = ? WHERE id = ?",
+  )
+    .bind(metaMediaId, now, now, job.id)
+    .run();
+  await env.MEDIA.delete(job.media_key);
 }
 
 async function processDueJobs(env: Env): Promise<{ processed: number; mode: string }> {

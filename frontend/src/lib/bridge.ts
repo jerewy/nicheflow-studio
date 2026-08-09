@@ -13,8 +13,10 @@ import type {
   AccountSummary,
   ApifyUsage,
   ApplyResult,
+  BatchCandidateGroup,
   BatchDraftImportResult,
   BatchFramesResult,
+  FinishBatchPlanEntry,
   CloudAccountSettings,
   CloudPublisherHealth,
   CloudWorkerAccountsResult,
@@ -91,6 +93,29 @@ interface PywebviewApi {
   get_clipboard_text(): Promise<Envelope<{ text: string }>>;
   prepare_account_batch_frames(itemIds: number[]): Promise<Envelope<BatchFramesResult>>;
   open_batch_frames_folder(folder: string): Promise<Envelope<{ folder: string }>>;
+  batch_draft_candidates(
+    niche: string | null,
+    perAccount: number,
+  ): Promise<Envelope<{ groups: BatchCandidateGroup[] }>>;
+  build_multi_account_batch_chat_prompt(
+    itemIds: number[],
+    payload: Record<string, unknown>,
+  ): Promise<Envelope<{ prompt: string }>>;
+  start_prepare_multi_account_batch_frames(
+    itemIds: number[],
+  ): Promise<Envelope<{ job_id: string }>>;
+  import_multi_account_batch_draft(
+    text: string,
+    itemIds: number[],
+  ): Promise<Envelope<BatchDraftImportResult>>;
+  multi_account_batch_order(itemIds: number[]): Promise<Envelope<{ item_ids: number[] }>>;
+  plan_finish_batch(itemIds: number[]): Promise<Envelope<{ plan: FinishBatchPlanEntry[] }>>;
+  start_finish_batch(itemIds: number[]): Promise<Envelope<{ job_id: string }>>;
+  get_ui_settings(keys: string[]): Promise<Envelope<Record<string, unknown>>>;
+  set_ui_setting(
+    key: string,
+    value: unknown,
+  ): Promise<Envelope<{ key: string; value: unknown }>>;
   get_workflow_settings(itemId: number): Promise<Envelope<WorkflowSettings>>;
   save_workflow_settings(
     itemId: number,
@@ -122,6 +147,7 @@ interface PywebviewApi {
   start_item_download(itemId: number): Promise<Envelope<{ job_id: string }>>;
   prefetch_originals(itemIds: number[]): Promise<Envelope<{ job_id: string | null }>>;
   get_job(jobId: string): Promise<Envelope<JobSnapshot>>;
+  cancel_job(jobId: string): Promise<Envelope<{ canceled: boolean }>>;
   list_publish_jobs(itemId: number): Promise<Envelope<PublishJob[]>>;
   set_processing_status(
     itemId: number,
@@ -580,6 +606,81 @@ export const bridge = {
     return unwrap(window.pywebview!.api.open_batch_frames_folder(folder));
   },
 
+  // --- Cross-account batch (Dashboard > Batch Drafts) ---------------------
+
+  batchDraftCandidates(
+    niche: string | null,
+    perAccount: number,
+  ): Promise<{ groups: BatchCandidateGroup[] }> {
+    if (!hasBridge()) return mock.batchDraftCandidates(perAccount);
+    return unwrap(window.pywebview!.api.batch_draft_candidates(niche, perAccount));
+  },
+
+  buildMultiAccountBatchChatPrompt(
+    itemIds: number[],
+    payload: Record<string, unknown>,
+  ): Promise<{ prompt: string }> {
+    if (!hasBridge())
+      return Promise.resolve({
+        prompt: itemIds
+          .map((itemId, index) => `===== REEL ${index + 1} (#${itemId}) =====`)
+          .join("\n\n"),
+      });
+    return unwrap(
+      window.pywebview!.api.build_multi_account_batch_chat_prompt(itemIds, payload),
+    );
+  },
+
+  /** The order the prompt walks the batch (grouped by account) — reel N maps to index N-1. */
+  multiAccountBatchOrder(itemIds: number[]): Promise<{ item_ids: number[] }> {
+    if (!hasBridge()) return Promise.resolve({ item_ids: itemIds });
+    return unwrap(window.pywebview!.api.multi_account_batch_order(itemIds));
+  },
+
+  startPrepareMultiAccountBatchFrames(itemIds: number[]): Promise<{ job_id: string }> {
+    if (!hasBridge()) return Promise.resolve({ job_id: `mock-frames-${itemIds.length}` });
+    return unwrap(window.pywebview!.api.start_prepare_multi_account_batch_frames(itemIds));
+  },
+
+  importMultiAccountBatchDraft(
+    text: string,
+    itemIds: number[],
+  ): Promise<BatchDraftImportResult> {
+    if (!hasBridge())
+      return Promise.resolve({ imported: itemIds, failed: [], unmatched: text ? [] : itemIds });
+    return unwrap(window.pywebview!.api.import_multi_account_batch_draft(text, itemIds));
+  },
+
+  planFinishBatch(itemIds: number[]): Promise<{ plan: FinishBatchPlanEntry[] }> {
+    if (!hasBridge()) return mock.planFinishBatch(itemIds);
+    return unwrap(window.pywebview!.api.plan_finish_batch(itemIds));
+  },
+
+  startFinishBatch(itemIds: number[]): Promise<{ job_id: string }> {
+    if (!hasBridge()) {
+      // Remember the real ids: finish_batch runs on exactly the planned items,
+      // so a mock that invents its own ids would show result rows that match no
+      // plan entry — and hide whether the real join works.
+      mockFinishedItemIds = [...itemIds];
+      return Promise.resolve({ job_id: `mock-finish-${itemIds.length}` });
+    }
+    return unwrap(window.pywebview!.api.start_finish_batch(itemIds));
+  },
+
+  // Remembered UI preferences live in the app DB, not localStorage: pywebview
+  // runs the window in private mode on a per-launch port, so browser storage
+  // silently reset on every restart. In the browser dev harness there is no
+  // bridge, so fall back to localStorage there and keep dev behaviour.
+  getUiSettings(keys: string[]): Promise<Record<string, unknown>> {
+    if (!hasBridge()) return mock.getUiSettings(keys);
+    return unwrap(window.pywebview!.api.get_ui_settings(keys));
+  },
+
+  setUiSetting(key: string, value: unknown): Promise<{ key: string; value: unknown }> {
+    if (!hasBridge()) return mock.setUiSetting(key, value);
+    return unwrap(window.pywebview!.api.set_ui_setting(key, value));
+  },
+
   getWorkflowSettings(itemId: number): Promise<WorkflowSettings> {
     if (!hasBridge()) return mock.getWorkflowSettings();
     return unwrap(window.pywebview!.api.get_workflow_settings(itemId));
@@ -650,8 +751,16 @@ export const bridge = {
   },
 
   getJob(jobId: string): Promise<JobSnapshot> {
-    if (!hasBridge()) return mock.getJob();
+    // The id has to reach the mock: it dispatches on the job kind, so dropping
+    // it made every mock job return a DraftRevision regardless of what the
+    // caller started (the mock-queue-publish branch was unreachable too).
+    if (!hasBridge()) return mock.getJob(jobId);
     return unwrap(window.pywebview!.api.get_job(jobId));
+  },
+
+  cancelJob(jobId: string): Promise<{ canceled: boolean }> {
+    if (!hasBridge()) return mock.cancelJob();
+    return unwrap(window.pywebview!.api.cancel_job(jobId));
   },
 
   listAccounts(): Promise<AccountSummary[]> {
@@ -1198,10 +1307,13 @@ const mockRevision: DraftRevision = {
     "One shot — no second chances",
     "He nailed it first try",
   ],
+  // Three titles sharing ONE caption: the shape the chat handoff now returns
+  // (the caption is fanned across the option slots on import), so the dev
+  // fixture exercises the shared-caption editor rather than the legacy layout.
   caption_options: [
-    "A single take changed the scene.",
-    "No retakes. Just nerve.",
-    "First try, on camera.",
+    "A single take changed the scene, and the crew only found out afterwards.",
+    "A single take changed the scene, and the crew only found out afterwards.",
+    "A single take changed the scene, and the crew only found out afterwards.",
   ],
   option_notes: ["Curiosity hook", "Tension hook", "Plain flex"],
   option_tiers: ["green", "yellow", "yellow"],
@@ -1218,7 +1330,82 @@ const mockRevision: DraftRevision = {
   applied_caption_index: null,
 };
 
+// Dev harness only: the ids the last mock "Finish batch" was started with, so
+// its result rows refer to the same reels the plan does.
+let mockFinishedItemIds: number[] = [];
+
+const MOCK_BATCH_ACCOUNTS = [
+  { account_id: 1, account_name: "Past Moments Daily", auto_schedules: true },
+  { account_id: 2, account_name: "Beneath History", auto_schedules: true },
+  { account_id: 3, account_name: "Resurfaced History", auto_schedules: false },
+];
+
 const mock = {
+  // Dev harness only: no Python bridge, so keep preferences in localStorage so
+  // the screens still behave. The real app persists these in the DB.
+  async getUiSettings(keys: string[]): Promise<Record<string, unknown>> {
+    const out: Record<string, unknown> = {};
+    for (const key of keys) {
+      const raw = window.localStorage.getItem(`nicheflow.ui.${key}`);
+      out[key] = raw === null ? null : JSON.parse(raw);
+    }
+    return out;
+  },
+
+  async setUiSetting(key: string, value: unknown): Promise<{ key: string; value: unknown }> {
+    window.localStorage.setItem(`nicheflow.ui.${key}`, JSON.stringify(value));
+    return { key, value };
+  },
+
+  async batchDraftCandidates(perAccount: number): Promise<{ groups: BatchCandidateGroup[] }> {
+    return {
+      groups: MOCK_BATCH_ACCOUNTS.map((account, groupIndex) => ({
+        ...account,
+        niche: "history",
+        // Deliberately fewer than requested for the last account, so the
+        // "6 of 9" backlog hint is visible in dev.
+        available: groupIndex === 2 ? 2 : perAccount + 3,
+        items: Array.from(
+          { length: groupIndex === 2 ? Math.min(2, perAccount) : perAccount },
+          (_, i) => {
+            const id = 100 * (groupIndex + 1) + i;
+            return {
+              id,
+              // Mock the real gap between the raw id and the per-account "#N"
+              // so dev exercises the same number the Processing table shows.
+              account_seq: i + 1,
+              title: `${account.account_name} clip ${i + 1}`,
+              source_url: `https://instagram.com/reel/mock${id}`,
+              preview_url: null,
+              has_draft: false,
+              // Mixed on purpose so the UI's vision/frame split is visible in dev.
+              has_vision: i % 2 === 0,
+            };
+          },
+        ),
+      })),
+    };
+  },
+
+  async planFinishBatch(itemIds: number[]): Promise<{ plan: FinishBatchPlanEntry[] }> {
+    return {
+      plan: itemIds.map((itemId, index) => ({
+        item_id: itemId,
+        account_seq: (index % 6) + 1,
+        title: `Mock reel ${itemId}`,
+        // Mixed so the cloud/local wording in the confirm dialog is visible in dev.
+        publishes_via_cloud: index % 2 === 0,
+        account_id: 1 + (index % MOCK_BATCH_ACCOUNTS.length),
+        account_name: MOCK_BATCH_ACCOUNTS[index % MOCK_BATCH_ACCOUNTS.length].account_name,
+        auto_schedules: MOCK_BATCH_ACCOUNTS[index % MOCK_BATCH_ACCOUNTS.length].auto_schedules,
+        // One entry not ready, so the blocked-reel path renders in dev.
+        ready: index !== 2,
+        reason: index === 2 ? "no draft revision yet" : undefined,
+        option: index === 2 ? undefined : (index % 3) + 1,
+      })),
+    };
+  },
+
   async getContext(): Promise<ProcessingContext> {
     return {
       item: {
@@ -1277,6 +1464,9 @@ const mock = {
   async startExport(): Promise<{ job_id: string }> {
     return { job_id: "mock-export" };
   },
+  async cancelJob(): Promise<{ canceled: boolean }> {
+    return { canceled: true };
+  },
   async listItems() {
     return [
       {
@@ -1305,6 +1495,59 @@ const mock = {
     };
   },
   async getJob(jobId?: string): Promise<JobSnapshot> {
+    // The cross-account batch jobs return their own shapes; without these the
+    // fallthrough below hands a DraftRevision to code expecting frames/results.
+    if (jobId?.startsWith("mock-frames-")) {
+      const count = Number(jobId.slice("mock-frames-".length)) || 0;
+      const needFrames = Math.floor(count / 2);
+      return {
+        id: jobId,
+        status: "succeeded",
+        progress: 1,
+        message: "Done",
+        result: {
+          folder: "C:/mock/batch-frames",
+          frames: Array.from({ length: needFrames }, (_, i) => ({
+            item_id: 100 + i,
+            path: `C:/mock/batch-frames/reel_${i + 1}.jpg`,
+          })),
+          described: [],
+          skipped: [],
+        },
+        error: null,
+      };
+    }
+    if (jobId?.startsWith("mock-finish-")) {
+      const ids = mockFinishedItemIds;
+      return {
+        id: jobId,
+        status: "succeeded",
+        progress: 1,
+        message: "Done",
+        result: {
+          applied: ids.map((itemId) => ({ item_id: itemId, option: 1 })),
+          exported: ids.map((itemId) => ({
+            item_id: itemId,
+            processed_path: `C:/mock/out/${itemId}.mp4`,
+          })),
+          // One export left unscheduled on purpose, so the "exported but not
+          // scheduled" row renders in dev too.
+          scheduled: ids.slice(0, Math.max(0, ids.length - 1)).map((itemId, i) => ({
+            item_id: itemId,
+            schedule: {
+              job_id: 900 + i,
+              scheduled_at: new Date().toISOString(),
+              // Mixed on purpose so the cloud/local split renders in dev — the
+              // real payload carries "cloud" only for cloud-mapped accounts.
+              status: i % 2 === 0 ? "cloud" : "scheduled",
+            },
+          })),
+          failed: [],
+          skipped: [],
+        },
+        error: null,
+      };
+    }
     if (jobId === "mock-queue-publish" || jobId === "mock-auto-schedule") {
       return {
         id: jobId,
@@ -1529,6 +1772,7 @@ const mock = {
       caption_style: "contextual_info",
       title_style: "",
       title_length: "long",
+      caption_mode: "shared",
       template: "gaming_meme_black",
       title_draft: "",
       caption_draft: "",
@@ -1539,6 +1783,10 @@ const mock = {
         { value: "medium", label: "Medium (10-16 words)" },
         { value: "long", label: "Long (15-28 words)" },
         { value: "auto", label: "Auto mix" },
+      ],
+      caption_mode_options: [
+        { value: "shared", label: "One shared caption (cheaper)" },
+        { value: "per_option", label: "A caption per title option" },
       ],
       template_options: [{ value: "gaming_meme_black", label: "Gaming Meme Black" }],
     };

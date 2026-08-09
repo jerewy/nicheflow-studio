@@ -376,3 +376,24 @@ def test_save_revision_keeps_hyphenated_words_intact() -> None:
 
     assert saved.title_options == ["A well-known never-before-told story"]
     assert saved.caption_options == ["Self-taught, one-take performance."]
+
+
+def test_save_revision_fans_a_single_caption_across_titles() -> None:
+    # The chat handoff returns three titles and ONE shared caption. Apply
+    # indexes titles and captions with the same option number, so an unpadded
+    # caption list would apply an empty caption for options 2 and 3.
+    item_id = _make_item()
+
+    saved = svc.save_revision(
+        item_id,
+        title_options=["First hook", "Second hook", "Third hook"],
+        caption_options=["One caption for all three."],
+        recommended_title_index=3,
+        recommended_caption_index=3,
+    )
+
+    assert saved.caption_options == ["One caption for all three."] * 3
+
+    applied = svc.apply_revision(item_id, 3)
+    assert applied["title_draft"] == "Third hook"
+    assert applied["caption_draft"] == "One caption for all three."

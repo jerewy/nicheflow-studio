@@ -7,7 +7,10 @@ import { PublishNowDialog } from "@/components/PublishNowDialog";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Textarea } from "@/components/ui/textarea";
 import { useToast } from "@/components/ui/Toast";
+import { useAutoRefresh } from "@/hooks/useAutoRefresh";
+import { useRevisitRefresh } from "@/hooks/useKeepAlive";
 import { bridge, whenBridgeReady } from "@/lib/bridge";
 import { formatDate } from "@/lib/format";
 import type {
@@ -27,6 +30,10 @@ const JOB_POLL_INTERVAL_MS = 1000;
 const JOB_TIMEOUT_MS = 180000;
 // Publishing drives a real browser and can take several minutes.
 const PUBLISH_TIMEOUT_MS = 480000;
+// Exports and scheduling upload the reel to the cloud Worker, and bulk runs
+// serialize those uploads through one request pipe — a job can legitimately
+// sit for many minutes waiting behind other accounts' uploads.
+const UPLOAD_TIMEOUT_MS = 1800000;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -62,6 +69,10 @@ const STATUS_META: Record<string, { label: string; dot: string }> = {
   exported: { label: "Exported", dot: "bg-violet-500" },
   scheduled: { label: "Scheduled", dot: "bg-fuchsia-500" },
   cloud: { label: "Cloud", dot: "bg-indigo-500" },
+  // Cloud-bound but the Worker upload hasn't landed yet. Same indigo family as
+  // "Cloud" on purpose: it never publishes locally, so it must not read as a
+  // fallback to the local path.
+  cloud_pending: { label: "Cloud · uploading", dot: "bg-indigo-400" },
   posted: { label: "Posted", dot: "bg-emerald-500" },
   rejected: { label: "Rejected", dot: "bg-orange-500" },
   skipped: { label: "Skipped", dot: "bg-zinc-500" },
@@ -85,6 +96,13 @@ function statusMeta(status: string): { label: string; dot: string } {
   return STATUS_META[status] ?? { label: status, dot: "bg-zinc-400" };
 }
 
+// Statuses backed by a live publish job. The manual status dropdown stays locked
+// for these: the schedule has to be cancelled first, or the row and the job
+// disagree about what is about to post.
+function isQueuedStatus(status: string): boolean {
+  return status === "scheduled" || status === "cloud" || status === "cloud_pending";
+}
+
 function shortDate(iso: string | null): string {
   if (!iso) return "";
   const d = new Date(iso);
@@ -97,16 +115,24 @@ function scheduleStatusMessage(status: string, scheduled: string): string {
     : `Scheduled locally for ${scheduled}.`;
 }
 
+// Deep-link target when arriving via "Edit in Processing" from the publish
+// schedule. itemId pins the exact library item (reliable: the exported title
+// differs from the item's original title); search is a fallback text seed used
+// only when no item id is available.
+export interface ProcessingDeepLink {
+  itemId: number | null;
+  search: string;
+}
+
 interface ProcessingScreenProps {
   activeAccountId: number;
   activeAccountName: string | null;
-  // Deep-link target when arriving via "Edit in Processing" from the publish
-  // schedule. initialItemId pins the exact library item (reliable: the exported
-  // title differs from the item's original title). initialSearch is a fallback
-  // text seed used only when no item id is available. Applied on mount; the
-  // screen remounts per visit.
-  initialItemId?: number | null;
-  initialSearch?: string;
+  // The screen stays mounted across tab switches (keep-alive), so the deep link
+  // is a prop that changes per navigation — a fresh object each time — rather
+  // than mount-time state. null on manual visits (no stale pin inherited).
+  deepLink?: ProcessingDeepLink | null;
+  // False while the screen is kept alive but hidden behind another tab.
+  active?: boolean;
 }
 
 function workflowPayload(workflow: WorkflowSettings | null): Record<string, unknown> {
@@ -115,9 +141,21 @@ function workflowPayload(workflow: WorkflowSettings | null): Record<string, unkn
     caption_style: workflow?.caption_style ?? "",
     title_style: workflow?.title_style ?? "",
     title_length: workflow?.title_length ?? "long",
+    caption_mode: workflow?.caption_mode ?? "shared",
     template: workflow?.template ?? "",
   };
 }
+
+// The POLLER gave up, not the job: the backend thread keeps running and will
+// finish on its own. Callers must report this as "still working in the
+// background", never as a failure — the old generic Error here produced false
+// "scheduling failed: The job timed out" toasts during bulk cloud uploads.
+class JobTimeoutError extends Error {}
+
+// The job was canceled at the user's request (e.g. "Cancel export", or a reject
+// that aborts an in-flight export). A clean outcome, not a failure — callers
+// report it quietly instead of raising an error toast.
+class JobCanceledError extends Error {}
 
 // Poll a background job until it finishes; resolve with its result or throw the
 // job's error message. Reports progress on each poll.
@@ -131,10 +169,13 @@ async function waitForJob(
     const snapshot = await bridge.getJob(jobId);
     onProgress?.(snapshot.progress, snapshot.message);
     if (snapshot.status === "succeeded") return snapshot.result;
+    if (snapshot.status === "canceled") {
+      throw new JobCanceledError(snapshot.message || "Canceled.");
+    }
     if (snapshot.status === "failed") {
       throw new Error(snapshot.error ?? "The job failed.");
     }
-    if (Date.now() > deadline) throw new Error("The job timed out.");
+    if (Date.now() > deadline) throw new JobTimeoutError("The job timed out.");
     await sleep(JOB_POLL_INTERVAL_MS);
   }
 }
@@ -152,6 +193,18 @@ function toEditable(revision: DraftRevision | null): EditableOptions {
   };
 }
 
+/**
+ * The one caption every option shares, or null when the options carry distinct
+ * captions (an older 3-caption revision, or one the user has edited apart).
+ * Returning null is what keeps those revisions rendering per-card as before.
+ */
+function sharedCaptionOf(captions: string[]): string | null {
+  if (captions.length < 2) return null;
+  const [first] = captions;
+  if (!first.trim()) return null;
+  return captions.every((caption) => caption === first) ? first : null;
+}
+
 function sameOptions(a: EditableOptions, revision: DraftRevision | null): boolean {
   if (!revision) return a.titles.length === 0 && a.captions.length === 0;
   return (
@@ -163,8 +216,8 @@ function sameOptions(a: EditableOptions, revision: DraftRevision | null): boolea
 export function ProcessingScreen({
   activeAccountId,
   activeAccountName,
-  initialItemId,
-  initialSearch,
+  deepLink,
+  active = true,
 }: ProcessingScreenProps) {
   const { pushToast } = useToast();
   const [context, setContext] = useState<ProcessingContext | null>(null);
@@ -172,6 +225,9 @@ export function ProcessingScreen({
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // Refilling this niche's pool from the header (same action as Pool & Distribute),
+  // tracked separately from `busy` so it doesn't gate per-item editing.
+  const [distributing, setDistributing] = useState(false);
   const [generating, setGenerating] = useState(false);
   const [canGenerate, setCanGenerate] = useState(false);
   // Export progress keyed by item id so exports run in the background: the
@@ -187,6 +243,10 @@ export function ProcessingScreen({
   const [exportJobs, setExportJobs] = useState<Record<number, { value: number; message: string }>>(
     {},
   );
+  // Job id of each item's in-flight export, so a "Cancel export" click or a
+  // reject can target the running job. A ref (not state) because it's only read
+  // inside async handlers — no re-render needs to depend on it.
+  const exportJobIdsRef = useRef<Record<number, string>>({});
   const [exportedPath, setExportedPath] = useState<string | null>(null);
   const [watermarkStatus, setWatermarkStatus] = useState<{
     replaced: boolean;
@@ -220,8 +280,10 @@ export function ProcessingScreen({
   const [isDesktop, setIsDesktop] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
   // A deep link pins one item by id; the text seed is only used without an id.
-  const [itemSearch, setItemSearch] = useState(initialItemId != null ? "" : (initialSearch ?? ""));
-  const [focusItemId, setFocusItemId] = useState<number | null>(initialItemId ?? null);
+  const [itemSearch, setItemSearch] = useState(
+    deepLink?.itemId != null ? "" : (deepLink?.search ?? ""),
+  );
+  const [focusItemId, setFocusItemId] = useState<number | null>(deepLink?.itemId ?? null);
   const [itemFilter, setItemFilter] = useState("all");
   const [handoffMessage, setHandoffMessage] = useState<string | null>(null);
   const [batchSize, setBatchSize] = useState(6);
@@ -305,6 +367,22 @@ export function ProcessingScreen({
     const timer = window.setTimeout(() => setActionError(null), 8000);
     return () => window.clearTimeout(timer);
   }, [actionError]);
+
+  // Apply a deep link in place: the screen no longer remounts per visit (tabs
+  // are kept alive), so the pin is adjusted when the prop changes — a fresh
+  // object per navigation. A manual tab visit clears the link (null), which
+  // drops any lingering schedule pin but keeps the user's own search text.
+  // Render-phase adjustment per react.dev "adjusting state when a prop changes".
+  const [prevDeepLink, setPrevDeepLink] = useState(deepLink);
+  if (deepLink !== prevDeepLink) {
+    setPrevDeepLink(deepLink);
+    if (deepLink) {
+      setFocusItemId(deepLink.itemId);
+      setItemSearch(deepLink.itemId != null ? "" : deepLink.search);
+    } else {
+      setFocusItemId(null);
+    }
+  }
 
   const loadRevisionIntoEditor = useCallback((revision: DraftRevision | null) => {
     setLoadedRevision(revision);
@@ -550,7 +628,7 @@ export function ProcessingScreen({
       const { job_id } = automatic
         ? await bridge.startAutoScheduleForPublish(scheduleItemId)
         : await bridge.startQueueForPublish(scheduleItemId, scheduledIso);
-      const result = (await waitForJob(job_id)) as {
+      const result = (await waitForJob(job_id, undefined, UPLOAD_TIMEOUT_MS)) as {
         status: string;
         scheduled_at: string | null;
       };
@@ -568,6 +646,17 @@ export function ProcessingScreen({
       }
       refreshItems(scheduleAccountId);
     } catch (err: unknown) {
+      if (err instanceof JobTimeoutError) {
+        // Only the poller gave up — the backend is still scheduling/uploading
+        // and the cloud sync sweep guarantees the outcome. The 30s refresh
+        // flips the row when it lands; a "failed" toast here would be false.
+        pushToast(
+          `${accountLabel} - #${scheduleItemId} is still scheduling in the background ` +
+            `(cloud upload). The list updates automatically when it lands.`,
+          "info",
+        );
+        return;
+      }
       const message = err instanceof Error ? err.message : String(err);
       if (itemIdRef.current === scheduleItemId) setActionError(message);
       pushToast(`${accountLabel} - #${scheduleItemId} scheduling failed: ${message}`, "error");
@@ -589,6 +678,25 @@ export function ProcessingScreen({
       // Non-fatal; the due count just won't update.
     }
   }, []);
+
+  // Kept-alive screens don't remount on revisit; restore the freshness a
+  // remount used to give (new scraped items, changed statuses) without
+  // resetting the open item, editor, or in-flight job progress.
+  useRevisitRefresh(active, () => {
+    refreshItems(activeAccountId);
+    void refreshDueCount();
+    if (itemIdRef.current !== null) refreshPublishJobs(itemIdRef.current);
+  });
+
+  // A row's derived status can change with no action on this screen: pool
+  // distribution schedules exported clips in the background and the cloud
+  // Worker posts them later, while download_items.status stays pending_review
+  // (the schedule outranks it in the derived status). Without a periodic pull
+  // the table shows "Pending review" long after a clip went to cloud.
+  useAutoRefresh(() => {
+    refreshItems(activeAccountId);
+    void refreshDueCount();
+  }, 30000);
 
   const publishNow = async () => {
     if (itemId === null) return;
@@ -918,6 +1026,15 @@ export function ProcessingScreen({
       return { ...prev, captions };
     });
 
+  // The chat handoff now returns three titles and ONE caption that works under
+  // any of them, fanned out across the option slots on import. Editing it in
+  // one place keeps every slot in sync, so Apply still writes a matching
+  // title/caption pair whichever option the user picks.
+  const updateSharedCaption = (value: string) =>
+    setEdits((prev) => ({ ...prev, captions: prev.captions.map(() => value) }));
+
+  const sharedCaption = sharedCaptionOf(edits.captions);
+
   const generate = async () => {
     if (itemId === null) return;
     setGenerating(true);
@@ -1040,6 +1157,11 @@ export function ProcessingScreen({
     setActionError(null);
     setHandoffMessage(null);
     try {
+      // Stop any in-flight export for this clip first: killing the render (and
+      // the auto-schedule it would trigger) before flipping review state means a
+      // rejected clip can't finish exporting and slip back into the schedule. The
+      // backend reject then unschedules any schedule/cloud job already committed.
+      await cancelExport(targetItemId);
       if (blocksFutureScrapes) {
         const result = await bridge.rejectItemGlobally(targetItemId, reasonLabel);
         const list = await bridge.listLibraryItems(activeAccountId);
@@ -1133,6 +1255,65 @@ export function ProcessingScreen({
       setActionError(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);
+    }
+  };
+
+  // Refill this niche's accounts from the pool without leaving Processing — the
+  // same engagement-ranked auto-distribute as Pool & Distribute. Handy right after
+  // rejecting a gone clip: the freed slot restocks in place. Runs on `distributing`
+  // (not `busy`) so the user can keep editing the open item while it works.
+  const distributeActiveNiche = async () => {
+    const niche = context?.account?.niche;
+    if (!niche) {
+      pushToast(
+        "This account has no niche set — assign one in Account settings first.",
+        "error",
+      );
+      return;
+    }
+    const nicheLabel = context?.account?.niche_label ?? niche;
+    if (
+      !window.confirm(
+        `Distribute the ${nicheLabel} pool now?\n\nRanks undistributed clips by engagement ` +
+          "and tops up each account in this niche. Footage downloads in the background.",
+      )
+    )
+      return;
+    setDistributing(true);
+    setActionError(null);
+    setHandoffMessage(null);
+    try {
+      const result = await bridge.distributeNiche(niche);
+      // Newly-distributed clips only reach this account's list once fetched, but
+      // refresh anyway so any already-on-disk assignments show up immediately.
+      refreshItems(activeAccountId);
+      if (result.assigned === 0) {
+        const reasonMessages: Record<string, string> = {
+          no_accounts: `No accounts are set to the "${nicheLabel}" niche — assign accounts first in Account settings.`,
+          no_ready_accounts: `No "${nicheLabel}" accounts are currently ready to publish.`,
+          all_at_cap:
+            "All accounts already hold their daily backlog target — they'll auto-top-up as posts drain it.",
+          pool_empty: "Pool is fully distributed — no unused clips remain.",
+        };
+        pushToast(reasonMessages[result.reason ?? ""] ?? "Nothing to distribute.", "info");
+      } else {
+        const breakdown = result.accounts
+          .map(
+            (a) =>
+              `${a.account_name} (${a.count}/${a.target}${a.pinned ? `, ${a.pinned} pinned` : ""})`,
+          )
+          .join(", ");
+        pushToast(
+          `✓ Distributed ${result.assigned} clip(s) — ${breakdown}. Footage downloads in the background.`,
+          "success",
+        );
+      }
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      setActionError(message);
+      pushToast(`Distribute failed: ${message}`, "error");
+    } finally {
+      setDistributing(false);
     }
   };
 
@@ -1310,8 +1491,16 @@ export function ProcessingScreen({
     setExportJobs((jobs) => ({ ...jobs, [exportItemId]: { value: 0, message: "Starting…" } }));
     try {
       const { job_id } = await bridge.startExport(exportItemId);
-      const result = (await waitForJob(job_id, (value, message) =>
-        setExportJobs((jobs) => ({ ...jobs, [exportItemId]: { value, message } })),
+      // Remember the job id so "Cancel export" (or a reject of this item) can
+      // stop it while it runs in the background.
+      exportJobIdsRef.current[exportItemId] = job_id;
+      // Export jobs include the auto-schedule cloud upload, so they get the
+      // long upload window, not the generic job timeout.
+      const result = (await waitForJob(
+        job_id,
+        (value, message) =>
+          setExportJobs((jobs) => ({ ...jobs, [exportItemId]: { value, message } })),
+        UPLOAD_TIMEOUT_MS,
       )) as ExportResult;
       // The scheduling warning must survive the user moving to another item or
       // niche mid-export: an exported-but-unscheduled reel is otherwise silent.
@@ -1349,15 +1538,50 @@ export function ProcessingScreen({
       // the new account's list with this (now-previous) account's items.
       refreshItems(activeAccountId);
     } catch (err: unknown) {
-      if (itemIdRef.current === exportItemId) {
+      if (err instanceof JobCanceledError) {
+        // User-requested cancel (button or reject). Clean outcome — no error
+        // banner; a quiet toast and a list refresh so the row reflects reality.
+        pushToast(`${activeAccountName ?? "Account"} - #${exportItemId} export canceled.`, "info");
+        refreshItems(activeAccountId);
+      } else if (err instanceof JobTimeoutError) {
+        // Poller gave up; the export/schedule keeps running in the backend and
+        // the row updates via the periodic refresh. Not a failure.
+        pushToast(
+          `${activeAccountName ?? "Account"} - #${exportItemId} export is still running in ` +
+            `the background. The list updates automatically when it finishes.`,
+          "info",
+        );
+      } else if (itemIdRef.current === exportItemId) {
         setActionError(err instanceof Error ? err.message : String(err));
       }
     } finally {
+      delete exportJobIdsRef.current[exportItemId];
       setExportJobs((jobs) => {
         const next = { ...jobs };
         delete next[exportItemId];
         return next;
       });
+    }
+  };
+
+  // Cancel an in-flight export for one item: kills the FFmpeg render and stops
+  // the export job before it can auto-schedule. Best-effort — if the job already
+  // finished there's nothing to cancel. The running exportReel poller observes
+  // the "canceled" status and clears its own progress/state.
+  const cancelExport = async (targetItemId: number) => {
+    const jobId = exportJobIdsRef.current[targetItemId];
+    if (!jobId) return;
+    // Reflect intent immediately so the button doesn't look unresponsive while
+    // the render process is torn down.
+    setExportJobs((jobs) =>
+      targetItemId in jobs
+        ? { ...jobs, [targetItemId]: { ...jobs[targetItemId], message: "Canceling…" } }
+        : jobs,
+    );
+    try {
+      await bridge.cancelJob(jobId);
+    } catch {
+      // Best-effort: the job may already be finishing. The poller settles state.
     }
   };
 
@@ -1439,7 +1663,13 @@ export function ProcessingScreen({
     // Deep link from the schedule: show only the pinned item, regardless of the
     // status filter or search text (status may be anything; title won't match).
     if (focusItemId != null) return candidate.id === focusItemId;
-    const matchesStatus = itemFilter === "all" || candidate.status === itemFilter;
+    // "Cloud" covers both the handed-off reels and the ones still uploading —
+    // they're the same publish path, so splitting them across two filter entries
+    // would just hide half a cloud account's queue behind the wrong option.
+    const matchesStatus =
+      itemFilter === "all" ||
+      candidate.status === itemFilter ||
+      (itemFilter === "cloud" && candidate.status === "cloud_pending");
     const search = itemSearch.trim().toLowerCase();
     const matchesSearch =
       !search ||
@@ -1464,6 +1694,15 @@ export function ProcessingScreen({
             {account?.niche_label ? ` · ${account.niche_label}` : ""}
           </p>
         </div>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={distributeActiveNiche}
+          disabled={distributing || !account?.niche}
+          title="Refill this niche's accounts from the pool — same as Pool & Distribute on the Dashboard"
+        >
+          {distributing ? "Distributing…" : "Distribute"}
+        </Button>
       </header>
 
       <div className="grid items-start gap-4 lg:grid-cols-[minmax(300px,0.8fr)_minmax(360px,1.2fr)]">
@@ -1580,12 +1819,10 @@ export function ProcessingScreen({
                             className="h-8 min-w-0 flex-1 rounded-md border border-input bg-background px-1 text-xs"
                             value={candidate.status}
                             disabled={
-                              updatingStatusIds[candidate.id] ||
-                              candidate.status === "scheduled" ||
-                              candidate.status === "cloud"
+                              updatingStatusIds[candidate.id] || isQueuedStatus(candidate.status)
                             }
                             title={
-                              candidate.status === "scheduled" || candidate.status === "cloud"
+                              isQueuedStatus(candidate.status)
                                 ? "Cancel the schedule before changing this status"
                                 : "Change this video's workflow status"
                             }
@@ -1889,25 +2126,46 @@ export function ProcessingScreen({
                   frames in ChatGPT or Claude, then import one pasted reply.
                 </p>
               </div>
-              <label className="grid gap-1 text-xs text-muted-foreground">
-                Batch size
-                <input
-                  type="number"
-                  min="1"
-                  max="20"
-                  className="h-9 w-24 rounded-md border border-input bg-transparent px-2 text-sm text-foreground disabled:opacity-50"
-                  value={batchSize}
-                  disabled={isManualBatch}
-                  title={
-                    isManualBatch
-                      ? "Using your ticked selection; batch size applies only to auto mode."
-                      : undefined
-                  }
-                  onChange={(event) =>
-                    setBatchSize(Math.max(1, Number(event.target.value) || 1))
-                  }
-                />
-              </label>
+              <div className="flex flex-wrap items-start gap-3">
+                {/* Sits with the batch controls, not the per-item workflow panel:
+                    it only changes the prompt this card copies. */}
+                {workflow ? (
+                  <label className="grid gap-1 text-xs text-muted-foreground">
+                    Captions per reel
+                    <select
+                      className="h-9 w-56 rounded-md border border-input bg-transparent px-2 text-sm text-foreground"
+                      value={workflow.caption_mode}
+                      title="One shared caption is about 55% fewer output tokens per reel. Importing accepts either shape, so a reply already in flight still works."
+                      onChange={(event) =>
+                        applyWorkflowChange({ caption_mode: event.target.value })
+                      }
+                    >
+                      {workflow.caption_mode_options.map((option) => (
+                        <option key={option.value} value={option.value}>{option.label}</option>
+                      ))}
+                    </select>
+                  </label>
+                ) : null}
+                <label className="grid gap-1 text-xs text-muted-foreground">
+                  Batch size
+                  <input
+                    type="number"
+                    min="1"
+                    max="20"
+                    className="h-9 w-24 rounded-md border border-input bg-transparent px-2 text-sm text-foreground disabled:opacity-50"
+                    value={batchSize}
+                    disabled={isManualBatch}
+                    title={
+                      isManualBatch
+                        ? "Using your ticked selection; batch size applies only to auto mode."
+                        : undefined
+                    }
+                    onChange={(event) =>
+                      setBatchSize(Math.max(1, Number(event.target.value) || 1))
+                    }
+                  />
+                </label>
+              </div>
             </div>
             <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
               {isManualBatch ? (
@@ -2060,24 +2318,52 @@ export function ProcessingScreen({
           </CardContent>
         </Card>
       ) : (
-        <div className="grid gap-4 md:grid-cols-3">
-          {edits.titles.map((title, index) => (
-            <OptionCard
-              key={index}
-              optionNumber={index + 1}
-              title={title}
-              caption={edits.captions[index] ?? ""}
-              note={loadedRevision.option_notes[index]}
-              tier={loadedRevision.option_tiers[index]}
-              recommended={loadedRevision.recommended_title_index === index + 1}
-              applied={appliedIndex === index + 1}
-              busy={busy}
-              onTitleChange={(v) => updateTitle(index, v)}
-              onCaptionChange={(v) => updateCaption(index, v)}
-              onApply={() => apply(index + 1)}
-            />
-          ))}
-        </div>
+        <>
+          <div className="grid gap-4 md:grid-cols-3">
+            {edits.titles.map((title, index) => (
+              <OptionCard
+                key={index}
+                optionNumber={index + 1}
+                title={title}
+                caption={sharedCaption === null ? edits.captions[index] ?? "" : undefined}
+                note={loadedRevision.option_notes[index]}
+                tier={loadedRevision.option_tiers[index]}
+                recommended={loadedRevision.recommended_title_index === index + 1}
+                applied={appliedIndex === index + 1}
+                busy={busy}
+                onTitleChange={(v) => updateTitle(index, v)}
+                onCaptionChange={
+                  sharedCaption === null ? (v) => updateCaption(index, v) : undefined
+                }
+                onApply={() => apply(index + 1)}
+              />
+            ))}
+          </div>
+          {sharedCaption !== null && (
+            <Card className="mt-4">
+              <CardContent className="space-y-2 p-4">
+                <div className="flex items-baseline justify-between">
+                  <label
+                    className="text-xs font-medium text-muted-foreground"
+                    htmlFor="shared-caption"
+                  >
+                    Shared caption
+                  </label>
+                  <span className="text-xs text-muted-foreground">
+                    Applies to whichever title you choose
+                  </span>
+                </div>
+                <Textarea
+                  id="shared-caption"
+                  value={sharedCaption}
+                  rows={8}
+                  onChange={(e) => updateSharedCaption(e.target.value)}
+                  placeholder="Caption"
+                />
+              </CardContent>
+            </Card>
+          )}
+        </>
       )}
 
       {loadedRevision && (
@@ -2112,6 +2398,15 @@ export function ProcessingScreen({
               />
               Auto-schedule on export
             </label>
+          )}
+          {exporting && (
+            <Button
+              variant="outline"
+              onClick={() => itemId !== null && void cancelExport(itemId)}
+              title="Stop this export — kills the render and skips auto-scheduling"
+            >
+              Cancel export
+            </Button>
           )}
           <Button
             variant="secondary"
@@ -2230,7 +2525,17 @@ export function ProcessingScreen({
               style={{ width: `${Math.round(exportProgress.value * 100)}%` }}
             />
           </div>
-          <p className="text-xs text-muted-foreground">{exportProgress.message}</p>
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-xs text-muted-foreground">{exportProgress.message}</p>
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-7 shrink-0 px-2 text-xs"
+              onClick={() => itemId !== null && void cancelExport(itemId)}
+            >
+              Cancel export
+            </Button>
+          </div>
         </div>
       )}
 

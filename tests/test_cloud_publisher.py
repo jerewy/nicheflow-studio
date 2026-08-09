@@ -101,6 +101,47 @@ def test_schedule_reel_creates_then_uploads(
     assert upload_req.headers.get("Content-type") == "video/mp4"
 
 
+def test_schedule_reel_cancels_orphan_when_upload_fails(
+    monkeypatch: pytest.MonkeyPatch, _configured, tmp_path
+) -> None:
+    """A failed video upload must cancel the just-created Worker job so it does not
+    strand in ``awaiting_upload`` (the stale-upload orphan the health alert flags)."""
+    video = tmp_path / "reel.mp4"
+    video.write_bytes(b"video-bytes")
+    captured: list = []
+
+    def fake_urlopen(request, timeout=120):  # noqa: ANN001
+        captured.append(request)
+        method = request.get_method()
+        if method == "POST" and request.full_url.endswith("/v1/jobs"):
+            return _FakeResponse(
+                b'{"id":"job1","upload_path":"/v1/jobs/job1/media","status":"awaiting_upload"}'
+            )
+        if method == "PUT":
+            raise urllib.error.HTTPError(
+                request.full_url, 500, "boom", {}, io.BytesIO(b"boom")
+            )
+        return _FakeResponse(b'{"id":"job1","status":"canceled"}')
+
+    monkeypatch.setattr(cloud_publisher.urllib.request, "urlopen", fake_urlopen)
+
+    with pytest.raises(CloudPublisherError, match="HTTP 500"):
+        cloud_publisher.schedule_reel(
+            external_id="local-7",
+            account_key="pastmomentsdaily",
+            caption="hi",
+            scheduled_at="2026-06-15T02:00:00Z",
+            video_path=video,
+        )
+
+    # create -> upload (fails) -> cancel the orphaned awaiting_upload job.
+    assert [(r.get_method(), r.full_url) for r in captured] == [
+        ("POST", "https://worker.example.dev/v1/jobs"),
+        ("PUT", "https://worker.example.dev/v1/jobs/job1/media"),
+        ("POST", "https://worker.example.dev/v1/jobs/job1/cancel"),
+    ]
+
+
 def test_schedule_reel_missing_video_raises(_configured, tmp_path) -> None:
     with pytest.raises(CloudPublisherError, match="video not found"):
         cloud_publisher.schedule_reel(
@@ -232,6 +273,32 @@ def test_transient_network_error_exhausts_retries(
 
     with pytest.raises(CloudPublisherError, match="Cloud publisher unreachable"):
         cloud_publisher.run_due()
+
+    assert calls["n"] == cloud_publisher._MAX_ATTEMPTS
+
+
+def test_raw_read_timeout_retries_and_wraps(
+    monkeypatch: pytest.MonkeyPatch, _configured
+) -> None:
+    """Regression: a timeout while READING the response body raises a raw
+    TimeoutError (urlopen only wraps connect-phase failures in URLError). It
+    used to escape unwrapped — skipping the retries AND the callers' error
+    handling, which stranded local jobs mid-cloud-handoff."""
+    monkeypatch.setattr(cloud_publisher, "_RETRY_BACKOFF_S", 0)
+    calls = {"n": 0}
+
+    class _TimeoutOnReadResponse(_FakeResponse):
+        def read(self) -> bytes:
+            raise TimeoutError("The read operation timed out")
+
+    def urlopen_read_times_out(request, timeout=120):  # noqa: ANN001
+        calls["n"] += 1
+        return _TimeoutOnReadResponse(b"")
+
+    monkeypatch.setattr(cloud_publisher.urllib.request, "urlopen", urlopen_read_times_out)
+
+    with pytest.raises(CloudPublisherError, match="Cloud publisher unreachable"):
+        cloud_publisher.list_jobs()
 
     assert calls["n"] == cloud_publisher._MAX_ATTEMPTS
 

@@ -9,7 +9,12 @@ def load_dotenv(dotenv_path: Path | None = None) -> None:
     if not target_path.exists():
         return
 
-    for raw_line in target_path.read_text(encoding="utf-8").splitlines():
+    # utf-8-sig, not utf-8: Notepad and PowerShell's Out-File write a UTF-8 BOM,
+    # and plain "utf-8" keeps it as a character on the first line — so the FIRST
+    # key in the file silently becomes "﻿GROQ_API_KEY" and every lookup of
+    # "GROQ_API_KEY" misses. Decoding as utf-8-sig drops the BOM if present and
+    # is a no-op otherwise.
+    for raw_line in target_path.read_text(encoding="utf-8-sig").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue

@@ -44,6 +44,7 @@ from nicheflow_studio.services.errors import ServiceError
 from nicheflow_studio.downloader.failures import (
     looks_like_auth_or_rate_limit,
     looks_like_missing_source,
+    looks_like_offline,
 )
 from nicheflow_studio.downloader.instagram import download_instagram_url
 from nicheflow_studio.core.instagram_session import best_instagram_yt_dlp_cookiefile
@@ -103,9 +104,10 @@ class SessionExpiredError(LibraryError):
 
 
 # Shared with queue.py / pooling.py so every download path classifies failures
-# the same way (transient session trouble vs permanently-gone source).
+# the same way (transient session trouble vs permanently-gone source vs offline).
 _looks_like_auth_or_rate_limit = looks_like_auth_or_rate_limit
 _looks_like_missing_source = looks_like_missing_source
+_looks_like_offline = looks_like_offline
 
 
 def _iso(value: dt.datetime | None) -> str | None:
@@ -119,9 +121,11 @@ def _derive_status(
     scheduled_item_ids: set[int],
     cloud_item_ids: set[int],
     reopened_item_ids: set[int],
+    cloud_pending_item_ids: set[int] | None = None,
 ) -> str:
     """Workflow status for the Processing table: posted > failed > cloud >
-    scheduled > rejected/skipped > pending_review > exported > draft > new.
+    cloud_pending > scheduled > rejected/skipped > exported > draft >
+    pending_review > new.
 
     ``scheduled``/``cloud`` outrank ``pending_review`` on purpose: auto-distributed
     clips are exported AND queued for a future post in the background while their
@@ -130,28 +134,43 @@ def _derive_status(
     a clip with no queued post still reads ``pending_review`` as before. ``cloud``
     is the same as ``scheduled`` but handed off to the Cloudflare Worker.
 
-    The review_state check must come before ``pending_review`` so that a clip
-    rejected while still in ``pending_review`` surfaces as ``rejected``, not
-    ``pending_review``."""
+    ``exported``/``draft`` outrank ``pending_review`` for the same reason.
+    ``apply_revision`` writes the chosen option onto ``title_draft`` /
+    ``caption_draft`` but leaves ``status`` at whatever distribution set, so a
+    reel carrying a finished, applied draft kept reporting ``pending_review`` —
+    it looked untouched in Processing while actually sitting one step from
+    export, which is how a batch could stall unnoticed between Import and
+    Finish. A distributed clip nobody has drafted yet still reads
+    ``pending_review``, because it has neither draft text nor a processed file.
+
+    The review_state check must come before all of these so that a clip rejected
+    while still in ``pending_review`` surfaces as ``rejected``."""
     if item.id in posted_item_ids and item.id not in reopened_item_ids:
         return "posted"
     if item.id in failed_item_ids:
         return "failed"
     if item.id in cloud_item_ids:
         return "cloud"
+    # A locally-'scheduled' job on a cloud-mapped account is cloud-bound, not on
+    # the local browser path: list_due_jobs excludes those accounts outright, so
+    # this reel will only ever be posted by the Worker. It reads 'scheduled' only
+    # because its upload hasn't landed yet. Labelling it plain "Scheduled" made
+    # that look like it had fallen back to local publishing.
+    if cloud_pending_item_ids and item.id in cloud_pending_item_ids:
+        return "cloud_pending"
     if item.id in scheduled_item_ids:
         return "scheduled"
     review_state = (item.review_state or "").lower()
     if review_state in _SKIPPED_REVIEW_STATES:
         return "rejected" if review_state == "rejected" else "skipped"
-    if item.status == "pending_review":
-        return "pending_review"
     if item.status in {"draft", "exported"}:
         return item.status
     if item.processed_path:
         return "exported"
     if item.title_draft or item.caption_draft:
         return "draft"
+    if item.status == "pending_review":
+        return "pending_review"
     return "new"
 
 
@@ -175,18 +194,82 @@ def account_sequence_map(session) -> dict[int, int]:
     return seq_by_item
 
 
+def posted_job_id_map(session) -> dict[int, int]:
+    """Newest posted UploadJob id per item, for items that have ever posted.
+
+    Publishing records the outcome on UploadJob, not on DownloadItem.status —
+    the legacy direct-download path never flips the item row — so this, not
+    ``status == "posted"``, is what actually means "already went out".
+    """
+    posted_job_ids: dict[int, int] = {}
+    for job_id, item_id in session.execute(
+        select(UploadJob.id, UploadJob.download_item_id)
+            .where(UploadJob.download_item_id.is_not(None))
+            .where((UploadJob.posted_at.is_not(None)) | (UploadJob.status == "posted"))
+    ):
+        posted_job_ids[item_id] = max(job_id, posted_job_ids.get(item_id, 0))
+    return posted_job_ids
+
+
+def reopened_item_ids(session, posted_job_ids: dict[int, int]) -> set[int]:
+    """Items that posted once but have a NEWER unposted job — deliberately
+    reopened for another attempt, so they count as unposted again."""
+    active_job_ids: dict[int, int] = {}
+    for job_id, item_id in session.execute(
+        select(UploadJob.id, UploadJob.download_item_id)
+            .where(UploadJob.download_item_id.is_not(None))
+            .where(UploadJob.posted_at.is_(None))
+            .where(UploadJob.status != "posted")
+    ):
+        active_job_ids[item_id] = max(job_id, active_job_ids.get(item_id, 0))
+    return {
+        item_id
+        for item_id, active_job_id in active_job_ids.items()
+        if active_job_id > posted_job_ids.get(item_id, active_job_id)
+        and item_id in posted_job_ids
+    }
+
+
+def already_posted_item_ids(session) -> set[int]:
+    """Items that have posted and have not since been reopened.
+
+    The single answer to "is this reel already out?", shared by the Processing
+    table and the cross-account batch screen so the two cannot disagree.
+    """
+    posted_job_ids = posted_job_id_map(session)
+    return set(posted_job_ids) - reopened_item_ids(session, posted_job_ids)
+
+
+def posted_source_video_ids(session) -> set[str]:
+    """``video_id`` of every reel that has already posted from ANY account.
+
+    The same source reel can reach two accounts — the pool dedups on its own
+    items, but clips pulled in through the legacy direct-download path were
+    never pool items, so the pool had no record that another account already
+    held them. Posting one reel from two accounts in the same network is a
+    footprint risk, so the batch screen uses this to skip a clip whose footage
+    is already out, whichever account published it.
+    """
+    posted = already_posted_item_ids(session)
+    if not posted:
+        return set()
+    return {
+        video_id
+        for video_id in session.scalars(
+            select(DownloadItem.video_id)
+            .where(DownloadItem.id.in_(posted))
+            .where(DownloadItem.video_id.is_not(None))
+        ).all()
+        if video_id
+    }
+
+
 def list_items(account_id: int | None = None, limit: int = _LIST_LIMIT) -> list[dict]:
     """Recent library items (newest first), with account name, derived workflow
     status, and a recency flag. Optionally filtered to one account."""
     with get_session() as session:
         names = {a.id: a.name for a in session.scalars(select(Account)).all()}
-        posted_job_ids: dict[int, int] = {}
-        for job_id, item_id in session.execute(
-            select(UploadJob.id, UploadJob.download_item_id)
-                .where(UploadJob.download_item_id.is_not(None))
-                .where((UploadJob.posted_at.is_not(None)) | (UploadJob.status == "posted"))
-        ):
-            posted_job_ids[item_id] = max(job_id, posted_job_ids.get(item_id, 0))
+        posted_job_ids = posted_job_id_map(session)
         posted_item_ids = set(posted_job_ids)
         # Items whose publish attempt failed and was never revived — the table
         # must surface these so the user knows to republish.
@@ -202,15 +285,36 @@ def list_items(account_id: int | None = None, limit: int = _LIST_LIMIT) -> list[
         }
         # Items queued for a future post (not yet posted) — surfaced as
         # "scheduled" so the table distinguishes them from merely-exported clips.
+        # Split by publish path: on a cloud-mapped account a 'scheduled' job is
+        # awaiting its Worker upload, never the local browser, so it gets the
+        # distinct 'cloud_pending' status instead (see _derive_status).
+        scheduled_rows = session.execute(
+            select(UploadJob.download_item_id, UploadJob.account_id)
+            .where(UploadJob.download_item_id.is_not(None))
+            .where(UploadJob.posted_at.is_(None))
+            .where(UploadJob.status == "scheduled")
+        ).all()
+        # Lazy import: keeps library importable without the cloud publisher's env.
+        from nicheflow_studio.services import cloud_publisher
+
+        cloud_mapped: dict[int | None, bool] = {}
+
+        def _is_cloud_mapped(account_id: int | None) -> bool:
+            if account_id not in cloud_mapped:
+                cloud_mapped[account_id] = bool(
+                    account_id is not None and cloud_publisher.cloud_account_key_for(account_id)
+                )
+            return cloud_mapped[account_id]
+
         scheduled_item_ids = {
-            row
-            for row in session.scalars(
-                select(UploadJob.download_item_id)
-                .where(UploadJob.download_item_id.is_not(None))
-                .where(UploadJob.posted_at.is_(None))
-                .where(UploadJob.status == "scheduled")
-            ).all()
-            if row is not None
+            item_id
+            for item_id, account_id in scheduled_rows
+            if item_id is not None and not _is_cloud_mapped(account_id)
+        }
+        cloud_pending_item_ids = {
+            item_id
+            for item_id, account_id in scheduled_rows
+            if item_id is not None and _is_cloud_mapped(account_id)
         }
         # Items handed off to the Cloudflare Worker (status 'cloud', not yet
         # posted) — surfaced distinctly so the table shows they publish via cloud.
@@ -224,20 +328,7 @@ def list_items(account_id: int | None = None, limit: int = _LIST_LIMIT) -> list[
             ).all()
             if row is not None
         }
-        active_job_ids: dict[int, int] = {}
-        for job_id, item_id in session.execute(
-            select(UploadJob.id, UploadJob.download_item_id)
-                .where(UploadJob.download_item_id.is_not(None))
-                .where(UploadJob.posted_at.is_(None))
-                .where(UploadJob.status != "posted")
-        ):
-            active_job_ids[item_id] = max(job_id, active_job_ids.get(item_id, 0))
-        reopened_item_ids = {
-            item_id
-            for item_id, active_job_id in active_job_ids.items()
-            if active_job_id > posted_job_ids.get(item_id, active_job_id)
-            and item_id in posted_job_ids
-        }
+        reopened = reopened_item_ids(session, posted_job_ids)
         query = (
             select(DownloadItem)
             # Globally-rejected ("blocked") items are hidden from Processing.
@@ -271,13 +362,14 @@ def list_items(account_id: int | None = None, limit: int = _LIST_LIMIT) -> list[
                         failed_item_ids,
                         scheduled_item_ids,
                         cloud_item_ids,
-                        reopened_item_ids,
+                        reopened,
+                        cloud_pending_item_ids,
                     ),
                     "raw_status": row.status,
                     # A posted item that was manually reopened (a newer draft repost
                     # attempt exists). The UI offers "Posted" only for these, to undo
                     # the reopen — see services/publish_queue._revert_reopen_to_posted.
-                    "reopened": row.id in reopened_item_ids,
+                    "reopened": row.id in reopened,
                     "review_state": row.review_state,
                     "file_path": row.file_path,
                     "has_file": bool(row.file_path),
@@ -509,9 +601,18 @@ def ensure_item_downloaded(item_id: int, *, downloader=None, progress=None) -> d
                         "expired or rate-limited. Re-login this account from the dashboard, "
                         "or wait a few minutes and try again. Don't reject the clip; it's fine."
                     ) from exc
-                # Transient (reset/timeout/rate-limit): back off and retry a few times
+                # Transient (reset/timeout/DNS blip): back off and retry a few times
                 # before giving up so a single network blip doesn't fail the open.
                 if attempt >= _DOWNLOAD_ATTEMPTS:
+                    # DNS/offline is our side of the wire — pointing the user at
+                    # their Instagram session or the clip would be the wrong fix.
+                    if _looks_like_offline(str(exc)):
+                        raise LibraryError(
+                            "No internet connection — the download couldn't reach "
+                            "Instagram (DNS lookup failed). Check your network, then "
+                            "reopen the clip. The clip and your Instagram session are "
+                            "fine; don't reject it."
+                        ) from exc
                     raise LibraryError(
                         "Couldn't fetch this clip's original from Instagram. Check your "
                         "connection and Instagram session, then try again — if it keeps "

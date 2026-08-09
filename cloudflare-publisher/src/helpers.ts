@@ -35,7 +35,18 @@ function metaErrorCode(error: unknown): number | null {
   return Number(match[1]);
 }
 
+// Meta service hiccups it explicitly asks us to retry: responses flagged
+// "is_transient":true, or code 2 ("An unexpected error has occurred. Please
+// retry your request later."). These arrive in multi-hour bursts, so burning
+// the 3 quick attempts would permanently fail a job (and delete its media)
+// for an outage that clears on its own — defer like an account block instead.
+export function isTransientMetaError(error: unknown): boolean {
+  if (/"is_transient"\s*:\s*true/.test(String(error))) return true;
+  return metaErrorCode(error) === 2;
+}
+
 export function isRecoverableMetaError(error: unknown): boolean {
+  if (isTransientMetaError(error)) return true;
   const code = metaErrorCode(error);
   return code !== null && RECOVERABLE_META_CODES.has(code);
 }

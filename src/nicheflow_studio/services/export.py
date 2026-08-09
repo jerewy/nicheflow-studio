@@ -16,21 +16,36 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from pathlib import Path
 from typing import Callable
 
-from nicheflow_studio.core.paths import processed_dir
+from nicheflow_studio.core.paths import account_headers_dir, processed_dir
 from nicheflow_studio.db.models import Account, DownloadItem
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.processing import video
+from nicheflow_studio.processing.post_header import PostHeader
 from nicheflow_studio.processing.watermark import replace_detected_watermark
 from nicheflow_studio.services import publishing, library
 from nicheflow_studio.services.errors import ServiceError
+from nicheflow_studio.services.jobs import JobCanceled
 from nicheflow_studio.services.processing_workflow import render_config
 
 logger = logging.getLogger(__name__)
 
 ProgressFn = Callable[[float, str], None]
+
+
+def _check_cancel(cancel_event: "threading.Event | None") -> None:
+    """Abort the export with :class:`JobCanceled` if cancellation was requested.
+
+    Called at the cheap gaps between the expensive stages (download, render,
+    watermark, auto-schedule) so a cancel that lands between them stops the job
+    before the next stage starts. The render stage itself is interrupted by
+    passing the same event down to :func:`video.export_cropped_video`.
+    """
+    if cancel_event is not None and cancel_event.is_set():
+        raise JobCanceled("Export canceled.")
 
 
 class ExportError(ServiceError):
@@ -71,6 +86,89 @@ def _parse_crop_override(raw: str | None) -> dict | None:
     if not isinstance(data, dict) or not _valid_rect(data):
         return None
     return {k: float(data[k]) for k in ("x", "y", "w", "h")}
+
+
+# --- Burned-in post header (avatar + name + verified badge) ---------------- #
+#
+# Identity for the header comes from the publishing account, not the template:
+# the avatar is a local file in ``data/account_headers/`` named after the
+# account's @handle, and the display name / badge come from the account's
+# processing preferences. Nothing is fetched from Instagram — see the
+# account-safety rule about never authenticating as a publishing account.
+
+_HEADER_AVATAR_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
+
+
+def _account_preferences(account: Account) -> dict:
+    if not account.processing_preferences:
+        return {}
+    try:
+        value = json.loads(account.processing_preferences)
+    except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _is_avatar_variant(stem: str, handle: str) -> bool:
+    """True for ``handle`` plus a version suffix: ``pastmomentsdaily_2``, ``…_pp4``.
+
+    The character after the handle must not be a letter, so ``beneathhistory``
+    never claims a ``beneathhistoryclub`` file.
+    """
+    if not stem.startswith(handle):
+        return False
+    rest = stem[len(handle) :]
+    return not rest or not rest[0].isalpha()
+
+
+def _header_avatar_path(account: Account, prefs: dict) -> Path | None:
+    configured = str(prefs.get("header_avatar_path") or "").strip()
+    if configured:
+        path = Path(configured).expanduser()
+        return path if path.is_file() else None
+    handle = (account.instagram_handle or account.name or "").strip().lstrip("@").lower()
+    if not handle:
+        return None
+    headers_dir = account_headers_dir()
+    exact = [headers_dir / f"{handle}{suffix}" for suffix in _HEADER_AVATAR_SUFFIXES]
+    for candidate in exact:
+        if candidate.is_file():
+            return candidate
+    if not headers_dir.is_dir():
+        return None
+    # Fall back to the newest versioned variant so swapping an account's
+    # profile picture is a file drop, not a rename.
+    variants = [
+        path
+        for path in headers_dir.iterdir()
+        if path.is_file()
+        and path.suffix.lower() in _HEADER_AVATAR_SUFFIXES
+        and _is_avatar_variant(path.stem.lower(), handle)
+    ]
+    if not variants:
+        return None
+    return max(variants, key=lambda path: path.stat().st_mtime)
+
+
+def build_post_header(account: Account | None) -> PostHeader | None:
+    """The header spec for ``account``, or ``None`` when it has no display name.
+
+    Must be called inside the session that loaded ``account`` — it reads lazy
+    ORM attributes.
+    """
+    if account is None:
+        return None
+    prefs = _account_preferences(account)
+    display_name = str(prefs.get("header_display_name") or "").strip() or (
+        account.name or ""
+    ).strip()
+    if not display_name:
+        return None
+    return PostHeader(
+        display_name=display_name,
+        avatar_path=_header_avatar_path(account, prefs),
+        verified=bool(prefs.get("header_verified", True)),
+    )
 
 
 def _coerce_rect(rect: dict) -> dict:
@@ -214,15 +312,26 @@ def _replace_watermark_best_effort(output_path: Path, replacement_handle: str) -
     return status
 
 
-def export_item(item_id: int, *, progress: ProgressFn | None = None) -> dict:
+def export_item(
+    item_id: int,
+    *,
+    progress: ProgressFn | None = None,
+    cancel_event: "threading.Event | None" = None,
+) -> dict:
     """Render the processed Reel for ``item_id`` and set ``processed_path``.
 
     Returns ``{"item_id", "processed_path"}``, plus scheduling details or a
     non-fatal scheduling warning when the account enables auto-scheduling.
     Raises :class:`ExportError` for user-fixable export problems (no source
     file, file missing) so the message reaches the UI cleanly.
+
+    ``cancel_event`` (injected by :class:`~nicheflow_studio.services.jobs.JobManager`
+    when this runs as a background job) makes the export cancellable: it is
+    checked between stages and passed to the FFmpeg render so an in-flight render
+    is killed, raising :class:`~nicheflow_studio.services.jobs.JobCanceled`.
     """
 
+    _check_cancel(cancel_event)
     with get_session() as session:
         pending_item = session.get(DownloadItem, item_id)
         should_download = bool(
@@ -248,6 +357,9 @@ def export_item(item_id: int, *, progress: ProgressFn | None = None) -> dict:
         # The publishing account's own @handle stamps over any foreign watermark.
         account = session.get(Account, item.account_id) if item.account_id is not None else None
         watermark_handle = (account.instagram_handle or "").strip() if account is not None else ""
+        # Built here (not after the render config lookup) because it reads ORM
+        # attributes that are unavailable once the session closes.
+        post_header = build_post_header(account)
 
     resolved_input = input_path.expanduser()
     if not resolved_input.exists():
@@ -266,26 +378,40 @@ def export_item(item_id: int, *, progress: ProgressFn | None = None) -> dict:
         except Exception:  # noqa: BLE001 - crop detection is best-effort; fall back to no crop
             crop = video.CropSettings()
 
+    _check_cancel(cancel_event)
     report(0.35, "Rendering reel…")
     render = render_config(item_id)
-    result_path = video.export_cropped_video(
-        input_path=input_path,
-        output_path=output_path,
-        crop=crop,
-        title_text=title_text,
-        title_layout=str(render.get("layout", "top_band")),
-        title_font_size=int(render.get("font_size", 54)),
-        title_font_name=str(render.get("font_name") or "arial_bold"),
-        title_color=str(render.get("color", "#FFFFFF")),
-        title_background=str(render.get("background", "none")),
-        enable_bold_keywords=bool(render.get("bold_keywords", False)),
-        title_align=str(render.get("align", "center")),
-        title_line_gap_scale=render.get("line_gap_scale"),
-    )
+    try:
+        result_path = video.export_cropped_video(
+            input_path=input_path,
+            output_path=output_path,
+            crop=crop,
+            title_text=title_text,
+            title_layout=str(render.get("layout", "top_band")),
+            title_font_size=int(render.get("font_size", 54)),
+            title_font_name=str(render.get("font_name") or "arial_bold"),
+            title_color=str(render.get("color", "#FFFFFF")),
+            title_background=str(render.get("background", "none")),
+            enable_bold_keywords=bool(render.get("bold_keywords", False)),
+            title_align=str(render.get("align", "center")),
+            title_line_gap_scale=render.get("line_gap_scale"),
+            post_header=post_header if render.get("post_header") else None,
+            cancel_event=cancel_event,
+        )
+    except video.RenderCanceled as exc:
+        # The FFmpeg render was killed mid-flight; drop the partial output so a
+        # canceled export never leaves a half-written file behind.
+        try:
+            output_path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Could not remove partial export output %s", output_path)
+        raise JobCanceled(str(exc)) from exc
 
+    _check_cancel(cancel_event)
     report(0.85, "Covering watermark…")
     watermark_status = _replace_watermark_best_effort(result_path, watermark_handle)
 
+    _check_cancel(cancel_event)
     report(0.9, "Saving…")
     auto_schedule_on_export = False
     with get_session() as session:
@@ -302,6 +428,13 @@ def export_item(item_id: int, *, progress: ProgressFn | None = None) -> dict:
             result["scheduled_publish"] = publishing.auto_schedule_for_publish(item_id)
         except publishing.PublishError as exc:
             result["warning"] = str(exc)
+        except Exception as exc:  # noqa: BLE001 - the export itself succeeded
+            # A scheduling crash (e.g. a network error mid-cloud-handoff) must
+            # not fail the whole export job: the reel is rendered and any local
+            # schedule that was committed will be re-pushed by the cloud sync
+            # sweep. Surface it the same way as a handled scheduling warning.
+            logger.exception("Auto-schedule after export failed for item %s", item_id)
+            result["warning"] = f"Auto-scheduling hit an unexpected error: {exc}"
 
     report(1.0, "Done")
     return result

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { isRecoverableMetaError, normalizeAccountKey, parseRange, safeFileName, shouldOfferManualLocalPublish } from "../src/helpers.ts";
+import { isRecoverableMetaError, isTransientMetaError, normalizeAccountKey, parseRange, safeFileName, shouldOfferManualLocalPublish } from "../src/helpers.ts";
 import { ageMinutes, statusCounts } from "../src/monitoring.ts";
 
 test("normalizes valid account keys", () => {
@@ -57,6 +57,22 @@ test("routes API-surface Meta failures to manual local publish option", () => {
   assert.equal(shouldOfferManualLocalPublish('Meta HTTP 400: {"error":{"code":4}}'), true);
   assert.equal(shouldOfferManualLocalPublish('Meta HTTP 400: {"error":{"code":17}}'), true);
   assert.equal(shouldOfferManualLocalPublish('Meta HTTP 400: {"error":{"code":613}}'), true);
+});
+
+test("treats Meta transient service errors as recoverable, not manual-local", () => {
+  // The exact shape that permanently failed a real job during a ~2h Meta
+  // outage window (HTTP 500, code 2, is_transient) — must defer, not fail.
+  const transient =
+    'Error: Meta HTTP 500: {"error":{"message":"An unexpected error has occurred. Please retry your request later.","type":"OAuthException","is_transient":true,"code":2,"fbtrace_id":"abc"}}';
+  assert.equal(isTransientMetaError(transient), true);
+  assert.equal(isRecoverableMetaError(transient), true);
+  // A service hiccup is not an account block: never route to manual publish.
+  assert.equal(shouldOfferManualLocalPublish(transient), false);
+  // is_transient alone is enough, whatever the code.
+  assert.equal(isTransientMetaError('Meta HTTP 500: {"error":{"code":99,"is_transient":true}}'), true);
+  // Code 2 alone (some responses omit the flag) is enough too.
+  assert.equal(isTransientMetaError('Meta HTTP 500: {"error":{"code":2}}'), true);
+  assert.equal(isTransientMetaError('Meta HTTP 400: {"error":{"code":100,"is_transient":false}}'), false);
 });
 
 test("treats genuine job failures as non-recoverable", () => {

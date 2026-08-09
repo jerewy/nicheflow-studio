@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
+import { useRevisitRefresh } from "@/hooks/useKeepAlive";
 import { bridge } from "@/lib/bridge";
 import { cn } from "@/lib/utils";
 import type { PoolReviewItem, RightsConfidence } from "@/types";
@@ -106,7 +107,12 @@ function Spinner() {
   );
 }
 
-export function PoolReviewScreen() {
+export function PoolReviewScreen({
+  active = true,
+}: {
+  // False while the screen is kept alive but hidden behind another (sub-)tab.
+  active?: boolean;
+} = {}) {
   const [niche, setNiche] = useState("history");
   const [sourceFilter, setSourceFilter] = useState("");
   const [items, setItems] = useState<PoolReviewItem[]>([]);
@@ -154,6 +160,10 @@ export function PoolReviewScreen() {
     }, 0);
     return () => window.clearTimeout(timer);
   }, [load]);
+
+  // Kept alive behind the sub-tab bar; reload the queue on revisit like a
+  // remount did, while in-flight approve/download jobs keep their progress.
+  useRevisitRefresh(active, () => void load());
 
   // Grow the rendered window when the bottom sentinel nears the viewport.
   useEffect(() => {

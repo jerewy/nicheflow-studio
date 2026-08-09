@@ -198,7 +198,9 @@ def test_export_cropped_video_can_render_title_band_layout(monkeypatch, tmp_path
     assert "[content]" in filter_chain
     assert "color=c=black:s=1080x" in filter_chain
     assert "[title][content]vstack=inputs=2[block]" in filter_chain
-    assert "[block]pad=1080:1920:(ow-iw)/2:0:color=black[vout]" in filter_chain
+    # Tall full-frame footage no longer collapses the block to y=0: the block
+    # keeps the reserved Reels-chrome gap at the top and the bottom margin.
+    assert "[block]pad=1080:1920:(ow-iw)/2:140:color=black[vout]" in filter_chain
     assert "(oh-ih)/2" not in filter_chain
     assert "boxblur" not in filter_chain
     assert "overlay=" not in filter_chain
@@ -1785,6 +1787,44 @@ def test_title_band_centers_video_content_not_combined_stack() -> None:
     assert "[block]pad=1080:1920:(ow-iw)/2:356:color=black[vout]" in filter_string
 
 
+def test_title_band_keeps_tall_footage_clear_of_reels_chrome() -> None:
+    """Tall (9:16) sources must not push the title under Instagram's top UI.
+
+    Regression: with footage tall enough to fill the area below the title
+    band, block_y collapsed to 0 — the first title line rendered under the
+    status bar / "Reels" header on-device and the footage ran flush to the
+    canvas bottom (pastmomentsdaily items #789/#792, 2026-07).
+    """
+    filter_string = video._title_band_filter_complex(
+        "Queen Elizabeth steps out in matching lilac with a fellow royal, "
+        "sheltering under one umbrella.",
+        crop="crop=1080:1920:0:0",
+        crop_width=1080,
+        crop_height=1920,
+        font_path=Path("dummy.ttf"),
+        requested_font_size=54,
+        title_font_name="arial",
+        title_color="white",
+        title_text_dir=Path("."),
+        duration_seconds=2.0,
+        title_align="left",
+        title_line_gap_scale=0.20,
+    )
+
+    import re as _re
+
+    band_height = int(_re.search(r"color=c=black:s=1080x(\d+)", filter_string).group(1))
+    content_height = int(_re.search(r"pad=1080:(\d+):\d+:0:color=black\[content\]", filter_string).group(1))
+    block_y = int(
+        _re.search(r"\[block\]pad=1080:1920:\(ow-iw\)/2:(\d+):color=black", filter_string).group(1)
+    )
+    start_y = min(int(m.group(1)) for m in _re.finditer(r"y=(\d+)", filter_string))
+    # First title line stays below the on-device Reels chrome:
+    assert block_y + start_y >= video._TITLE_TEXT_MIN_TOP_PX
+    # Footage bottom keeps the reserved margin above the canvas edge:
+    assert block_y + band_height + content_height <= 1920 - video._BLOCK_MIN_BOTTOM_GAP_PX
+
+
 def test_title_band_insets_cinema_viral_bold_content_width() -> None:
     filter_string = video._title_band_filter_complex(
         "One of the most visually stunning\ntransitions ever made.",
@@ -2004,3 +2044,147 @@ def test_bold_font_file_maps_known_fonts_and_skips_unknown() -> None:
     assert "georgia" in video._BOLD_FONT_SIBLINGS
     assert video._BOLD_FONT_SIBLINGS["georgia"] == "georgia_bold"
     assert video._bold_font_file("totally_unknown_font") is None
+
+
+# --- Vertical clip render primitive -----------------------------------------
+
+
+def _capture_filter_complex(monkeypatch) -> dict[str, object]:
+    captured: dict[str, object] = {}
+
+    def fake_run(command: list[str], **kwargs) -> subprocess.CompletedProcess[str]:
+        captured["command"] = command
+        captured["filter_complex"] = command[command.index("-filter_complex") + 1]
+        return subprocess.CompletedProcess(args=command, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(video.subprocess, "run", fake_run)
+    return captured
+
+
+def test_render_vertical_clip_builds_blur_reframe_and_seek(monkeypatch, tmp_path: Path) -> None:
+    input_path = tmp_path / "episode.mp4"
+    output_path = tmp_path / "clips" / "clip-01.mp4"
+    input_path.write_bytes(b"video")
+
+    monkeypatch.setattr(video, "ffmpeg_binary", lambda: Path("C:/tools/ffmpeg.exe"))
+    captured = _capture_filter_complex(monkeypatch)
+
+    result = video.render_vertical_clip(
+        input_path=input_path,
+        output_path=output_path,
+        start_seconds=62.5,
+        end_seconds=95.0,
+    )
+
+    assert result == output_path.resolve()
+    command = captured["command"]
+    assert command[0] == str(Path("C:/tools/ffmpeg.exe"))
+    # Input seeking: -ss/-t appear before -i so the clip's first frame is t=0.
+    assert command.index("-ss") < command.index("-i")
+    assert command[command.index("-ss") + 1] == "62.500"
+    assert command[command.index("-t") + 1] == "32.500"
+    graph = str(captured["filter_complex"])
+    assert "split=2[clipbg][clipfg]" in graph
+    assert "gblur=sigma=20" in graph
+    assert "overlay=(W-w)/2:(H-h)/2" in graph
+    assert graph.endswith("[vout]")
+    assert "scale=1080:1920:force_original_aspect_ratio=decrease[fg]" in graph
+    assert command[command.index("-map") + 1] == "[vout]"
+    # No audio alteration requested -> pass the source audio through untouched.
+    assert "0:a?" in command
+    assert command[-1] == str(output_path.resolve())
+
+
+def test_render_vertical_clip_black_background_pillarboxes(monkeypatch, tmp_path: Path) -> None:
+    input_path = tmp_path / "episode.mp4"
+    output_path = tmp_path / "clip.mp4"
+    input_path.write_bytes(b"video")
+
+    monkeypatch.setattr(video, "ffmpeg_binary", lambda: Path("C:/tools/ffmpeg.exe"))
+    captured = _capture_filter_complex(monkeypatch)
+
+    video.render_vertical_clip(
+        input_path=input_path,
+        output_path=output_path,
+        start_seconds=0.0,
+        end_seconds=8.0,
+        background="black",
+    )
+
+    graph = str(captured["filter_complex"])
+    assert "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black" in graph
+    assert "gblur" not in graph
+    assert "overlay" not in graph
+    assert graph.endswith("[vout]")
+
+
+def test_render_vertical_clip_alters_audio_and_burns_subtitles(
+    monkeypatch, tmp_path: Path
+) -> None:
+    input_path = tmp_path / "episode.mp4"
+    output_path = tmp_path / "clip.mp4"
+    subtitles_path = tmp_path / "clip.srt"
+    input_path.write_bytes(b"video")
+    subtitles_path.write_text("1\n00:00:00,000 --> 00:00:02,000\nhi\n", encoding="utf-8")
+
+    monkeypatch.setattr(video, "ffmpeg_binary", lambda: Path("C:/tools/ffmpeg.exe"))
+    monkeypatch.setattr(video, "has_audio_stream", lambda _path: True)
+    captured = _capture_filter_complex(monkeypatch)
+
+    video.render_vertical_clip(
+        input_path=input_path,
+        output_path=output_path,
+        start_seconds=10.0,
+        end_seconds=25.0,
+        subtitles_path=subtitles_path,
+        audio_mode="alter",
+        audio_alter_params=video.AudioAlterParams(tempo=1.02, pitch=1.01, volume=1.0, delay_ms=0),
+    )
+
+    command = captured["command"]
+    graph = str(captured["filter_complex"])
+    assert "subtitles='" in graph
+    # Altered audio is routed through its own labeled output, not a raw passthrough.
+    assert ";[0:a]" in graph
+    assert "[aout]" in graph
+    assert command[command.index("-map", command.index("-map") + 1) + 1] == "[aout]"
+    assert "0:a?" not in command
+
+
+def test_render_vertical_clip_rejects_nonpositive_duration(monkeypatch, tmp_path: Path) -> None:
+    input_path = tmp_path / "episode.mp4"
+    input_path.write_bytes(b"video")
+    monkeypatch.setattr(video, "ffmpeg_binary", lambda: Path("C:/tools/ffmpeg.exe"))
+
+    with pytest.raises(ValueError, match="greater than start_seconds"):
+        video.render_vertical_clip(
+            input_path=input_path,
+            output_path=tmp_path / "clip.mp4",
+            start_seconds=30.0,
+            end_seconds=30.0,
+        )
+
+
+def test_build_vertical_reframe_filter_rejects_unknown_background() -> None:
+    with pytest.raises(ValueError, match="Unknown background"):
+        video.build_vertical_reframe_filter(background="rainbow")
+
+
+def test_write_clip_srt_clips_and_shifts_to_zero_based(tmp_path: Path) -> None:
+    cues = [
+        video.SubtitleCue(start=5.0, end=7.0, text="before the window"),
+        video.SubtitleCue(start=11.0, end=13.5, text="first line"),
+        video.SubtitleCue(start=14.0, end=20.0, text="spans past the end"),
+        video.SubtitleCue(start=30.0, end=31.0, text="after the window"),
+        video.SubtitleCue(start=12.0, end=12.5, text="   "),
+    ]
+    output_path = tmp_path / "clip.srt"
+
+    video.write_clip_srt(cues, output_path, clip_start=10.0, clip_end=18.0)
+
+    content = output_path.read_text(encoding="utf-8")
+    assert "before the window" not in content
+    assert "after the window" not in content
+    # Blank cue is dropped, so numbering stays contiguous over the kept cues.
+    assert content.startswith("1\n00:00:01,000 --> 00:00:03,500\nfirst line")
+    assert "2\n00:00:04,000 --> 00:00:08,000\nspans past the end" in content

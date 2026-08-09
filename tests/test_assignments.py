@@ -8,9 +8,18 @@ from nicheflow_studio.db.assignments import (
     assignment_counts_by_account,
     assignments_for_account,
     distribute_niche,
+    undrafted_item_counts_by_account,
 )
 from nicheflow_studio.db.media_library import find_or_register_media_asset
-from nicheflow_studio.db.models import Account, Assignment, MediaAsset, PoolItem, ScrapeCandidate
+from nicheflow_studio.db.models import (
+    Account,
+    Assignment,
+    DownloadItem,
+    DraftRevision,
+    MediaAsset,
+    PoolItem,
+    ScrapeCandidate,
+)
 from nicheflow_studio.db.pools import accept_into_pool
 from nicheflow_studio.db.session import get_session, init_db
 
@@ -194,6 +203,45 @@ def test_redistribute_only_places_new_clips(tmp_path) -> None:
         assert len(second) >= 0  # may be 0 if all collided — the key invariant is no dupes
 
 
+def test_distribute_reuses_processing_row_despite_url_form_drift(tmp_path) -> None:
+    """No duplicate Processing row when the account already has the reel under a
+    different URL form (legacy trailing slash vs canonical without)."""
+    init_db()
+    with get_session() as session:
+        (account_id,) = _make_accounts(session, "history", 1)
+        asset, _ = find_or_register_media_asset(
+            session,
+            source_url="https://www.instagram.com/reel/driftAB123",
+            shortcode="driftAB123",
+        )
+        accept_into_pool(session, media_asset=asset, niche="history")
+        # The account already handled this reel, recorded with a trailing slash.
+        session.add(
+            DownloadItem(
+                source_url="https://www.instagram.com/reel/driftAB123/",
+                video_id="driftAB123",
+                title="already here",
+                status="pending_review",
+                account_id=account_id,
+            )
+        )
+        session.commit()
+
+        created = distribute_niche(session, "history", rng=random.Random(1))
+        session.commit()
+
+        assert len(created) == 1  # assignment bookkeeping still happens
+        rows = (
+            session.query(DownloadItem)
+            .filter(
+                DownloadItem.account_id == account_id,
+                DownloadItem.video_id == "driftAB123",
+            )
+            .all()
+        )
+        assert len(rows) == 1  # but no second Processing row was created
+
+
 def test_distribute_no_accounts_returns_empty(tmp_path) -> None:
     init_db()
     with get_session() as session:
@@ -303,6 +351,127 @@ def test_assignment_counts_only_include_pending_assigned_status() -> None:
         session.commit()
 
         assert assignment_counts_by_account(session, "history") == {account_id: 1}
+
+
+def test_distribute_counts_reels_in_processing_not_assignment_rows() -> None:
+    """An assignment row that produced no reel must not hold a slot.
+
+    Assignments created before materialisation was wired into distribute left
+    accounts with rows but an empty Processing list. Counting rows meant those
+    accounts reported themselves at target forever, so Distribute answered
+    "all at cap" and placed nothing while the user stared at zero reels.
+    """
+    init_db()
+    with get_session() as session:
+        (account_id,) = _make_accounts(session, "history", 1)
+        _fill_pool(session, "history", 20)
+        session.commit()
+
+        distribute_niche(session, "history", rng=random.Random(1), max_per_account=6)
+        session.commit()
+        assert assignment_counts_by_account(session, "history") == {account_id: 6}
+
+        # Delete the reels the assignments produced, leaving the rows behind:
+        # exactly the phantom state, an account with 6 rows and nothing to work on.
+        for item in session.query(DownloadItem).filter(
+            DownloadItem.account_id == account_id
+        ):
+            session.delete(item)
+        session.commit()
+
+        assert assignment_counts_by_account(session, "history") == {account_id: 6}
+        assert undrafted_item_counts_by_account(session, "history").get(account_id, 0) == 0
+
+        # So a re-run must refill the account rather than report it full.
+        created = distribute_niche(session, "history", rng=random.Random(2), max_per_account=6)
+        session.commit()
+        assert len(created) == 6
+        assert undrafted_item_counts_by_account(session, "history")[account_id] == 6
+
+
+def test_already_drafted_reels_do_not_hold_a_slot() -> None:
+    """The target means "N reels ready to draft", matching Batch Drafts.
+
+    Counting every open item instead let an account sit "at target" holding 9
+    reels of which only 5 still needed a draft, so the Batch Drafts screen never
+    filled up no matter how many times Distribute ran.
+    """
+    init_db()
+    with get_session() as session:
+        (account_id,) = _make_accounts(session, "history", 1)
+        _fill_pool(session, "history", 20)
+        session.commit()
+        distribute_niche(session, "history", rng=random.Random(1), max_per_account=6)
+        session.commit()
+        assert undrafted_item_counts_by_account(session, "history") == {account_id: 6}
+
+        # Draft three of them: still open work, but no longer work of the kind
+        # this target is counting.
+        items = (
+            session.query(DownloadItem)
+            .filter(DownloadItem.account_id == account_id)
+            .order_by(DownloadItem.id)
+            .limit(3)
+            .all()
+        )
+        for item in items:
+            session.add(DraftRevision(download_item_id=item.id, revision_number=1))
+        session.commit()
+
+        assert undrafted_item_counts_by_account(session, "history") == {account_id: 3}
+        # ...so a re-run refills the three drafted slots.
+        created = distribute_niche(session, "history", rng=random.Random(2), max_per_account=6)
+        session.commit()
+        assert len(created) == 3
+        assert undrafted_item_counts_by_account(session, "history") == {account_id: 6}
+
+
+def test_reels_still_downloading_count_so_top_up_does_not_pile_on() -> None:
+    """A distributed reel whose file hasn't landed yet is work already on its
+    way. If it didn't count, every top-up tick would order more clips for the
+    same slot until the downloads finished."""
+    init_db()
+    with get_session() as session:
+        (account_id,) = _make_accounts(session, "history", 1)
+        _fill_pool(session, "history", 20)
+        session.commit()
+        distribute_niche(session, "history", rng=random.Random(1), max_per_account=6)
+        session.commit()
+
+        for item in session.query(DownloadItem).filter(
+            DownloadItem.account_id == account_id
+        ):
+            item.file_path = None
+        session.commit()
+
+        assert undrafted_item_counts_by_account(session, "history") == {account_id: 6}
+        assert distribute_niche(session, "history", rng=random.Random(2), max_per_account=6) == []
+
+
+def test_open_item_counts_ignore_posted_and_rejected_reels() -> None:
+    """Finished work must not count toward the target."""
+    init_db()
+    with get_session() as session:
+        (account_id,) = _make_accounts(session, "history", 1)
+        _fill_pool(session, "history", 10)
+        session.commit()
+        distribute_niche(session, "history", rng=random.Random(1), max_per_account=4)
+        session.commit()
+
+        items = (
+            session.query(DownloadItem)
+            .filter(DownloadItem.account_id == account_id)
+            .order_by(DownloadItem.id)
+            .all()
+        )
+        assert len(items) == 4
+        items[0].status = "posted"
+        items[1].review_state = "rejected"
+        items[2].review_state = "blocked"
+        session.commit()
+
+        # Only the untouched fourth reel is still work in hand.
+        assert undrafted_item_counts_by_account(session, "history") == {account_id: 1}
 
 
 def test_top_up_adds_new_accounts_without_touching_existing(tmp_path) -> None:

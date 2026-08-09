@@ -229,6 +229,63 @@ def test_status_derivation_scheduled_outranks_pending_review() -> None:
     assert by_id[item] == "scheduled"
 
 
+def test_status_derivation_applied_draft_outranks_pending_review() -> None:
+    """A reel carrying an applied draft must not read as untouched.
+
+    apply_revision writes title_draft/caption_draft but leaves `status` at
+    whatever distribution set it to, so these reels reported "Pending review"
+    while actually sitting one step from export — which is how a batch stalls
+    unnoticed between Import pasted reply and Finish batch.
+    """
+    account_id = _make_account()
+    item = _make_item(account_id=account_id)
+    with get_session() as session:
+        row = session.get(DownloadItem, item)
+        row.status = "pending_review"
+        row.review_state = "pending_review"
+        row.title_draft = "An applied hook"
+        row.caption_draft = "An applied caption"
+        session.commit()
+
+    by_id = {r["id"]: r["status"] for r in library.list_items(account_id=account_id)}
+    assert by_id[item] == "draft"
+
+
+def test_status_derivation_undrafted_distributed_clip_still_reads_pending_review() -> None:
+    """The other side of the same rule: a freshly distributed clip nobody has
+    drafted has no draft text and no processed file, so it must keep reading
+    "Pending review" — otherwise the review queue would look empty."""
+    account_id = _make_account()
+    item = _make_item(account_id=account_id)
+    with get_session() as session:
+        row = session.get(DownloadItem, item)
+        row.status = "pending_review"
+        row.review_state = "pending_review"
+        row.title_draft = None
+        row.caption_draft = None
+        row.processed_path = None
+        session.commit()
+
+    by_id = {r["id"]: r["status"] for r in library.list_items(account_id=account_id)}
+    assert by_id[item] == "pending_review"
+
+
+def test_status_derivation_rejected_still_wins_over_an_applied_draft() -> None:
+    """Rejection outranks everything below the live-job checks, so a rejected
+    clip that had already been drafted must not resurface as "Draft"."""
+    account_id = _make_account()
+    item = _make_item(account_id=account_id)
+    with get_session() as session:
+        row = session.get(DownloadItem, item)
+        row.status = "pending_review"
+        row.review_state = "rejected"
+        row.title_draft = "An applied hook"
+        session.commit()
+
+    by_id = {r["id"]: r["status"] for r in library.list_items(account_id=account_id)}
+    assert by_id[item] == "rejected"
+
+
 def test_status_derivation_cloud_job() -> None:
     # A job handed off to the Cloudflare Worker (status 'cloud') reads as "Cloud"
     # in the table, ranked like 'scheduled' (above pending_review).
@@ -252,6 +309,67 @@ def test_status_derivation_cloud_job() -> None:
 
     by_id = {r["id"]: r["status"] for r in library.list_items(account_id=account_id)}
     assert by_id[item] == "cloud"
+
+
+def test_status_derivation_scheduled_on_a_cloud_account_reads_as_cloud_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A cloud-mapped account's locally-'scheduled' job is waiting on its Worker
+    # upload, never on the local browser (list_due_jobs excludes those accounts).
+    # Plain "Scheduled" made that look like it had fallen back to local posting.
+    from nicheflow_studio.db.models import UploadJob
+    from nicheflow_studio.services import cloud_publisher
+
+    account_id = _make_account()
+    item = _make_item(account_id=account_id)
+    monkeypatch.setattr(
+        cloud_publisher,
+        "cloud_account_key_for",
+        lambda candidate: "mapped" if candidate == account_id else None,
+    )
+    with get_session() as session:
+        row = session.get(DownloadItem, item)
+        row.processed_path = "C:/out.mp4"
+        session.add(
+            UploadJob(
+                account_id=account_id,
+                download_item_id=item,
+                processed_path="C:/out.mp4",
+                status="scheduled",
+            )
+        )
+        session.commit()
+
+    by_id = {r["id"]: r["status"] for r in library.list_items(account_id=account_id)}
+    assert by_id[item] == "cloud_pending"
+
+
+def test_status_derivation_scheduled_on_a_local_account_stays_scheduled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The mirror case: an unmapped account really does publish from this machine,
+    # so it must keep reading "Scheduled".
+    from nicheflow_studio.db.models import UploadJob
+    from nicheflow_studio.services import cloud_publisher
+
+    account_id = _make_account()
+    item = _make_item(account_id=account_id)
+    monkeypatch.setattr(cloud_publisher, "cloud_account_key_for", lambda candidate: None)
+    with get_session() as session:
+        row = session.get(DownloadItem, item)
+        row.processed_path = "C:/out.mp4"
+        session.add(
+            UploadJob(
+                account_id=account_id,
+                download_item_id=item,
+                processed_path="C:/out.mp4",
+                status="scheduled",
+            )
+        )
+        session.commit()
+
+    by_id = {r["id"]: r["status"] for r in library.list_items(account_id=account_id)}
+    assert by_id[item] == "scheduled"
 
 
 def test_status_derivation_cloud_outranks_stale_scheduled_job() -> None:
@@ -772,6 +890,35 @@ def test_deleted_source_raises_clean_reject_prompt(monkeypatch: pytest.MonkeyPat
     assert calls == 1  # no retry — the source won't come back
 
 
+def test_logged_in_info_400_raises_clean_reject_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When fetching with sourcing cookies, a removed/private post fails on the
+    *logged-in* media-info endpoint with 'HTTP Error 400', not the anonymous
+    'empty media response'. That 400 must still be recognized as a gone source so
+    the user is told to reject it — not sent to re-check their connection/session.
+    Like other gone sources it must fail on the first attempt without retrying."""
+    item_id = _make_item(file_path=None)
+    monkeypatch.setattr(library.time, "sleep", lambda _seconds: None)
+    calls = 0
+
+    def gone_download(*, url, output_dir):
+        nonlocal calls
+        calls += 1
+        raise RuntimeError(
+            "ERROR: [Instagram] DZNRCbipea3: Video info extraction failed: "
+            "HTTP Error 400: Bad Request (caused by <HTTPError 400: Bad Request>)"
+        )
+
+    with pytest.raises(library.SourceUnavailableError) as excinfo:
+        library.ensure_item_downloaded(item_id, downloader=gone_download)
+    assert "no longer available" in str(excinfo.value).lower() or "deleted" in str(
+        excinfo.value
+    ).lower()
+    assert isinstance(excinfo.value, LibraryError)
+    assert calls == 1  # no retry — the source won't come back
+
+
 def test_transient_download_failure_retries_then_succeeds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -841,6 +988,34 @@ def test_rate_limit_or_login_required_tells_user_to_relogin(
     assert "re-login" in message or "login" in message
     assert "reject" in message  # only as "don't reject" guidance
     assert calls == 1  # no retry — rate-limit won't clear within our backoff
+
+
+def test_dns_failure_reports_offline_not_session_trouble(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A DNS/offline failure (yt-dlp 'getaddrinfo failed') is our side of the
+    wire — the message must say the network is down, not point the user at
+    their Instagram session or suggest rejecting the clip."""
+    item_id = _make_item(file_path=None)
+    monkeypatch.setattr(library.time, "sleep", lambda _seconds: None)
+    calls = 0
+
+    def offline_download(*, url, output_dir):
+        nonlocal calls
+        calls += 1
+        raise RuntimeError(
+            "ERROR: [Instagram] DZBKm3Rtovw: Video info extraction failed: "
+            "HTTPSConnection(host='i.instagram.com', port=443): Failed to resolve "
+            "'i.instagram.com' ([Errno 11002] getaddrinfo failed)"
+        )
+
+    with pytest.raises(LibraryError) as excinfo:
+        library.ensure_item_downloaded(item_id, downloader=offline_download)
+    message = str(excinfo.value).lower()
+    assert "no internet connection" in message
+    assert "don't reject" in message
+    assert "re-login" not in message  # not a session problem
+    assert calls == library._DOWNLOAD_ATTEMPTS  # a blip may clear — retry first
 
 
 def test_prefetch_warms_uncached_skips_cached_and_swallows_failures(

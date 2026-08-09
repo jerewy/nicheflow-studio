@@ -31,6 +31,7 @@ from nicheflow_studio.db.models import DownloadItem
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.services import (
     accounts as accounts_svc,
+    batch_finish,
     cloud_publisher,
     draft_generation,
     draft_handoff,
@@ -45,6 +46,7 @@ from nicheflow_studio.services import (
     processing_workflow,
     scraping,
     sourcing,
+    ui_settings,
 )
 from nicheflow_studio.services.errors import ServiceError
 from nicheflow_studio.services.jobs import JobManager
@@ -584,6 +586,69 @@ class ProcessingBridge:
     def import_account_batch_draft(self, text: str, item_ids: list[int]) -> dict:
         return draft_handoff.import_account_batch_draft(text, item_ids)
 
+    # --- Cross-account batch (Dashboard > Batch Drafts) ---------------------
+    # Same three-step handoff as the per-account batch, but one prompt covers
+    # every account: the shared style rules are sent once and reel headers echo
+    # the GLOBAL item id so replies can be routed back across accounts.
+
+    @_guard
+    def batch_draft_candidates(
+        self, niche: str | None = None, per_account: int = 6
+    ) -> dict:
+        groups = draft_handoff.batch_candidates(niche=niche, per_account=per_account)
+        # Same virtual-host gating as get_context: only hand out media URLs once
+        # the WebView folder mapping is installed, so the review player can play
+        # the source clip before it is drafted.
+        mapping_ready = self._media_ready is None or self._media_ready.wait(timeout=5)
+        for group in groups:
+            for item in group["items"]:
+                # Always drop the raw path, mapped or not: the UI has no use for
+                # a local filesystem path and it must not leak into the page.
+                file_path = item.pop("file_path", None)
+                item["preview_url"] = media_url(file_path) if mapping_ready else None
+        return {"groups": groups}
+
+    @_guard
+    def build_multi_account_batch_chat_prompt(
+        self, item_ids: list[int], payload: dict | None = None
+    ) -> dict:
+        return {
+            "prompt": draft_handoff.build_multi_account_batch_chat_prompt(item_ids, payload)
+        }
+
+    @_guard
+    def prepare_multi_account_batch_frames(self, item_ids: list[int]) -> dict:
+        return draft_handoff.multi_account_batch_frames(item_ids)
+
+    @_guard
+    def start_prepare_multi_account_batch_frames(self, item_ids: list[int]) -> dict:
+        """Frame prep runs the vision pass per reel, so a 36-reel batch would
+        block the bridge for minutes. Run it as a job and poll like exports."""
+        job_id = self._jobs.start(draft_handoff.multi_account_batch_frames, item_ids)
+        return {"job_id": job_id}
+
+    @_guard
+    def import_multi_account_batch_draft(self, text: str, item_ids: list[int]) -> dict:
+        return draft_handoff.import_multi_account_batch_draft(text, item_ids)
+
+    @_guard
+    def multi_account_batch_order(self, item_ids: list[int]) -> dict:
+        return {"item_ids": draft_handoff.multi_account_batch_order(item_ids)}
+
+    @_guard
+    def plan_finish_batch(self, item_ids: list[int]) -> dict:
+        return {"plan": batch_finish.plan_batch(item_ids)}
+
+    @_guard
+    def start_finish_batch(self, item_ids: list[int]) -> dict:
+        """Apply each reel's recommended option and export it, in the background.
+
+        Accounts with auto-schedule-on-export turned on get their reels booked
+        into the next safe slot as each export lands; the job reports which.
+        """
+        job_id = self._jobs.start(batch_finish.finish_batch, item_ids)
+        return {"job_id": job_id}
+
     # navigator.clipboard requires the webview document to be focused, so a copy
     # that lands after a long async step (batch prepare, downloads) fails with
     # "Document is not focused" once the user alt-tabs away. The OS clipboard has
@@ -615,6 +680,15 @@ class ProcessingBridge:
             raise ServiceError(f"Batch frames folder not found: {path}")
         os.startfile(str(path))
         return {"folder": str(path)}
+
+    @_guard
+    def get_ui_settings(self, keys: list[str]) -> dict:
+        """Remembered UI preferences. Unset keys come back as null."""
+        return ui_settings.get_settings([str(key) for key in keys or []])
+
+    @_guard
+    def set_ui_setting(self, key: str, value) -> dict:
+        return ui_settings.set_setting(str(key), value)
 
     @_guard
     def get_workflow_settings(self, item_id: int) -> dict:
@@ -700,6 +774,17 @@ class ProcessingBridge:
         if snapshot is None:
             raise svc.DraftRevisionError(f"Unknown job id {job_id}.")
         return snapshot
+
+    @_guard
+    def cancel_job(self, job_id: str) -> dict:
+        """Request cooperative cancellation of a background job (e.g. an export).
+
+        Returns ``{"canceled": bool}`` — ``True`` when the job was still active
+        and the cancel flag was set, ``False`` when the id is unknown or the job
+        already finished. Best-effort: only jobs that poll their cancel flag
+        (currently the export job) actually stop early.
+        """
+        return {"canceled": self._jobs.cancel(job_id)}
 
     @_guard
     def list_publish_jobs(self, item_id: int) -> list[dict]:

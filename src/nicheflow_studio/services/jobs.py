@@ -7,8 +7,12 @@ JSON-serializable status snapshot the React UI can poll
 
 It is deliberately tiny: start a callable, poll its status, read the result.
 There is no persistence — jobs live for the process lifetime, which is all the
-poll-based UI needs. Anything richer (cancellation, queues) is deferred until a
-real need appears.
+poll-based UI needs. Queues are still deferred until a real need appears.
+
+Cancellation is cooperative: :meth:`JobManager.cancel` sets a per-job
+``threading.Event``, and a callable that declares a ``cancel_event`` parameter is
+handed that event so it can poll it and bail out (e.g. the export job kills its
+FFmpeg subprocess). Callables that don't declare it simply run to completion.
 """
 
 from __future__ import annotations
@@ -17,7 +21,7 @@ import inspect
 import logging
 import threading
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
@@ -27,12 +31,21 @@ PENDING = "pending"
 RUNNING = "running"
 SUCCEEDED = "succeeded"
 FAILED = "failed"
+CANCELED = "canceled"
 
 
-def _accepts_progress(func: Callable[..., Any]) -> bool:
-    """True if ``func`` declares a ``progress`` parameter (so we can inject one)."""
+class JobCanceled(Exception):
+    """Raised by a cooperative job when it observes its ``cancel_event`` is set.
+
+    The manager treats this as a clean ``CANCELED`` outcome rather than a
+    ``FAILED`` one, so a user-requested cancel never surfaces as an error.
+    """
+
+
+def _accepts_param(func: Callable[..., Any], name: str) -> bool:
+    """True if ``func`` declares a parameter ``name`` (so we can inject it)."""
     try:
-        return "progress" in inspect.signature(func).parameters
+        return name in inspect.signature(func).parameters
     except (TypeError, ValueError):
         return False
 
@@ -45,6 +58,8 @@ class Job:
     message: str = ""
     result: Any = None
     error: str | None = None
+    # Set by JobManager.cancel(); cooperative jobs poll it and raise JobCanceled.
+    cancel_event: threading.Event = field(default_factory=threading.Event)
 
     def snapshot(self) -> dict:
         """JSON-serializable view for the bridge/UI."""
@@ -55,6 +70,7 @@ class Job:
             "message": self.message,
             "result": self.result,
             "error": self.error,
+            "cancel_requested": self.cancel_event.is_set(),
         }
 
 
@@ -88,14 +104,22 @@ class JobManager:
                     job.message = message
 
         call_kwargs = dict(kwargs)
-        if _accepts_progress(func):
+        if _accepts_param(func, "progress"):
             call_kwargs["progress"] = report
+        if _accepts_param(func, "cancel_event"):
+            call_kwargs["cancel_event"] = job.cancel_event
 
         def _run() -> None:
             with self._lock:
                 job.status = RUNNING
             try:
                 result = func(*args, **call_kwargs)
+            except JobCanceled as exc:
+                # A user-requested cancel is a clean outcome, not a failure.
+                with self._lock:
+                    job.message = str(exc) or "Canceled."
+                    job.status = CANCELED
+                return
             except Exception as exc:  # noqa: BLE001 - boundary: record, don't crash the thread
                 logger.exception("Background job %s failed", job.id)
                 with self._lock:
@@ -117,6 +141,21 @@ class JobManager:
         with self._lock:
             job = self._jobs.get(job_id)
             return job.snapshot() if job is not None else None
+
+    def cancel(self, job_id: str) -> bool:
+        """Request cooperative cancellation of a job.
+
+        Sets the job's ``cancel_event`` so a cooperative callable can bail out.
+        Returns ``True`` when the flag was set on a still-active job, ``False``
+        when the id is unknown or the job already finished. Best-effort: a job
+        that doesn't poll the event runs to completion regardless.
+        """
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job.status in (SUCCEEDED, FAILED, CANCELED):
+                return False
+            job.cancel_event.set()
+            return True
 
     def join(self, job_id: str, timeout: float = 5.0) -> dict | None:
         """Block until a job finishes (or ``timeout``); return its snapshot.

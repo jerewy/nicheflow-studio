@@ -1,11 +1,12 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { AccountManager } from "@/components/AccountManager";
 import { Dashboard } from "@/components/Dashboard";
-import { ProcessingScreen } from "@/components/ProcessingScreen";
+import { ProcessingScreen, type ProcessingDeepLink } from "@/components/ProcessingScreen";
 import { PublishEventToaster } from "@/components/PublishEventToaster";
 import { ScrapingScreen } from "@/components/ScrapingScreen";
 import { ToastProvider } from "@/components/ui/Toast";
+import { usePauseHiddenMedia } from "@/hooks/useKeepAlive";
 import { bridge, whenBridgeReady } from "@/lib/bridge";
 import { cn } from "@/lib/utils";
 import type { AccountSummary } from "@/types";
@@ -26,11 +27,19 @@ function App() {
   const [loaded, setLoaded] = useState(false);
   const [activeAccountError, setActiveAccountError] = useState<string | null>(null);
   // Deep-link target handed to Processing from the publish schedule ("Edit in
-  // Processing"). The item id is the reliable key (the exported title differs from
-  // the library item's original title); search is a fallback. Cleared on any
-  // manual visit so it doesn't linger.
-  const [processingItemId, setProcessingItemId] = useState<number | null>(null);
-  const [processingSearch, setProcessingSearch] = useState("");
+  // Processing"). A fresh object per navigation so re-linking the same item still
+  // re-applies the pin; cleared (null) on any manual visit so it doesn't linger.
+  const [processingLink, setProcessingLink] = useState<ProcessingDeepLink | null>(null);
+  // Screens stay mounted once visited (hidden with CSS when inactive) so
+  // background jobs — exports, scheduling, publishing, scrapes — keep their
+  // progress UI and timers across tab switches. Lazy: a tab mounts on first
+  // visit, not at startup. Updated from the navigation handlers, the only
+  // places the tab can change.
+  const [visitedTabs, setVisitedTabs] = useState<ReadonlySet<Tab>>(() => new Set(["accounts"]));
+  const tabsHostRef = useRef<HTMLDivElement | null>(null);
+
+  const markVisited = (t: Tab) =>
+    setVisitedTabs((prev) => (prev.has(t) ? prev : new Set(prev).add(t)));
 
   const refreshAccounts = useCallback(async () => {
     try {
@@ -71,8 +80,8 @@ function App() {
     search: string,
   ) => {
     await chooseActive(accountId);
-    setProcessingItemId(itemId);
-    setProcessingSearch(search);
+    setProcessingLink({ itemId, search });
+    markVisited("processing");
     setTab("processing");
   };
 
@@ -80,6 +89,11 @@ function App() {
   const effectiveTab: Tab =
     activeId === null && activeTabConfig?.gated ? "accounts" : tab;
   const activeName = accounts.find((a) => a.id === activeId)?.name ?? null;
+
+  // A hidden tab keeps playing <video> audio otherwise (display:none doesn't pause).
+  usePauseHiddenMedia(tabsHostRef, effectiveTab);
+
+  const isTabMounted = (t: Tab) => effectiveTab === t || visitedTabs.has(t);
 
   return (
     <main className="dark min-h-screen bg-background text-foreground">
@@ -95,10 +109,8 @@ function App() {
                 onClick={() => {
                   if (locked) return;
                   // A manual visit should not inherit a stale deep-link target.
-                  if (t.id === "processing") {
-                    setProcessingItemId(null);
-                    setProcessingSearch("");
-                  }
+                  if (t.id === "processing") setProcessingLink(null);
+                  markVisited(t.id);
                   setTab(t.id);
                 }}
                 disabled={locked}
@@ -137,28 +149,46 @@ function App() {
         </div>
       </nav>
 
-      {effectiveTab === "accounts" && (
-        <AccountManager
-          activeId={activeId}
-          onAccountsChanged={refreshAccounts}
-          onUseAccount={chooseActive}
-        />
-      )}
-      {effectiveTab === "processing" &&
-        (activeId !== null ? (
-          <ProcessingScreen
-            activeAccountId={activeId}
-            activeAccountName={activeName}
-            initialItemId={processingItemId}
-            initialSearch={processingSearch}
+      {/* Keep-alive tabs: once mounted, an inactive screen is hidden, not
+          unmounted, so in-flight jobs keep reporting progress. Gated screens
+          still unmount if the active niche is cleared. */}
+      <div ref={tabsHostRef}>
+        <div hidden={effectiveTab !== "accounts"}>
+          <AccountManager
+            activeId={activeId}
+            onAccountsChanged={refreshAccounts}
+            onUseAccount={chooseActive}
           />
-        ) : null)}
-      {effectiveTab === "dashboard" && activeId !== null ? (
-        <Dashboard activeAccountId={activeId} onOpenInProcessing={openInProcessing} />
-      ) : null}
-      {effectiveTab === "scraping" && activeId !== null ? (
-        <ScrapingScreen activeAccountId={activeId} activeAccountName={activeName} />
-      ) : null}
+        </div>
+        {activeId !== null && isTabMounted("processing") && (
+          <div hidden={effectiveTab !== "processing"}>
+            <ProcessingScreen
+              activeAccountId={activeId}
+              activeAccountName={activeName}
+              deepLink={processingLink}
+              active={effectiveTab === "processing"}
+            />
+          </div>
+        )}
+        {activeId !== null && isTabMounted("dashboard") && (
+          <div hidden={effectiveTab !== "dashboard"}>
+            <Dashboard
+              activeAccountId={activeId}
+              onOpenInProcessing={openInProcessing}
+              active={effectiveTab === "dashboard"}
+            />
+          </div>
+        )}
+        {activeId !== null && isTabMounted("scraping") && (
+          <div hidden={effectiveTab !== "scraping"}>
+            <ScrapingScreen
+              activeAccountId={activeId}
+              activeAccountName={activeName}
+              active={effectiveTab === "scraping"}
+            />
+          </div>
+        )}
+      </div>
 
       {loaded && activeId === null && effectiveTab === "accounts" && (
         <p className="px-6 pb-6 text-sm text-muted-foreground">

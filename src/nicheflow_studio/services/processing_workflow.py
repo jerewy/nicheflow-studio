@@ -44,12 +44,21 @@ TITLE_LENGTHS = [
     {"value": "long", "label": "Long (15-28 words)"},
     {"value": "auto", "label": "Auto mix"},
 ]
+# How many captions the chat handoff asks for per reel. Values must match the
+# ones draft_handoff._caption_mode() branches on; it reads the raw string out of
+# the settings dict rather than importing this list, because
+# processing_workflow -> draft_handoff -> export -> processing_workflow cycles.
+CAPTION_MODES = [
+    {"value": "shared", "label": "One shared caption (cheaper)"},
+    {"value": "per_option", "label": "A caption per title option"},
+]
 TEMPLATES = [
     {"value": "gaming_meme_black", "label": "Gaming Meme Black"},
     {"value": "reaction_clip_black", "label": "Reaction Clip Black"},
     {"value": "story_reel_clean", "label": "Story Reel Clean"},
     {"value": "lost_archive_black", "label": "Past Moments Black"},
     {"value": "historytrails_left", "label": "(History) HistoryTrails Left"},
+    {"value": "historytrails_post_header", "label": "(History) HistoryTrails Post Header"},
     {"value": "cinematic_study", "label": "Cinematic Study"},
     {"value": "cinema_viral_bold", "label": "Cinema Viral Bold"},
     {"value": "cinema_normal", "label": "Cinema Normal"},
@@ -88,6 +97,18 @@ TEMPLATE_RENDER_CONFIG = {
         "color": "#FFFFFF",
         "align": "left",
         "line_gap_scale": 0.20,
+    },
+    # Same title treatment as historytrails_left, with the account identity
+    # strip (avatar + name + verified badge) burned above the title so the clip
+    # reads like a screenshot of the account's own feed post.
+    "historytrails_post_header": {
+        "layout": "top_band",
+        "font_size": 54,
+        "font_name": "arial",
+        "color": "#FFFFFF",
+        "align": "left",
+        "line_gap_scale": 0.20,
+        "post_header": True,
     },
     "cinematic_study": {
         "layout": "top_band",
@@ -155,12 +176,14 @@ def get_settings(item_id: int) -> dict:
             or default_caption,
             "title_style": prefs.get("prompt_title_style") or "",
             "title_length": prefs.get("title_length") or "long",
+            "caption_mode": prefs.get("caption_mode") or "shared",
             "template": prefs.get("template") or default_template,
             "title_draft": item.title_draft or "",
             "caption_draft": item.caption_draft or "",
             "caption_style_options": CAPTION_STYLES,
             "title_style_options": TITLE_STYLES,
             "title_length_options": TITLE_LENGTHS,
+            "caption_mode_options": CAPTION_MODES,
             "template_options": TEMPLATES,
         }
 
@@ -170,6 +193,9 @@ def save_settings(item_id: int, payload: dict) -> dict:
     caption_style = str(payload.get("caption_style") or "contextual_info")
     title_style = str(payload.get("title_style") or "")
     title_length = str(payload.get("title_length") or "long")
+    caption_mode = str(payload.get("caption_mode") or "shared")
+    if caption_mode not in {mode["value"] for mode in CAPTION_MODES}:
+        caption_mode = "shared"
     template = str(payload.get("template") or "gaming_meme_black")
     set_ui_pref(f"{_PREMISE_KEY_PREFIX}{item_id}", premise)
     with get_session() as session:
@@ -185,6 +211,7 @@ def save_settings(item_id: int, payload: dict) -> dict:
                     "caption_style": caption_style,
                     "prompt_title_style": title_style,
                     "title_length": title_length,
+                    "caption_mode": caption_mode,
                     "template": template,
                 }
             )

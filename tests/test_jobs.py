@@ -1,6 +1,14 @@
 from __future__ import annotations
 
-from nicheflow_studio.services.jobs import FAILED, SUCCEEDED, JobManager
+import threading
+
+from nicheflow_studio.services.jobs import (
+    CANCELED,
+    FAILED,
+    SUCCEEDED,
+    JobCanceled,
+    JobManager,
+)
 
 
 def test_job_runs_and_stores_result() -> None:
@@ -64,3 +72,47 @@ def test_job_without_progress_param_runs_unchanged() -> None:
     snapshot = manager.join(job_id)
     assert snapshot["result"] == 7
     assert snapshot["progress"] == 0.0
+
+
+def test_cooperative_job_cancels_when_it_observes_the_event() -> None:
+    manager = JobManager()
+    started = threading.Event()
+    release = threading.Event()
+
+    def work(cancel_event: threading.Event) -> str:
+        started.set()
+        release.wait(2.0)
+        if cancel_event.is_set():
+            raise JobCanceled("stopped by user")
+        return "done"
+
+    job_id = manager.start(work)
+    assert started.wait(2.0)
+    # Cancel while the job is still running, then let it reach its cancel check.
+    assert manager.cancel(job_id) is True
+    release.set()
+
+    snapshot = manager.join(job_id)
+    assert snapshot is not None
+    assert snapshot["status"] == CANCELED
+    assert snapshot["cancel_requested"] is True
+    assert snapshot["error"] is None
+
+
+def test_cancel_returns_false_for_unknown_or_finished_job() -> None:
+    manager = JobManager()
+    assert manager.cancel("does-not-exist") is False
+
+    job_id = manager.start(lambda: 1)
+    manager.join(job_id)
+    # Already succeeded — nothing left to cancel.
+    assert manager.cancel(job_id) is False
+
+
+def test_job_without_cancel_event_param_runs_unchanged() -> None:
+    # A non-cooperative callable never sees the event and completes normally.
+    manager = JobManager()
+    job_id = manager.start(lambda: 9)
+    snapshot = manager.join(job_id)
+    assert snapshot["status"] == SUCCEEDED
+    assert snapshot["result"] == 9

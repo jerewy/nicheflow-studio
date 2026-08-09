@@ -11,6 +11,8 @@ It is the first real background-job payload (run through
 
 from __future__ import annotations
 
+import json
+import logging
 from pathlib import Path
 
 from sqlalchemy import select
@@ -22,6 +24,8 @@ from nicheflow_studio.processing import draft_guard, smart_drafts
 from nicheflow_studio.services import draft_revisions, library
 from nicheflow_studio.services.draft_revisions import DraftRevisionDTO, DraftRevisionError
 
+logger = logging.getLogger(__name__)
+
 # Number of recent same-account drafts fed to the generator so it can avoid
 # repeating hooks/templates (mirrors the PyQt recent-drafts behavior).
 _RECENT_DRAFTS_LIMIT = 8
@@ -30,6 +34,125 @@ _RECENT_DRAFTS_LIMIT = 8
 def can_generate() -> bool:
     """True when a draft provider (Groq/Ollama) is configured."""
     return smart_drafts.can_generate_smart_drafts()
+
+
+# A provider-level vision failure (model_not_found, revoked key, no key at all)
+# fails identically for every item in a batch, and each attempt costs a full
+# round-trip. Recognising those lets a batch stop after the first one instead of
+# paying the timeout N times. Rate limits are NOT in this set: those are
+# per-key and transient, and run_vision_pass already rotates keys for them.
+_VISION_UNAVAILABLE_MARKERS = ("model_not_found", "404", "invalid_api_key", "401", "403")
+
+
+def _vision_unavailable(error: str | None) -> bool:
+    lowered = (error or "").lower()
+    return any(marker in lowered for marker in _VISION_UNAVAILABLE_MARKERS)
+
+
+def _stored_vision_payload(item_id: int) -> str:
+    with get_session() as session:
+        item = session.get(DownloadItem, item_id)
+        return (item.smart_vision_payload or "").strip() if item else ""
+
+
+def vision_pass_for_item(item_id: int, *, force: bool = False) -> smart_drafts.VisionPass | None:
+    """Run the visual-evidence pass for one item and persist the payload.
+
+    Returns None when the item already had usable evidence (nothing to do) or
+    has no video on disk; otherwise the :class:`VisionPass`, whose ``error``
+    tells a batch caller whether retrying the next item is worth it.
+    """
+    with get_session() as session:
+        item = session.get(DownloadItem, item_id)
+        if item is None:
+            raise DraftRevisionError(f"No download item with id {item_id}.")
+        existing = (item.smart_vision_payload or "").strip()
+        if existing and not force:
+            return None  # already grounded; nothing to run
+        account = session.get(Account, item.account_id) if item.account_id else None
+        video_path = Path(item.file_path) if item.file_path else None
+        context = {
+            "transcript_text": item.transcript_text or "",
+            "source_title": item.title,
+            "source_description": item.source_description,
+            "niche_label": account.niche_label if account is not None else None,
+        }
+
+    if video_path is None or not video_path.exists():
+        return None
+
+    # The vision call is slow and must run outside the DB session.
+    result = smart_drafts.describe_video_frames(video_path, **context)
+    if result.payload is not None:
+        with get_session() as session:
+            item = session.get(DownloadItem, item_id)
+            if item is not None:
+                item.smart_vision_payload = json.dumps(result.payload, indent=2, sort_keys=True)
+                session.commit()
+    return result
+
+
+def ensure_vision_payload(item_id: int, *, force: bool = False) -> dict | None:
+    """The item's visual-evidence JSON, running the vision pass if needed.
+
+    The batch chat handoff sends this JSON to the external assistant as TEXT
+    instead of attaching a still frame per reel: the vision model reads up to 5
+    sampled frames plus burned-in on-screen text, where an attachment is one
+    still, at roughly a twentieth of the tokens.
+
+    Returns None when there is no video on disk, no working Groq vision model,
+    or the pass failed. Never raises for those cases: batch prep must still
+    work from the source caption alone.
+    """
+    result = vision_pass_for_item(item_id, force=force)
+    if result is not None:
+        return result.payload
+    # None means "nothing was run" — either already grounded, or no video.
+    with get_session() as session:
+        item = session.get(DownloadItem, item_id)
+        stored = (item.smart_vision_payload or "").strip() if item else ""
+    if not stored:
+        return None
+    try:
+        return json.loads(stored)
+    except ValueError:
+        return None
+
+
+def ensure_batch_vision_payloads(item_ids: list[int], *, force: bool = False) -> dict:
+    """Fill in missing visual evidence for a batch, best effort.
+
+    One failing item must not sink the batch prep, so per-item errors are
+    collected and reported rather than raised. A provider-level failure (no
+    vision model on the account, bad key) aborts the remaining items instead of
+    paying an identical failed round-trip per reel.
+    """
+    described: list[int] = []
+    skipped: list[dict] = []
+    unavailable: str | None = None
+    for item_id in item_ids:
+        if unavailable is not None:
+            skipped.append({"item_id": item_id, "reason": unavailable})
+            continue
+        try:
+            result = vision_pass_for_item(item_id, force=force)
+            if result is None:
+                # Nothing ran: the item was already grounded, or has no video.
+                if _stored_vision_payload(item_id):
+                    described.append(item_id)
+                else:
+                    skipped.append({"item_id": item_id, "reason": "no video on disk"})
+            elif result.payload is not None:
+                described.append(item_id)
+            else:
+                reason = result.error or "vision returned no payload"
+                if _vision_unavailable(result.error):
+                    unavailable = reason  # every remaining item fails the same way
+                skipped.append({"item_id": item_id, "reason": reason})
+        except Exception as exc:  # noqa: BLE001 - vision is an optional enrichment
+            logger.warning("Vision pass failed for item %s: %s", item_id, exc)
+            skipped.append({"item_id": item_id, "reason": str(exc)})
+    return {"described": described, "skipped": skipped, "unavailable": unavailable}
 
 
 # Per-niche follow outro appended to every generated caption (before hashtags).

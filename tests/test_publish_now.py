@@ -157,12 +157,27 @@ def test_posted_job_releases_assignment_and_next_distribute_backfills(
         assigned_asset = assigned_pool.media_asset
         assigned_url = assigned_asset.canonical_source_url
         assigned_shortcode = assigned_asset.source_shortcode
-    item_id = _make_exported_item(account_id)
+    # Publish the reel distribute already materialised, rather than inserting a
+    # second DownloadItem for the same footage. _create_pending_review_item
+    # dedupes per account, so that duplicate cannot occur in production — and
+    # faking it left an extra unposted copy that kept the account at target.
     with get_session() as session:
-        item = session.get(DownloadItem, item_id)
-        item.source_url = assigned_url
-        item.video_id = assigned_shortcode
+        item = (
+            session.query(DownloadItem)
+            .filter(
+                DownloadItem.account_id == account_id,
+                DownloadItem.video_id == assigned_shortcode,
+            )
+            .one()
+        )
+        assert item.source_url == assigned_url
+        item.title_draft = "Title"
+        item.caption_draft = "Caption"
+        item.file_path = "C:/v.mp4"
+        item.processed_path = "C:/out.mp4"
+        item.status = "completed"
         session.commit()
+        item_id = item.id
     monkeypatch.setattr(
         publish_now,
         "_do_publish_reel",
@@ -300,6 +315,40 @@ def test_due_jobs_exclude_flagged_account(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setattr(
         publish_now, "_do_publish_reel", lambda p, v, c: _fake_result("posted", posted_url="https://x/p/1/")
     )
+    summary = publish_now.publish_due_jobs()
+    assert summary["due"] == 0
+    assert summary["posted"] == 0
+
+
+def test_due_jobs_exclude_cloud_mapped_account(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A due 'scheduled' job on a cloud-mapped account is a stray whose Worker
+    push hasn't landed (the cloud sync sweep re-pushes it). The local browser
+    loop must never post it: those accounts are Graph-API-only."""
+    account_id = _make_account()
+    item_id = _make_exported_item(account_id)
+    past = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)
+    with get_session() as session:
+        session.add(
+            UploadJob(
+                account_id=account_id,
+                download_item_id=item_id,
+                processed_path="C:/out.mp4",
+                description="Cap",
+                status="scheduled",
+                scheduled_at=past,
+            )
+        )
+        session.commit()
+
+    assert publish_now.due_count() == 1  # not cloud-mapped yet -> locally due
+
+    monkeypatch.setenv("CLOUDFLARE_PUBLISHER_URL", "https://worker.example.dev")
+    monkeypatch.setenv("CLOUDFLARE_PUBLISHER_API_KEY", "secret")
+    monkeypatch.setenv("CLOUDFLARE_PUBLISH_ACCOUNTS", json.dumps({str(account_id): "somekey"}))
+
+    assert publish_now.due_count() == 0
+    assert publish_now.list_due_jobs() == []
+
     summary = publish_now.publish_due_jobs()
     assert summary["due"] == 0
     assert summary["posted"] == 0

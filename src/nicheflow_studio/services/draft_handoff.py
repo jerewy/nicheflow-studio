@@ -8,8 +8,10 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
+from sqlalchemy import select
+
 from nicheflow_studio.core.paths import processed_dir
-from nicheflow_studio.db.models import Account, DownloadItem
+from nicheflow_studio.db.models import Account, DownloadItem, DraftRevision
 from nicheflow_studio.db.post_metrics import top_titles_for_account
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.processing import draft_guard, smart_drafts
@@ -35,6 +37,13 @@ _HEADERS: list[tuple[str, re.Pattern[str]]] = [
     ("pick", re.compile(r"^recommended\s*pick\s*:\s*(.*)$", re.IGNORECASE)),
     ("why", re.compile(r"^why\s*:\s*(.*)$", re.IGNORECASE)),
     ("notes", re.compile(r"^selection\s*notes\s*:\s*(.*)$", re.IGNORECASE)),
+    # One caption serving every title option. The Instagram description tells
+    # the clip's story while the title is the on-screen hook, so the caption is
+    # title-agnostic in practice -- models already collapsed the duplicates
+    # themselves ("[Same caption as Option 1]", see _CAPTION_REFERENCE_RE).
+    # Asking for it once cuts roughly two thirds of the reply's tokens, which
+    # are dominated by the 80-150 word captions.
+    ("shared_caption", re.compile(r"^shared\s*caption\s*:\s*(.*)$", re.IGNORECASE)),
 ]
 _NOTE_LINE = re.compile(r"^option\s*(\d+)\s*:\s*(.*)$", re.IGNORECASE)
 # Chat models often append a sources block after the last reel: a markdown
@@ -57,6 +66,89 @@ _REEL_HEADER = re.compile(
     r"\s*(?:[:|)\-=#*_].*)?$",
     re.IGNORECASE,
 )
+
+
+# Chat models routinely collapse an identical caption to a placeholder like
+# "[Same caption as Option 1]" instead of repeating the full text. Left as-is,
+# that placeholder becomes the stored caption for Options 2/3 and shows verbatim
+# in the review UI and the exported Instagram post. Match a caption whose ENTIRE
+# body is only such a reference (case-insensitive, brackets optional, "caption"
+# optional) so a caption that merely mentions another option in its prose is
+# never rewritten.
+_CAPTION_REFERENCE_RE = re.compile(
+    r"^\[?\s*same\b[^\]]*?\boption\s*(\d+)\b\s*\]?\s*\.?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _resolve_caption_references(captions: list[str]) -> list[str]:
+    """Expand placeholder captions ("[Same caption as Option 1]") to the real
+    caption they point at, following a reference chain but never looping.
+
+    A broken reference (out of range, self-referential, or pointing at another
+    placeholder that can't be resolved) is left untouched, so a malformed
+    placeholder degrades to the honest original rather than silently emptying.
+    """
+
+    def resolve(index: int, seen: set[int]) -> str:
+        caption = captions[index]
+        match = _CAPTION_REFERENCE_RE.match(caption.strip())
+        if match is None:
+            return caption
+        target = int(match.group(1)) - 1
+        if target == index or target in seen or not (0 <= target < len(captions)):
+            return caption
+        seen.add(index)
+        return resolve(target, seen)
+
+    return [resolve(i, set()) for i in range(len(captions))]
+
+
+# How many captions the chat model is asked to write per reel.
+#   "shared"     -- one 'Shared Caption:' that works under any of the three
+#                   titles. Roughly 55% fewer output tokens, and output bills
+#                   ~5x input, so this is where the reply's cost actually sits.
+#   "per_option" -- a 'Caption Option N:' per title, for reels where the three
+#                   title angles genuinely need their own caption.
+# This steers the PROMPT only. parse_pasted_draft accepts either shape whatever
+# the setting says, so switching modes never strands a reply already in flight.
+# The selectable labels live in processing_workflow.CAPTION_MODES; only the raw
+# values are needed here (same arrangement as title_length).
+CAPTION_MODE_SHARED = "shared"
+CAPTION_MODE_PER_OPTION = "per_option"
+
+
+def _caption_mode(settings: dict | None) -> str:
+    """Normalize the caption-mode setting, defaulting to the cheaper shared caption."""
+    value = str((settings or {}).get("caption_mode") or "").strip().lower()
+    return CAPTION_MODE_PER_OPTION if value == CAPTION_MODE_PER_OPTION else CAPTION_MODE_SHARED
+
+
+def _return_format_lines(caption_mode: str) -> list[str]:
+    """The exact section headers the model must echo, in the order it writes them.
+
+    Shared mode puts 'Shared Caption:' AFTER the pick and reason so the model
+    settles on a winning title before writing the one caption it gets.
+    """
+    if caption_mode == CAPTION_MODE_PER_OPTION:
+        return [
+            "Title Option 1:",
+            "Caption Option 1:",
+            "Title Option 2:",
+            "Caption Option 2:",
+            "Title Option 3:",
+            "Caption Option 3:",
+            "Recommended Pick: Title Option N + Caption Option N",
+            "Why:",
+        ]
+    return [
+        "Title Option 1:",
+        "Title Option 2:",
+        "Title Option 3:",
+        "Recommended Pick: Title Option N",
+        "Why:",
+        "Shared Caption:",
+    ]
 
 
 def _strip_header_emphasis(line: str) -> str:
@@ -87,7 +179,7 @@ def _strip_header_emphasis(line: str) -> str:
 
 def parse_pasted_draft(text: str) -> PastedDraft:
     indexed: dict[str, dict[int, list[str]]] = {"title": {}, "caption": {}, "style": {}}
-    singleton: dict[str, list[str]] = {"pick": [], "why": [], "notes": []}
+    singleton: dict[str, list[str]] = {"pick": [], "why": [], "notes": [], "shared_caption": []}
     active_kind: str | None = None
     active_index: int | None = None
     buffer: list[str] = []
@@ -95,7 +187,20 @@ def parse_pasted_draft(text: str) -> PastedDraft:
     def flush() -> None:
         nonlocal buffer
         if active_kind in indexed and active_index is not None:
-            indexed[active_kind].setdefault(active_index, []).extend(buffer)
+            # A repeated "Title/Caption/Style Option N:" header redefines that
+            # slot rather than appending to it -- models restate an option (a
+            # leading summary list of all three titles, then the same titles
+            # interleaved with their captions) and appending would concatenate
+            # the text into itself ("Janet... Michael Janet... Michael").
+            #
+            # But an EMPTY restatement must not redefine anything: models also
+            # list the three titles up front and then restate a BARE "Title
+            # Option 2:" purely as a lead-in to "Caption Option 2:". Wiping the
+            # slot there destroyed the real title, so the reply imported with
+            # only Option 1 and the screen showed a single card (2026-07-15
+            # batch, items 838-843). Keep the earlier declaration in that case.
+            if any(line.strip() for line in buffer) or active_index not in indexed[active_kind]:
+                indexed[active_kind][active_index] = buffer
         elif active_kind in singleton:
             singleton[active_kind].extend(buffer)
         buffer = []
@@ -114,15 +219,8 @@ def parse_pasted_draft(text: str) -> PastedDraft:
         if active_kind in indexed:
             active_index = int(match.group(1))
             inline = match.group(2).strip()
-            # A repeated "Title/Caption/Style Option N:" header redefines that
-            # slot rather than appending to it. Chat models (and hand-edits)
-            # sometimes restate an option -- e.g. a leading summary list of all
-            # three titles followed by the same titles interleaved with their
-            # captions -- and flush()'s extend() would otherwise concatenate the
-            # text into itself ("Janet... Michael Janet... Michael"). Clear the
-            # slot so the latest declaration wins; continuation lines are not
-            # headers and never reach here, so multi-paragraph captions are safe.
-            indexed[active_kind].pop(active_index, None)
+            # Redefinition is decided in flush(), once the slot's new content is
+            # known -- an empty restatement must not clear an earlier value.
         else:
             active_index = None
             inline = match.group(1).strip()
@@ -147,7 +245,24 @@ def parse_pasted_draft(text: str) -> PastedDraft:
     )
     titles = [join_title(indexed["title"].get(i, [])) for i in range(1, max_index + 1)]
     captions = [join_caption(indexed["caption"].get(i, [])) for i in range(1, max_index + 1)]
+    captions = _resolve_caption_references(captions)
     styles = [join_line(indexed["style"].get(i, [])) for i in range(1, max_index + 1)]
+
+    # A "Shared Caption:" fills every option that has no caption of its own, so
+    # the downstream paired model (title_options[i] pairs with caption_options[i],
+    # and Apply applies one option NUMBER as a unit) is unchanged. Per-option
+    # captions still win where present, which keeps older 3-caption replies
+    # parsing exactly as before.
+    shared_caption = join_caption(singleton["shared_caption"])
+    if shared_caption:
+        if not titles:
+            titles = [""]
+            styles = [""]
+        captions = [
+            caption if caption.strip() else shared_caption
+            for caption in (captions + [""] * (len(titles) - len(captions)))
+        ]
+
     while titles and not titles[-1] and not captions[-1]:
         titles.pop()
         captions.pop()
@@ -175,12 +290,19 @@ def parse_pasted_draft(text: str) -> PastedDraft:
     pick = " ".join(singleton["pick"])
     title_pick = re.search(r"title\s*option\s*(\d+)", pick, re.IGNORECASE)
     caption_pick = re.search(r"caption\s*option\s*(\d+)", pick, re.IGNORECASE)
+    recommended_title_index = int(title_pick.group(1)) if title_pick else None
+    recommended_caption_index = int(caption_pick.group(1)) if caption_pick else None
+    # With one shared caption there is no "Caption Option N" to name, so the
+    # pick line only carries a title. Apply treats the two indexes as one unit,
+    # so the caption index has to follow the title's rather than stay None.
+    if shared_caption and recommended_caption_index is None:
+        recommended_caption_index = recommended_title_index
     return PastedDraft(
         title_options=titles,
         caption_options=captions,
         option_notes=notes,
-        recommended_title_index=int(title_pick.group(1)) if title_pick else None,
-        recommended_caption_index=int(caption_pick.group(1)) if caption_pick else None,
+        recommended_title_index=recommended_title_index,
+        recommended_caption_index=recommended_caption_index,
         reason=join_line(singleton["why"]) or None,
     )
 
@@ -206,7 +328,9 @@ def _caption_rule_voice(account: Account | None) -> dict[str, str] | None:
 # slot and dumped the real full-length description under an unparsed
 # "Caption Option N (full):" header, so the importer only saw the one-line copy.
 # Spell the two fields out so the full caption lands in the slot the importer reads.
-def _field_disambiguation_lines(caption_style: str | None) -> list[str]:
+def _field_disambiguation_lines(
+    caption_style: str | None, caption_mode: str = CAPTION_MODE_SHARED
+) -> list[str]:
     """Spell the two fields apart, echoing the selected style's real length.
 
     This block used to hardcode "about 80-120 words across two paragraphs"
@@ -219,19 +343,42 @@ def _field_disambiguation_lines(caption_style: str | None) -> list[str]:
     to those rules instead of restating it.
     """
     word_target = smart_drafts._caption_word_target(caption_style)
+    if caption_mode == CAPTION_MODE_PER_OPTION:
+        return [
+            "Title Option and Caption Option are TWO DIFFERENT texts for each option, "
+            "never the same words twice:",
+            "- Title Option N is the on-screen overlay line from the on-screen title "
+            "rules above (one sentence; its length follows the AUTO MIX bands).",
+            f"- Caption Option N is the Instagram description from the caption rules "
+            f"above: about {word_target} words, in the exact paragraph structure those "
+            "caption rules specify. Writing toward the upper end of that range beats "
+            "compressing paragraphs together. Put that full description directly on "
+            "and below the 'Caption Option N:' line.",
+            "Write all THREE captions in full. Never abbreviate one to a placeholder "
+            "like '[Same caption as Option 1]': if the three captions would say the "
+            "same thing, that is a sign the three titles are not different enough.",
+            "Do NOT copy the title into the caption, do NOT write a one-line caption, and "
+            "do NOT add any extra field such as 'Caption Option N (full):'. There is "
+            "exactly one 'Caption Option N:' per option and its full caption follows it.",
+        ]
     return [
-        "Title Option and Caption Option are TWO DIFFERENT texts for each option, "
-        "never the same words twice:",
+        "Title Option and Shared Caption are TWO DIFFERENT texts, never the same "
+        "words twice:",
         "- Title Option N is the on-screen overlay line from the on-screen title "
-        "rules above (one sentence; its length follows the AUTO MIX bands).",
-        f"- Caption Option N is the Instagram description from the caption rules "
+        "rules above (one sentence; its length follows the AUTO MIX bands). Write "
+        "THREE of these, meaningfully different from each other.",
+        f"- Shared Caption is the ONE Instagram description from the caption rules "
         f"above: about {word_target} words, in the exact paragraph structure those "
         "caption rules specify. Writing toward the upper end of that range beats "
         "compressing paragraphs together. Put that full description directly on "
-        "and below the 'Caption Option N:' line.",
+        "and below the 'Shared Caption:' line.",
+        "Write the caption ONCE, and write it so it works under ANY of the three "
+        "titles: it tells the clip's story, while the title is the on-screen hook. "
+        "Do not write it as a continuation of one particular title, and do not "
+        "repeat a title's exact wording in its opening line.",
         "Do NOT copy the title into the caption, do NOT write a one-line caption, and "
-        "do NOT add any extra field such as 'Caption Option N (full):'. There is "
-        "exactly one 'Caption Option N:' per option and its full caption follows it.",
+        "do NOT add any extra field such as 'Shared Caption (full):' or a separate "
+        "'Caption Option N:' per title. There is exactly ONE 'Shared Caption:' per reel.",
     ]
 
 # Verify-then-use: the chat path routes through models that can identify
@@ -341,6 +488,7 @@ def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
         transcript = (item.transcript_text or "").strip() or "(none; inspect the local video)"
         vision_text = (item.smart_vision_payload or "").strip() or "(none)"
     caption_style = settings.get("caption_style") or None
+    caption_mode = _caption_mode(settings)
     title_style = settings.get("title_style") or None
     # Same rule source as the live Groq prompt (see effective_title_rules
     # docstring) so the chat path and the API path never drift apart.
@@ -412,16 +560,33 @@ def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
                 if caption_outro
                 else []
             ),
-            "Generate 3 meaningfully different on-screen title options and 3 caption options.",
+            (
+                "Generate 3 meaningfully different on-screen title options and 3 caption options."
+                if caption_mode == CAPTION_MODE_PER_OPTION
+                else "Generate 3 meaningfully different on-screen title options and exactly ONE "
+                "shared caption that works under any of them."
+            ),
             "Keep display titles plain text. Only use internal **keyword** emphasis when the Cinema Bold Keywords style requires it.",
             "Never write em dashes or double hyphens ('--') in titles or captions; "
             "use a comma, period, or colon instead. Long dashes read as AI-generated copy.",
-            "Recommend the strongest title/caption pair and add one short selection note "
-            "per option. Never recommend an option BECAUSE it is the safest or most "
-            "hedged; recommend the one whose specific the clip delivers most strongly.",
-            "The recommended title and caption MUST share the same option number: the app "
-            "applies title+caption as ONE unit, so rearrange your options before returning "
-            "until the strongest pair sits together (never recommend Title 2 + Caption 3).",
+            *(
+                [
+                    "Recommend the strongest title/caption pair and add one short selection "
+                    "note per option. Never recommend an option BECAUSE it is the safest or "
+                    "most hedged; recommend the one whose specific the clip delivers most "
+                    "strongly.",
+                    "The recommended title and caption MUST share the same option number: the "
+                    "app applies title+caption as ONE unit, so rearrange your options before "
+                    "returning until the strongest pair sits together (never recommend Title 2 "
+                    "+ Caption 3).",
+                ]
+                if caption_mode == CAPTION_MODE_PER_OPTION
+                else [
+                    "Recommend the strongest title and add one short selection note per option. "
+                    "Never recommend an option BECAUSE it is the safest or most hedged; recommend "
+                    "the one whose specific the clip delivers most strongly.",
+                ]
+            ),
             "Do not invent unsupported facts.",
             "",
             "Automatic NicheFlow handoff for Codex or Claude Code:",
@@ -430,6 +595,14 @@ def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
             f"  .venv\\Scripts\\python.exe scripts\\nicheflow_drafts.py save --item-id {item_id} --file <draft-json-path>",
             "- Do NOT pipe the JSON through Get-Content into --stdin: PowerShell re-decodes "
             "the bytes and silently corrupts em dashes and emoji before Python sees them.",
+            *(
+                []
+                if caption_mode == CAPTION_MODE_PER_OPTION
+                else [
+                    "- caption_options may hold a SINGLE shared caption even with three titles; "
+                    "it is fanned out across the options on save."
+                ]
+            ),
             "- Use JSON fields title_options, caption_options, option_notes (a LIST of "
             "strings, one per option, NOT an object), option_tiers (a LIST of "
             "'green'/'yellow'/'red' strings, one per title, from the HOOK FRAMING tiers "
@@ -440,7 +613,7 @@ def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
             "'claude-code' (a short label, never a file path).",
             "- The running Processing screen automatically detects the saved revision. Do not ask the user to paste it manually.",
             "",
-            *_field_disambiguation_lines(caption_style),
+            *_field_disambiguation_lines(caption_style, caption_mode),
             "",
             "Niche fit check (MANDATORY): compare the clip's actual subject to the "
             f"account niche ('{niche_label or 'none set'}'). Before 'Title Option 1:', "
@@ -454,14 +627,7 @@ def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
             "Return format (write every section header exactly as shown, plain text — "
             "never bold or markdown-formatted; '**Title Option 1:**' breaks the importer):",
             "Niche check: <fits | OFF-NICHE, reason>",
-            "Title Option 1:",
-            "Caption Option 1:",
-            "Title Option 2:",
-            "Caption Option 2:",
-            "Title Option 3:",
-            "Caption Option 3:",
-            "Recommended Pick: Title Option N + Caption Option N",
-            "Why:",
+            *_return_format_lines(caption_mode),
             "Selection Notes:",
             "Option 1:",
             "Option 2:",
@@ -481,13 +647,37 @@ def _batch_item_delimiter(index: int, seq: int | None) -> str:
     return f"===== REEL {index} ====="
 
 
+# The visual evidence JSON is now the PRIMARY visual grounding on the batch
+# path (it replaced the per-reel image attachment), so the prompt has to say
+# what its fields mean. Without this the model treated the JSON as loose
+# metadata and kept writing from the source caption alone, which is exactly the
+# off-clip drift the vision pass exists to prevent.
+_VISUAL_EVIDENCE_GUIDANCE = [
+    "How to use the Visual evidence JSON (this is what is actually on screen):",
+    "- It comes from a vision model that read up to 5 frames sampled across the "
+    "clip, so it describes the WHOLE clip, not one moment. Treat it as your eyes.",
+    "- 'ocr_text' and 'on_screen_hook' are text burned into the video. The hook is "
+    "often the real premise of the clip; the title you write must not contradict it.",
+    "- 'main_subject', 'main_action', and 'scene_summary' are what the viewer sees. "
+    "A title describing something absent from these is off-clip: rewrite it.",
+    "- 'referenced_entity' / 'referenced_concept' name the movie, person, game, or "
+    "meme format the clip depends on. Use them; do not guess a different one.",
+    "- 'confidence' and 'uncertainty_notes' bound how specific you may be. On low "
+    "confidence, stay with what the source caption supports.",
+    "- When the JSON is '(none)', there was no vision pass for that reel: work from "
+    "the source caption and any attached frame, and stay more conservative.",
+]
+
+
 def _account_prompt_header(
     account: Account | None,
     *,
     settings: dict,
     item_ids: list[int],
+    attachments_expected: bool = False,
 ) -> list[str]:
     niche_label = account.niche_label if account and account.niche_label else None
+    caption_mode = _caption_mode(settings)
     account_key = account.instagram_handle if account is not None else None
     few_shot_winners = top_titles_for_account(account_key) if account_key else []
     title_rules = smart_drafts.effective_title_rules(
@@ -507,7 +697,18 @@ def _account_prompt_header(
     )
     return [
         "You are drafting Instagram Reel titles and captions for one NicheFlow account.",
-        "This is for ChatGPT or Claude web. The user will attach one still image per reel.",
+        "This is for ChatGPT or Claude web.",
+        *(
+            [
+                "Some reels below ask you to attach and inspect a still image; the rest "
+                "carry their visual evidence as JSON instead."
+            ]
+            if attachments_expected
+            else [
+                "No images are attached: each reel's visual evidence is provided as JSON "
+                "in its context block."
+            ]
+        ),
         "",
         "Shared account voice and style:",
         f"Account: {account.name if account else '(none)'}",
@@ -534,6 +735,10 @@ def _account_prompt_header(
         "Caption rules (follow these exactly):",
         *caption_rules,
         "",
+        *_VISUAL_EVIDENCE_GUIDANCE,
+        "",
+        *_SOURCE_CAPTION_GUIDANCE,
+        "",
         *_FACT_CHECK_LINES,
         "",
         *_WEB_RESEARCH_LINES,
@@ -543,7 +748,11 @@ def _account_prompt_header(
         "- Do not use markdown formatting in section headers or titles.",
         "- Never write em dashes or double hyphens ('--') in titles or captions.",
         "- Do not invent unsupported facts.",
-        "- The recommended title and caption MUST share the same option number.",
+        (
+            "- The recommended title and caption MUST share the same option number."
+            if caption_mode == CAPTION_MODE_PER_OPTION
+            else "- Write THREE title options and exactly ONE 'Shared Caption:' per reel."
+        ),
         "- Never recommend an option BECAUSE it is the safest or most hedged; "
         "recommend the one whose specific the clip delivers most strongly.",
         "",
@@ -564,17 +773,10 @@ def _account_prompt_header(
         "Flag borderline or unclear fits as OFF-NICHE so the user decides. Still "
         "draft all three options either way; the app imports flagged reels normally.",
         "",
-        *_field_disambiguation_lines(settings.get("caption_style") or None),
+        *_field_disambiguation_lines(settings.get("caption_style") or None, caption_mode),
         "Inside each block, use this exact plain-text format:",
         "Niche check: <fits | OFF-NICHE, reason>",
-        "Title Option 1:",
-        "Caption Option 1:",
-        "Title Option 2:",
-        "Caption Option 2:",
-        "Title Option 3:",
-        "Caption Option 3:",
-        "Recommended Pick: Title Option N + Caption Option N",
-        "Why:",
+        *_return_format_lines(caption_mode),
         "Selection Notes:",
         "Option 1:",
         "Option 2:",
@@ -583,18 +785,32 @@ def _account_prompt_header(
 
 
 def _batch_item_context(index: int, item: DownloadItem, seq: int | None) -> list[str]:
+    """One reel's context block.
+
+    Vision-first: when the item carries visual-evidence JSON (from the Groq
+    vision pass over up to 5 sampled frames, including burned-in on-screen
+    text), that JSON IS the visual grounding and no image is attached. An
+    attached still is ~1.5k tokens and shows one moment; the JSON is ~100 and
+    covers the whole clip. Items whose vision pass could not run still ask for
+    the frame, so a missing Groq key degrades to the old behavior instead of
+    leaving the model blind.
+    """
     transcript = (item.transcript_text or "").strip() or "(none)"
-    vision_text = (item.smart_vision_payload or "").strip() or "(none)"
+    vision_text = (item.smart_vision_payload or "").strip()
     frame_name = f"reel_{index}_item{item.id}.jpg"
     return [
         _batch_item_delimiter(index, seq),
-        f"Attach and inspect image file: {frame_name}",
+        *(
+            []
+            if vision_text
+            else [f"Attach and inspect image file: {frame_name}"]
+        ),
         f"Source title: {item.title or '(none)'}",
         f"Source URL: {item.source_url or '(none)'}",
         f"Source description: {item.source_description or '(none)'}",
         "",
         "Visual evidence JSON:",
-        vision_text[:4000],
+        vision_text[:4000] or "(none)",
         "",
         "Transcript/context excerpt:",
         transcript[:3000],
@@ -628,10 +844,397 @@ def build_account_batch_chat_prompt(
         from nicheflow_studio.services import library
 
         seq_by_item = library.account_sequence_map(session)
-        lines = _account_prompt_header(account, settings=settings, item_ids=ids)
+        # Only reels WITHOUT visual evidence still need an attached still, so
+        # the header's attachment instruction has to match what the reel blocks
+        # below actually ask for.
+        attachments_expected = any(
+            not (item.smart_vision_payload or "").strip() for item in ordered
+        )
+        lines = _account_prompt_header(
+            account,
+            settings=settings,
+            item_ids=ids,
+            attachments_expected=attachments_expected,
+        )
         lines.extend(["", "Reel contexts:"])
         for index, item in enumerate(ordered, start=1):
             lines.extend(["", *_batch_item_context(index, item, seq_by_item.get(item.id))])
+    return "\n".join(lines)
+
+
+# Above this many differing rule lines, an account is treated as having its own
+# rules rather than a delta on the shared block (see build_multi_account_batch_chat_prompt).
+_MAX_RULE_DELTA_LINES = 6
+
+
+def _account_voice_delta(account: Account | None, *, item_count: int) -> list[str]:
+    """The per-account fields that actually differ between accounts.
+
+    The style RULES (title/hook/caption blocks, ~14k characters) are emitted
+    once for the whole batch when every account resolves to the same ones,
+    which is the normal case for a niche network. Only this short voice block
+    repeats per account.
+    """
+    return [
+        f"Account: {account.name if account else '(none)'}",
+        f"Niche: {account.niche_label if account and account.niche_label else '(none)'}",
+        f"Tone: {account.writing_tone if account and account.writing_tone else '(none)'}",
+        f"Target audience: {account.target_audience if account and account.target_audience else '(none)'}",
+        f"Hook style: {account.hook_style if account and account.hook_style else '(none)'}",
+        f"Banned phrases: {account.banned_phrases if account and account.banned_phrases else '(none)'}",
+        f"Title rules: {account.title_style_notes if account and account.title_style_notes else '(none)'}",
+        f"Caption rules: {account.caption_style_notes if account and account.caption_style_notes else '(none)'}",
+        f"Reels for this account: {item_count}",
+    ]
+
+
+def _account_style_rules(account: Account | None, settings: dict) -> list[str]:
+    """The style-rule block for one account (title + hook + caption rules)."""
+    niche_label = account.niche_label if account and account.niche_label else None
+    account_key = account.instagram_handle if account is not None else None
+    few_shot_winners = top_titles_for_account(account_key) if account_key else []
+    return [
+        "On-screen title rules (follow these exactly):",
+        *smart_drafts.effective_title_rules(
+            settings.get("title_style") or None,
+            settings.get("caption_style") or None,
+            niche_label,
+            few_shot_winners=few_shot_winners,
+            title_length=settings.get("title_length") or "long",
+        ),
+        "",
+        "Hook framing (drama is allowed, overclaiming is not):",
+        *smart_drafts._hook_drama_and_fact_safety_rules(),
+        "",
+        "Caption rules (follow these exactly):",
+        *smart_drafts.effective_caption_rules(
+            settings.get("caption_style") or None,
+            account_voice=_caption_rule_voice(account),
+        ),
+    ]
+
+
+# Review states that take a reel out of the drafting queue. "rejected" is the
+# per-account reject; "blocked" is the global one (library.reject_item_globally),
+# which already hides the reel from the Processing table — offering it for a
+# batch draft would resurrect a clip the user killed everywhere else.
+_UNDRAFTABLE_REVIEW_STATES = frozenset({"rejected", "blocked"})
+
+
+def batch_candidates(
+    *,
+    niche: str | None = None,
+    per_account: int = 6,
+    account_ids: list[int] | None = None,
+) -> list[dict]:
+    """Draftless, publishable reels per account, ready for a cross-account batch.
+
+    Mirrors the Processing screen's own draftable filter (no draft yet, not
+    posted/skipped, neither locally rejected nor globally blocked) so the two
+    surfaces agree on what still needs a draft. Resting and flagged accounts are
+    excluded for the same reason distribution skips them: their reels should not
+    be queued up for posting.
+    """
+    limit = max(1, int(per_account))
+    # Lazy import: keep draft_handoff free of library's downloader import chain.
+    from nicheflow_studio.services import library
+
+    with get_session() as session:
+        query = session.query(Account)
+        if account_ids:
+            query = query.filter(Account.id.in_([int(a) for a in account_ids]))
+        if niche:
+            query = query.filter(Account.niche == niche)
+        accounts = [
+            account
+            for account in query.all()
+            if (account.operational_status or "active") == "active"
+        ]
+
+        drafted_item_ids = {
+            row[0]
+            for row in session.execute(select(DraftRevision.download_item_id).distinct()).all()
+        }
+        # The "#N" the Processing table shows and the batch prompt/paste-router
+        # key on. Surfacing the raw id here instead made the batch list name the
+        # same clip by a different number than every other surface.
+        seq_by_item = library.account_sequence_map(session)
+        # Publishing marks UploadJob, not DownloadItem.status, so filtering on
+        # the item's own status alone let already-posted reels back in here as
+        # "draftless" while Processing correctly showed them as Posted.
+        posted_item_ids = library.already_posted_item_ids(session)
+        # ...and the same reel reaching a SECOND account is still a repost of
+        # footage the network has already published, so match on the source
+        # video too, not just on this account's own copy of it.
+        posted_video_ids = library.posted_source_video_ids(session)
+
+        groups: list[dict] = []
+        for account in accounts:
+            items = (
+                session.query(DownloadItem)
+                .filter(
+                    DownloadItem.account_id == account.id,
+                    DownloadItem.status.notin_(["posted", "skipped"]),
+                    DownloadItem.file_path.is_not(None),
+                )
+                .order_by(DownloadItem.id)
+                .all()
+            )
+            eligible = [
+                item
+                for item in items
+                if item.id not in drafted_item_ids
+                and item.id not in posted_item_ids
+                and (item.video_id or "") not in posted_video_ids
+                and (item.review_state or "") not in _UNDRAFTABLE_REVIEW_STATES
+            ]
+            candidates = [
+                {
+                    "id": item.id,
+                    "account_seq": seq_by_item.get(item.id),
+                    "title": item.title,
+                    "source_url": item.source_url,
+                    # The bridge turns this into a virtual-host preview URL; the
+                    # service stays free of the app layer's media mapping.
+                    "file_path": item.file_path,
+                    "has_draft": item.id in drafted_item_ids,
+                    "has_vision": bool((item.smart_vision_payload or "").strip()),
+                }
+                for item in eligible[:limit]
+            ]
+            groups.append(
+                {
+                    "account_id": account.id,
+                    "account_name": account.name,
+                    "niche": account.niche,
+                    "auto_schedules": bool(account.auto_schedule_on_export),
+                    "items": candidates,
+                    # How many more this account could offer if the per-account
+                    # limit were raised — the UI shows "6 of 9" so a short list
+                    # reads as a small backlog rather than a bug.
+                    "available": len(eligible),
+                }
+            )
+    return groups
+
+
+def multi_account_batch_order(item_ids: list[int]) -> list[int]:
+    """Item ids grouped by account, accounts in first-appearance order.
+
+    Reel numbers and frame filenames are both positional, so the prompt builder
+    and the frame extractor MUST walk the batch in the same order or reel 4's
+    context would point at reel 7's image. Both call this.
+    """
+    ids = [int(item_id) for item_id in item_ids]
+    with get_session() as session:
+        account_by_item = {
+            item.id: item.account_id
+            for item in session.query(DownloadItem).filter(DownloadItem.id.in_(ids)).all()
+        }
+    grouped: dict[object, list[int]] = {}
+    for item_id in ids:
+        grouped.setdefault(account_by_item.get(item_id), []).append(item_id)
+    return [item_id for group in grouped.values() for item_id in group]
+
+
+def multi_account_batch_frames(item_ids: list[int]) -> dict:
+    """Vision-first frame prep for a cross-account batch (see ``batch_frames``)."""
+    return batch_frames(multi_account_batch_order(item_ids))
+
+
+def build_multi_account_batch_chat_prompt(item_ids: list[int], settings: dict | None = None) -> str:
+    """One prompt covering reels from SEVERAL accounts.
+
+    Running six single-account batches re-sends the same ~5k tokens of style
+    rules six times. Here the rules are emitted once up front, and an account
+    repeats them only when its own niche or style genuinely resolves to
+    different rules. Reel headers carry the GLOBAL item id so blocks can be
+    routed back across accounts (see ``import_multi_account_batch_draft``).
+    """
+    settings = settings or {}
+    if not item_ids:
+        raise DraftRevisionError("Choose at least one item for the batch.")
+    # Same walk order as multi_account_batch_frames, so reel N's context and
+    # reel N's frame filename always refer to the same clip.
+    ids = multi_account_batch_order(item_ids)
+
+    with get_session() as session:
+        items = session.query(DownloadItem).filter(DownloadItem.id.in_(ids)).all()
+        by_id = {item.id: item for item in items}
+        missing = [item_id for item_id in ids if item_id not in by_id]
+        if missing:
+            raise DraftRevisionError(f"Item(s) not found: {', '.join(map(str, missing))}.")
+        ordered = [by_id[item_id] for item_id in ids]
+        unassigned = [item.id for item in ordered if item.account_id is None]
+        if unassigned:
+            raise DraftRevisionError(
+                f"Item(s) not assigned to an account: {', '.join(map(str, unassigned))}."
+            )
+
+        # Group by account, preserving the order accounts first appear so reel
+        # numbering stays aligned with the caller's item order.
+        grouped: dict[int, list[DownloadItem]] = {}
+        for item in ordered:
+            grouped.setdefault(item.account_id, []).append(item)
+        accounts = {
+            account_id: session.get(Account, account_id) for account_id in grouped
+        }
+        missing_accounts = [str(a) for a, acc in accounts.items() if acc is None]
+        if missing_accounts:
+            raise DraftRevisionError(
+                f"Account(s) not found: {', '.join(missing_accounts)}."
+            )
+
+        rules_by_account = {
+            account_id: _account_style_rules(accounts[account_id], settings)
+            for account_id in grouped
+        }
+        shared_rules = next(iter(rules_by_account.values()))
+        # Accounts in one niche resolve to near-identical rule blocks: measured
+        # across three history accounts, 45 of 46 lines matched and only the
+        # audience-echo ban differed (it quotes each account's own audience).
+        # Emitting the ~14k-character block once plus a few delta lines is the
+        # whole point of batching accounts together, so compare LINE BY LINE
+        # rather than requiring exact equality.
+        rule_deltas = {
+            account_id: [line for line in rules if line not in set(shared_rules)]
+            for account_id, rules in rules_by_account.items()
+        }
+        # A large delta means genuinely different rules (another niche or style),
+        # not a voice-derived tweak. Additive deltas would then read as
+        # contradictions layered on the shared block, so such an account gets its
+        # own full block instead.
+        needs_own_rules = {
+            account_id
+            for account_id, delta in rule_deltas.items()
+            if len(delta) > _MAX_RULE_DELTA_LINES
+        }
+        attachments_expected = any(
+            not (item.smart_vision_payload or "").strip() for item in ordered
+        )
+
+        lines: list[str] = [
+            "You are drafting Instagram Reel titles and captions for SEVERAL NicheFlow "
+            "accounts in one pass.",
+            "This is for ChatGPT or Claude web.",
+            *(
+                [
+                    "Some reels below ask you to attach and inspect a still image; the rest "
+                    "carry their visual evidence as JSON instead."
+                ]
+                if attachments_expected
+                else [
+                    "No images are attached: each reel's visual evidence is provided as JSON "
+                    "in its context block."
+                ]
+            ),
+            "",
+            f"Accounts in this batch: {len(grouped)}. Total reels: {len(ids)}.",
+            "Each account has its own voice block below. Write every reel in the voice of "
+            "the account it sits under, and never mix one account's voice into another's.",
+            f"Caption style: {settings.get('caption_style') or '(none)'}",
+            f"Title style: {settings.get('title_style') or 'Auto (match caption style)'}",
+            f"Title length: {(settings.get('title_length') or 'long').title()}",
+            f"Clip premise / user direction: {settings.get('clip_premise') or '(none)'}",
+            "",
+        ]
+
+        lines.extend(
+            [
+                "Shared style rules (apply to EVERY reel in this batch unless that reel's "
+                "account overrides them below):",
+                *shared_rules,
+                "",
+            ]
+        )
+
+        lines.extend(
+            [
+                *_VISUAL_EVIDENCE_GUIDANCE,
+                "",
+                *_SOURCE_CAPTION_GUIDANCE,
+                "",
+                *_FACT_CHECK_LINES,
+                "",
+                *_WEB_RESEARCH_LINES,
+                "",
+                "Plain-text rules:",
+                "- Keep display titles plain text.",
+                "- Do not use markdown formatting in section headers or titles.",
+                "- Never write em dashes or double hyphens ('--') in titles or captions.",
+                "- Do not invent unsupported facts.",
+                "- Write THREE title options and exactly ONE 'Shared Caption:' per reel.",
+                "- Never recommend an option BECAUSE it is the safest or most hedged; "
+                "recommend the one whose specific the clip delivers most strongly.",
+                "",
+                "Return one block per reel, one for every reel, in order.",
+                "START each reel's block with its own header line that is exactly:",
+                "===== REEL <n> (#<id>) =====",
+                "copying BOTH the reel number and the (#id) exactly as shown in that reel's "
+                "context below. The (#id) is how the app files each reply to the correct "
+                "video ACROSS accounts, so never change, drop, or invent it.",
+                "Do not rename, renumber, merge, or skip any reel, even if two clips look "
+                "similar or belong to different accounts.",
+                "",
+                "Niche fit check (per reel, MANDATORY): compare the clip's actual subject to "
+                "the niche of ITS OWN account. Directly under the reel's header line, before "
+                "'Title Option 1:', write exactly one line:",
+                "Niche check: fits",
+                "or",
+                "Niche check: OFF-NICHE, <one short reason>",
+                "Flag borderline or unclear fits as OFF-NICHE so the user decides. Still "
+                "draft all three options either way.",
+                "",
+                *_field_disambiguation_lines(settings.get("caption_style") or None),
+                "Inside each block, use this exact plain-text format:",
+                "Niche check: <fits | OFF-NICHE, reason>",
+                "Title Option 1:",
+                "Title Option 2:",
+                "Title Option 3:",
+                "Recommended Pick: Title Option N",
+                "Why:",
+                "Shared Caption:",
+                "Selection Notes:",
+                "Option 1:",
+                "Option 2:",
+                "Option 3:",
+            ]
+        )
+
+        reel_number = 0
+        for account_id, account_items in grouped.items():
+            account = accounts[account_id]
+            lines.extend(
+                [
+                    "",
+                    f"########## ACCOUNT: {account.name} ##########",
+                    *_account_voice_delta(account, item_count=len(account_items)),
+                ]
+            )
+            if account_id in needs_own_rules:
+                lines.extend(
+                    [
+                        "",
+                        "This account's style rules REPLACE the shared rules above:",
+                        *rules_by_account[account_id],
+                    ]
+                )
+            elif rule_deltas[account_id]:
+                lines.extend(
+                    [
+                        "",
+                        "Additional rules for this account (on top of the shared rules above):",
+                        *rule_deltas[account_id],
+                    ]
+                )
+            lines.append("")
+            lines.append("Reel contexts for this account:")
+            for item in account_items:
+                reel_number += 1
+                # The echoed id is the GLOBAL item id here, not the per-account
+                # sequence: account-relative numbers repeat across accounts.
+                lines.extend(["", *_batch_item_context(reel_number, item, item.id)])
+
     return "\n".join(lines)
 
 
@@ -664,29 +1267,44 @@ def _split_header_line(line: str) -> tuple[str, re.Match[str] | None]:
     return "", None
 
 
-def _split_batch_blocks(text: str) -> dict[int, tuple[int | None, str]]:
-    """Split a pasted reply into blocks keyed by 1-based REEL NUMBER, each paired
-    with the echoed ``(#id)`` from its header (``None`` when the model dropped it).
+def _split_batch_blocks(text: str) -> list[tuple[int, int | None, str]]:
+    """Split a pasted reply into blocks in document order, each as
+    ``(reel_number, echoed_id, block_text)``. ``echoed_id`` is the ``(#id)`` from
+    the header, or ``None`` when the model dropped it.
 
-    A repeated header for the same reel keeps the first block and its id (later
-    headers are treated as continuations of nothing useful and ignored).
+    Blocks are deliberately NOT keyed by reel number. Models sometimes renumber
+    every block (emitting all of them as "REEL 1") while still echoing distinct,
+    correct ids; keying by reel merged those into one block, whose later
+    Title/Caption headers then redefined the first block's options -- one item
+    silently imported another item's draft and the rest came back unmatched.
+    Routing (by echoed id first, reel number only as a fallback) is the caller's
+    job, so a block is never dropped before its id has been consulted.
     """
-    blocks: dict[int, list[str]] = {}
-    echoed: dict[int, int | None] = {}
-    current_reel: int | None = None
+    blocks: list[tuple[int, int | None, list[str]]] = []
     for line in (text or "").splitlines():
         head, match = _split_header_line(line)
         if match:
-            if head and current_reel is not None:
-                blocks[current_reel].append(head)
-            current_reel = int(match.group(1))
-            if current_reel not in blocks:
-                blocks[current_reel] = []
-                echoed[current_reel] = int(match.group(2)) if match.group(2) else None
+            # Text glued in front of an embedded delimiter belongs to the block
+            # that was open before this header.
+            if head and blocks:
+                blocks[-1][2].append(head)
+            blocks.append((int(match.group(1)), int(match.group(2)) if match.group(2) else None, []))
             continue
-        if current_reel is not None:
-            blocks[current_reel].append(line)
-    return {reel: (echoed[reel], "\n".join(lines).strip()) for reel, lines in blocks.items()}
+        if blocks:
+            blocks[-1][2].append(line)
+    return [(reel, echoed, "\n".join(lines).strip()) for reel, echoed, lines in blocks]
+
+
+# Does a routed block actually carry drafts? Models write commentary ABOVE the
+# first "===== REEL 1 =====" delimiter and refer to the reels by name there
+# ("Reel 1 (#88): verified the Ledger story..."), which _REEL_HEADER accepts as a
+# delimiter -- so the note becomes a block that shadows the real one. Emphasis
+# chars are tolerated because _strip_header_emphasis unwraps "**Title Option 1:**"
+# later; this only decides which block is worth routing.
+_DRAFT_SECTION = re.compile(
+    r"^[ \t]*[*_#>`]*[ \t]*(?:title|caption)\s*option\s*\d+\s*:",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
 def _batch_seq_to_item(item_ids: list[int]) -> dict[int, int]:
@@ -727,30 +1345,57 @@ def _reject_prompt_paste(text: str) -> None:
 
 
 def import_account_batch_draft(text: str, item_ids: list[int]) -> dict:
+    """Import a single-account batch reply, routing by account-relative ``#id``."""
+    requested = [int(item_id) for item_id in item_ids]
+    return _import_batch(text, requested, _batch_seq_to_item(requested))
+
+
+def import_multi_account_batch_draft(text: str, item_ids: list[int]) -> dict:
+    """Import a CROSS-ACCOUNT batch reply.
+
+    Account-relative "#id"s collide once a batch spans accounts (every account
+    numbers its own reels from 1), so the multi-account prompt echoes the GLOBAL
+    download-item id instead and routing is an identity map. Everything else --
+    reel-number fallback, duplicate handling, per-item error collection -- is
+    shared with the single-account path.
+    """
+    requested = [int(item_id) for item_id in item_ids]
+    return _import_batch(text, requested, {item_id: item_id for item_id in requested})
+
+
+def _import_batch(text: str, requested: list[int], seq_to_item: dict[int, int]) -> dict:
     """Import a batch reply. Each block routes to a specific item by the echoed
     ``(#id)`` when it names an item in this batch (most reliable — survives
-    reordering and reel-number drift), otherwise by REEL NUMBER position. An
-    ``(#id)`` that is not part of this batch (e.g. the model parroted a frame
-    filename's item id) is ignored and the reel number is used instead, so a
-    garbled id never misroutes."""
+    reordering, reel-number drift, and duplicate reel numbers), otherwise by REEL
+    NUMBER position, which is the only routing key that depends on the order the
+    items were selected. An ``(#id)`` that is not part of this batch (e.g. the
+    model parroted a frame filename's item id) is ignored and the reel number is
+    used instead, so a garbled id never misroutes."""
     _reject_prompt_paste(text)
-    requested = [int(item_id) for item_id in item_ids]
-    seq_to_item = _batch_seq_to_item(requested)
-    blocks_by_reel = _split_batch_blocks(text)
     imported: list[int] = []
     failed: list[dict] = []
-    seen: set[int] = set()
-    for reel, (echoed_id, block) in sorted(blocks_by_reel.items()):
+    routed: dict[int, str] = {}
+    order: list[int] = []
+    # Report in reel order; sorted() is stable, so blocks sharing a reel number
+    # keep their document order and the first one still wins below.
+    for reel, echoed_id, block in sorted(_split_batch_blocks(text), key=lambda b: b[0]):
         item_id = seq_to_item.get(echoed_id) if echoed_id is not None else None
         if item_id is None:
             if reel < 1 or reel > len(requested):
                 continue  # reel number outside this batch and no valid id — ignore it
             item_id = requested[reel - 1]
-        if item_id in seen:
-            continue  # duplicate target — first block wins
-        seen.add(item_id)
+        if item_id not in routed:
+            routed[item_id] = block
+            order.append(item_id)
+        elif not _DRAFT_SECTION.search(routed[item_id]) and _DRAFT_SECTION.search(block):
+            # Duplicate target: the first block still wins between two real
+            # drafts, but a block with no Title/Caption sections at all is a
+            # stray (a preamble note the model addressed to "Reel 1 (#88):")
+            # and must not shadow the block that actually carries the draft.
+            routed[item_id] = block
+    for item_id in order:
         try:
-            import_pasted_draft(item_id, block)
+            import_pasted_draft(item_id, routed[item_id])
             imported.append(item_id)
         except DraftRevisionError as exc:
             failed.append({"item_id": item_id, "error": str(exc)})
@@ -763,14 +1408,27 @@ def import_account_batch_draft(text: str, item_ids: list[int]) -> dict:
 
 
 def batch_frames(item_ids: list[int]) -> dict:
+    """Prepare each reel's visual grounding for the chat handoff.
+
+    Vision-first: run the Groq vision pass over every item that has no visual
+    evidence yet, and cut a still frame ONLY for the items it could not cover.
+    Vision reads 5 frames per clip for roughly a twentieth of the tokens one
+    attached still costs, so the frame folder is now a fallback rather than the
+    normal path. ``described`` lets the UI say how many reels are vision-backed.
+    """
     ids = [int(item_id) for item_id in item_ids]
     if not ids:
         raise DraftRevisionError("Choose at least one item for the batch.")
+    vision = draft_generation.ensure_batch_vision_payloads(ids)
+    described = set(vision["described"])
+
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
     folder = processed_dir() / "chatgpt-batches" / f"batch-{stamp}"
     folder.mkdir(parents=True, exist_ok=True)
     frames: list[dict] = []
     for index, item_id in enumerate(ids, start=1):
+        if item_id in described:
+            continue  # vision JSON carries this reel; no attachment needed
         try:
             source = export_svc.crop_preview_frame(item_id)
         except ExportError as exc:
@@ -778,7 +1436,12 @@ def batch_frames(item_ids: list[int]) -> dict:
         target = folder / f"reel_{index}_item{item_id}.jpg"
         shutil.copyfile(source, target)
         frames.append({"item_id": item_id, "path": str(target)})
-    return {"folder": str(folder), "frames": frames}
+    return {
+        "folder": str(folder),
+        "frames": frames,
+        "described": sorted(described),
+        "skipped": vision["skipped"],
+    }
 
 
 def import_pasted_draft(item_id: int, text: str) -> DraftRevisionDTO:
@@ -786,7 +1449,31 @@ def import_pasted_draft(item_id: int, text: str) -> DraftRevisionDTO:
     parsed = parse_pasted_draft(text)
     if not any(value.strip() for value in [*parsed.title_options, *parsed.caption_options]):
         raise DraftRevisionError(
-            "No 'Title Option' or 'Caption Option' sections found in the clipboard text."
+            "No 'Title Option' or 'Shared Caption' sections found in the clipboard text."
+        )
+    # A half-parsed reply is worse than a rejected one: with (say) captions 2-3
+    # parsed but their title headers unrecognized, save_revision would drop the
+    # empty titles and store a 1-title/3-caption revision — the UI then shows a
+    # single option card and Apply's shared title/caption index pairing breaks.
+    # Fail loudly and name the exact headers that didn't parse instead.
+    paired = list(zip(parsed.title_options, parsed.caption_options))
+    missing_titles = [str(i + 1) for i, (t, c) in enumerate(paired) if c.strip() and not t.strip()]
+    missing_captions = [
+        str(i + 1) for i, (t, c) in enumerate(paired) if t.strip() and not c.strip()
+    ]
+    if missing_titles or missing_captions:
+        problems = []
+        if missing_titles:
+            problems.append(f"Title Option {'/'.join(missing_titles)}")
+        if missing_captions:
+            # Every option shares one caption, so a gap here means the whole
+            # 'Shared Caption:' header failed to parse, not option N's own.
+            problems.append(f"the caption for Option {'/'.join(missing_captions)}")
+        raise DraftRevisionError(
+            f"{' and '.join(problems)} did not parse while the paired sections did — those "
+            "header lines deviated from the plain 'Title Option N:' / 'Shared Caption:' "
+            "format. Fix the header lines in the reply (or ask the model to re-emit "
+            "plain-text headers) and import again."
         )
     # Chat assistants can't rate their own output into the paste format, so
     # pasted drafts arrive untiered: the deterministic guard assigns tiers

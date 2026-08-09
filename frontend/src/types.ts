@@ -31,7 +31,11 @@ export interface BatchFrame {
 
 export interface BatchFramesResult {
   folder: string;
+  /** Only the reels that still need an attached still; vision-backed reels are omitted. */
   frames: BatchFrame[];
+  /** Reels whose visual evidence JSON covers them, so no image is attached. */
+  described?: number[];
+  skipped?: { item_id: number; reason: string }[];
 }
 
 export interface BatchDraftImportResult {
@@ -39,6 +43,74 @@ export interface BatchDraftImportResult {
   failed: { item_id: number; error: string }[];
   unmatched: number[];
 }
+
+export interface BatchCandidateItem {
+  id: number;
+  /** Per-account "#N" shown in Processing; also what the batch prompt/paste-router keys on. */
+  account_seq: number | null;
+  title: string | null;
+  source_url: string | null;
+  /** Virtual-host URL for the source clip, or null until media mapping is ready. */
+  preview_url: string | null;
+  has_draft: boolean;
+  has_vision: boolean;
+}
+
+/** One account's draftless reels, offered for a cross-account batch. */
+export interface BatchCandidateGroup {
+  account_id: number;
+  account_name: string;
+  niche: string | null;
+  auto_schedules: boolean;
+  items: BatchCandidateItem[];
+  /** Total eligible reels for this account, before the per-account limit. */
+  available: number;
+}
+
+/** What "Finish batch" would do to one reel, before it runs. */
+export interface FinishBatchPlanEntry {
+  item_id: number;
+  /** Per-account "#N", so results can name a reel the way Processing does. */
+  account_seq: number | null;
+  title: string | null;
+  account_id: number | null;
+  account_name: string | null;
+  auto_schedules: boolean;
+  /** True when this account's post is handed to the Cloudflare Worker rather
+   *  than published from this machine. */
+  publishes_via_cloud: boolean;
+  ready?: boolean;
+  reason?: string;
+  option?: number;
+  revision_id?: number;
+}
+
+/** What queue_for_publish reported for one auto-scheduled reel. */
+export interface FinishBatchSchedule {
+  job_id?: number;
+  /** "cloud" once handed off to the Worker, "scheduled" while local-only. */
+  status?: string;
+  /**
+   * "deferred" when the Worker upload was handed to a background thread instead
+   * of awaited (batch exports pipeline it against the next render). The reel is
+   * cloud-bound even though `status` still reads "scheduled".
+   */
+  cloud_handoff?: string;
+  scheduled_at?: string | null;
+  message?: string;
+}
+
+export interface FinishBatchResult {
+  applied: { item_id: number; option: number }[];
+  exported: { item_id: number; processed_path: string | null }[];
+  scheduled: { item_id: number; schedule: FinishBatchSchedule }[];
+  failed: { item_id: number; stage: string; error: string }[];
+  skipped: { item_id: number; reason: string }[];
+  // Reels whose Worker upload was still running on a background thread when the
+  // batch job finished. They read "Scheduled" in the library until it lands.
+  pending_cloud?: number;
+}
+
 
 export interface ProcessingItem {
   id: number;
@@ -91,7 +163,7 @@ export interface ApplyResult {
   caption_draft: string;
 }
 
-export type JobStatus = "pending" | "running" | "succeeded" | "failed";
+export type JobStatus = "pending" | "running" | "succeeded" | "failed" | "canceled";
 
 export interface JobSnapshot {
   id: string;
@@ -100,6 +172,8 @@ export interface JobSnapshot {
   message: string;
   result: unknown;
   error: string | null;
+  // True once cancellation was requested for this job (cooperative cancel).
+  cancel_requested?: boolean;
 }
 
 export interface ExportResult {
@@ -190,12 +264,17 @@ export interface WorkflowSettings {
   caption_style: string;
   title_style: string;
   title_length: string;
+  // "shared" = one caption for all three titles (cheaper); "per_option" = one
+  // caption per title. Steers the generated prompt only; the importer accepts
+  // either shape regardless.
+  caption_mode: string;
   template: string;
   title_draft: string;
   caption_draft: string;
   caption_style_options: WorkflowOption[];
   title_style_options: WorkflowOption[];
   title_length_options: WorkflowOption[];
+  caption_mode_options: WorkflowOption[];
   template_options: WorkflowOption[];
 }
 
@@ -364,6 +443,7 @@ export interface PoolSource {
 export interface NicheAccount {
   id: number;
   name: string;
+  operational_status: AccountOperationalStatus;
 }
 
 export interface PoolSourceClip {
