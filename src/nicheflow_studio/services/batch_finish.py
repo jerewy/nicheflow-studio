@@ -119,6 +119,10 @@ def finish_batch(
 
     Renders run one at a time on purpose: FFmpeg saturates the CPU, so running
     a 36-reel batch in parallel would be slower overall and would starve the UI.
+    Measured on four real reels (35s/10s/16s/35s) on a 22-thread machine —
+    sequential 28.7s, two at a time 33.7s, three 31.6s, four 33.3s. Concurrency
+    here costs 10-17%: x264 is already multithreaded, so extra encoders only
+    contend. Do not "optimise" this into a thread pool.
     The cloud upload is a different resource, though, so it is pipelined against
     the next render via :func:`publishing.deferred_cloud_handoff` — uploads still
     go one at a time, they just no longer block the CPU stage. That means the job
