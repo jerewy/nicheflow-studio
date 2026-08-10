@@ -68,8 +68,12 @@ def _download_error_message(exc: Exception) -> str:
     return message.removeprefix("ERROR:").strip()[:200] or exc.__class__.__name__
 
 
-def _ensure_pool_item_downloaded(pool_item_id: int) -> None:
-    """Materialize a pool item's shared asset before it can be assigned."""
+def _ensure_pool_item_downloaded(pool_item_id: int) -> str | None:
+    """Materialize a pool item's shared asset before it can be assigned.
+
+    Returns the asset's shortcode so the caller can link just this clip onto its
+    pending-review rows instead of rescanning every one of them.
+    """
     with get_session() as session:
         pool_item = session.get(PoolItem, pool_item_id)
         if pool_item is None:
@@ -77,8 +81,9 @@ def _ensure_pool_item_downloaded(pool_item_id: int) -> None:
         asset = session.get(MediaAsset, pool_item.media_asset_id)
         if asset is None:
             raise PoolingError(f"Pool item {pool_item_id} has no media asset.")
+        shortcode = asset.source_shortcode
         if _asset_is_downloaded(asset):
-            return
+            return shortcode
         asset_id = asset.id
         source_url = asset.canonical_source_url
 
@@ -123,6 +128,7 @@ def _ensure_pool_item_downloaded(pool_item_id: int) -> None:
             content_hash=content_hash,
         )
         session.commit()
+        return asset.source_shortcode
 
 
 def _unassigned_pool_item_ids(niche: str) -> list[int]:
@@ -158,17 +164,21 @@ _DOWNLOAD_LOCK = threading.Lock()
 def _download_pool_assets(pool_item_ids: list[int]) -> None:
     """Download any not-yet-downloaded footage for these pool items, then link it
     onto the pending-review Processing rows. Synchronous; best-effort per clip."""
-    downloaded_any = False
     for pool_item_id in pool_item_ids:
         with _DOWNLOAD_LOCK:
             try:
-                _ensure_pool_item_downloaded(pool_item_id)
-                downloaded_any = True
+                shortcode = _ensure_pool_item_downloaded(pool_item_id)
             except PoolingError as exc:
                 logger.warning("Background pool download failed for %s: %s", pool_item_id, exc)
-    if downloaded_any:
+                continue
+        # Link each clip the moment its footage lands, not once the whole batch
+        # finishes. The Batch Drafts screen hides pending-review rows that have
+        # no local file, so a single backfill at the end made a just-distributed
+        # account read "5 of 5" until every other clip in the run had downloaded.
         try:
-            repair_pending_review_media_links()
+            repair_pending_review_media_links(
+                shortcodes={shortcode} if shortcode else None
+            )
         except Exception:  # noqa: BLE001 - background backfill must not crash the worker
             logger.exception("Linking downloaded footage to pending-review items failed.")
 
@@ -992,13 +1002,23 @@ def release_missing_media_assignments(
     }
 
 
-def repair_pending_review_media_links(*, dry_run: bool = False) -> dict:
-    """Backfill legacy pending-review rows from their downloaded shared asset."""
+def repair_pending_review_media_links(
+    *, dry_run: bool = False, shortcodes: set[str] | None = None
+) -> dict:
+    """Backfill legacy pending-review rows from their downloaded shared asset.
+
+    ``shortcodes`` narrows the scan to specific source clips, which is what the
+    background download loop uses to link one freshly downloaded clip without
+    re-walking the whole pending-review backlog on every iteration.
+    """
     repaired: list[dict] = []
     with get_session() as session:
-        pending_items = session.query(DownloadItem).filter(
+        query = session.query(DownloadItem).filter(
             DownloadItem.status == "pending_review"
-        ).all()
+        )
+        if shortcodes is not None:
+            query = query.filter(DownloadItem.video_id.in_(sorted(shortcodes)))
+        pending_items = query.all()
         for item in pending_items:
             if item.file_path and Path(item.file_path).exists():
                 continue

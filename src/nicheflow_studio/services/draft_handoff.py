@@ -975,12 +975,15 @@ def batch_candidates(
                 .filter(
                     DownloadItem.account_id == account.id,
                     DownloadItem.status.notin_(["posted", "skipped"]),
-                    DownloadItem.file_path.is_not(None),
                 )
                 .order_by(DownloadItem.id)
                 .all()
             )
-            eligible = [
+            # Everything the account still owes a draft on. Rejected and blocked
+            # reels drop out HERE, so a clip the user killed can never come back
+            # as a "still downloading" ghost below — retired rows keep no media
+            # link, and this is the only place that could resurface them.
+            draftable = [
                 item
                 for item in items
                 if item.id not in drafted_item_ids
@@ -988,6 +991,14 @@ def batch_candidates(
                 and (item.video_id or "") not in posted_video_ids
                 and (item.review_state or "") not in _UNDRAFTABLE_REVIEW_STATES
             ]
+            # A distributed clip gets its pending-review row immediately but its
+            # file_path only once the shared asset finishes downloading. Those
+            # rows can't be drafted yet, so they stay out of `items`/`available`
+            # — but they are reported separately, because silently dropping them
+            # is what made a freshly distributed account read "5 of 5" after a
+            # 6-clip distribute.
+            eligible = [item for item in draftable if item.file_path]
+            pending_media = len(draftable) - len(eligible)
             candidates = [
                 {
                     "id": item.id,
@@ -1013,6 +1024,10 @@ def batch_candidates(
                     # limit were raised — the UI shows "6 of 9" so a short list
                     # reads as a small backlog rather than a bug.
                     "available": len(eligible),
+                    # Draftable reels whose footage is still downloading. Shown
+                    # so a short list reads as "wait a moment", not "distribute
+                    # gave me fewer than I asked for".
+                    "pending_media": pending_media,
                 }
             )
     return groups

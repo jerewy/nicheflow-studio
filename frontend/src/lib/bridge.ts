@@ -1365,6 +1365,10 @@ const mock = {
         // Deliberately fewer than requested for the last account, so the
         // "6 of 9" backlog hint is visible in dev.
         available: groupIndex === 2 ? 2 : perAccount + 3,
+        // One account mid-download, so the "still downloading" hint (the reason
+        // a fresh distribute can briefly offer fewer clips than it assigned) is
+        // visible in dev too.
+        pending_media: groupIndex === 1 ? 1 : 0,
         items: Array.from(
           { length: groupIndex === 2 ? Math.min(2, perAccount) : perAccount },
           (_, i) => {

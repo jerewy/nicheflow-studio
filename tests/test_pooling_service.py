@@ -1387,3 +1387,60 @@ def test_repair_pending_review_media_links_reuses_shared_download(tmp_path: Path
     assert result["repaired_items"] == 1
     with get_session() as session:
         assert session.get(DownloadItem, item_id).file_path == str(media_file)
+
+
+def test_background_download_links_each_clip_as_soon_as_it_lands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The backfill used to run once, after the whole batch had downloaded, so
+    # every clip in a distribute run stayed unlinked until the slowest one
+    # finished — and the Batch Drafts screen (which hides rows with no file)
+    # showed the account one clip short the entire time. Each clip must be
+    # linked as it lands.
+    with get_session() as session:
+        session.add(Account(name="Linker Hist", platform="instagram", niche="history"))
+        pool_ids: list[int] = []
+        item_ids: list[int] = []
+        for shortcode in ("first", "second"):
+            asset = MediaAsset(
+                platform="instagram",
+                canonical_source_url=f"https://instagram.com/reel/{shortcode}",
+                source_shortcode=shortcode,
+                download_status="pending",
+            )
+            session.add(asset)
+            session.flush()
+            pool_item = PoolItem(
+                media_asset_id=asset.id, niche="history", acceptance_status="accepted"
+            )
+            item = DownloadItem(
+                source_url=asset.canonical_source_url,
+                video_id=shortcode,
+                status="pending_review",
+                review_state="pending_review",
+            )
+            session.add_all([pool_item, item])
+            session.flush()
+            pool_ids.append(pool_item.id)
+            item_ids.append(item.id)
+        session.commit()
+
+    real_ensure = pooling._ensure_pool_item_downloaded
+    # What the first clip's Processing row looks like at the START of each
+    # download — i.e. what the batch screen would have seen mid-run.
+    first_row_paths: list[str | None] = []
+
+    def ensure(pool_item_id: int) -> str | None:
+        with get_session() as session:
+            first_row_paths.append(session.get(DownloadItem, item_ids[0]).file_path)
+        return real_ensure(pool_item_id)
+
+    monkeypatch.setattr(pooling, "_ensure_pool_item_downloaded", ensure)
+
+    pooling._download_pool_assets(pool_ids)
+
+    assert first_row_paths[0] is None
+    # Linked before the second clip even started downloading.
+    assert first_row_paths[1] is not None
+    with get_session() as session:
+        assert session.get(DownloadItem, item_ids[1]).file_path is not None

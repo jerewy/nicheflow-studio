@@ -728,6 +728,9 @@ export function BatchDraftsScreen({
                       <span className="block text-xs text-muted-foreground">
                         {group.items.length} of {group.available} draftless
                         {more > 0 ? ` · ${more} more available` : ""}
+                        {group.pending_media > 0
+                          ? ` · ${group.pending_media} still downloading`
+                          : ""}
                         {group.auto_schedules ? " · auto-schedules on export" : ""}
                       </span>
                     </span>
@@ -743,8 +746,9 @@ export function BatchDraftsScreen({
                 </div>
                 {group.items.length === 0 ? (
                   <p className="text-xs text-muted-foreground">
-                    No undrafted reels with a downloaded file. Distribute more from Pool &amp;
-                    Distribute.
+                    {group.pending_media > 0
+                      ? `${group.pending_media} distributed reel(s) still downloading. Refresh in a moment.`
+                      : "No undrafted reels with a downloaded file. Distribute more from Pool & Distribute."}
                   </p>
                 ) : (
                   <ul className="space-y-1">

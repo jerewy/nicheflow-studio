@@ -65,6 +65,8 @@ export interface BatchCandidateGroup {
   items: BatchCandidateItem[];
   /** Total eligible reels for this account, before the per-account limit. */
   available: number;
+  /** Draftable reels whose footage is still downloading, so not offered yet. */
+  pending_media: number;
 }
 
 /** What "Finish batch" would do to one reel, before it runs. */

@@ -1514,6 +1514,46 @@ def test_batch_candidates_reports_the_full_backlog_beyond_the_limit() -> None:
     assert mine["available"] == len(item_ids)
 
 
+def test_batch_candidates_report_reels_whose_footage_is_still_downloading() -> None:
+    # Distribute creates the pending-review row immediately but its file_path
+    # only lands when the shared asset finishes downloading. Dropping those rows
+    # silently made a 6-clip distribute read "5 of 5 draftless" until the
+    # background download caught up, which looked like distribution shorting the
+    # account. They stay out of the offer list but must be counted and shown.
+    account_id, item_ids = _make_second_account_items("PsiHistory", 3)
+    with get_session() as session:
+        session.get(DownloadItem, item_ids[0]).file_path = None
+        session.commit()
+
+    groups = draft_handoff.batch_candidates(niche="history", per_account=10)
+    mine = next(g for g in groups if g["account_id"] == account_id)
+
+    assert [item["id"] for item in mine["items"]] == item_ids[1:]
+    assert mine["available"] == 2
+    assert mine["pending_media"] == 1
+
+
+def test_batch_candidates_never_count_retired_reels_as_still_downloading() -> None:
+    # Retiring a clip (per-account reject or the global block) leaves the row
+    # with no media link, which is the same shape as "still downloading". The
+    # new counter must not resurrect those: a killed reel has to stay gone from
+    # every surface, including the "still downloading" hint.
+    account_id, item_ids = _make_second_account_items("OmegaHistory", 3)
+    with get_session() as session:
+        for item_id, state in zip(item_ids[:2], ["rejected", "blocked"]):
+            item = session.get(DownloadItem, item_id)
+            item.review_state = state
+            item.file_path = None
+        session.commit()
+
+    groups = draft_handoff.batch_candidates(niche="history", per_account=10)
+    mine = next(g for g in groups if g["account_id"] == account_id)
+
+    assert [item["id"] for item in mine["items"]] == [item_ids[2]]
+    assert mine["available"] == 1
+    assert mine["pending_media"] == 0
+
+
 def test_batch_candidates_expose_a_preview_path_and_source_url() -> None:
     # The review player needs both: the bridge maps file_path to a media URL.
     account_id, item_ids = _make_second_account_items("LambdaHistory", 1)
