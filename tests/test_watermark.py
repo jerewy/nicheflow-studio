@@ -125,11 +125,53 @@ def test_corner_offsets_right_x_equals_width_minus_corner_w():
     assert x_off == probe.width - cw
 
 
-def test_watermark_scan_regions_include_content_edge_lanes() -> None:
-    regions = _watermark_scan_regions(VideoProbe(width=720, height=1280, duration_seconds=10.0))
-    names = {name for name, *_coords in regions}
+def _covers(regions, box: tuple[int, int, int, int]) -> bool:
+    """True when some single region wholly contains ``box`` (x, y, w, h)."""
+    bx, by, bw, bh = box
+    return any(
+        x <= bx and y <= by and x + w >= bx + bw and y + h >= by + bh
+        for _name, x, y, w, h in regions
+    )
 
-    assert {"top-right", "bottom-right", "right-upper", "right-mid", "bottom-center"} <= names
+
+def test_watermark_scan_regions_leave_no_gap_in_the_frame() -> None:
+    # The old hand-placed lanes had holes between them. Every pixel must now sit
+    # in some region, or a watermark can land where nothing ever looks.
+    probe = VideoProbe(width=720, height=1280, duration_seconds=10.0)
+    regions = _watermark_scan_regions(probe)
+
+    for px in range(0, probe.width, 17):
+        for py in range(0, probe.height, 17):
+            assert any(
+                x <= px < x + w and y <= py < y + h for _n, x, y, w, h in regions
+            ), f"({px},{py}) is not scanned"
+
+
+def test_watermark_scan_regions_wholly_contain_a_bottom_right_mark() -> None:
+    # Regression for the miss on Vaulted History #66: @historybypass sat at
+    # x 749-897, y 1224-1257 of a 1080x1920 render, in the gap below "right-mid"
+    # and above "bottom-center". Overlapping tiles must contain it INTACT — a
+    # mark split across two tiles reads as two fragments and matches neither.
+    probe = VideoProbe(width=1080, height=1920, duration_seconds=10.0)
+    regions = _watermark_scan_regions(probe)
+
+    assert _covers(regions, (749, 1224, 148, 33))
+
+
+def test_watermark_scan_regions_stay_inside_the_footage_when_known() -> None:
+    # On an exported reel everything outside the footage is this app's own post
+    # header and title band. Scanning it can only ever yield a false positive —
+    # which is exactly how "Vaulted History" + a verified badge became "@story".
+    probe = VideoProbe(width=1080, height=1920, duration_seconds=10.0)
+    footage = (74, 638, 932, 643)
+    regions = _watermark_scan_regions(probe, footage_rect=footage)
+
+    fx, fy, fw, fh = footage
+    for name, x, y, w, h in regions:
+        assert x >= fx and y >= fy, name
+        assert x + w <= fx + fw and y + h <= fy + fh, name
+    # ...and the real mark is still wholly inside one of them.
+    assert _covers(regions, (749, 1224, 148, 33))
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +209,34 @@ def test_group_boxes_large_horizontal_gap_splits():
     boxes = [_box("@", 10, 100, w=15), _box("epic", 250, 100, w=40)]
     groups = _group_boxes_by_line(boxes)
     assert len(groups) == 2
+
+
+def test_group_boxes_are_ordered_left_to_right_not_by_top():
+    # The caller joins each group into a string, so order is meaning. Boxes were
+    # walked in (top, left) order, which puts a box that sits further RIGHT but a
+    # pixel HIGHER first — fabricating text that appears nowhere on screen.
+    boxes = [_box("story", 0, 14, w=89), _box("@", 103, 13, w=30)]
+    (group,) = _group_boxes_by_line(boxes)
+    assert [b.text for b in group] == ["story", "@"]
+
+
+def test_find_handle_ignores_a_trailing_at_glyph_after_plain_text():
+    # Regression: Vaulted History's burned-in post header OCR'd as "story" (the
+    # tail of the display name, clipped by the scan region's left edge) plus the
+    # verified badge misread as "@". Joined in the wrong order that read as the
+    # handle "@story", so the cover painted over the account's own header and
+    # stamped its handle on top of it.
+    boxes = [_box("story", 0, 14, w=89), _box("@", 103, 13, w=30)]
+    assert _find_handle_in_boxes(boxes, x_offset=486, y_offset=288, corner="right-upper") is None
+
+
+def test_find_handle_still_joins_a_split_handle_left_to_right():
+    # The reason pass 2 exists: Tesseract splits "@" from the username. A real
+    # split handle must still be found once ordering is enforced.
+    boxes = [_box("@", 10, 13, w=15), _box("epicpage", 28, 14, w=80)]
+    region = _find_handle_in_boxes(boxes, x_offset=0, y_offset=0, corner="bottom-right")
+    assert region is not None
+    assert region.text == "@epicpage"
 
 
 # ---------------------------------------------------------------------------
@@ -283,7 +353,39 @@ def test_best_watermark_detection_accepts_repeated_partial_handle() -> None:
     first = WatermarkRegion(x=10, y=20, w=100, h=18, text="@Come", corner="bottom-left")
     second = WatermarkRegion(x=12, y=20, w=102, h=18, text="@Come", corner="bottom-left")
 
-    assert _best_watermark_detection([first, second]) is first
+    best = _best_watermark_detection([first, second])
+
+    assert best.text == "@Come"
+    # The box spans both reads (10..114), because whichever read saw more of the
+    # mark is the one the cover has to be big enough for.
+    assert (best.x, best.w) == (10, 104)
+
+
+def test_best_watermark_detection_prefers_the_fullest_read_of_one_mark() -> None:
+    # The raw pass reads "@HISTORYBY" and the enhanced pass "@HISTORYBYPASS" —
+    # the same mark to different depths. Treated as rival handles the shorter one
+    # won on vote count (2 vs 2, insertion order) and the cover, sized to its
+    # box, left "ASS" of the original showing on a real export.
+    short_a = WatermarkRegion(x=667, y=1224, w=164, h=22, text="@HISTORYBY", corner="r2c2")
+    short_b = WatermarkRegion(x=667, y=1224, w=164, h=22, text="@HISTORYBY", corner="r2c3")
+    full = WatermarkRegion(x=667, y=1224, w=229, h=22, text="@HISTORYBYPASS", corner="r2c2")
+
+    best = _best_watermark_detection([short_a, short_b, full])
+
+    assert best.text == "@HISTORYBYPASS"
+    assert best.x + best.w == 667 + 229
+
+
+def test_best_watermark_detection_does_not_merge_two_separate_marks() -> None:
+    # Same handle stamped in two places must not yield one rect spanning the
+    # whole frame; only reads overlapping the fullest one are merged.
+    top = WatermarkRegion(x=100, y=100, w=120, h=20, text="@samehandle", corner="r0c0")
+    bottom = WatermarkRegion(x=100, y=1500, w=120, h=20, text="@samehandle", corner="r4c0")
+
+    best = _best_watermark_detection([top, bottom])
+
+    assert best.h == 20
+    assert best.y in (100, 1500)
 
 
 # ---------------------------------------------------------------------------

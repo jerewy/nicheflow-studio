@@ -21,6 +21,7 @@ import re
 import subprocess
 import tempfile
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -58,6 +59,19 @@ _BOX_PADDING = 8
 
 _CORNERS = ("top-left", "top-right", "bottom-left", "bottom-right")
 _MIN_HANDLE_BODY_CHARS = 4
+
+# Scan tiles step by half a tile, so any handle narrower than half a tile is
+# fully inside at least one tile no matter where it sits.
+_TILE_STEP_RATIO = 0.5
+
+# Concurrency for the OCR stage. Each Tesseract call is a short-lived
+# subprocess, so threads scale on it (the GIL is released while it runs) — but
+# they are CPU-bound processes, so this is capped well under the core count to
+# leave the machine responsive during a long batch.
+_MAX_OCR_WORKERS = 8
+
+# FFmpeg's `eq=brightness=0.3` shifts luma by 0.3 of full range; 8-bit equivalent.
+_ENHANCE_BRIGHTNESS_LIFT = round(0.3 * 255)
 
 
 @dataclass(frozen=True)
@@ -111,17 +125,25 @@ def detect_watermark(video_path: Path, *, sample_count: int = 3) -> WatermarkReg
     - The video file does not exist or cannot be probed
     - No @handle watermark is found in any corner
 
-    The detection samples ``sample_count`` evenly-spaced frames and checks
-    strict corners plus broader content-edge regions where repost watermarks
-    often sit under title bands. The most consistently detected handle wins.
+    The detection samples ``sample_count`` evenly-spaced frames and OCRs
+    overlapping tiles across the footage (see :func:`_watermark_scan_regions`).
+    The most consistently detected handle wins.
 
     Two-pass strategy
     -----------------
     Pass 1 (raw): OCR on the unmodified crop — works for normal solid watermarks.
-    Pass 2 (enhanced): if pass 1 finds nothing, retry every region with a
-    contrast-boosted, greyscale, 2x-upscaled crop. This makes semi-transparent
-    or low-contrast watermarks (e.g. ``@clips`` style) readable by Tesseract
-    without touching the cover/replacement logic at all.
+    Pass 2 (enhanced): the same tiles with a negated, greyscale, 2x-upscaled
+    crop, which makes semi-transparent or low-contrast watermarks (white text on
+    sky/content) readable. It also samples more timestamps, so a mark that is
+    off-screen during a scene cut still gets seen.
+
+    Both passes ALWAYS run and their detections are pooled. Pass 2 used to be a
+    fallback that fired only when pass 1 came up empty, on the reasoning that it
+    was expensive — but the two passes read the same mark to different depths,
+    and stopping at pass 1's shallower read (``@HISTORYBY`` vs the full
+    ``@HISTORYBYPASS``) sized the cover too small and left the tail of the
+    original visible. Since a pass now costs one FFmpeg seek per timestamp plus
+    concurrent OCR, paying for both is cheaper than the old single fallback pass.
     """
     ffmpeg_path = ffmpeg_binary()
     tesseract_path = tesseract_binary()
@@ -141,7 +163,13 @@ def detect_watermark(video_path: Path, *, sample_count: int = 3) -> WatermarkReg
     if not timestamps:
         return None
 
-    scan_regions = _watermark_scan_regions(probe)
+    # Scope the scan to the embedded footage when it can be found: the foreign
+    # watermark is always inside it, and on an exported reel everything outside
+    # it is text this app drew (post header, title band) — OCR there produces
+    # nothing but false positives.
+    scan_regions = _watermark_scan_regions(
+        probe, footage_rect=_footage_rect(resolved, probe)
+    )
 
     with tempfile.TemporaryDirectory(prefix="nicheflow-wm-") as tmp:
         tmp_root = Path(tmp)
@@ -153,23 +181,17 @@ def detect_watermark(video_path: Path, *, sample_count: int = 3) -> WatermarkReg
             enhance=False, label="raw",
         )
 
-        # Pass 2: enhanced crop — only runs when pass 1 found nothing.
-        # Uses negate+brightness-lift so Tesseract can read light-on-light
-        # watermarks (white text on sky/content) that pass 1 missed.
-        # Also uses more sample timestamps: the enhanced pass is slower per
-        # frame, but since it only fires when pass 1 found nothing, the extra
-        # frames are only paid for genuinely hard cases. More samples reduce
-        # the chance of every timestamp landing in a gap where the watermark
-        # is not on screen (e.g. during scene cuts or animated intros).
-        if not detections:
-            enhanced_timestamps = _sample_timestamps(
-                probe, count=max(5, sample_count * 2)
-            )
-            detections = _ocr_pass(
-                ffmpeg_path, tesseract_path, resolved,
-                enhanced_timestamps, scan_regions, tmp_root,
-                enhance=True, label="enh",
-            )
+        # Pass 2: enhanced crop. Negate + brightness-lift makes light-on-light
+        # marks readable, and the extra timestamps reduce the chance of every
+        # sample landing where the mark is off-screen (animated intros, cuts).
+        # Pooled with pass 1 rather than replacing it: whichever pass read the
+        # mark most completely is what _best_watermark_detection sizes on.
+        detections += _ocr_pass(
+            ffmpeg_path, tesseract_path, resolved,
+            _sample_timestamps(probe, count=max(5, sample_count * 2)),
+            scan_regions, tmp_root,
+            enhance=True, label="enh",
+        )
 
     if not detections:
         return None
@@ -434,7 +456,36 @@ def _cover_geometry(
     )
 
 
+def _boxes_overlap(a: WatermarkRegion, b: WatermarkRegion, *, slack: int) -> bool:
+    """Whether two detected boxes are the same on-screen mark, within ``slack``."""
+    return not (
+        a.x > b.x + b.w + slack
+        or b.x > a.x + a.w + slack
+        or a.y > b.y + b.h + slack
+        or b.y > a.y + a.h + slack
+    )
+
+
 def _best_watermark_detection(detections: list[WatermarkRegion]) -> WatermarkRegion | None:
+    """The most consistently detected handle, as a box covering its full extent.
+
+    Three things this has to get right, each learned from a real miss:
+
+    1. **Votes count per handle BODY, not per region.** Scan tiles overlap by
+       design, so one real watermark is normally found in two to four adjacent
+       tiles. Keying the count on the tile name split those votes and let a
+       single spurious read outrank a mark seen repeatedly.
+    2. **A truncated read reinforces the fullest one instead of competing with
+       it.** OCR reads the same mark to different depths — ``@HISTORYBY`` from
+       the raw pass, ``@HISTORYBYPASS`` from the enhanced one. Treated as rival
+       handles, the short read could win and the cover, sized to its box, left
+       the tail of the original showing.
+    3. **The returned box is the union of that mark's reads.** Same reason: the
+       widest read is the best estimate of what actually has to be buried.
+       Only boxes that overlap the fullest read are merged, so a handle that
+       genuinely appears twice in different places never yields one giant rect
+       spanning both.
+    """
     candidates = [
         detection
         for detection in detections
@@ -443,14 +494,34 @@ def _best_watermark_detection(detections: list[WatermarkRegion]) -> WatermarkReg
     if not candidates:
         return None
 
-    grouped: Counter[tuple[str, str]] = Counter(
-        (_handle_body(detection.text), detection.corner) for detection in candidates
+    bodies = {_handle_body(detection.text) for detection in candidates}
+
+    def _fullest(body: str) -> str:
+        """The longest body this one is a prefix of (or itself)."""
+        return max(
+            (other for other in bodies if other.startswith(body) or body.startswith(other)),
+            key=len,
+        )
+
+    votes: Counter[str] = Counter(_fullest(_handle_body(d.text)) for d in candidates)
+    best_body = votes.most_common(1)[0][0]
+    group = [d for d in candidates if _fullest(_handle_body(d.text)) == best_body]
+
+    # Seed on the longest read: it saw the most of the mark, so its box is the
+    # best anchor and its text the most complete.
+    seed = max(group, key=lambda d: (len(_handle_body(d.text)), d.w))
+    slack = max(4, seed.h // 2)
+    merged = [d for d in group if _boxes_overlap(d, seed, slack=slack)]
+    left = min(d.x for d in merged)
+    top = min(d.y for d in merged)
+    return WatermarkRegion(
+        x=left,
+        y=top,
+        w=max(d.x + d.w for d in merged) - left,
+        h=max(d.y + d.h for d in merged) - top,
+        text=seed.text,
+        corner=seed.corner,
     )
-    best_key = grouped.most_common(1)[0][0]
-    for detection in candidates:
-        if (_handle_body(detection.text), detection.corner) == best_key:
-            return detection
-    return candidates[0]
 
 
 def _normalize_handle(value: str | None) -> str:
@@ -497,41 +568,47 @@ def _ocr_pass(
                  to the extracted crop before handing it to Tesseract.
         label:   Short string used to name temp files so passes don't collide.
 
-    Returns a (possibly empty) list of detected WatermarkRegion objects.
+    Returns a (possibly empty) list of detected WatermarkRegion objects, in
+    timestamp-then-region order regardless of the order the OCR calls finished,
+    so :func:`_best_watermark_detection` stays deterministic.
+
+    Cost shape: ONE FFmpeg seek per timestamp (not one per region — the regions
+    are cut out of that single decoded frame in-process), then the per-region
+    Tesseract calls run concurrently. Before that, a 9-region scan spent 9
+    FFmpeg launches re-decoding the same frame and ran every OCR back to back,
+    which is what made this step ~40s per reel.
     """
+    coord_scale = 2.0 if enhance else 1.0
     detections: list[WatermarkRegion] = []
     for idx, ts in enumerate(timestamps):
-        for region_name, x_off, y_off, width, height in scan_regions:
-            frame_path = tmp_root / f"f{idx}-{region_name}-{label}.png"
+        frame_path = tmp_root / f"frame{idx}-{label}.png"
+        try:
+            _extract_full_frame(ffmpeg_path, video_path, ts, frame_path)
+            crops = _write_region_crops(
+                frame_path, scan_regions, tmp_root, index=idx, label=label, enhance=enhance
+            )
+        except Exception:  # noqa: BLE001 - a bad frame just contributes nothing
+            continue
+
+        def _ocr(item: tuple[tuple[str, int, int, int, int], Path]):
+            (region_name, x_off, y_off, _w, _h), crop_path = item
             try:
-                _extract_region_crop(
-                    ffmpeg_path,
-                    video_path,
-                    ts,
-                    x=x_off,
-                    y=y_off,
-                    width=width,
-                    height=height,
-                    output_path=frame_path,
-                    enhance=enhance,
+                boxes = _parse_tesseract_text_boxes(
+                    _run_tesseract_tsv(tesseract_path, crop_path)
                 )
             except Exception:  # noqa: BLE001
-                continue
-
-            try:
-                tsv = _run_tesseract_tsv(tesseract_path, frame_path)
-                boxes = _parse_tesseract_text_boxes(tsv)
-            except Exception:  # noqa: BLE001
-                continue
-
-            # Enhanced pass scales the image 2x so Tesseract coordinates are in
-            # 2x space; divide by 2 before adding the region offset.
-            coord_scale = 2.0 if enhance else 1.0
-            region = _find_handle_in_boxes(
+                return None
+            return _find_handle_in_boxes(
                 boxes, x_off, y_off, region_name, coord_scale=coord_scale
             )
-            if region is not None:
-                detections.append(region)
+
+        workers = max(1, min(_MAX_OCR_WORKERS, len(crops)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            # map() keeps results in submission order, which is what makes the
+            # detection list independent of thread scheduling.
+            for region in pool.map(_ocr, crops):
+                if region is not None:
+                    detections.append(region)
 
     return detections
 
@@ -551,34 +628,85 @@ def _corner_offsets(probe: VideoProbe, corner: str) -> tuple[int, int]:
     return x_off, y_off
 
 
-def _watermark_scan_regions(probe: VideoProbe) -> list[tuple[str, int, int, int, int]]:
+def _tile_origins(start: int, span: int, tile: int, step: int) -> list[int]:
+    """Tile origins covering ``start..start+span``, always flush to both ends.
+
+    The last origin is pinned to the far edge rather than left wherever the
+    stride happened to stop, so the trailing strip is never unscanned — that
+    off-by-a-stride strip is exactly where a bottom-right watermark hides.
+    """
+    if span <= tile:
+        return [start]
+    origins = list(range(start, start + span - tile + 1, step))
+    last = start + span - tile
+    if not origins or origins[-1] != last:
+        origins.append(last)
+    return origins
+
+
+def _watermark_scan_regions(
+    probe: VideoProbe,
+    *,
+    footage_rect: tuple[int, int, int, int] | None = None,
+) -> list[tuple[str, int, int, int, int]]:
     """Return (name, x, y, w, h) regions to OCR for watermark handles.
 
-    Coverage map (vertical bands, left side):
-      0-20%   → top-left corner
-      18-48%  → left-upper-mid  ← plugs the gap where @clips-style watermarks sit
-                                   (just below a title band, upper-left of content)
-      62-92%  → left-lower
-      80-100% → bottom-left corner
+    Tiles the search area with corner-sized crops stepping by half a tile, so
+    every pixel is covered and a handle straddling one tile boundary is still
+    whole inside its neighbour. This replaced nine hand-placed "lanes" that left
+    gaps between them: a real ``@historybypass`` mark at the bottom-right of the
+    footage sat in the gap below ``right-mid`` and above ``bottom-center`` and
+    was never OCR'd at all, while the lanes DID reach up into the app's own
+    burned-in post header and produced false positives there.
 
-    Right side has right-upper (15-50%) and right-mid (20-55%).
+    ``footage_rect`` (x, y, w, h) restricts tiling to the embedded footage. Two
+    reasons: a foreign watermark is always inside the footage, and everything
+    outside it on an exported reel is text this app drew itself — scanning our
+    own header/title can only ever yield a false positive. Falls back to the
+    whole frame when the footage rectangle is unknown (e.g. a raw clip whose
+    footage already fills the canvas).
     """
-    width = probe.width
-    height = probe.height
-    cw, ch = _corner_dimensions(probe)
-    return [
-        ("top-left", 0, 0, cw, ch),
-        ("top-right", width - cw, 0, cw, ch),
-        ("bottom-left", 0, height - ch, cw, ch),
-        ("bottom-right", width - cw, height - ch, cw, ch),
-        # Left mid: catches watermarks just below a title band (e.g. @clips style).
-        # Covers y=18%-48%, left 40% of frame — the gap between top-left and left-lower.
-        ("left-upper-mid", 0, int(height * 0.18), int(width * 0.40), int(height * 0.30)),
-        ("right-upper", int(width * 0.45), int(height * 0.15), int(width * 0.55), int(height * 0.35)),
-        ("right-mid", int(width * 0.55), int(height * 0.20), int(width * 0.45), int(height * 0.35)),
-        ("left-lower", 0, int(height * 0.62), int(width * 0.58), int(height * 0.30)),
-        ("bottom-center", int(width * 0.25), int(height * 0.68), int(width * 0.50), int(height * 0.25)),
-    ]
+    tile_w, tile_h = _corner_dimensions(probe)
+    if footage_rect is not None:
+        x0, y0, span_w, span_h = footage_rect
+    else:
+        x0, y0, span_w, span_h = 0, 0, probe.width, probe.height
+    tile_w = min(tile_w, span_w)
+    tile_h = min(tile_h, span_h)
+    step_x = max(1, int(tile_w * _TILE_STEP_RATIO))
+    step_y = max(1, int(tile_h * _TILE_STEP_RATIO))
+
+    regions: list[tuple[str, int, int, int, int]] = []
+    for row, y in enumerate(_tile_origins(y0, span_h, tile_h, step_y)):
+        for col, x in enumerate(_tile_origins(x0, span_w, tile_w, step_x)):
+            regions.append((f"r{row}c{col}", x, y, tile_w, tile_h))
+    return regions
+
+
+def _footage_rect(
+    video_path: Path, probe: VideoProbe
+) -> tuple[int, int, int, int] | None:
+    """The embedded footage rectangle as (x, y, w, h), or None if not found.
+
+    Best-effort: a failure just means the scan tiles the whole frame, which is
+    correct but slower and re-exposes the app's own overlays to OCR.
+    """
+    try:
+        # Local import: video imports nothing from here, but keeping the heavy
+        # numpy-backed detector out of module import stays consistent with how
+        # the rest of this module reaches into video.
+        from nicheflow_studio.processing.video import detect_content_rectangle
+
+        crop = detect_content_rectangle(video_path, probe)
+    except Exception:  # noqa: BLE001 - detection is advisory
+        return None
+    if crop is None:
+        return None
+    width = probe.width - crop.left - crop.right
+    height = probe.height - crop.top - crop.bottom
+    if width < _MIN_CORNER_W or height < _MIN_CORNER_H:
+        return None
+    return crop.left, crop.top, width, height
 
 
 def _extract_corner_crop(
@@ -610,6 +738,80 @@ def _extract_corner_crop(
     )
 
 
+def _extract_full_frame(
+    ffmpeg_path: Path,
+    input_path: Path,
+    timestamp: float,
+    output_path: Path,
+) -> None:
+    """Extract one whole frame as a PNG.
+
+    The scan cuts every region out of this one decode. Cropping per region in
+    FFmpeg instead meant N seeks and N decodes of the same frame for N regions.
+    """
+    command = [
+        str(ffmpeg_path),
+        "-hide_banner", "-y",
+        "-ss", f"{timestamp:.3f}",
+        "-i", str(input_path),
+        "-frames:v", "1",
+        str(output_path),
+    ]
+    subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+        **subprocess_run_kwargs(),
+    )
+
+
+def _enhance_crop(image):  # noqa: ANN001, ANN201 - PIL image in, PIL image out
+    """Pillow equivalent of the FFmpeg enhance chain used by the second pass.
+
+    Mirrors ``negate,eq=brightness=0.3:saturation=0,scale=iw*2:ih*2``:
+    invert, then greyscale (saturation=0) with mid-tones lifted by 0.3 of full
+    range (~77/255), then 2x upscale. Kept in lockstep with
+    :func:`_extract_region_crop`, which remains the FFmpeg reference for it.
+    """
+    from PIL import Image, ImageOps
+
+    inverted = ImageOps.invert(image.convert("RGB")).convert("L")
+    lifted = inverted.point(lambda value: min(255, value + _ENHANCE_BRIGHTNESS_LIFT))
+    return lifted.resize(
+        (lifted.width * 2, lifted.height * 2), resample=Image.BICUBIC
+    )
+
+
+def _write_region_crops(
+    frame_path: Path,
+    scan_regions: list[tuple[str, int, int, int, int]],
+    tmp_root: Path,
+    *,
+    index: int,
+    label: str,
+    enhance: bool,
+) -> list[tuple[tuple[str, int, int, int, int], Path]]:
+    """Cut every scan region out of one extracted frame. Returns (region, path)."""
+    from PIL import Image
+
+    crops: list[tuple[tuple[str, int, int, int, int], Path]] = []
+    with Image.open(frame_path) as frame:
+        frame.load()
+        for region in scan_regions:
+            name, x, y, width, height = region
+            box = (x, y, min(x + width, frame.width), min(y + height, frame.height))
+            if box[2] <= box[0] or box[3] <= box[1]:
+                continue
+            crop = frame.crop(box)
+            if enhance:
+                crop = _enhance_crop(crop)
+            crop_path = tmp_root / f"f{index}-{name}-{label}.png"
+            crop.save(crop_path)
+            crops.append((region, crop_path))
+    return crops
+
+
 def _extract_region_crop(
     ffmpeg_path: Path,
     input_path: Path,
@@ -623,6 +825,11 @@ def _extract_region_crop(
     enhance: bool = False,
 ) -> None:
     """Extract a rectangular crop from a single frame as a PNG.
+
+    The FFmpeg reference for the enhance chain that :func:`_enhance_crop`
+    mirrors in Pillow. The scan itself no longer calls this (one decode per
+    region was most of its cost); kept because it is the ground truth those
+    two implementations are checked against.
 
     When ``enhance`` is True the crop is post-processed with:
     - ``negate`` — inverts the image so white-on-light watermarks (the most
@@ -735,6 +942,14 @@ def _group_boxes_by_line(
 
     Boxes are on the same line if their tops are within ``v_tolerance`` pixels
     and the horizontal gap between consecutive boxes is within ``h_gap_max``.
+
+    Each group is returned in left-to-right order, NOT in the ``(top, left)``
+    order used to walk the boxes. Those differ whenever two boxes on one line
+    sit a pixel or two apart vertically, and the caller joins the group into a
+    string — so returning sort order let a box further right be prepended and
+    fabricate text that is nowhere on screen. That is how a "Vaulted History"
+    post header plus a verified badge misread as ``@`` became the handle
+    ``@story`` and got covered as if it were a foreign watermark.
     """
     if not boxes:
         return []
@@ -749,7 +964,7 @@ def _group_boxes_by_line(
             last_group.append(box)
         else:
             groups.append([box])
-    return groups
+    return [sorted(group, key=lambda b: b.left) for group in groups]
 
 
 def _rounded_rect_filter(
