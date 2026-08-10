@@ -48,6 +48,9 @@ type Stage = "pick" | "prepared" | "imported";
 const SETTING_EXCLUDED_ACCOUNTS = "batchDrafts.excludedAccountIds";
 const SETTING_AUTO_DISTRIBUTE = "batchDrafts.autoDistributeOnReject";
 const SETTING_NICHE = "batchDrafts.niche";
+// Read by the Python export path, not just this screen — hence the un-namespaced
+// key. Keep it in sync with export.WATERMARK_SCAN_SETTING_KEY.
+const SETTING_WATERMARK_SCAN = "export_watermark_scan";
 const KNOWN_NICHES = ["history", "movie"] as const;
 
 function parseExcludedAccounts(value: unknown): ReadonlySet<number> {
@@ -184,6 +187,9 @@ export function BatchDraftsScreen({
   const [reviewing, setReviewing] = useState<BatchCandidateItem | null>(null);
   const [rejectReason, setRejectReason] = useState("wrong_niche");
   const [autoDistributeOnReject, setAutoDistributeOnReject] = useState(false);
+  // Defaults to on, matching the Python side: an export that quietly stopped
+  // covering foreign handles is worse than a slow one.
+  const [watermarkScan, setWatermarkScan] = useState(true);
   // Crop is opened per review, so it never stays open across clips.
   const [cropOpen, setCropOpen] = useState(false);
 
@@ -217,11 +223,15 @@ export function BatchDraftsScreen({
           SETTING_EXCLUDED_ACCOUNTS,
           SETTING_AUTO_DISTRIBUTE,
           SETTING_NICHE,
+          SETTING_WATERMARK_SCAN,
         ]);
         if (cancelled) return;
         setExcludedAccounts(parseExcludedAccounts(stored[SETTING_EXCLUDED_ACCOUNTS]));
         setAutoDistributeOnReject(stored[SETTING_AUTO_DISTRIBUTE] === true);
         setNiche(parseNiche(stored[SETTING_NICHE]));
+        // Unset reads back as undefined, which must mean on — same default the
+        // export path applies when the row has never been written.
+        setWatermarkScan(stored[SETTING_WATERMARK_SCAN] !== false);
       } catch {
         // A preference that won't load must not block the screen; defaults stand.
       } finally {
@@ -250,6 +260,11 @@ export function BatchDraftsScreen({
     if (!settingsLoaded) return;
     void bridge.setUiSetting(SETTING_NICHE, niche);
   }, [niche, settingsLoaded]);
+
+  useEffect(() => {
+    if (!settingsLoaded) return;
+    void bridge.setUiSetting(SETTING_WATERMARK_SCAN, watermarkScan);
+  }, [watermarkScan, settingsLoaded]);
 
   // Esc closes the review popup — and closes the crop editor first when it is
   // open, so one press never discards an in-progress crop along with the popup.
@@ -630,6 +645,21 @@ export function BatchDraftsScreen({
             <Button size="sm" variant="secondary" onClick={load} disabled={busy}>
               Refresh
             </Button>
+            <label
+              className="flex items-center gap-2 text-muted-foreground"
+              title="Scans every reel for a foreign @handle and covers it with yours. Adds roughly 17s per reel, about half of an export. Turn it off when the source accounts don't watermark."
+            >
+              <input
+                type="checkbox"
+                checked={watermarkScan}
+                disabled={busy}
+                onChange={(event) => setWatermarkScan(event.target.checked)}
+              />
+              <span>
+                Cover foreign watermarks
+                {!watermarkScan && " (off — exports ~17s/reel faster)"}
+              </span>
+            </label>
           </div>
 
           {progress && (

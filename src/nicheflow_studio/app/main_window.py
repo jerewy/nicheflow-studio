@@ -1516,7 +1516,13 @@ class ProcessWorker(QObject):
                 "watermark_detected_text": None,
                 "watermark_replacement_text": self._job.watermark_replacement_text,
             }
-            if self._job.watermark_replacement_text:
+            # Same switch the React export path reads, so turning the scan off
+            # means off everywhere rather than only on one of the two surfaces.
+            from nicheflow_studio.services.export import watermark_scan_enabled
+
+            if self._job.watermark_replacement_text and not watermark_scan_enabled():
+                watermark_payload["watermark_skipped_reason"] = "watermark scan turned off"
+            elif self._job.watermark_replacement_text:
                 temp_output = output_path.with_stem(output_path.stem + "_watermark")
                 replacement = replace_detected_watermark(
                     output_path,

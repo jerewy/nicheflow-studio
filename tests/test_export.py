@@ -11,7 +11,7 @@ from nicheflow_studio.db.models import Account, DownloadItem, UploadJob
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.processing import video
 from nicheflow_studio.services import export as export_svc
-from nicheflow_studio.services import publishing
+from nicheflow_studio.services import publishing, ui_settings
 from nicheflow_studio.services.export import ExportError
 
 
@@ -355,6 +355,40 @@ def test_export_skips_watermark_when_account_has_no_handle(
 
     assert result["watermark_replaced"] is False
     assert result["watermark_skipped_reason"] == "no publishing handle set"
+
+
+def test_export_skips_watermark_when_the_scan_is_turned_off(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The scan is ~40s of a ~45s export and finds nothing on unwatermarked
+    sources, so it is switchable — and switching it off must skip the detection
+    pass itself, not just the cover step."""
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake")
+    item_id = _make_item(file_path=str(source), instagram_handle="@ourbrand")
+    _mock_video(monkeypatch, {})
+
+    def fail_if_called(*_args, **_kwargs):
+        pytest.fail("watermark detection must not run when the scan is off")
+
+    monkeypatch.setattr(export_svc, "replace_detected_watermark", fail_if_called)
+    ui_settings.set_setting(export_svc.WATERMARK_SCAN_SETTING_KEY, False)
+
+    result = export_svc.export_item(item_id)
+
+    assert result["watermark_replaced"] is False
+    assert result["watermark_skipped_reason"] == "watermark scan turned off"
+    assert result["processed_path"]
+
+
+def test_watermark_scan_is_on_until_it_is_explicitly_turned_off() -> None:
+    # An unset preference must read as ON: defaulting a never-configured install
+    # to "off" would silently ship foreign handles on real posts.
+    assert export_svc.watermark_scan_enabled() is True
+    ui_settings.set_setting(export_svc.WATERMARK_SCAN_SETTING_KEY, False)
+    assert export_svc.watermark_scan_enabled() is False
+    ui_settings.set_setting(export_svc.WATERMARK_SCAN_SETTING_KEY, True)
+    assert export_svc.watermark_scan_enabled() is True
 
 
 def test_export_missing_file_path_raises() -> None:

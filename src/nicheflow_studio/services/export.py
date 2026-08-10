@@ -35,6 +35,23 @@ logger = logging.getLogger(__name__)
 
 ProgressFn = Callable[[float, str], None]
 
+# Whether exports scan for a foreign @handle to cover. The scan OCRs overlapping
+# tiles across several sampled frames, which measured ~17s per reel over 38 real
+# exports — roughly half of a ~32s export, the other half being the render. On
+# sources that never watermark that is pure overhead, so it is switchable.
+# Defaults to ON: turning detection off silently would let a foreign brand ship
+# on a post.
+WATERMARK_SCAN_SETTING_KEY = "export_watermark_scan"
+
+
+def watermark_scan_enabled() -> bool:
+    """Whether the watermark cover step runs. Defaults to on."""
+    # Lazy import: ui_settings pulls in the DB models, and export is imported
+    # from the processing chain during app start.
+    from nicheflow_studio.services import ui_settings
+
+    return ui_settings.get_setting(WATERMARK_SCAN_SETTING_KEY, True) is not False
+
 
 def _check_cancel(cancel_event: "threading.Event | None") -> None:
     """Abort the export with :class:`JobCanceled` if cancellation was requested.
@@ -288,6 +305,11 @@ def _replace_watermark_best_effort(output_path: Path, replacement_handle: str) -
         "watermark_detected_text": None,
         "watermark_skipped_reason": None,
     }
+    if not watermark_scan_enabled():
+        # Turned off for speed; same shape as the other skips so callers and the
+        # results view need no special case.
+        status["watermark_skipped_reason"] = "watermark scan turned off"
+        return status
     if not replacement_handle:
         # No account handle to stamp — skip before the (expensive) detection pass.
         status["watermark_skipped_reason"] = "no publishing handle set"
@@ -408,7 +430,8 @@ def export_item(
         raise JobCanceled(str(exc)) from exc
 
     _check_cancel(cancel_event)
-    report(0.85, "Covering watermark…")
+    if watermark_scan_enabled():
+        report(0.85, "Covering watermark…")
     watermark_status = _replace_watermark_best_effort(result_path, watermark_handle)
 
     _check_cancel(cancel_event)
