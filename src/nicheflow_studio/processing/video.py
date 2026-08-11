@@ -9,7 +9,7 @@ import threading
 import base64
 import av
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from statistics import median
 from pathlib import Path
 
@@ -1064,6 +1064,330 @@ def sample_video_frame_data_urls(input_path: Path, *, max_frames: int = 5) -> li
                 f"data:image/jpeg;base64,{base64.b64encode(frame_path.read_bytes()).decode('ascii')}"
             )
     return sampled_urls
+
+
+# Two cuts closer together than this are treated as one shot: ffmpeg's scene
+# filter often fires on both the transition frame and the frame after it.
+_MIN_SHEET_TILE_GAP_SECONDS = 0.6
+# Width cap for a rendered contact sheet, chosen so a 6-tile grid lands near
+# 1,100 image tokens regardless of the source clip's aspect ratio.
+_MAX_SHEET_WIDTH = 1100
+# Downscale width for the static-overlay probe. Small is fine: a burned-in
+# banner spans the full width, so it survives aggressive downscaling.
+_OVERLAY_PROBE_WIDTH = 320
+# Mean per-row luma difference below which two frames count as identical.
+_OVERLAY_STABLE_ROW_TOLERANCE = 2.0
+# Ceiling on how much of the footage an "overlay" may claim, so a near-still
+# clip does not get cropped down to nothing.
+_MAX_OVERLAY_FRACTION = 0.35
+
+
+def detect_scene_change_timestamps(
+    input_path: Path,
+    *,
+    threshold: float = 0.15,
+    limit: int = 24,
+    crop_filter: str | None = None,
+) -> list[float]:
+    """Timestamps where the picture changes enough to be a new shot.
+
+    Evenly spaced sampling wastes slots on static shots: on a 35s awards clip,
+    9 evenly spaced frames yielded only about 5 distinct moments because three
+    of them landed on the same podium shot. Scene cuts spend every slot on
+    something the previous slot did not already show.
+
+    ``crop_filter`` matters more than it looks. These reels are letterboxed, so
+    unchanging black bars cover over 40% of the frame and drag every scene score
+    down: an obvious hard cut in the footage scored under 0.25 on the full frame
+    and vanished entirely at the usual 0.3 threshold. Measuring the cropped
+    footage region restores normal scores, which is why the default threshold
+    here is tuned for cropped input.
+
+    Returns an empty list when ffmpeg is missing or the clip has no detectable
+    cuts (a single continuous take), so callers must fall back to
+    :func:`_sample_timestamps`.
+    """
+    resolved_input = input_path.expanduser().resolve()
+    ffmpeg_path = ffmpeg_binary()
+    if ffmpeg_path is None or not resolved_input.exists():
+        return []
+
+    select_chain = f"select='gt(scene,{threshold})',showinfo"
+    command = [
+        str(ffmpeg_path),
+        "-hide_banner",
+        "-i",
+        str(resolved_input),
+        "-vf",
+        f"{crop_filter},{select_chain}" if crop_filter else select_chain,
+        "-an",
+        "-f",
+        "null",
+        "-",
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            **subprocess_run_kwargs(),
+        )
+    except Exception:  # noqa: BLE001 - scene detection is an optimisation, never fatal
+        return []
+
+    timestamps: list[float] = []
+    for match in re.finditer(r"pts_time:([0-9]+\.?[0-9]*)", completed.stderr or ""):
+        try:
+            timestamps.append(float(match.group(1)))
+        except ValueError:
+            continue
+        if len(timestamps) >= limit:
+            break
+    return timestamps
+
+
+def detect_static_top_overlay_height(
+    input_path: Path,
+    *,
+    crop_filter: str,
+    region_height: int,
+) -> int:
+    """Height in source pixels of a burned-in banner at the top of the footage.
+
+    The source reels carry the original account's on-screen title welded into
+    the picture. It repeats identically in every tile of a contact sheet, so on
+    a 6-tile grid the same sentence is rendered six times for roughly a sixth of
+    the image budget. That text is already handed to the model as ``Source
+    title``, so the pixels buy nothing.
+
+    Detection is by stability rather than OCR: rows that are pixel-identical
+    between two frames far apart in the clip are an overlay, not footage. This
+    costs about half a second against roughly ten seconds for the OCR-based
+    :func:`detect_top_title_crop`.
+
+    Returns 0 when nothing static is found or ffmpeg/Pillow are unavailable.
+    """
+    ffmpeg_path = ffmpeg_binary()
+    if ffmpeg_path is None or region_height <= 0:
+        return 0
+    try:
+        from PIL import Image  # noqa: PLC0415 - optional at import time
+        import numpy as np  # noqa: PLC0415
+    except ImportError:
+        return 0
+
+    probe = probe_video(input_path)
+    duration = probe.duration_seconds or 0.0
+    if duration <= 0:
+        return 0
+
+    rows: list[object] = []
+    with tempfile.TemporaryDirectory(prefix="nicheflow-overlay-") as temp_dir:
+        for index, fraction in enumerate((0.15, 0.85)):
+            frame_path = Path(temp_dir) / f"probe-{index}.png"
+            command = [
+                str(ffmpeg_path),
+                "-hide_banner",
+                "-y",
+                "-ss",
+                f"{duration * fraction:.3f}",
+                "-i",
+                str(input_path),
+                "-frames:v",
+                "1",
+                "-vf",
+                f"{crop_filter},scale={_OVERLAY_PROBE_WIDTH}:-2",
+                str(frame_path),
+            ]
+            try:
+                subprocess.run(
+                    command,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    **subprocess_run_kwargs(),
+                )
+                rows.append(np.asarray(Image.open(frame_path).convert("L"), dtype=np.int16))
+            except Exception:  # noqa: BLE001 - the crop simply stays wider
+                return 0
+
+    if len(rows) != 2:
+        return 0
+    first, second = rows
+    probe_height = min(first.shape[0], second.shape[0])
+    if probe_height <= 0:
+        return 0
+
+    row_difference = np.abs(first[:probe_height] - second[:probe_height]).mean(axis=1)
+    static_rows = 0
+    for row_index in range(probe_height):
+        if row_difference[row_index] >= _OVERLAY_STABLE_ROW_TOLERANCE:
+            break
+        static_rows = row_index + 1
+
+    if static_rows == 0:
+        return 0
+    # A slideshow or a frozen frame is static everywhere; never crop away the
+    # footage itself just because the clip barely moves.
+    ratio = min(static_rows / probe_height, _MAX_OVERLAY_FRACTION)
+    return int(region_height * ratio)
+
+
+def _spread_timestamps(
+    candidates: list[float], *, count: int, duration: float | None
+) -> list[float]:
+    """Pick ``count`` timestamps from ``candidates``, spread across the clip.
+
+    Scene detection often clusters cuts (a fast cutaway and back), so taking the
+    first N would sample one busy second and miss the rest of the clip. Walking
+    evenly through the sorted candidates keeps coverage.
+    """
+    unique: list[float] = []
+    for value in sorted({round(value, 2) for value in candidates if value >= 0}):
+        if duration and value > max(duration - 0.1, 0.0):
+            continue
+        # Detection fires twice on some cuts (the transition frame and the one
+        # after), which would spend two tiles on the same shot.
+        if unique and value - unique[-1] < _MIN_SHEET_TILE_GAP_SECONDS:
+            continue
+        unique.append(value)
+    if not unique:
+        return []
+    if len(unique) <= count:
+        return unique
+    step = len(unique) / count
+    return [unique[min(int(index * step), len(unique) - 1)] for index in range(count)]
+
+
+def build_contact_sheet(
+    input_path: Path,
+    output_path: Path,
+    *,
+    max_tiles: int = 6,
+    columns: int = 3,
+    tile_height: int = 420,
+) -> Path:
+    """Render one grid image showing several moments from a clip.
+
+    One still shows one moment, which is how a draft ends up describing a man at
+    a podium and missing that the cartoon characters are sitting in the audience.
+    A 6-tile sheet costs about 1,300 image tokens against roughly 970 for a
+    single full-height still, so the extra evidence is close to free.
+
+    Tiles are cropped with :func:`detect_border_crop` because these reels are
+    letterboxed: on a typical 1080x1920 source the black bands are over 40% of
+    the frame, and the burned-in source title inside them is already supplied to
+    the model as ``Source title`` text. Cropping spends the token budget on
+    footage instead of on bars and duplicated text.
+    """
+    resolved_input = input_path.expanduser().resolve()
+    resolved_output = output_path.expanduser().resolve()
+    ffmpeg_path = ffmpeg_binary()
+    if ffmpeg_path is None:
+        raise RuntimeError("ffmpeg is not installed.")
+    if not resolved_input.exists():
+        raise FileNotFoundError(f"Video file not found: {resolved_input}")
+
+    probe = probe_video(resolved_input)
+    tiles = max(1, max_tiles)
+
+    crop = detect_border_crop(resolved_input, probe) or CropSettings()
+    keep_width = max(probe.width - crop.left - crop.right, 16)
+    keep_height = max(probe.height - crop.top - crop.bottom, 16)
+
+    def _crop_filter(top: int, height: int) -> str:
+        # Even dimensions keep the JPEG encoder and the tile filter happy.
+        return f"crop={keep_width - keep_width % 2}:{height - height % 2}:{crop.left}:{top}"
+
+    overlay_height = detect_static_top_overlay_height(
+        resolved_input,
+        crop_filter=_crop_filter(crop.top, keep_height),
+        region_height=keep_height,
+    )
+    if overlay_height > 0 and keep_height - overlay_height >= 16:
+        crop = replace(crop, top=crop.top + overlay_height)
+        keep_height -= overlay_height
+    crop_filter = _crop_filter(crop.top, keep_height)
+
+    timestamps = _spread_timestamps(
+        detect_scene_change_timestamps(resolved_input, crop_filter=crop_filter),
+        count=tiles,
+        duration=probe.duration_seconds,
+    )
+    # A continuous take has no cuts to find, and a clip with only two cuts still
+    # has more than two moments worth showing, so top up to the tile count.
+    if len(timestamps) < tiles:
+        timestamps = sorted({*timestamps, *_sample_timestamps(probe, count=tiles)})[:tiles]
+
+    resolved_output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="nicheflow-sheet-") as temp_dir:
+        temp_root = Path(temp_dir)
+        written = 0
+        for timestamp in timestamps:
+            tile_path = temp_root / f"tile-{written}.jpg"
+            command = [
+                str(ffmpeg_path),
+                "-hide_banner",
+                "-y",
+                "-ss",
+                f"{timestamp:.3f}",
+                "-i",
+                str(resolved_input),
+                "-frames:v",
+                "1",
+                "-vf",
+                f"{crop_filter},scale=-2:{tile_height}",
+                "-q:v",
+                "4",
+                str(tile_path),
+            ]
+            try:
+                subprocess.run(
+                    command,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    **subprocess_run_kwargs(),
+                )
+            except subprocess.CalledProcessError:
+                # Seeking past a truncated stream yields no frame; skip that
+                # moment rather than losing the whole sheet.
+                continue
+            written += 1
+
+        if written == 0:
+            raise RuntimeError(f"No frames could be sampled from {resolved_input}.")
+
+        rows = (written + columns - 1) // columns
+        tile_command = [
+            str(ffmpeg_path),
+            "-hide_banner",
+            "-y",
+            "-framerate",
+            "1",
+            "-i",
+            str(temp_root / "tile-%d.jpg"),
+            "-vf",
+            f"tile={min(columns, written)}x{rows}:padding=4:color=gray,"
+            # Source aspect varies once the letterbox is cropped, so an unbounded
+            # grid swings between roughly 1,200 and 1,700 image tokens. Capping
+            # the width keeps the per-reel cost predictable across a batch.
+            f"scale='min({_MAX_SHEET_WIDTH},iw)':-2",
+            "-frames:v",
+            "1",
+            "-q:v",
+            "4",
+            str(resolved_output),
+        ]
+        subprocess.run(
+            tile_command,
+            check=True,
+            capture_output=True,
+            text=True,
+            **subprocess_run_kwargs(),
+        )
+    return resolved_output
 
 
 def extract_video_preview_frame(

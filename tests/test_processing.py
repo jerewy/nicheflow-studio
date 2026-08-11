@@ -2188,3 +2188,69 @@ def test_write_clip_srt_clips_and_shifts_to_zero_based(tmp_path: Path) -> None:
     # Blank cue is dropped, so numbering stays contiguous over the kept cues.
     assert content.startswith("1\n00:00:01,000 --> 00:00:03,500\nfirst line")
     assert "2\n00:00:04,000 --> 00:00:08,000\nspans past the end" in content
+
+
+def test_detect_scene_change_timestamps_measures_the_cropped_region(
+    monkeypatch, tmp_path: Path
+) -> None:
+    # Regression: these reels are letterboxed, so unchanging black bars covering
+    # over 40% of the frame dragged every scene score down. An obvious hard cut
+    # scored under 0.25 on the full frame and vanished at the usual 0.3
+    # threshold, which is why the crop has to be applied before the measurement.
+    input_path = tmp_path / "reel.mp4"
+    input_path.write_bytes(b"video")
+    monkeypatch.setattr(video, "ffmpeg_binary", lambda: Path("C:/tools/ffmpeg.exe"))
+    captured: dict[str, list[str]] = {}
+
+    def fake_run(command: list[str], **kwargs) -> subprocess.CompletedProcess[str]:
+        captured["command"] = command
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=0,
+            stdout="",
+            stderr="[Parsed_showinfo] n:0 pts_time:3.5 \n[Parsed_showinfo] n:1 pts_time:10.7 \n",
+        )
+
+    monkeypatch.setattr(video.subprocess, "run", fake_run)
+
+    result = video.detect_scene_change_timestamps(
+        input_path, crop_filter="crop=1080:1098:0:426"
+    )
+
+    assert result == [3.5, 10.7]
+    filter_chain = captured["command"][captured["command"].index("-vf") + 1]
+    assert filter_chain.startswith("crop=1080:1098:0:426,")
+    assert "select='gt(scene,0.15)'" in filter_chain
+
+
+def test_detect_scene_change_timestamps_survives_a_missing_ffmpeg(
+    monkeypatch, tmp_path: Path
+) -> None:
+    input_path = tmp_path / "reel.mp4"
+    input_path.write_bytes(b"video")
+    monkeypatch.setattr(video, "ffmpeg_binary", lambda: None)
+
+    assert video.detect_scene_change_timestamps(input_path) == []
+
+
+def test_spread_timestamps_drops_double_fired_cuts() -> None:
+    # ffmpeg's scene filter often fires on both the transition frame and the one
+    # after it, which would otherwise spend two contact-sheet tiles on one shot.
+    result = video._spread_timestamps([1.5, 1.52, 5.6, 8.6], count=4, duration=30.0)
+
+    assert result == [1.5, 5.6, 8.6]
+
+
+def test_spread_timestamps_walks_evenly_through_clustered_cuts() -> None:
+    # A busy second of cutaways must not eat every tile: coverage across the
+    # whole clip matters more than catching each cut in one burst.
+    candidates = [1.0, 2.0, 3.0, 4.0, 5.0, 20.0, 21.0, 22.0]
+
+    result = video._spread_timestamps(candidates, count=3, duration=30.0)
+
+    assert result[0] == 1.0
+    assert max(result) >= 20.0
+
+
+def test_spread_timestamps_ignores_cuts_past_the_end() -> None:
+    assert video._spread_timestamps([1.0, 99.0], count=3, duration=10.0) == [1.0]

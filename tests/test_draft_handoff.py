@@ -419,7 +419,11 @@ def test_build_account_batch_chat_prompt_uses_measured_winners_and_title_length(
     assert "MEASURED ACCOUNT WINNER EXAMPLES" in prompt
     assert "Measured batch winner" in prompt
     assert "Title length: Auto" in prompt
-    assert "Option 1 SHORT" in prompt
+    # The band list must reach the chat prompt; which option carries which band
+    # is deliberately left to the register assignment (see
+    # test_title_length_auto_does_not_pin_a_band_to_an_option_number).
+    assert "each length band exactly once" in prompt
+    assert "5-9 words" in prompt
 
 
 def test_build_chat_prompt_requires_niche_fit_check() -> None:
@@ -1565,3 +1569,59 @@ def test_batch_candidates_expose_a_preview_path_and_source_url() -> None:
     assert item["file_path"] == "C:/clips/LambdaHistory1.mp4"
     assert item["source_url"] == "https://instagram.com/reel/LambdaHistory1"
     assert item["id"] == item_ids[0]
+
+
+def test_batch_headers_defer_the_recommendation_to_the_style_rules() -> None:
+    # Regression: the batch header carried its own global "recommend the one
+    # whose specific the clip delivers most strongly" line that competed with the
+    # style-specific RECOMMENDED PICK rule. After the HistoryTrails rules were
+    # retuned so the reactive register wins by default, a real batch still picked
+    # the documentary option in 6 of 6 reels and justified each as "the strongest
+    # concrete signal", which is the header's wording and not the style rule's.
+    account_id, item_ids = _make_account_items(2)
+
+    prompt = draft_handoff.build_account_batch_chat_prompt(
+        account_id,
+        item_ids,
+        {"title_style": "historytrails_record", "caption_style": "history_context"},
+    )
+
+    assert "whose specific the clip delivers most strongly" not in prompt
+    assert "RECOMMENDED PICK rule in the on-screen title rules above" in prompt
+    # The style rule must still be the one voice that IS present.
+    assert "a REACTIVE option is the default pick" in prompt
+
+
+def test_batch_headers_ban_repeating_a_title_stem_across_reels() -> None:
+    # Regression: one prompt draws one example set and every reel is written
+    # against it, so a real six-reel batch came back with four titles opening
+    # "Would you ..." / "Would this ...". Within-reel variety rules cannot see
+    # across reels; the batch header has to say it.
+    account_id, item_ids = _make_account_items(3)
+
+    prompt = draft_handoff.build_account_batch_chat_prompt(account_id, item_ids, {})
+
+    assert "Cross-reel variety (HARD RULE)" in prompt
+    assert "Never open two reels' titles with the same first three words" in prompt
+    assert "Would you ..." in prompt
+
+
+def test_multi_account_batch_header_carries_the_same_variety_rules() -> None:
+    _account_id, item_ids = _make_account_items(2)
+
+    prompt = draft_handoff.build_multi_account_batch_chat_prompt(item_ids, {})
+
+    assert "Cross-reel variety (HARD RULE)" in prompt
+    assert "whose specific the clip delivers most strongly" not in prompt
+
+
+def test_batch_header_requires_the_recommended_register_to_vary() -> None:
+    # Regression: a six-reel batch recommended Option 2, the question, in all six
+    # reels. Within-reel rules cannot see that pattern; only the batch header can.
+    _account_id, item_ids = _make_account_items(2)
+
+    prompt = draft_handoff.build_account_batch_chat_prompt(_account_id, item_ids, {})
+
+    assert "Vary the RECOMMENDED register across reels" in prompt
+    assert "no single register may take more than about half" in prompt
+    assert "the option number you recommend must change between" in prompt

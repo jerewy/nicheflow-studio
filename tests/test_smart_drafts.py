@@ -1167,24 +1167,66 @@ def test_history_lost_archive_title_rules_allow_one_controlled_curiosity_gap() -
     assert "first-ever status" in joined
 
 
-def test_historytrails_title_rules_require_one_comment_hook_option() -> None:
+def test_historytrails_title_rules_require_two_reactive_options() -> None:
     rules = smart_drafts._historytrails_title_rules()
     joined = "\n".join(rules)
 
-    # Exactly one of three options must invite a reply, not just a save.
-    assert "COMMENT HOOK" in joined
-    assert "EXACTLY ONE of the three options" in joined
-    # The three sanctioned comment-hook shapes are spelled out.
+    # Two of three options must be reactive, not one. Scoring the 726-title
+    # reference set put questions at 187k median views against 73k for the rest
+    # and first-person at 95k, so the museum-label declarative is the weakest of
+    # the three registers and must not hold the majority of the options.
+    assert "REGISTER MIX" in joined
+    assert "TWO of the three options in a REACTIVE" in joined
+    assert "only ONE as a calm documentary line" in joined
+    # The sanctioned reactive shapes are spelled out.
     assert "a real question" in joined
-    assert "first-person reaction" in joined
     assert "nostalgia prompt" in joined
-    # The other two options keep the documentary voice.
-    assert "Keep the other two options in the calm" in joined
+    # Two reactive options must not be the same shape twice.
+    assert "must be DIFFERENT shapes" in joined
+
+
+def test_historytrails_title_rules_require_a_first_person_option() -> None:
+    # Regression: a real six-reel batch produced one question per reel and ZERO
+    # first-person titles across all 18 options, because "reactive" was stated as
+    # a menu of three shapes and the model read it as "question". First person
+    # measures 95k median views against 73k, so it is now named as required and
+    # second person is explicitly not a substitute.
+    joined = "\n".join(smart_drafts._historytrails_title_rules())
+
+    assert "exactly one of them MUST be first-person" in joined
+    assert "I, my, me, we, our, or us" in joined
+    assert "second person is not first person" in joined
+
+
+def test_historytrails_recommender_leads_on_register_not_concreteness() -> None:
+    # Regression: with the hard-specific quota removed but the old recommender
+    # line left in place, a real batch still picked the documentary option in 6
+    # of 6 reels and justified each as "the strongest concrete signal", which is
+    # that line's wording. Concreteness must not be able to outrank register.
+    joined = "\n".join(smart_drafts._historytrails_title_rules())
+
+    assert "a REACTIVE option is the default pick" in joined
+    assert "concreteness is a tiebreaker inside a register" in joined
+    assert "never a reason to cross registers" in joined
+    assert "whose specific this clip delivers most strongly" not in joined
     # Loosening the voice must not loosen fact or clickbait discipline.
     assert "no invented facts" in joined
     assert "you won't believe" in joined
     # These rules ban em-dashes, so the rule text must not contain one itself.
     assert "—" not in joined and "–" not in joined
+
+
+def test_historytrails_title_rules_do_not_mandate_hard_specifics() -> None:
+    # Regression: the rules used to demand "at least TWO options must carry a
+    # hard specific (date, number, or real name)" and list "When <person>..." as
+    # a proven shape. Measured on the same account both underperform (a year at
+    # 72k median views against 76k without, "When ..." at 54k against 74k), so
+    # the quota is gone and the shape is explicitly discouraged.
+    joined = "\n".join(smart_drafts._historytrails_title_rules())
+
+    assert "At least TWO options must carry a hard specific" not in joined
+    assert "Do NOT open with 'When ...'" in joined
+    assert "never reach for one to satisfy a quota" in joined
 
 
 def test_history_title_rules_ban_artifact_narration_with_thin_evidence_fallback() -> None:
@@ -1204,7 +1246,11 @@ def test_history_title_rules_ban_artifact_narration_with_thin_evidence_fallback(
         assert "the story left untold" in joined
         assert "THIN-EVIDENCE FALLBACK" in joined
         assert "VISIBLE specifics" in joined
-        assert "Never choose an option BECAUSE it is the safest or most hedged" in joined
+        # Substring rather than the full sentence: the two voices word the guard
+        # differently now that the HistoryTrails recommender leads on register,
+        # but neither may lose the anti-hedging clause.
+        assert "safest or most hedged" in joined
+        assert "hedging is not a virtue" in joined
         # These voices ban em/en dashes, so the rule text itself must stay clean.
         assert "—" not in joined and "–" not in joined
 
@@ -1231,16 +1277,16 @@ def test_historytrails_archive_caption_rule_bans_recording_meta() -> None:
     assert "describe the visible scene in concrete detail instead" in rule
 
 
-def test_effective_title_rules_comment_hook_reaches_historytrails_style() -> None:
-    # The "(History) HistoryTrails" dropdown is historytrails_record; the comment
-    # hook must arrive through the shared router that BOTH the live generation
+def test_effective_title_rules_register_mix_reaches_historytrails_style() -> None:
+    # The "(History) HistoryTrails" dropdown is historytrails_record; the register
+    # mix must arrive through the shared router that BOTH the live generation
     # prompt and the Copy Chat Prompt contract use.
     rules = smart_drafts.effective_title_rules(
         "historytrails_record",
         None,
         "History moments, old clips, strange facts, and forgotten stories",
     )
-    assert "COMMENT HOOK" in "\n".join(rules)
+    assert "REGISTER MIX" in "\n".join(rules)
 
 
 def test_history_lost_archive_title_rules_include_static_winner_examples() -> None:
@@ -2858,9 +2904,25 @@ def test_title_length_rules_default_to_long() -> None:
 def test_title_length_rules_auto_spans_all_three_options() -> None:
     rules = "\n".join(smart_drafts._title_length_rules("auto"))
 
-    assert "Option 1" in rules and "5-9 words" in rules
-    assert "Option 2" in rules and "10-16 words" in rules
-    assert "Option 3" in rules and "15-28 words" in rules
+    # All three bands must still be required exactly once.
+    assert "5-9 words" in rules
+    assert "10-16 words" in rules
+    assert "15-28 words" in rules
+    assert "each length band exactly once" in rules
+
+
+def test_title_length_auto_does_not_pin_a_band_to_an_option_number() -> None:
+    # Regression: AUTO MIX used to read "Option 1 SHORT, Option 2 MEDIUM,
+    # Option 3 LONG". Any register rule in play assigns registers WITHOUT option
+    # numbers, so the two schemes competed for the same three slots. Which band
+    # lands on which option carries no meaning, so the register picks first.
+    rules = "\n".join(smart_drafts._title_length_rules("auto"))
+
+    assert "Option 1 SHORT" not in rules
+    assert "Option 2 MEDIUM" not in rules
+    assert "Option 3 LONG" not in rules
+    assert "Which option gets which band is YOUR choice" in rules
+    assert "Assign the register first" in rules
 
 
 def test_smart_draft_prompt_default_title_length_matches_explicit_long() -> None:
@@ -2903,3 +2965,20 @@ def test_generation_meta_records_none_styles_when_omitted(monkeypatch) -> None:
     meta = result.generation_meta or {}
     assert meta["caption_style"] is None
     assert meta["title_style"] is None
+
+
+def test_historytrails_recommender_does_not_rank_question_above_first_person() -> None:
+    # Regression: the recommender cited 187k for questions against 95k for
+    # first-person, and the model turned that into a fixed ranking, recommending
+    # the question option in 6 of 6 reels and freezing the option slots. The
+    # first-person titles were written and then discarded every time, so the
+    # register that had just been fixed still never shipped.
+    joined = "\n".join(smart_drafts._historytrails_title_rules())
+
+    assert "neither outranks the other by default" in joined
+    assert "Do NOT default to the question every time" in joined
+    assert "do NOT keep recommending the same option NUMBER" in joined
+    # The 187k figure rests on 18 titles; the prompt must say so where it is
+    # quoted, or it reads as law rather than as a prior.
+    assert "just 18 measured titles" in joined
+    assert "roughly equal rather than" in joined

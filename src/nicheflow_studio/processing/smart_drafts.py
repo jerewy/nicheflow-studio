@@ -9,6 +9,7 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+from nicheflow_studio.processing import title_references
 from nicheflow_studio.processing.video import sample_video_frame_data_urls
 
 
@@ -1518,10 +1519,21 @@ def _title_length_rules(title_length: str | None) -> list[str]:
         ]
     if normalized == "auto":
         return [
-            "- TITLE LENGTH CONTROL: AUTO MIX. The three options must visibly "
-            "span all length bands: Option 1 SHORT at 5-9 words and 1-2 lines; "
-            "Option 2 MEDIUM at 10-16 words and 2-3 lines; Option 3 LONG at "
-            "15-28 words and 4 lines."
+            "- TITLE LENGTH CONTROL: AUTO MIX. Across the three options you must "
+            "use each length band exactly once: SHORT at 5-9 words and 1-2 "
+            "lines, MEDIUM at 10-16 words and 2-3 lines, LONG at 15-28 words "
+            "and 4 lines.",
+            # Length used to be pinned to option NUMBER (Option 1 short, Option 2
+            # medium, Option 3 long). Any register rule in play assigns registers
+            # without numbers, so the two schemes competed for the same three
+            # slots and the model resolved it by dropping whichever register was
+            # hardest to fit the assigned length. Which band lands on which
+            # option carries no meaning, so let the register choose.
+            "- Which option gets which band is YOUR choice, not a fixed order. "
+            "Assign the register first, then give each option the band that "
+            "suits it: a reaction can be very short, a documentary line usually "
+            "needs the long band to carry its specifics. Do not reorder the "
+            "options to satisfy length; reassign the bands instead.",
         ]
     return [
         "- TITLE LENGTH CONTROL: LONG. Each title must be 15-28 words and target "
@@ -1866,21 +1878,33 @@ def _historytrails_title_rules(
     renders 3-5 left-aligned lines. Title format only; pairs with any
     caption_style.
 
-    One of the three options is a deliberate COMMENT HOOK (question, first-person
-    reaction, or shared-memory prompt). The reference @historytrails set
-    (data/title_analysis/historytrails-ocr) shows the highest-comment posts are
-    written in that reactive voice, while pure museum-label declaratives earn
-    saves but few replies. The other two options stay in the documentary voice.
+    TWO of the three options are written in a reactive voice (question,
+    first-person, or shared-memory prompt), not one. Scoring the 726-title
+    reference set (data/title_analysis/historytrails-ocr) against views put
+    questions at 187k median against 73k for everything else, and first-person
+    at 95k against 73k, while the hard specifics this prompt used to mandate
+    measured slightly *below* average: a four-digit year at 72k against 76k, a
+    superlative at 61k against 76k. "When ..." openings were the weakest shape
+    tested at 54k, so they are no longer listed as proven.
+
+    Examples now rotate per generation via :mod:`title_references` instead of
+    being five fixed lines, because a fixed example set is a fixed attractor:
+    50 of the last 360 generated titles opened with "It looked like".
     """
     measured = tuple(
         cleaned
         for value in (few_shot_winners or ())
         if (cleaned := _normalize_whitespace(str(value)))
     )
-    winners = measured or _HISTORYTRAILS_FEW_SHOT_WINNERS
-    winner_label = (
-        "MEASURED ACCOUNT WINNER EXAMPLES" if measured else "STATIC WINNER EXAMPLES"
-    )
+    if measured:
+        winners = measured
+        winner_label = "MEASURED ACCOUNT WINNER EXAMPLES"
+    elif retrieved := tuple(title_references.select_reference_titles()):
+        winners = retrieved
+        winner_label = "REFERENCE ACCOUNT WINNER EXAMPLES (rotating, real, top-performing)"
+    else:
+        winners = _HISTORYTRAILS_FEW_SHOT_WINNERS
+        winner_label = "STATIC WINNER EXAMPLES"
     return [
         "- GOAL: write the long, calm documentary caption that sits at the top of "
         "the clip. It SETS A SCENE in full sentences, names who/what/when, and "
@@ -1890,10 +1914,13 @@ def _historytrails_title_rules(
         "past tense. State real facts plainly and let them carry; no hype words, "
         "no selling, no exclamation marks. This is the same restraint as Cinematic "
         "Record, only written out as a complete descriptive sentence.",
-        "- BE SPECIFIC (the rule that matters most): anchor every title to at least "
-        "one hard real detail from THIS clip's evidence: a recognizable name, an "
-        "exact year or date, a number, or a place. STRANGER TEST: if a stranger "
-        "cannot tell THIS clip from any other by the title alone, add the specific.",
+        "- BE SPECIFIC, BUT NOT NECESSARILY FACTUAL: the test is that a stranger "
+        "can tell THIS clip from any other by the title alone. A hard detail "
+        "(name, year, number, place) is one way to pass it and a vivid visible "
+        "detail is another, so use a hard specific when the clip's evidence "
+        "genuinely carries one and never reach for one to satisfy a quota. "
+        "Measured on this account, titles built around a year or a superlative "
+        "slightly UNDERperform the ones built around a moment.",
         "- LENGTH AND LAYOUT: the proven sweet spot on this account is a fuller "
         "sentence of about 18-24 words that wraps to FOUR left-aligned overlay "
         "lines; that length and line count earn the most saves here, so default "
@@ -1908,30 +1935,38 @@ def _historytrails_title_rules(
         "surprising, emotional, or record detail. End on the beat the VIDEO pays "
         "off; do not state the full visual payoff in words.",
         "- FORMATS: use THREE DIFFERENT shapes across the three options (never "
-        "three rewrites of one). Proven shapes, strongest first: (1) 'That time "
-        "<named person> <improbable thing>'; (2) declarative 'The <moment/day> "
-        "<subject> <action>'; (3) plain descriptive sentence naming subject + "
-        "action + context; (4) 'When <person/event>...'; (5) 'In <year>, <what "
-        "happened>'; (6) a '<subject> <did X> for the first time ... (year)' "
-        "anecdote. At least TWO options must carry a hard specific (date, number, "
-        "or real name).",
-        "- COMMENT HOOK (HARD RULE, write EXACTLY ONE of the three options this "
-        "way): the documentary voice earns saves but rarely replies, so make one "
-        "option invite a response, not just a silent save. Measured against this "
-        "account's own comment winners, the highest-comment posts are written as a "
-        "reaction, a question, or a shared-memory prompt, not a museum label. Use "
-        "ONE of these shapes, whichever the clip earns honestly: (1) a real "
-        "question the footage makes a stranger want to answer ('How is he this "
-        "calm under that kind of pressure?'); (2) a first-person reaction that "
-        "takes a gentle stance ('I had never seen this before', 'this is one of "
-        "my favorite moments'); (3) a nostalgia prompt that names the era and asks "
-        "the viewer to confirm they remember it ('Remember <thing> (years)?'). "
-        "This one option may drop the strict third-person distance, but it STILL "
-        "obeys green-tier (no invented facts) and the anti-clickbait ban below: "
-        "never 'you won't believe', never manufactured outrage, never an "
-        "exclamation-point sell. Keep the other two options in the calm "
-        "documentary voice. The comment-hook option may double as the open-loop "
-        "option or be separate.",
+        "three rewrites of one). Proven shapes on this account, strongest first: "
+        "(1) a real question the footage makes a stranger want to answer; "
+        "(2) a first-person or 'we' reaction taking a gentle stance; "
+        "(3) 'This <thing> <does/did X>' declarative; (4) 'That time <named "
+        "person> <improbable thing>'; (5) plain descriptive sentence naming "
+        "subject + action + context; (6) 'In <year>, <what happened>'. Do NOT "
+        "open with 'When ...': it is the weakest measured shape on this account.",
+        "- REGISTER MIX (HARD RULE): write TWO of the three options in a REACTIVE "
+        "voice and only ONE as a calm documentary line. This is measured, not "
+        "taste: on this account's own scored titles, questions reach 187k median "
+        "views against 73k for everything else, and first-person lines reach 95k "
+        "against 73k, while the museum-label declarative is the weakest of the "
+        "three registers. Treat those two figures as roughly equal rather than "
+        "as a ranking: the question number rests on just 18 measured titles, "
+        "which is enough to say questions belong in the mix and nowhere near "
+        "enough to say every clip deserves one. The two reactive options must "
+        "be DIFFERENT shapes, and "
+        "exactly one of them MUST be first-person: (A) FIRST PERSON (required for "
+        "one option, singular or collective): a reaction that takes a gentle "
+        "stance in your own voice and uses I, my, me, we, our, or us "
+        "('I had never seen this before', 'We grew up with this and nobody talks "
+        "about it', 'This is one of my favourite moments in sport'). Do not "
+        "substitute a 'you' question for it; second person is not first person. "
+        "(B) the other reactive option, pick ONE of: a real question the footage "
+        "makes a stranger want to answer ('How is he this calm under that kind of "
+        "pressure?'); or a nostalgia prompt that names the era and asks the "
+        "viewer to confirm they remember it ('Remember <thing> (years)?'). "
+        "The reactive options drop the third-person distance but STILL obey "
+        "green-tier (no invented facts) and the anti-clickbait ban below: never "
+        "'you won't believe', never manufactured outrage, never an "
+        "exclamation-point sell. The remaining option stays in the calm "
+        "documentary voice and carries the clip's hard specific if it has one.",
         "- OPEN LOOP (use for at most ONE option, only on a visual clip): keep "
         "everything concrete but withhold the ONE thing the footage reveals, the "
         "subject OR the outcome, never both.",
@@ -1948,16 +1983,36 @@ def _historytrails_title_rules(
         "rarity claim the evidence does not back.",
         *_thin_evidence_and_artifact_rules(),
         "- NO emoji, NO hashtags, NO all-caps lines, sentence case.",
-        "- RECOMMENDED PICK: choose the option whose specific this clip delivers "
-        "most strongly, justified with a clip-specific reason. Never choose an "
-        "option BECAUSE it is the safest or most hedged; hedging is not a "
-        "virtue, delivered specificity is.",
+        "- RECOMMENDED PICK (READ THIS BEFORE CHOOSING): a REACTIVE option is the "
+        "default pick, and the documentary option has to clearly beat it on "
+        "delivery to win. Do NOT pick an option because it is the most concrete, "
+        "the most factual, or carries the most specifics: concreteness is a "
+        "tiebreaker inside a register, never a reason to cross registers. Never "
+        "pick an option because it is the safest or most hedged either; hedging "
+        "is not a virtue.",
+        "- CHOOSING BETWEEN THE TWO REACTIVE OPTIONS (do not shortcut this): the "
+        "question and the first-person option are BOTH strong here and neither "
+        "outranks the other by default. Pick whichever one THIS clip earns. A "
+        "question wins when the footage poses a real puzzle a stranger would "
+        "answer; a first-person line wins when the clip's pull is a feeling, a "
+        "shared memory, or something absurd worth reacting to rather than "
+        "explaining. If the question you wrote is abstract, rhetorical, or one "
+        "the clip already answers on screen, the first-person option wins. Do "
+        "NOT default to the question every time, and do NOT keep recommending "
+        "the same option NUMBER: option order carries no meaning.",
+        "- Justify the pick with a clip-specific reason. Naming the register is "
+        "fine, but a reason that would fit any clip is not a reason.",
         "- EXAMPLES ILLUSTRATE STRUCTURE ONLY (HARD RULE): never reproduce an "
         "example sentence verbatim and never copy a fact from one clip onto "
         "another. Write a fully original line for THIS clip.",
-        f"- {winner_label} (calibrate the long documentary voice and the descriptive "
-        "shape to these, and never copy their facts onto another clip):\n- "
-        + "\n- ".join(winners),
+        f"- {winner_label}. These are real titles that performed on this account, "
+        "and they deliberately span several registers: questions, first-person "
+        "reactions, short labels, and long documentary sentences. Calibrate voice "
+        "and shape to them, match the REGISTER MIX above rather than imitating "
+        "whichever register happens to appear most often here, and never copy "
+        "their facts onto another clip. A few carry small OCR spacing artifacts "
+        "from how they were captured; they illustrate structure, so ignore the "
+        "typos and never reproduce one:\n- " + "\n- ".join(winners),
     ]
 
 

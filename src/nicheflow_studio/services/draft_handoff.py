@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import re
 import shutil
 from dataclasses import dataclass
@@ -14,10 +15,12 @@ from nicheflow_studio.core.paths import processed_dir
 from nicheflow_studio.db.models import Account, DownloadItem, DraftRevision
 from nicheflow_studio.db.post_metrics import top_titles_for_account
 from nicheflow_studio.db.session import get_session
-from nicheflow_studio.processing import draft_guard, smart_drafts
+from nicheflow_studio.processing import draft_guard, smart_drafts, video
 from nicheflow_studio.services import draft_generation, draft_revisions, export as export_svc
 from nicheflow_studio.services.draft_revisions import DraftRevisionDTO, DraftRevisionError
 from nicheflow_studio.services.export import ExportError
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -571,10 +574,7 @@ def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
             "use a comma, period, or colon instead. Long dashes read as AI-generated copy.",
             *(
                 [
-                    "Recommend the strongest title/caption pair and add one short selection "
-                    "note per option. Never recommend an option BECAUSE it is the safest or "
-                    "most hedged; recommend the one whose specific the clip delivers most "
-                    "strongly.",
+                    _RECOMMENDER_DEFERRAL,
                     "The recommended title and caption MUST share the same option number: the "
                     "app applies title+caption as ONE unit, so rearrange your options before "
                     "returning until the strongest pair sits together (never recommend Title 2 "
@@ -582,9 +582,7 @@ def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
                 ]
                 if caption_mode == CAPTION_MODE_PER_OPTION
                 else [
-                    "Recommend the strongest title and add one short selection note per option. "
-                    "Never recommend an option BECAUSE it is the safest or most hedged; recommend "
-                    "the one whose specific the clip delivers most strongly.",
+                    _RECOMMENDER_DEFERRAL,
                 ]
             ),
             "Do not invent unsupported facts.",
@@ -647,6 +645,54 @@ def _batch_item_delimiter(index: int, seq: int | None) -> str:
     return f"===== REEL {index} ====="
 
 
+# Every prompt on this path carries a style-specific "RECOMMENDED PICK" rule
+# inside its title-rules block. The batch headers used to ALSO carry their own
+# global version ("recommend the one whose specific the clip delivers most
+# strongly"), and the two competed: after the HistoryTrails rules were retuned
+# so the reactive register wins by default, a real batch still recommended the
+# documentary option in 6 of 6 reels and justified every one of them as "the
+# strongest concrete signal", which is the global line's wording, not the style
+# rule's. The header now defers instead of instructing, so the style rule is the
+# only voice on this decision.
+_RECOMMENDER_DEFERRAL = (
+    "Recommend one option per reel using the RECOMMENDED PICK rule in the "
+    "on-screen title rules above; that rule is tuned per account and overrides "
+    "any instinct to pick the most factual or most hedged option. Add one short "
+    "selection note per option."
+)
+
+# The title rules police variety WITHIN a reel's three options, and nothing used
+# to police it ACROSS reels. A real six-reel batch came back with four titles
+# opening "Would you ..." / "Would this ...", because one prompt draws one set of
+# examples and every reel is written against it. Cross-reel variety therefore has
+# to be stated where the batch itself is described.
+_BATCH_VARIETY_RULES = (
+    "Cross-reel variety (HARD RULE): the reels in this batch are written against "
+    "one shared set of rules and examples, which pulls every reel toward the same "
+    "sentence. Do NOT let that happen.",
+    "- Never open two reels' titles with the same first three words. If you have "
+    "already written 'Would you ...' once in this batch, the next question must "
+    "take a different shape ('How did ...', 'Which ...', 'Remember ...', 'What "
+    "happens when ...').",
+    "- Across the batch, question openers must vary and first-person openers must "
+    "vary. Repeating one stem is the single most common failure here.",
+    "- Vary the RECOMMENDED register across reels too. A batch that recommends "
+    "the same register, or the same option number, for every reel has not "
+    "actually chosen: it has applied a default. Over a batch of four or more "
+    "reels, no single register may take more than about half the "
+    "recommendations, and the option number you recommend must change between "
+    "reels. Pick per clip, then check the spread before you return.",
+)
+
+# Appended to each reel's attachment line. The attached image is no longer one
+# still: it is a grid of moments sampled at the clip's scene cuts, so the model
+# has to be told to read it as a sequence or it describes the first tile and
+# stops. Kept short because it repeats once per reel in the batch prompt.
+_CONTACT_SHEET_HINT = (
+    "(a contact sheet: several moments from this one clip, in time order, "
+    "left to right then top to bottom. Read every tile before writing.)"
+)
+
 # The visual evidence JSON is now the PRIMARY visual grounding on the batch
 # path (it replaced the per-reel image attachment), so the prompt has to say
 # what its fields mean. Without this the model treated the JSON as loose
@@ -700,7 +746,8 @@ def _account_prompt_header(
         "This is for ChatGPT or Claude web.",
         *(
             [
-                "Some reels below ask you to attach and inspect a still image; the rest "
+                "Some reels below ask you to attach and inspect a contact sheet (a grid of "
+                "moments from that one clip); the rest "
                 "carry their visual evidence as JSON instead."
             ]
             if attachments_expected
@@ -753,8 +800,9 @@ def _account_prompt_header(
             if caption_mode == CAPTION_MODE_PER_OPTION
             else "- Write THREE title options and exactly ONE 'Shared Caption:' per reel."
         ),
-        "- Never recommend an option BECAUSE it is the safest or most hedged; "
-        "recommend the one whose specific the clip delivers most strongly.",
+        f"- {_RECOMMENDER_DEFERRAL}",
+        "",
+        *_BATCH_VARIETY_RULES,
         "",
         "Return one block per reel, one for every reel, in order.",
         "START each reel's block with its own header line that is exactly:",
@@ -803,7 +851,7 @@ def _batch_item_context(index: int, item: DownloadItem, seq: int | None) -> list
         *(
             []
             if vision_text
-            else [f"Attach and inspect image file: {frame_name}"]
+            else [f"Attach and inspect image file: {frame_name} {_CONTACT_SHEET_HINT}"]
         ),
         f"Source title: {item.title or '(none)'}",
         f"Source URL: {item.source_url or '(none)'}",
@@ -1134,7 +1182,8 @@ def build_multi_account_batch_chat_prompt(item_ids: list[int], settings: dict | 
             "This is for ChatGPT or Claude web.",
             *(
                 [
-                    "Some reels below ask you to attach and inspect a still image; the rest "
+                    "Some reels below ask you to attach and inspect a contact sheet (a grid of "
+                "moments from that one clip); the rest "
                     "carry their visual evidence as JSON instead."
                 ]
                 if attachments_expected
@@ -1179,8 +1228,9 @@ def build_multi_account_batch_chat_prompt(item_ids: list[int], settings: dict | 
                 "- Never write em dashes or double hyphens ('--') in titles or captions.",
                 "- Do not invent unsupported facts.",
                 "- Write THREE title options and exactly ONE 'Shared Caption:' per reel.",
-                "- Never recommend an option BECAUSE it is the safest or most hedged; "
-                "recommend the one whose specific the clip delivers most strongly.",
+                f"- {_RECOMMENDER_DEFERRAL}",
+                "",
+                *_BATCH_VARIETY_RULES,
                 "",
                 "Return one block per reel, one for every reel, in order.",
                 "START each reel's block with its own header line that is exactly:",
@@ -1426,10 +1476,16 @@ def batch_frames(item_ids: list[int]) -> dict:
     """Prepare each reel's visual grounding for the chat handoff.
 
     Vision-first: run the Groq vision pass over every item that has no visual
-    evidence yet, and cut a still frame ONLY for the items it could not cover.
-    Vision reads 5 frames per clip for roughly a twentieth of the tokens one
-    attached still costs, so the frame folder is now a fallback rather than the
-    normal path. ``described`` lets the UI say how many reels are vision-backed.
+    evidence yet, and attach an image ONLY for the items it could not cover.
+    ``described`` lets the UI say how many reels are vision-backed.
+
+    The attachment is a contact sheet rather than the single middle still it used
+    to be. A still shows one moment, which is how a draft ends up describing a
+    man at a podium while missing that the cartoon characters are seated in the
+    audience. Measured over six library clips, a 6-tile sheet averages ~930
+    image tokens against ~971 for one full-height still, because cropping the
+    letterbox and the burned-in title banner reclaims more than the extra tiles
+    cost. More evidence, slightly cheaper.
     """
     ids = [int(item_id) for item_id in item_ids]
     if not ids:
@@ -1444,12 +1500,11 @@ def batch_frames(item_ids: list[int]) -> dict:
     for index, item_id in enumerate(ids, start=1):
         if item_id in described:
             continue  # vision JSON carries this reel; no attachment needed
-        try:
-            source = export_svc.crop_preview_frame(item_id)
-        except ExportError as exc:
-            raise DraftRevisionError(f"Reel {index} (item {item_id}): {exc}") from exc
         target = folder / f"reel_{index}_item{item_id}.jpg"
-        shutil.copyfile(source, target)
+        try:
+            _write_contact_sheet(item_id, target)
+        except (ExportError, DraftRevisionError) as exc:
+            raise DraftRevisionError(f"Reel {index} (item {item_id}): {exc}") from exc
         frames.append({"item_id": item_id, "path": str(target)})
     return {
         "folder": str(folder),
@@ -1457,6 +1512,30 @@ def batch_frames(item_ids: list[int]) -> dict:
         "described": sorted(described),
         "skipped": vision["skipped"],
     }
+
+
+def _write_contact_sheet(item_id: int, target: Path) -> None:
+    """Render one reel's contact sheet, falling back to the single still.
+
+    Sheet building runs ffmpeg several times (scene detection, an overlay probe,
+    one pass per tile). Any of those can fail on a truncated download, and a
+    batch that refuses to prepare is worse than one reel grounded on a single
+    frame, so failure degrades to the old behaviour instead of raising.
+    """
+    with get_session() as session:
+        item = session.get(DownloadItem, item_id)
+        if item is None:
+            raise DraftRevisionError(f"No download item with id {item_id}.")
+        source_path = Path(item.file_path) if item.file_path else None
+
+    if source_path is not None and source_path.exists():
+        try:
+            video.build_contact_sheet(source_path, target)
+            return
+        except Exception:  # noqa: BLE001 - any ffmpeg/probe failure falls back
+            logger.warning("Contact sheet failed for item %s; using a single frame", item_id)
+
+    shutil.copyfile(export_svc.crop_preview_frame(item_id), target)
 
 
 def import_pasted_draft(item_id: int, text: str) -> DraftRevisionDTO:
