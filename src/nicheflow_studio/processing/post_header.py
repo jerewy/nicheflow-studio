@@ -33,7 +33,9 @@ NAME_BADGE_GAP_PX = 14
 # footage's left edge. Measured off a real post at ~90px on the 1080 canvas.
 INDENT_PX = 90
 
-_VERIFIED_BLUE = (56, 151, 240, 255)
+# Gold seal (Meta Verified) rather than the blue tick, matching the badge the
+# history accounts actually display.
+_VERIFIED_GOLD = (242, 194, 48, 255)
 _NAME_COLOR = (255, 255, 255, 255)
 _AVATAR_FALLBACK_BG = (58, 58, 58, 255)
 # Circles and the badge are drawn at 4x and downscaled with LANCZOS; Pillow has
@@ -184,7 +186,7 @@ def _verified_badge_image(size: int):  # noqa: ANN201 - PIL image
                 lobe_x + lobe_radius,
                 lobe_y + lobe_radius,
             ),
-            fill=_VERIFIED_BLUE,
+            fill=_VERIFIED_GOLD,
         )
     core_radius = scaled * 0.375
     draw.ellipse(
@@ -194,7 +196,7 @@ def _verified_badge_image(size: int):  # noqa: ANN201 - PIL image
             center + core_radius,
             center + core_radius,
         ),
-        fill=_VERIFIED_BLUE,
+        fill=_VERIFIED_GOLD,
     )
     check = [
         (center - scaled * 0.155, center + scaled * 0.005),
