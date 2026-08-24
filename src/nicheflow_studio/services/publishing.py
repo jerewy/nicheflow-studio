@@ -809,6 +809,14 @@ def sync_cloud_jobs() -> dict:
                 job.posted_at = _parse_iso(worker.get("published_at")) or dt.datetime.now(
                     dt.timezone.utc
                 )
+                # The Worker's media_publish id is the only handle a cloud post
+                # has (there is no permalink to scrape as on the local browser
+                # path), and it is what joins this job's title to the insights
+                # row that later reports its views. Dropping it here is why
+                # 1,468 of 1,478 posted jobs had no link to their metrics.
+                media_id = str(worker.get("meta_media_id") or "").strip()
+                if media_id:
+                    job.posted_media_id = media_id
                 if job.download_item_id is not None:
                     item = session.get(DownloadItem, job.download_item_id)
                     if item is not None:
