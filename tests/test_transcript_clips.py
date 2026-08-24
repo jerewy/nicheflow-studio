@@ -93,6 +93,52 @@ def test_clip_window_around_grows_forward_to_target() -> None:
     assert window.duration >= 8.0
 
 
+def test_clip_window_from_opens_on_the_anchor_and_grows_forward() -> None:
+    sentences = _sentences()
+    window = tc.clip_window_from(sentences, 1, target_seconds=8.0)
+    # Anchor (2..6) is only 4s, so it grows forward into 6..11.5. It must NOT
+    # reach back into sentence 0 the way the centring builder would.
+    assert window.start == 2.0
+    assert window.end == 11.5
+    assert "first sentence" not in window.text
+
+
+def test_clip_window_from_keeps_the_anchor_first_where_around_would_not() -> None:
+    sentences = _sentences()
+    # Anchor (6..11.5) cannot grow forward: the next sentence is across an 8.5s
+    # gap. The centring builder reaches backward here; this one holds its
+    # opening because 5.5s already clears the floor it was given.
+    hook_first = tc.clip_window_from(sentences, 2, target_seconds=8.0, min_seconds=4.0)
+    centred = tc.clip_window_around(sentences, 8.0, target_seconds=8.0, min_seconds=4.0)
+    assert hook_first.start == 6.0
+    assert centred.start == 2.0
+
+
+def test_clip_window_from_reaches_back_only_to_clear_the_floor() -> None:
+    sentences = _sentences()
+    # Same anchor, but now 5.5s is below the campaign floor and there is nothing
+    # forward to grow into, so it trades the opening for a usable duration.
+    window = tc.clip_window_from(sentences, 2, target_seconds=8.0, min_seconds=8.0)
+    assert window.start == 2.0
+    assert window.duration >= 8.0
+
+
+def test_clip_window_from_does_not_cross_a_long_gap() -> None:
+    sentences = _sentences()
+    window = tc.clip_window_from(sentences, 2, target_seconds=40.0)
+    assert window.end == 11.5
+    assert "fresh sentence" not in window.text
+
+
+def test_clip_window_from_rejects_an_out_of_range_index() -> None:
+    sentences = _sentences()
+    try:
+        tc.clip_window_from(sentences, len(sentences))
+    except IndexError:
+        return
+    raise AssertionError("expected an IndexError for an out-of-range index")
+
+
 def test_clip_window_around_does_not_cross_a_long_gap() -> None:
     sentences = _sentences()
     # Anchoring on the last speaker line, a big target must NOT pull in the
@@ -148,3 +194,17 @@ def test_caption_srt_for_window_is_zero_based(tmp_path) -> None:
     assert content.startswith("1\n00:00:00,000 -->")
     # Nothing should exceed the 9.5s window length.
     assert "00:00:10," not in content and "00:00:11," not in content
+
+
+def test_opens_mid_thought_catches_joining_words_and_filler() -> None:
+    assert tc.opens_mid_thought("And I believe this image came from somebody's account.")
+    assert tc.opens_mid_thought("But what the Gates Foundation has is $50 billion.")
+    assert tc.opens_mid_thought("Um so, um I in fact I set a record.")
+    assert tc.opens_mid_thought("That's why nobody ever tried it again.")
+
+
+def test_opens_mid_thought_allows_a_clean_cold_open() -> None:
+    assert not tc.opens_mid_thought("I just bought this card for $400,000.")
+    assert not tc.opens_mid_thought("Nobody knew the factory had burned down.")
+    # "So" joins as often as it opens, so it is deliberately not flagged.
+    assert not tc.opens_mid_thought("So I borrowed $10,000 cash.")

@@ -22,7 +22,9 @@ from nicheflow_studio.processing.transcript_clips import (
     DEFAULT_TARGET_SECONDS,
     ClipWindow,
     TranscriptSentence,
-    clip_window_around,
+    clip_window_from,
+    ends_mid_thought,
+    opens_mid_thought,
 )
 
 
@@ -65,10 +67,29 @@ class MomentCandidate:
     signal_score: float
     duration_fit: float
     signals: tuple[ViralitySignal, ...]
+    # Seconds shaved off the front because the window opened mid-thought, and
+    # whether it *still* does after that. Both are review aids, not filters: a
+    # clip that opens on "And I'm like…" is worth cutting, just not worth
+    # trusting the in-point of.
+    opening_trimmed: float = 0.0
+    opens_mid_thought: bool = False
+    # And the same for the out-point: true when the window still stops before the
+    # speaker finishes, after the close-extension had its go. Usually means the
+    # transcript ran out of room inside max_seconds.
+    ends_mid_thought: bool = False
+    # Silence kept after the final word so the clip has a beat to land on.
+    # Included in ``end`` (it is part of the cut) but excluded from the scoring
+    # duration — holding on a reaction is not the same as saying more.
+    tail_hold: float = 0.0
 
     @property
     def duration(self) -> float:
         return round(self.end - self.start, 3)
+
+    @property
+    def spoken_duration(self) -> float:
+        """The talking part, without the held beat — what the score is judged on."""
+        return round(self.end - self.start - self.tail_hold, 3)
 
     @property
     def score(self) -> float:
@@ -270,12 +291,186 @@ def _extend_to_payoff(
     return ClipWindow(window.start, end, " ".join(texts))
 
 
+def _extend_to_close(
+    sentences: list[TranscriptSentence],
+    window: ClipWindow,
+    *,
+    max_seconds: float,
+    max_extra_seconds: float = 8.0,
+) -> ClipWindow:
+    """Grow the window forward until the last sentence actually finishes.
+
+    ``_extend_to_payoff`` stops at the first sentence carrying no hook signal,
+    and the sentence that *closes* a thought is exactly that: the resolution
+    names no money and no superlative, so it scores zero and is left out. The
+    clip then ends hanging.
+
+    This runs after it and asks a different question — not "is there more
+    signal?" but "has the speaker finished?" — so a signal-free closing line is
+    included when it is the one that lands the point. Bounded the same way, and
+    a no-op when the window already ends on a full sentence.
+    """
+    if not ends_mid_thought(window.text):
+        return window
+
+    last_covered = -1
+    for index, sentence in enumerate(sentences):
+        if sentence.end <= window.end + 0.05:
+            last_covered = index
+
+    end = window.end
+    texts = [window.text]
+    for sentence in sentences[last_covered + 1 :]:
+        if sentence.end - window.start > max_seconds:
+            break
+        if sentence.end - window.end > max_extra_seconds:
+            break
+        texts.append(sentence.text)
+        end = sentence.end
+        if not ends_mid_thought(sentence.text):
+            break
+    else:
+        # Ran out of transcript without closing; the extra fragments add nothing.
+        return window
+    if end <= window.end or ends_mid_thought(texts[-1]):
+        return window
+    return ClipWindow(window.start, end, " ".join(texts))
+
+
+def _hold_after_last_word(
+    sentences: list[TranscriptSentence],
+    window: ClipWindow,
+    *,
+    max_hold_seconds: float,
+) -> float:
+    """Seconds of silence to keep after the final word, capped by the next line.
+
+    The window ends on the last syllable, so the clip stops the instant the
+    sentence resolves — before the reaction, the cutaway, or the shot of the
+    thing being talked about. A held beat is standard practice in an edit and
+    the difference between a clip that lands and one that snaps shut.
+
+    The cap is what keeps it safe: the hold never reaches the next sentence, so
+    it can only ever add silence (or B-roll over silence), never the truncated
+    first half of a line nobody asked for. A speaker who barely pauses gets a
+    correspondingly short hold, which is the right answer — there is no beat
+    there to keep.
+    """
+    if max_hold_seconds <= 0:
+        return 0.0
+    for sentence in sentences:
+        if sentence.start > window.end + 0.01:
+            return round(max(0.0, min(max_hold_seconds, sentence.start - window.end)), 3)
+    # Nothing follows: the source's own end bounds this, applied by the caller
+    # that knows the media duration.
+    return round(max_hold_seconds, 3)
+
+
+def _trim_weak_opening(
+    sentences: list[TranscriptSentence],
+    window: ClipWindow,
+    *,
+    min_seconds: float,
+    celebrity_names: tuple[str, ...],
+    keep_ratio: float = 0.8,
+    max_trim_ratio: float = 0.35,
+) -> tuple[ClipWindow, float]:
+    """Advance the in-point past opening sentences that say nothing.
+
+    A window opens on the sentence that earned its ranking, but that sentence is
+    often the back half of a thought ("And I believe this image came from
+    somebody's account…"). Measured on two 85-minute sources, half of the top
+    twenty moments opened this way.
+
+    Dropping the line is only safe when the moment survives it nearly intact, so
+    three conditions are checked: what remains still clears the campaign floor,
+    it retains at least ``keep_ratio`` of the window's signal, and no more than
+    ``max_trim_ratio`` of the window's duration comes off. The signal ratio is
+    what protects a hook that happens to be phrased as a continuation — "And I'm
+    like, that's all I want is 400K" carries the number that made it rank, so
+    removing it would fail the test and the moment is merely flagged instead.
+
+    ``max_trim_ratio`` exists because the signal test alone measures the wrong
+    thing. Setup sentences name no money and no superlative, so they score zero
+    and cost nothing to drop — which let this strip 9.3 seconds off a 20-second
+    window and leave "we had around 900k worth of value" with no way to tell
+    whose value, or of what. Signal survived; the meaning did not. A duration cap
+    is a blunt guard, but it bounds the failure in the one dimension the score
+    cannot see.
+
+    Returns the window and how many seconds came off the front.
+    """
+    covered = [
+        sentence
+        for sentence in sentences
+        if sentence.start >= window.start - 0.05 and sentence.end <= window.end + 0.05
+    ]
+    if len(covered) < 2:
+        return window, 0.0
+
+    full_score, _ = score_text(window.text, celebrity_names=celebrity_names)
+    trim_budget = window.duration * max_trim_ratio
+    first = 0
+    while first < len(covered) - 1:
+        if not opens_mid_thought(covered[first].text):
+            break
+        remaining = covered[first + 1 :]
+        if window.end - remaining[0].start < min_seconds:
+            break
+        if remaining[0].start - window.start > trim_budget:
+            break
+        remaining_score, _ = score_text(
+            " ".join(sentence.text for sentence in remaining), celebrity_names=celebrity_names
+        )
+        if remaining_score < full_score * keep_ratio:
+            break
+        first += 1
+
+    if first == 0:
+        return window, 0.0
+    kept = covered[first:]
+    trimmed = ClipWindow(
+        kept[0].start, window.end, " ".join(sentence.text for sentence in kept)
+    )
+    return trimmed, round(trimmed.start - window.start, 3)
+
+
 def _overlaps(a: MomentCandidate, b_start: float, b_end: float, *, min_ratio: float) -> bool:
     overlap = min(a.end, b_end) - max(a.start, b_start)
     if overlap <= 0:
         return False
     shorter = min(a.end - a.start, b_end - b_start) or 1.0
     return overlap / shorter >= min_ratio
+
+
+# Words too common to say anything about what a moment is *about*. Kept short on
+# purpose: this is a topic-overlap guard, not a search index.
+_TOPIC_STOPWORDS = frozenset(
+    """
+    a an and are as at be been but by can did do does for from get got had has have he
+    her him his how i if in into is it its just like me my no not of on one or our out
+    said say she so than that the their them then there these they this to too up us
+    was we were what when which who will with would you your
+    """.split()
+)
+# Two moments sharing this fraction of their content words are treated as the
+# same story. Five clips from one source only pay if they are five *different*
+# stories; posting the same $400,000 sale from two timestamps splits its own
+# audience and reads as spam to anyone following more than one account.
+_TOPIC_OVERLAP_RATIO = 0.5
+
+
+def _topic_words(text: str) -> frozenset[str]:
+    words = re.findall(r"[a-z']{4,}", text.lower())
+    return frozenset(word for word in words if word not in _TOPIC_STOPWORDS)
+
+
+def _same_topic(a: frozenset[str], b: frozenset[str], *, min_ratio: float) -> bool:
+    """Whether two moments are about the same thing, by content-word overlap."""
+    if not a or not b:
+        return False
+    shared = len(a & b)
+    return shared / min(len(a), len(b)) >= min_ratio
 
 
 def rank_moments(
@@ -286,31 +481,46 @@ def rank_moments(
     target_seconds: float = 14.0,
     min_seconds: float = DEFAULT_MIN_SECONDS,
     max_seconds: float = DEFAULT_MAX_SECONDS,
+    topic_overlap_ratio: float = _TOPIC_OVERLAP_RATIO,
     overlap_ratio: float = 0.4,
+    tail_hold_seconds: float = 1.5,
 ) -> list[MomentCandidate]:
     """Rank the most clippable moments in a transcript.
 
-    Every sentence with a hook signal seeds a clip window (via
-    :func:`clip_window_around`); the window's full text is scored, near-duplicate
+    Every sentence with a hook signal *opens* a clip window (via
+    :func:`clip_window_from`); the window's full text is scored, near-duplicate
     windows are collapsed keeping the strongest, and the top ``top_n`` are
     returned highest-score first.
+
+    The window opens on the signal-bearing sentence rather than centring on it,
+    so the line that earned the ranking is what a viewer hears first.
     """
     scored_windows: list[MomentCandidate] = []
     seen_spans: set[tuple[float, float]] = set()
 
-    for sentence in sentences:
+    for index, sentence in enumerate(sentences):
         seed_score, _ = score_text(sentence.text, celebrity_names=celebrity_names)
         if seed_score <= 0:
             continue
-        window: ClipWindow = clip_window_around(
+        window: ClipWindow = clip_window_from(
             sentences,
-            (sentence.start + sentence.end) / 2,
+            index,
             target_seconds=target_seconds,
             min_seconds=min_seconds,
             max_seconds=max_seconds,
         )
         window = _extend_to_payoff(
             sentences, window, max_seconds=max_seconds, celebrity_names=celebrity_names
+        )
+        # Then close the sentence the payoff hunt stopped inside of. Ordered this
+        # way so the closing line is chosen against the furthest the signal
+        # reached, not against a window that would grow past it afterwards.
+        window = _extend_to_close(sentences, window, max_seconds=max_seconds)
+        # After the payoff is secured, not before: growing forward can only add
+        # to what the trim decides about the front, and trimming first would let
+        # a shorter window pull in different trailing sentences.
+        window, opening_trimmed = _trim_weak_opening(
+            sentences, window, min_seconds=min_seconds, celebrity_names=celebrity_names
         )
         span = (round(window.start, 3), round(window.end, 3))
         if span in seen_spans:
@@ -319,27 +529,45 @@ def rank_moments(
         window_score, signals = score_text(window.text, celebrity_names=celebrity_names)
         if window_score <= 0:
             continue
+        # Applied last and kept out of duration_fit: a held beat is part of the
+        # cut, but scoring it as clip length would penalise exactly the moments
+        # that earned a pause. Deduping still keys off the spoken span above.
+        hold = _hold_after_last_word(
+            sentences, window, max_hold_seconds=tail_hold_seconds
+        )
         scored_windows.append(
             MomentCandidate(
                 start=window.start,
-                end=window.end,
+                end=round(window.end + hold, 3),
                 text=window.text,
                 signal_score=window_score,
                 duration_fit=duration_fit(window.duration, min_seconds=min_seconds),
                 signals=signals,
+                opening_trimmed=opening_trimmed,
+                opens_mid_thought=opens_mid_thought(window.text),
+                ends_mid_thought=ends_mid_thought(window.text),
+                tail_hold=hold,
             )
         )
 
     scored_windows.sort(key=lambda moment: moment.score, reverse=True)
 
     ranked: list[MomentCandidate] = []
+    accepted_topics: list[frozenset[str]] = []
     for candidate in scored_windows:
         if any(
             _overlaps(accepted, candidate.start, candidate.end, min_ratio=overlap_ratio)
             for accepted in ranked
         ):
             continue
+        # Time overlap alone is not enough: the same story told twenty minutes
+        # apart produces two windows that never overlap and still compete for the
+        # same viewers.
+        topic = _topic_words(candidate.text)
+        if any(_same_topic(topic, seen, min_ratio=topic_overlap_ratio) for seen in accepted_topics):
+            continue
         ranked.append(candidate)
+        accepted_topics.append(topic)
         if len(ranked) >= top_n:
             break
     return ranked

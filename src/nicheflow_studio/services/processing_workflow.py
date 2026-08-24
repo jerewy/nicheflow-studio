@@ -236,6 +236,17 @@ def render_config(item_id: int) -> dict:
     return TEMPLATE_RENDER_CONFIG.get(template, TEMPLATE_RENDER_CONFIG["gaming_meme_black"])
 
 
+def account_template(account: Account | None) -> str:
+    """The template an account exports with, or ``""`` when it has no preference.
+
+    Clip Studio renders before an item exists, so it cannot go through
+    :func:`get_settings` (which is keyed on a ``DownloadItem``). This exposes the
+    same preference lookup for callers that only have the account.
+    """
+    template = _account_preferences(account).get("template")
+    return str(template) if template in TEMPLATE_RENDER_CONFIG else ""
+
+
 def open_folder(item_id: int) -> dict:
     with get_session() as session:
         item = session.get(DownloadItem, item_id)

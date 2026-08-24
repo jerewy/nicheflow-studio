@@ -169,6 +169,11 @@ class DownloadItem(Base):
     # ``local://<filename>`` source_url that points at its own copy, so grouping
     # by source_url cannot tell which long video it came out of.
     clip_source_ref: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    # The window this clip was cut from, in source seconds. Stored so a second
+    # send of the same moment is recognisable: the filename carries the start
+    # but is renamed on the way into the library, so it cannot be read back.
+    clip_start_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    clip_end_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
     account_id: Mapped[int | None] = mapped_column(ForeignKey("accounts.id"), nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="queued")
 

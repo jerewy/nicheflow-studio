@@ -195,6 +195,14 @@ def _ensure_compatibility() -> None:
             connection.execute(
                 text("ALTER TABLE download_items ADD COLUMN clip_source_ref VARCHAR(2048)")
             )
+        if "clip_start_seconds" not in columns:
+            connection.execute(
+                text("ALTER TABLE download_items ADD COLUMN clip_start_seconds FLOAT")
+            )
+        if "clip_end_seconds" not in columns:
+            connection.execute(
+                text("ALTER TABLE download_items ADD COLUMN clip_end_seconds FLOAT")
+            )
 
         account_columns = {column["name"] for column in inspect(connection).get_columns("accounts")}
         if "scrape_source_urls" not in account_columns:

@@ -21,6 +21,13 @@ import type {
   CloudPublisherHealth,
   CloudWorkerAccountsResult,
   CloudWorkerJobsResult,
+  Campaign,
+  CaptionCheck,
+  ClipBatchTitleImport,
+  ClipSourceClip,
+  ClipSourceHistory,
+  ClipTitleSuggestions,
+  RegisteredClip,
   CropRect,
   DeleteAccountResult,
   DistributeNicheResult,
@@ -48,6 +55,8 @@ import type {
   QueueResult,
   ScheduleCoverage,
   ScrapeCandidate,
+  SubmissionStatus,
+  SwapScheduledJobResult,
   SourceProfile,
   WorkflowSettings,
 } from "@/types";
@@ -97,6 +106,9 @@ interface PywebviewApi {
     niche: string | null,
     perAccount: number,
   ): Promise<Envelope<{ groups: BatchCandidateGroup[] }>>;
+  start_fetch_missing_batch_media(
+    accountIds: number[] | null,
+  ): Promise<Envelope<{ job_id: string }>>;
   build_multi_account_batch_chat_prompt(
     itemIds: number[],
     payload: Record<string, unknown>,
@@ -147,6 +159,52 @@ interface PywebviewApi {
   start_item_download(itemId: number): Promise<Envelope<{ job_id: string }>>;
   prefetch_originals(itemIds: number[]): Promise<Envelope<{ job_id: string | null }>>;
   get_job(jobId: string): Promise<Envelope<JobSnapshot>>;
+  list_campaigns(): Promise<Envelope<Campaign[]>>;
+  save_campaign(payload: Partial<Campaign>): Promise<Envelope<Campaign>>;
+  delete_campaign(slug: string): Promise<Envelope<{ slug: string; remaining: number }>>;
+  build_campaign_caption(slug: string, hook: string): Promise<Envelope<CaptionCheck>>;
+  validate_campaign_caption(
+    slug: string,
+    caption: string,
+  ): Promise<Envelope<{ problems: string[] }>>;
+  clip_submission_status(postedAt: string): Promise<Envelope<SubmissionStatus>>;
+  start_clip_plan(url: string, topN: number): Promise<Envelope<{ job_id: string }>>;
+  start_clip_previews(url: string, topN: number): Promise<Envelope<{ job_id: string }>>;
+  start_local_clip_previews(
+    videoPath: string,
+    topN: number,
+  ): Promise<Envelope<{ job_id: string }>>;
+  start_clip_section_download(
+    url: string,
+    start: number,
+    end: number,
+  ): Promise<Envelope<{ job_id: string }>>;
+  start_clip_render(payload: Record<string, unknown>): Promise<Envelope<{ job_id: string }>>;
+  clip_media_url(path: string): Promise<Envelope<{ url: string }>>;
+  start_clip_title_suggestions(
+    payload: Record<string, unknown>,
+  ): Promise<Envelope<{ job_id: string }>>;
+  build_clip_title_prompt(
+    payload: Record<string, unknown>,
+  ): Promise<Envelope<{ prompt: string; copied: boolean }>>;
+  import_clip_titles(
+    payload: Record<string, unknown>,
+  ): Promise<Envelope<ClipTitleSuggestions>>;
+  build_clip_batch_title_prompt(
+    payload: Record<string, unknown>,
+  ): Promise<Envelope<{ prompt: string; copied: boolean; clip_count: number }>>;
+  import_clip_batch_titles(
+    payload: Record<string, unknown>,
+  ): Promise<Envelope<ClipBatchTitleImport>>;
+  list_clip_sources(): Promise<Envelope<ClipSourceHistory[]>>;
+  list_clip_source_clips(sourceRef: string): Promise<Envelope<ClipSourceClip[]>>;
+  forget_clip_source(
+    sourceRef: string,
+    deleteWorkspace: boolean,
+  ): Promise<Envelope<{ source_ref: string; workspace_removed: boolean }>>;
+  pick_video_file(): Promise<Envelope<{ path: string | null }>>;
+  import_local_clip(payload: Record<string, unknown>): Promise<Envelope<RegisteredClip>>;
+  send_clip_to_processing(payload: Record<string, unknown>): Promise<Envelope<RegisteredClip>>;
   cancel_job(jobId: string): Promise<Envelope<{ canceled: boolean }>>;
   list_publish_jobs(itemId: number): Promise<Envelope<PublishJob[]>>;
   set_processing_status(
@@ -234,6 +292,10 @@ interface PywebviewApi {
   ): Promise<Envelope<PublishQueueJob>>;
   reschedule_job(jobId: number, scheduledAt: string): Promise<Envelope<PublishQueueJob>>;
   unschedule_job(jobId: number): Promise<Envelope<PublishQueueJob>>;
+  swap_scheduled_job(
+    jobId: number,
+    replacementJobId: number,
+  ): Promise<Envelope<SwapScheduledJobResult>>;
   remove_publish_job(jobId: number): Promise<Envelope<{ removed_job_id: number }>>;
   pooling_overview(): Promise<Envelope<PoolingOverview>>;
   list_pool_items(niche: string): Promise<Envelope<PoolClip[]>>;
@@ -560,7 +622,12 @@ export const bridge = {
 
   importAccountBatchDraft(text: string, itemIds: number[]): Promise<BatchDraftImportResult> {
     if (!hasBridge())
-      return Promise.resolve({ imported: itemIds, failed: [], unmatched: text ? [] : itemIds });
+      return Promise.resolve({
+        imported: itemIds,
+        failed: [],
+        skipped: [],
+        unmatched: text ? [] : itemIds,
+      });
     return unwrap(window.pywebview!.api.import_account_batch_draft(text, itemIds));
   },
 
@@ -616,6 +683,12 @@ export const bridge = {
     return unwrap(window.pywebview!.api.batch_draft_candidates(niche, perAccount));
   },
 
+  /** Retry footage for distributed reels whose one-shot background download never landed. */
+  startFetchMissingBatchMedia(accountIds: number[] | null): Promise<{ job_id: string }> {
+    if (!hasBridge()) return mock.startFetchMissingBatchMedia();
+    return unwrap(window.pywebview!.api.start_fetch_missing_batch_media(accountIds));
+  },
+
   buildMultiAccountBatchChatPrompt(
     itemIds: number[],
     payload: Record<string, unknown>,
@@ -647,7 +720,12 @@ export const bridge = {
     itemIds: number[],
   ): Promise<BatchDraftImportResult> {
     if (!hasBridge())
-      return Promise.resolve({ imported: itemIds, failed: [], unmatched: text ? [] : itemIds });
+      return Promise.resolve({
+        imported: itemIds,
+        failed: [],
+        skipped: [],
+        unmatched: text ? [] : itemIds,
+      });
     return unwrap(window.pywebview!.api.import_multi_account_batch_draft(text, itemIds));
   },
 
@@ -748,6 +826,163 @@ export const bridge = {
   startItemDownload(itemId: number): Promise<{ job_id: string }> {
     if (!hasBridge()) return Promise.resolve({ job_id: "mock-job" });
     return unwrap(window.pywebview!.api.start_item_download(itemId));
+  },
+
+  // --- Clip Studio --- //
+
+  listCampaigns(): Promise<Campaign[]> {
+    // One campaign rather than none: the caption builder, the required-mention
+    // hint and the per-card floor warning are all gated on having one selected,
+    // so an empty list left that whole half of the screen unreachable in dev.
+    if (!hasBridge())
+      return Promise.resolve([
+        {
+          slug: "mock-clips",
+          name: "Mock Clip Campaign",
+          required_mention: "YOUTUBE: MockSource",
+          hashtags: ["#mockclips"],
+          min_clip_seconds: 16,
+          max_clips_per_day: 10,
+          country_tiers: [1],
+          min_views_per_clip: 1000,
+          min_views_for_payout: 5000,
+          notes: [],
+        },
+      ]);
+    return unwrap(window.pywebview!.api.list_campaigns());
+  },
+
+  saveCampaign(payload: Partial<Campaign>): Promise<Campaign> {
+    if (!hasBridge()) return Promise.resolve(payload as Campaign);
+    return unwrap(window.pywebview!.api.save_campaign(payload));
+  },
+
+  deleteCampaign(slug: string): Promise<{ slug: string; remaining: number }> {
+    if (!hasBridge()) return Promise.resolve({ slug, remaining: 0 });
+    return unwrap(window.pywebview!.api.delete_campaign(slug));
+  },
+
+  buildCampaignCaption(slug: string, hook: string): Promise<CaptionCheck> {
+    if (!hasBridge()) return Promise.resolve({ caption: hook, problems: [] });
+    return unwrap(window.pywebview!.api.build_campaign_caption(slug, hook));
+  },
+
+  validateCampaignCaption(slug: string, caption: string): Promise<{ problems: string[] }> {
+    if (!hasBridge()) return Promise.resolve({ problems: [] });
+    return unwrap(window.pywebview!.api.validate_campaign_caption(slug, caption));
+  },
+
+  clipSubmissionStatus(postedAt: string): Promise<SubmissionStatus> {
+    if (!hasBridge()) {
+      return Promise.resolve({
+        deadline: postedAt,
+        seconds_remaining: 3600,
+        expired: false,
+        view_ceiling: 1000,
+      });
+    }
+    return unwrap(window.pywebview!.api.clip_submission_status(postedAt));
+  },
+
+  startClipPlan(url: string, topN = 10): Promise<{ job_id: string }> {
+    if (!hasBridge()) return Promise.resolve({ job_id: "mock-clip-plan" });
+    return unwrap(window.pywebview!.api.start_clip_plan(url, topN));
+  },
+
+  startClipPreviews(url: string, topN = 8): Promise<{ job_id: string }> {
+    if (!hasBridge()) return Promise.resolve({ job_id: "mock-clip-previews" });
+    return unwrap(window.pywebview!.api.start_clip_previews(url, topN));
+  },
+
+  startLocalClipPreviews(videoPath: string, topN = 8): Promise<{ job_id: string }> {
+    if (!hasBridge()) return Promise.resolve({ job_id: "mock-local-clip-previews" });
+    return unwrap(window.pywebview!.api.start_local_clip_previews(videoPath, topN));
+  },
+
+  startClipSectionDownload(url: string, start: number, end: number): Promise<{ job_id: string }> {
+    if (!hasBridge()) return Promise.resolve({ job_id: "mock-clip-section" });
+    return unwrap(window.pywebview!.api.start_clip_section_download(url, start, end));
+  },
+
+  startClipRender(payload: Record<string, unknown>): Promise<{ job_id: string }> {
+    if (!hasBridge()) return Promise.resolve({ job_id: "mock-clip-render" });
+    return unwrap(window.pywebview!.api.start_clip_render(payload));
+  },
+
+  startClipTitleSuggestions(payload: Record<string, unknown>): Promise<{ job_id: string }> {
+    if (!hasBridge()) return Promise.resolve({ job_id: "mock-clip-titles" });
+    return unwrap(window.pywebview!.api.start_clip_title_suggestions(payload));
+  },
+
+  buildClipTitlePrompt(
+    payload: Record<string, unknown>,
+  ): Promise<{ prompt: string; copied: boolean }> {
+    if (!hasBridge()) return Promise.resolve({ prompt: "(mock prompt)", copied: true });
+    return unwrap(window.pywebview!.api.build_clip_title_prompt(payload));
+  },
+
+  importClipTitles(payload: Record<string, unknown>): Promise<ClipTitleSuggestions> {
+    if (!hasBridge()) return mock.importClipTitles();
+    return unwrap(window.pywebview!.api.import_clip_titles(payload));
+  },
+
+  buildClipBatchTitlePrompt(
+    payload: Record<string, unknown>,
+  ): Promise<{ prompt: string; copied: boolean; clip_count: number }> {
+    if (!hasBridge())
+      return Promise.resolve({
+        prompt: "(mock batch prompt)",
+        copied: true,
+        clip_count: ((payload.clips as unknown[]) ?? []).length,
+      });
+    return unwrap(window.pywebview!.api.build_clip_batch_title_prompt(payload));
+  },
+
+  importClipBatchTitles(payload: Record<string, unknown>): Promise<ClipBatchTitleImport> {
+    if (!hasBridge()) return mock.importClipBatchTitles(payload);
+    return unwrap(window.pywebview!.api.import_clip_batch_titles(payload));
+  },
+
+  clipMediaUrl(path: string): Promise<{ url: string }> {
+    // A truthy placeholder, not "": every player and every render-state control
+    // in Clip Studio is gated on having a URL, so returning empty made all of
+    // them permanently invisible in the dev harness. The clip will not decode —
+    // there is no real footage here — but the surrounding UI is exercisable.
+    if (!hasBridge()) return Promise.resolve({ url: MOCK_MEDIA_URL });
+    return unwrap(window.pywebview!.api.clip_media_url(path));
+  },
+
+  listClipSources(): Promise<ClipSourceHistory[]> {
+    if (!hasBridge()) return Promise.resolve(mock.clipSources());
+    return unwrap(window.pywebview!.api.list_clip_sources());
+  },
+
+  listClipSourceClips(sourceRef: string): Promise<ClipSourceClip[]> {
+    if (!hasBridge()) return Promise.resolve(mock.clipSourceClips(sourceRef));
+    return unwrap(window.pywebview!.api.list_clip_source_clips(sourceRef));
+  },
+
+  forgetClipSource(
+    sourceRef: string,
+    deleteWorkspace = false,
+  ): Promise<{ source_ref: string; workspace_removed: boolean }> {
+    if (!hasBridge()) return Promise.resolve({ source_ref: sourceRef, workspace_removed: false });
+    return unwrap(window.pywebview!.api.forget_clip_source(sourceRef, deleteWorkspace));
+  },
+
+  pickVideoFile(): Promise<{ path: string | null }> {
+    if (!hasBridge()) return Promise.resolve({ path: "C:/mock/clips/manual_import.mov" });
+    return unwrap(window.pywebview!.api.pick_video_file());
+  },
+
+  importLocalClip(payload: Record<string, unknown>): Promise<RegisteredClip> {
+    if (!hasBridge()) return Promise.resolve(mock.registeredClip(payload));
+    return unwrap(window.pywebview!.api.import_local_clip(payload));
+  },
+
+  sendClipToProcessing(payload: Record<string, unknown>): Promise<RegisteredClip> {
+    if (!hasBridge()) return Promise.resolve(mock.registeredClip(payload));
+    return unwrap(window.pywebview!.api.send_clip_to_processing(payload));
   },
 
   getJob(jobId: string): Promise<JobSnapshot> {
@@ -891,6 +1126,11 @@ export const bridge = {
   unscheduleJob(jobId: number): Promise<PublishQueueJob> {
     if (!hasBridge()) return mock.publishQueueJob();
     return unwrap(window.pywebview!.api.unschedule_job(jobId));
+  },
+
+  swapScheduledJob(jobId: number, replacementJobId: number): Promise<SwapScheduledJobResult> {
+    if (!hasBridge()) return mock.swapScheduledJob(jobId, replacementJobId);
+    return unwrap(window.pywebview!.api.swap_scheduled_job(jobId, replacementJobId));
   },
 
   removePublishJob(jobId: number) {
@@ -1340,6 +1580,11 @@ const MOCK_BATCH_ACCOUNTS = [
   { account_id: 3, account_name: "Resurfaced History", auto_schedules: false },
 ];
 
+// A bare MP4 `ftyp` box: enough for a <video> element to mount and for the URL
+// to be truthy, with no network request and no real media behind it.
+const MOCK_MEDIA_URL =
+  "data:video/mp4;base64,AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDE=";
+
 const mock = {
   // Dev harness only: no Python bridge, so keep preferences in localStorage so
   // the screens still behave. The real app persists these in the DB.
@@ -1389,6 +1634,10 @@ const mock = {
         ),
       })),
     };
+  },
+
+  async startFetchMissingBatchMedia(): Promise<{ job_id: string }> {
+    return { job_id: "mock-fetch-missing-media" };
   },
 
   async planFinishBatch(itemIds: number[]): Promise<{ plan: FinishBatchPlanEntry[] }> {
@@ -1521,6 +1770,120 @@ const mock = {
         error: null,
       };
     }
+    if (jobId === "mock-fetch-missing-media") {
+      return {
+        id: jobId,
+        status: "succeeded",
+        progress: 1,
+        message: "Done",
+        result: {
+          stuck_rows: 1,
+          linked_from_disk: 1,
+          fetched: 0,
+          retired_gone: 0,
+          unresolved: 0,
+          failures: [],
+        },
+        error: null,
+      };
+    }
+    if (jobId === "mock-clip-titles") {
+      return {
+        id: jobId,
+        status: "succeeded",
+        progress: 1,
+        message: "Written",
+        result: {
+          titles: [
+            "A card worth more than a house",
+            "What is the true cost of rarity",
+            "A secret global handoff for one card",
+          ],
+          tiers: ["green", "yellow", "red"],
+          notes: ["", "", "Grounding check: 'secret' not backed by the clip."],
+          flagged_terms: { "2": ["secret", "global"] },
+          recommendation_shifted: true,
+          recommended_index: 0,
+          reason: "Opens on the comparison the clip actually lands.",
+          summary: "A collector compares a card's price to his own house.",
+          provider_label: "Mock provider",
+          used_fallback: false,
+        },
+        error: null,
+      };
+    }
+    if (jobId === "mock-clip-render") {
+      // render_clip returns the output path; the screen resolves it via
+      // clipMediaUrl, which the dev harness answers with an empty src.
+      return {
+        id: jobId,
+        status: "succeeded",
+        progress: 1,
+        message: "Rendered",
+        result: "C:/mock/data/clips/a1b2c3d4e5f6/clip_1632_1653.mp4",
+        error: null,
+      };
+    }
+    if (jobId === "mock-clip-previews") {
+      // Mixed static/visual and a repeated theme, so the "static" badge and the
+      // shortlist's variety are both visible in dev.
+      const seeds = [
+        { at: 1632, score: 12.6, kb: 21.5, why: "big money: $60 million | drama: scandal" },
+        { at: 2982, score: 11.0, kb: 19.7, why: "big money: 400K | emotion: crazy" },
+        { at: 3854, score: 10.0, kb: 7.5, why: "big money: $400,000" },
+        { at: 1022, score: 9.5, kb: 37.6, why: "drama: controversies | superlative: biggest" },
+        { at: 736, score: 9.36, kb: 48.9, why: "big money: quarter million" },
+        { at: 5, score: 8.1, kb: 44.0, why: "superlative: biggest | history: in 1996", payoff: true },
+        { at: 2483, score: 8.0, kb: 7.4, why: "big money: $100,000", payoff: true },
+        { at: 3373, score: 7.65, kb: 17.4, why: "big money: $10,000 | emotion: insane", payoff: true },
+      ];
+      return {
+        id: jobId,
+        status: "succeeded",
+        progress: 1,
+        message: "Done",
+        result: {
+          url: "https://youtu.be/mock",
+          transcript_path: "C:/mock/clips/transcript.en-orig.srt",
+          transcript_available: true,
+          source: {
+            video_path: "C:/mock/clips/source.mp4",
+            title: "Mock documentary",
+            width: 1280,
+            height: 720,
+            duration_seconds: 5249,
+            from_cache: true,
+          },
+          previews: seeds.map((seed, index) => ({
+            index,
+            video_path: `C:/mock/clips/previews/preview_${index}.mp4`,
+            start: seed.at,
+            end: seed.at + 15,
+            duration: 15,
+            score: seed.score,
+            range_label: `${Math.floor(seed.at / 60)}:${String(seed.at % 60).padStart(2, "0")}`,
+            reasons: seed.why.split(" | "),
+            visual_activity: { kb_per_second: seed.kb, looks_static: seed.kb < 14 },
+            // Matches what render_previews sends: the preview file carries this
+            // much footage past the out-point, which is the room the trim
+            // handles extend into. Without it the dev grid cannot be extended.
+            lookahead_seconds: 4,
+            tail_hold: 1.5,
+            visual_payoff: seed.payoff
+              ? {
+                  detected: true,
+                  body_kb_per_second: seed.kb,
+                  tail_kb_per_second: seed.kb * 2.4,
+                  extra_seconds: 4,
+                }
+              : { detected: false },
+            context: `Mock transcript for the moment at ${seed.at}s, long enough to show how the
+              context block wraps in the card and in the hook step below it.`,
+          })),
+        },
+        error: null,
+      };
+    }
     if (jobId?.startsWith("mock-finish-")) {
       const ids = mockFinishedItemIds;
       return {
@@ -1574,6 +1937,145 @@ const mock = {
       message: "Done",
       result: mockRevision,
       error: null,
+    };
+  },
+  registeredClip(payload: Record<string, unknown>): RegisteredClip {
+    return {
+      item_id: 9001,
+      title: (payload.title as string) || "Mock imported clip",
+      file_path: "C:/mock/downloads/local/clip_20260813_120000_mock.mp4",
+      account_id: Number(payload.account_id ?? 1),
+      source_url: (payload.source_url as string) || "local://mock.mp4",
+      has_transcript_context: Boolean(payload.transcript_context),
+    };
+  },
+  async importClipBatchTitles(
+    payload: Record<string, unknown>,
+  ): Promise<ClipBatchTitleImport> {
+    const clips = (payload.clips as unknown[]) ?? [];
+    const results: Record<string, ClipTitleSuggestions> = {};
+    // All but the last, so the "some clips missing" path is visible in dev.
+    for (let index = 0; index < Math.max(clips.length - 1, 0); index += 1) {
+      results[String(index)] = await mock.importClipTitles();
+    }
+    return {
+      results,
+      missing: clips.length ? [clips.length] : [],
+      imported: Object.keys(results).length,
+    };
+  },
+
+  async importClipTitles(): Promise<ClipTitleSuggestions> {
+    return {
+      titles: [
+        "A card worth more than the house he lives in",
+        "He offered 400,000 dollars for a single card",
+        "A secret global handoff nobody has ever seen",
+      ],
+      tiers: ["green", "green", "red"],
+      notes: ["", "", "Grounding check: 'secret' not backed by the clip."],
+      flagged_terms: { "2": ["secret"] },
+      recommended_index: 0,
+      recommendation_shifted: true,
+      reason: "Pasted pick was flagged; moved to the strongest clean option.",
+      summary: "",
+      provider_label: "Pasted",
+      used_fallback: false,
+    };
+  },
+
+  clipSources(): ClipSourceHistory[] {
+    return [
+      {
+        source_ref: "https://youtu.be/mock-documentary",
+        kind: "url",
+        title: "Mock 90-minute documentary",
+        workspace_path: "C:/mock/data/clips/a1b2c3d4e5f6",
+        duration_seconds: 5220,
+        transcript_available: true,
+        preview_count: 8,
+        clip_count: 3,
+        created_at: new Date(Date.now() - 86_400_000).toISOString(),
+        last_analyzed_at: new Date(Date.now() - 3_600_000).toISOString(),
+      },
+      {
+        // A source that produced nothing is exactly what history is for.
+        source_ref: "file://C:/mock/clips/campaign_pack.mov",
+        kind: "file",
+        title: "campaign_pack",
+        workspace_path: "C:/mock/data/clips/9f8e7d6c5b4a",
+        duration_seconds: 612,
+        transcript_available: false,
+        preview_count: 0,
+        clip_count: 0,
+        created_at: new Date(Date.now() - 172_800_000).toISOString(),
+        last_analyzed_at: new Date(Date.now() - 172_800_000).toISOString(),
+      },
+    ];
+  },
+  clipSourceClips(sourceRef: string): ClipSourceClip[] {
+    if (!sourceRef.startsWith("https://")) return [];
+    return [
+      {
+        item_id: 9001,
+        title: "The bit about the sealed room",
+        created_at: new Date(Date.now() - 3_000_000).toISOString(),
+        file_path: "C:/mock/downloads/local/moment_120_mock.mp4",
+        processed_path: "C:/mock/processed/9001.mp4",
+        review_state: "approved",
+        account_id: 1,
+        account_name: "Mock Movie Account",
+        stage: "posted",
+        job_id: 501,
+        job_status: "posted",
+        scheduled_at: new Date(Date.now() - 7_200_000).toISOString(),
+        posted_at: new Date(Date.now() - 7_000_000).toISOString(),
+        posted_url: "https://instagram.com/p/mock",
+      },
+      {
+        item_id: 9002,
+        title: "What they found underneath",
+        created_at: new Date(Date.now() - 2_000_000).toISOString(),
+        file_path: "C:/mock/downloads/local/moment_845_mock.mp4",
+        processed_path: "C:/mock/processed/9002.mp4",
+        review_state: "approved",
+        account_id: 1,
+        account_name: "Mock Movie Account",
+        stage: "scheduled",
+        job_id: 502,
+        job_status: "cloud",
+        scheduled_at: new Date(Date.now() + 7_200_000).toISOString(),
+        posted_at: null,
+        posted_url: null,
+      },
+      {
+        item_id: 9003,
+        title: null,
+        created_at: new Date(Date.now() - 600_000).toISOString(),
+        file_path: "C:/mock/downloads/local/moment_2210_mock.mp4",
+        processed_path: null,
+        review_state: "new",
+        account_id: 1,
+        account_name: "Mock Movie Account",
+        stage: "library",
+        job_id: null,
+        job_status: null,
+        scheduled_at: null,
+        posted_at: null,
+        posted_url: null,
+      },
+    ];
+  },
+  async swapScheduledJob(
+    jobId: number,
+    replacementJobId: number,
+  ): Promise<SwapScheduledJobResult> {
+    const base = await mock.publishQueueJob();
+    const slotAt = new Date(Date.now() + 3_600_000).toISOString();
+    return {
+      slot_at: slotAt,
+      unscheduled: { ...base, id: jobId, status: "draft", scheduled_at: null },
+      scheduled: { ...base, id: replacementJobId, status: "scheduled", scheduled_at: slotAt },
     };
   },
   async listAccounts(): Promise<AccountSummary[]> {

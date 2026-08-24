@@ -100,6 +100,88 @@ def generate_transcript_draft_in_subprocess(
     )
 
 
+def _srt_timestamp(seconds: float) -> str:
+    millis = int(round(max(0.0, seconds) * 1000))
+    hours, millis = divmod(millis, 3_600_000)
+    minutes, millis = divmod(millis, 60_000)
+    secs, millis = divmod(millis, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def transcribe_to_srt(
+    input_path: Path,
+    output_path: Path,
+    *,
+    model_size: str = "base",
+    language: str | None = "en",
+    vocabulary: tuple[str, ...] = (),
+) -> Path:
+    """Transcribe ``input_path`` to a timestamped SRT at ``output_path``.
+
+    :func:`generate_transcript_draft` runs the same model but joins every
+    segment into one string, discarding ``segment.start``/``segment.end``. Those
+    timings are what the whole clip pipeline is built on, so this writes an SRT
+    instead — the exact format :mod:`transcript_clips` already parses. A local
+    file and a captioned YouTube URL then converge on one code path rather than
+    two.
+
+    ``language`` is pinned to English by default: campaign rules require English
+    output, and letting the model auto-detect on a noisy intro occasionally
+    picks the wrong language and returns translated text.
+
+    ``vocabulary`` biases decoding toward names the model would otherwise
+    mangle, and it matters more than it looks: the ranker matches celebrity
+    names literally, so a mangled name is a signal that silently never fires.
+    Measured on a real interview, "Noah Lyles" came out as "Noah Laos" on the
+    base model and "Noah Lowes" on small — passing the roster fixed it on base
+    with no extra runtime.
+    """
+    resolved_input = input_path.expanduser().resolve()
+    if not resolved_input.exists():
+        raise FileNotFoundError(f"Video file not found: {resolved_input}")
+
+    ffmpeg_path = ffmpeg_binary()
+    if ffmpeg_path is None:
+        raise RuntimeError("ffmpeg is not installed.")
+
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError as exc:
+        raise RuntimeError(
+            "faster-whisper is not installed. Add it to the environment to transcribe local files."
+        ) from exc
+
+    with tempfile.TemporaryDirectory(prefix="nicheflow-transcribe-srt-") as temp_dir:
+        audio_path = Path(temp_dir) / "audio.wav"
+        _extract_audio_for_transcription(ffmpeg_path, resolved_input, audio_path)
+        model = WhisperModel(model_size, device="cpu", compute_type="int8")
+        segments, _info = model.transcribe(
+            str(audio_path),
+            vad_filter=True,
+            language=language,
+            initial_prompt=", ".join(vocabulary) + "." if vocabulary else None,
+        )
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        written = 0
+        with output_path.open("w", encoding="utf-8") as handle:
+            for segment in segments:
+                text = _normalize_whitespace(segment.text or "")
+                if not text:
+                    continue
+                written += 1
+                handle.write(
+                    f"{written}\n"
+                    f"{_srt_timestamp(segment.start)} --> {_srt_timestamp(segment.end)}\n"
+                    f"{text}\n\n"
+                )
+
+    if written == 0:
+        output_path.unlink(missing_ok=True)
+        raise RuntimeError("No speech was detected in this video.")
+    return output_path
+
+
 def _extract_audio_for_transcription(ffmpeg_path: Path, input_path: Path, output_path: Path) -> None:
     command = [
         str(ffmpeg_path),
