@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 import re
 import shutil
@@ -634,6 +635,260 @@ def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
     )
 
 
+def build_clip_title_prompt(
+    *,
+    account_id: int,
+    clip_words: str,
+    surrounding_context: str | None = None,
+    source_title: str | None = None,
+    video_path: str | None = None,
+    range_label: str | None = None,
+    title_style: str | None = None,
+    title_length: str | None = None,
+) -> str:
+    """A copy-paste prompt asking a chat model for this clip's title options.
+
+    The Clip Studio counterpart to :func:`build_chat_prompt`. Same title rules
+    (:func:`smart_drafts.effective_title_rules`) and the same section headers the
+    Processing paste parser already reads, so one parser serves both paths and
+    the chat route cannot drift from the API route.
+
+    Titles only: a Clip Studio caption is composed from the campaign template
+    (``services.campaigns.build_caption``), not written by a model, so asking for
+    captions here would produce text nothing consumes.
+
+    The clip's own words and the surrounding minute are given as SEPARATE
+    sections on purpose. The model needs the wider context to know what the clip
+    is about, but the title has to be delivered by the clip itself — stating
+    which is which is what keeps a title off things the viewer never sees.
+    """
+    context_lines, rule_lines = _clip_title_prompt_parts(
+        account_id=account_id,
+        source_title=source_title,
+        video_path=video_path,
+        title_style=title_style,
+        title_length=title_length,
+    )
+    return "\n".join(
+        [
+            "Write on-screen title options for ONE short clip cut from a longer video.",
+            "",
+            *context_lines,
+            f"Clip position in the source: {range_label or '(unknown)'}",
+            "",
+            "WHAT THE CLIP ITSELF SAYS (the title must be delivered by THIS):",
+            (clip_words or "").strip()[:4000] or "(no speech in this window)",
+            "",
+            "SURROUNDING CONTEXT (what the clip is about; do NOT claim anything from "
+            "here that the clip above does not deliver):",
+            (surrounding_context or "").strip()[:6000] or "(none)",
+            "",
+            *rule_lines,
+            "",
+            "Return EXACTLY these section headers as PLAIN TEXT, never bold or "
+            "prefixed — the app parses them with a line-start match and any prefix "
+            "silently breaks the whole import:",
+            "Title Option 1:",
+            "Title Option 2:",
+            "Title Option 3:",
+            "Recommended Pick: Title Option N",
+            "Why:",
+        ]
+    )
+
+
+def _clip_title_prompt_parts(
+    *,
+    account_id: int,
+    source_title: str | None,
+    video_path: str | None = None,
+    title_style: str | None,
+    title_length: str | None,
+) -> tuple[list[str], list[str]]:
+    """``(account/source context, rule block)`` shared by both clip prompts.
+
+    Split out because the batch prompt needs the same rules stated once for many
+    clips. Deriving them by slicing the single-clip prompt's text is what an
+    earlier version did, and it silently dropped every rule — they sit *after*
+    the per-clip material, so the slice kept only the account header.
+    """
+    with get_session() as session:
+        account = session.get(Account, int(account_id))
+        if account is None:
+            raise DraftRevisionError(f"No account with id {account_id}.")
+        niche_label = account.niche_label or None
+        account_key = account.instagram_handle
+        fields = [
+            f"Account: {account.name}",
+            f"Niche: {niche_label or '(none)'}",
+            f"Tone: {account.writing_tone or '(none)'}",
+            f"Target audience: {account.target_audience or '(none)'}",
+            f"Hook style: {account.hook_style or '(none)'}",
+            f"Banned phrases: {account.banned_phrases or '(none)'}",
+            f"Title rules: {account.title_style_notes or '(none)'}",
+        ]
+        try:
+            prefs = json.loads(account.processing_preferences or "{}")
+        except ValueError:
+            prefs = {}
+        if not isinstance(prefs, dict):
+            prefs = {}
+    few_shot_winners = top_titles_for_account(account_key) if account_key else []
+    resolved_style = title_style or prefs.get("prompt_title_style") or None
+    resolved_length = title_length or prefs.get("title_length") or "long"
+    title_rules = smart_drafts.effective_title_rules(
+        resolved_style,
+        None,
+        niche_label,
+        few_shot_winners=few_shot_winners,
+        title_length=resolved_length,
+    )
+    context_lines = [
+        *(
+            ["Local clip file (inspect the frames if you can open it):", f'"{video_path}"', ""]
+            if video_path
+            else []
+        ),
+        "Account context:",
+        *fields,
+        f"Title style: {resolved_style or 'Auto'}",
+        f"Title length: {str(resolved_length).title()}",
+        "",
+        f"Source video title: {source_title or '(unknown)'}",
+    ]
+    rule_lines = [
+        *_WEB_RESEARCH_LINES,
+        "",
+        "On-screen title rules (follow these exactly):",
+        *title_rules,
+        "",
+        "Hook framing (drama is allowed, overclaiming is not):",
+        *smart_drafts._hook_drama_and_fact_safety_rules(),
+        "",
+        *_FACT_CHECK_LINES,
+        "",
+        "Generate 3 meaningfully different on-screen title options per clip.",
+        "Keep display titles plain text.",
+        "Never write em dashes or double hyphens ('--'); use a comma, period, or "
+        "colon instead. Long dashes read as AI-generated copy.",
+        "Do not invent unsupported facts.",
+        _RECOMMENDER_DEFERRAL,
+    ]
+    return context_lines, rule_lines
+
+
+# A clip header in a batch reply. Same shape as _REEL_HEADER (tolerant of
+# markdown, "#", and trailing labels) but keyed on CLIP NUMBER: Clip Studio
+# candidates have no DownloadItem id to echo — they only exist in the batch.
+_CLIP_HEADER = re.compile(
+    r"^\s*(?:[*_#=]+\s*)?clip\s*#?\s*(\d+)\s*(?:[:|)\-=#*_].*)?$",
+    re.IGNORECASE,
+)
+
+
+def build_clip_batch_title_prompt(
+    *,
+    account_id: int,
+    clips: list[dict],
+    source_title: str | None = None,
+    title_style: str | None = None,
+    title_length: str | None = None,
+) -> str:
+    """One prompt covering every candidate in the batch.
+
+    Writing titles one clip at a time means one copy, one paste and one model
+    round trip per candidate — eight of each for a normal batch. The rules are
+    identical for every clip in it, so they are stated once and each clip
+    contributes only its own words.
+
+    Each ``clips`` entry needs ``number`` (1-based, the routing key), ``words``
+    (what the clip says) and optionally ``context`` and ``range_label``.
+    """
+    if not clips:
+        raise DraftRevisionError("No clips to write titles for.")
+    context_lines, rule_lines = _clip_title_prompt_parts(
+        account_id=account_id,
+        source_title=source_title,
+        title_style=title_style,
+        title_length=title_length,
+    )
+
+    blocks: list[str] = []
+    for clip in clips:
+        number = int(clip.get("number") or 0)
+        words = str(clip.get("words") or "").strip()
+        context = str(clip.get("context") or "").strip()
+        blocks.extend(
+            [
+                "",
+                f"Clip {number}: {clip.get('range_label') or ''}".rstrip(),
+                "What this clip says (the title must be delivered by THIS):",
+                words[:2500] or "(no speech in this window)",
+                *(
+                    ["Surrounding context (do NOT claim what the clip does not deliver):",
+                     context[:1500]]
+                    if context
+                    else []
+                ),
+            ]
+        )
+
+    return "\n".join(
+        [
+            "Write on-screen title options for SEVERAL short clips cut from one "
+            "longer video. The rules below apply to every clip.",
+            "",
+            *context_lines,
+            "",
+            *rule_lines,
+            "",
+            f"There are {len(clips)} clips below. Write titles for EVERY one.",
+            *blocks,
+            "",
+            "Return EXACTLY this shape, repeated once per clip, with PLAIN TEXT "
+            "headers — never bold or prefixed, because the app matches them at "
+            "line start and any prefix silently breaks the import:",
+            "",
+            "Clip 1:",
+            "Title Option 1:",
+            "Title Option 2:",
+            "Title Option 3:",
+            "Recommended Pick: Title Option N",
+            "Why:",
+            "",
+            "Clip 2:",
+            "... and so on for every clip, in order, using the same clip numbers "
+            "given above.",
+        ]
+    )
+
+
+def parse_clip_batch_titles(text: str) -> dict[int, PastedDraft]:
+    """Split a batch reply into ``{clip number: parsed titles}``.
+
+    Routing is by the echoed clip number rather than by position, so a reply that
+    reorders the clips, or omits one, still lands every block on the right
+    candidate instead of silently shifting them all by one.
+    """
+    lines = (text or "").splitlines()
+    blocks: dict[int, list[str]] = {}
+    current: int | None = None
+    for line in lines:
+        match = _CLIP_HEADER.match(line)
+        if match:
+            current = int(match.group(1))
+            blocks.setdefault(current, [])
+            continue
+        if current is not None:
+            blocks[current].append(line)
+    parsed: dict[int, PastedDraft] = {}
+    for number, body in blocks.items():
+        draft = parse_pasted_draft("\n".join(body))
+        if draft.title_options:
+            parsed[number] = draft
+    return parsed
+
+
 def _batch_item_delimiter(index: int, seq: int | None) -> str:
     # Header carries the reel number (which models reproduce reliably) plus the
     # account-relative "#id" the user sees in the list. Import prefers the #id
@@ -966,7 +1221,11 @@ def _account_style_rules(account: Account | None, settings: dict) -> list[str]:
 # per-account reject; "blocked" is the global one (library.reject_item_globally),
 # which already hides the reel from the Processing table — offering it for a
 # batch draft would resurrect a clip the user killed everywhere else.
-_UNDRAFTABLE_REVIEW_STATES = frozenset({"rejected", "blocked"})
+#
+# Public because a batch's item list is PINNED when the prompt is prepared, so
+# every later stage (import here, plan/finish in batch_finish) has to re-check
+# this rather than trusting the candidate list it was built from.
+UNDRAFTABLE_REVIEW_STATES = frozenset({"rejected", "blocked"})
 
 
 def batch_candidates(
@@ -985,7 +1244,18 @@ def batch_candidates(
     """
     limit = max(1, int(per_account))
     # Lazy import: keep draft_handoff free of library's downloader import chain.
-    from nicheflow_studio.services import library
+    from nicheflow_studio.services import library, pooling
+
+    # Distribution creates a Processing row before its shared footage lands, and
+    # the only thing that ever fills in the path is a one-shot daemon thread. If
+    # that thread died (app closed, transient download failure) the row keeps a
+    # NULL file_path forever and this screen reports it as "waiting on footage"
+    # on every refresh. Re-linking here costs one batched query and self-heals
+    # every row whose footage a sibling account already pulled.
+    try:
+        pooling.repair_pending_review_media_links()
+    except Exception:  # noqa: BLE001 - a repair failure must not blank the screen
+        logger.exception("Re-linking pending-review footage before a batch failed.")
 
     with get_session() as session:
         query = session.query(Account)
@@ -1037,7 +1307,7 @@ def batch_candidates(
                 if item.id not in drafted_item_ids
                 and item.id not in posted_item_ids
                 and (item.video_id or "") not in posted_video_ids
-                and (item.review_state or "") not in _UNDRAFTABLE_REVIEW_STATES
+                and (item.review_state or "") not in UNDRAFTABLE_REVIEW_STATES
             ]
             # A distributed clip gets its pending-review row immediately but its
             # file_path only once the shared asset finishes downloading. Those
@@ -1428,6 +1698,28 @@ def import_multi_account_batch_draft(text: str, item_ids: list[int]) -> dict:
     return _import_batch(text, requested, {item_id: item_id for item_id in requested})
 
 
+def _rejected_in_batch(item_ids: list[int]) -> set[int]:
+    """Which of these reels the user has rejected or blocked since the batch was
+    prepared.
+
+    The batch's item list is pinned when the prompt is copied, so a reject made
+    afterwards (here or in Processing) leaves the reel in the list and the chat
+    reply still carries a block for it. Nothing downstream re-checked review
+    state, so the reel got a draft revision, then read as "ready" in the finish
+    plan, and was applied, exported, and re-scheduled — silently undoing the
+    reject, which had cancelled that clip's publish jobs.
+    """
+    if not item_ids:
+        return set()
+    with get_session() as session:
+        rows = (
+            session.query(DownloadItem.id, DownloadItem.review_state)
+            .filter(DownloadItem.id.in_([int(item_id) for item_id in item_ids]))
+            .all()
+        )
+    return {row[0] for row in rows if (row[1] or "") in UNDRAFTABLE_REVIEW_STATES}
+
+
 def _import_batch(text: str, requested: list[int], seq_to_item: dict[int, int]) -> dict:
     """Import a batch reply. Each block routes to a specific item by the echoed
     ``(#id)`` when it names an item in this batch (most reliable — survives
@@ -1441,6 +1733,10 @@ def _import_batch(text: str, requested: list[int], seq_to_item: dict[int, int]) 
     failed: list[dict] = []
     routed: dict[int, str] = {}
     order: list[int] = []
+    # Rejected reels keep their SLOT in `requested`: the reel-number fallback
+    # below routes by position, so dropping one would shift every later reel
+    # onto the wrong clip. They are skipped at the save step instead.
+    rejected = _rejected_in_batch(requested)
     # Report in reel order; sorted() is stable, so blocks sharing a reel number
     # keep their document order and the first one still wins below.
     for reel, echoed_id, block in sorted(_split_batch_blocks(text), key=lambda b: b[0]):
@@ -1459,15 +1755,24 @@ def _import_batch(text: str, requested: list[int], seq_to_item: dict[int, int]) 
             # and must not shadow the block that actually carries the draft.
             routed[item_id] = block
     for item_id in order:
+        if item_id in rejected:
+            continue
         try:
             import_pasted_draft(item_id, routed[item_id])
             imported.append(item_id)
         except DraftRevisionError as exc:
             failed.append({"item_id": item_id, "error": str(exc)})
-    matched = set(imported) | {row["item_id"] for row in failed}
+    matched = set(imported) | {row["item_id"] for row in failed} | rejected
     return {
         "imported": imported,
         "failed": failed,
+        # Reported separately from "unmatched" (a reply that lost a block) so the
+        # count reads as a deliberate exclusion rather than a parse failure.
+        "skipped": [
+            {"item_id": item_id, "reason": "rejected since this batch was prepared"}
+            for item_id in requested
+            if item_id in rejected
+        ],
         "unmatched": [item_id for item_id in requested if item_id not in matched],
     }
 
@@ -1580,13 +1885,18 @@ def import_pasted_draft(item_id: int, text: str) -> DraftRevisionDTO:
         signals_text = draft_guard.build_signals_text(
             item.transcript_text if item else None,
             item.title if item else None,
-            item.source_description if item else None,
             account.niche_label if account else None,
             item.smart_vision_payload if item else None,
+        )
+        # The scraped post's own caption is another reposter's claim, not
+        # evidence we observed — kept separate so it flags instead of clears.
+        asserted_text = draft_guard.build_signals_text(
+            item.source_description if item else None,
         )
     guarded = draft_guard.guard_options(
         title_options=parsed.title_options,
         signals_text=signals_text,
+        asserted_signals_text=asserted_text,
         option_notes=parsed.option_notes,
         recommended_index=(
             parsed.recommended_title_index - 1 if parsed.recommended_title_index else None
