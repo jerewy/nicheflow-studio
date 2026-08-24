@@ -73,6 +73,23 @@ _CLAIM_SUPPORT: dict[str, tuple[str | re.Pattern[str], ...]] = {
     "illegal": ("illegal", "banned", "outlaw", "law"),
     "forbidden": ("forbidden", "banned", "prohibit"),
     "secret": ("secret", "classified", "hidden"),
+    # Venue / place. A named venue is one of the easiest things for a viewer
+    # to fact-check and one of the most common corrections we get: a real
+    # title read "On the palace lawn" for footage shot on the Government
+    # House lawn in Auckland, and the top comment was the correction. Only
+    # venue-TYPE nouns are listed (open-ended city and country names cannot be
+    # a lexicon); each is supported by its own stem, so a title may say
+    # "palace" whenever any signal does.
+    "palace": ("palace",),
+    "castle": ("castle",),
+    "cathedral": ("cathedral", "church", "basilica"),
+    "stadium": ("stadium", "arena"),
+    "arena": ("arena", "stadium"),
+    "parliament": ("parliament", "congress", "senate"),
+    "embassy": ("embassy", "consulate"),
+    "prison": ("prison", "jail", "penitentiary"),
+    "museum": ("museum", "gallery"),
+    "courtroom": ("courtroom", "courthouse", "court", "trial"),
 }
 _CLAIM_WORD_RES: dict[str, re.Pattern[str]] = {
     word: re.compile(rf"\b{re.escape(word)}\b") for word in _CLAIM_SUPPORT
@@ -120,19 +137,32 @@ def build_signals_text(*parts: object) -> str:
 class TitleClaimReport:
     claim_terms: list[str]
     unsupported_terms: list[str]
+    asserted_terms: list[str] = field(default_factory=list)
 
 
 def check_title_claims(
-    title: str, signals_text: str, citation: str | None = None
+    title: str,
+    signals_text: str,
+    citation: str | None = None,
+    asserted_text: str | None = None,
 ) -> TitleClaimReport:
     """Find concrete claim terms in ``title`` and which lack signal support.
 
     A citation (the model's quoted supporting phrase) clears the whole option,
     but only when the quote actually appears in the signals — an invented
     quote changes nothing.
+
+    ``asserted_text`` holds signals we did not observe ourselves — chiefly the
+    scraped post's own caption, written by another repost account. Those are
+    second-hand claims, not evidence: reposters routinely embellish dates,
+    records and identities, so treating their caption as proof launders their
+    mistakes into our titles as confident fact. Terms backed ONLY there come
+    back as ``asserted_terms`` (flag for review) rather than either silently
+    supported or hard-red.
     """
     normalized_title = _normalize_text(title)
     normalized_signals = _normalize_text(signals_text)
+    normalized_asserted = _normalize_text(asserted_text)
 
     claim_terms: list[str] = [
         word for word, pattern in _CLAIM_WORD_RES.items() if pattern.search(normalized_title)
@@ -145,16 +175,30 @@ def check_title_claims(
     if not claim_terms:
         return TitleClaimReport(claim_terms=[], unsupported_terms=[])
 
+    # A citation clears the option only when it quotes something we observed.
+    # Quoting the reposter's caption is exactly the laundering case above, so
+    # it downgrades to "asserted" instead of clearing.
     normalized_citation = _normalize_text((citation or "").strip("\"'“”‘’"))
-    if normalized_citation not in _NO_CITATION_VALUES and normalized_citation in normalized_signals:
+    cited = normalized_citation not in _NO_CITATION_VALUES
+    if cited and normalized_citation in normalized_signals:
         return TitleClaimReport(claim_terms=claim_terms, unsupported_terms=[])
+    if cited and normalized_asserted and normalized_citation in normalized_asserted:
+        return TitleClaimReport(
+            claim_terms=claim_terms, unsupported_terms=[], asserted_terms=claim_terms
+        )
 
-    unsupported = [
-        term
-        for term in claim_terms
-        if not _term_supported(term, normalized_signals)
-    ]
-    return TitleClaimReport(claim_terms=claim_terms, unsupported_terms=unsupported)
+    unsupported: list[str] = []
+    asserted: list[str] = []
+    for term in claim_terms:
+        if _term_supported(term, normalized_signals):
+            continue
+        if normalized_asserted and _term_supported(term, normalized_asserted):
+            asserted.append(term)
+        else:
+            unsupported.append(term)
+    return TitleClaimReport(
+        claim_terms=claim_terms, unsupported_terms=unsupported, asserted_terms=asserted
+    )
 
 
 def _term_supported(term: str, normalized_signals: str) -> bool:
@@ -192,6 +236,7 @@ def guard_options(
     *,
     title_options: list[str],
     signals_text: str,
+    asserted_signals_text: str | None = None,
     option_tiers: list[str] | None = None,
     option_notes: list[str] | None = None,
     claim_supports: list[str] | None = None,
@@ -216,7 +261,7 @@ def guard_options(
     ]
     for i, title in enumerate(title_options):
         citation = claim_supports[i] if claim_supports and i < len(claim_supports) else None
-        report = check_title_claims(title, signals_text, citation)
+        report = check_title_claims(title, signals_text, citation, asserted_signals_text)
         if option_tiers and i < len(option_tiers):
             tier = _normalize_tier(option_tiers[i])
         else:
@@ -226,7 +271,17 @@ def guard_options(
             tier = "red"
             warning = (
                 f"Grounding check: {_format_terms(report.unsupported_terms)} not backed by "
-                "the transcript, source caption, or visual evidence; verify before posting."
+                "the transcript or visual evidence; verify before posting."
+            )
+            notes[i] = f"{notes[i]} [{warning}]".strip() if notes[i] else warning
+        elif report.asserted_terms:
+            # Second-hand only: the reposter said it, we did not see it. Never
+            # green (it is a checkable claim we cannot check) but not red
+            # either, since it is usually right — the user decides.
+            tier = "yellow" if _TIER_RANK[tier] < _TIER_RANK["yellow"] else tier
+            warning = (
+                f"Unverified: {_format_terms(report.asserted_terms)} comes only from the "
+                "original poster's caption, not the clip itself; check it before posting."
             )
             notes[i] = f"{notes[i]} [{warning}]".strip() if notes[i] else warning
         tiers.append(tier)
