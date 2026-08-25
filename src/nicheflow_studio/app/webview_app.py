@@ -137,6 +137,18 @@ def _run_started_webview() -> None:
         min_size=(960, 640),
     )
 
+    # Native open-file dialog for manual clip intake. A webview <input type=file>
+    # hands back a File object with no filesystem path, which the importer cannot
+    # use, so the picker has to come from the window.
+    def pick_video_file() -> list[str] | None:
+        return window.create_file_dialog(
+            webview.OPEN_DIALOG,
+            allow_multiple=False,
+            file_types=("Video files (*.mp4;*.mov;*.mkv;*.webm)", "All files (*.*)"),
+        )
+
+    bridge.set_file_picker(pick_video_file)
+
     mapping_installed = False
 
     def install_mapping_and_open_app() -> None:
