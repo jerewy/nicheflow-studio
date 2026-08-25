@@ -217,8 +217,14 @@ def test_suggested_action_is_advisory_from_tier_er_and_duration() -> None:
     # Short clips: engagement splits accept vs review.
     assert suggested_action("S", source_er=0.03, duration_seconds=30) == "accept"
     assert suggested_action("A", source_er=0.01, duration_seconds=30) == "review"
-    # Tier C/D are always rejected, regardless of engagement or length.
-    assert suggested_action("C", source_er=0.20, duration_seconds=20) == "reject"
+    # D is always rejected: a content exclusion (hydraulic press, physics demos),
+    # not a performance call.
+    assert suggested_action("D", source_er=0.20, duration_seconds=20) == "reject"
+    # C is NOT. It was auto-rejected on the label until 2026-08-12, when tier C
+    # turned out to have the highest median views of any tier across 1,100
+    # measured posts. It now earns its advice like any other clip.
+    assert suggested_action("C", source_er=0.20, duration_seconds=20) == "accept"
+    assert suggested_action("C", source_er=0.01, duration_seconds=20) == "review"
     # Long clips (>35s) are only rejected when engagement is also weak; a long
     # clip that already engages well stays accept (the cap is ER-aware now).
     assert suggested_action("B", source_er=0.03, duration_seconds=36) == "accept"
@@ -312,3 +318,38 @@ def test_plan_first_cycle_preserves_order_when_not_shuffling() -> None:
     )
     # Only the top 3 clips are placed (cap 1 each), and they are the first three.
     assert {a.pool_item_id for a in plan} == {10, 20, 30}
+
+
+def test_ranked_clip_order_sizes_the_jitter_block_against_the_run_not_the_pool() -> None:
+    # Sizing the shuffled block as a fraction of the POOL means a better-stocked
+    # pool discards more of the ranking. Measured on a real 805-clip pool placing
+    # 33 clips, the 25% block was 201 wide and the drawn clips had a median
+    # source reach of 14,552 against 243,611 for the genuine top 33.
+    scored = [(i, float(1000 - i)) for i in range(400)]
+
+    placed = ranked_clip_order(scored, rng=random.Random(0), slots=10)[:10]
+
+    # Every placed clip comes from the top of the ranking, not from a 100-wide
+    # block: 10 slots x 1.2 = a 12-clip window.
+    assert max(placed) < 12
+    # Still jittered — the order within that window is not the raw ranking.
+    assert placed != list(range(10))
+
+
+def test_ranked_clip_order_falls_back_to_pool_fraction_without_slots() -> None:
+    scored = [(i, float(1000 - i)) for i in range(400)]
+
+    placed = ranked_clip_order(scored, rng=random.Random(0))[:10]
+
+    # No slot count: the old 25%-of-pool behaviour still applies, so the first
+    # ten can come from anywhere in the top 100.
+    assert max(placed) >= 12
+
+
+def test_ranked_clip_order_is_deterministic_for_a_tiny_run() -> None:
+    # A run placing one or two clips rounds back to its own size, so the single
+    # best clip actually wins. Ceiling here made a 2-clip pool a coin flip.
+    scored = [(i, float(100 - i)) for i in range(50)]
+
+    assert ranked_clip_order(scored, rng=random.Random(3), slots=1)[:1] == [0]
+    assert sorted(ranked_clip_order(scored, rng=random.Random(3), slots=2)[:2]) == [0, 1]

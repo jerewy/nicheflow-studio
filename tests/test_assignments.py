@@ -62,7 +62,11 @@ def test_distribute_assigns_every_clip_once_balanced(tmp_path) -> None:
 
 
 def test_distribute_prefers_high_source_er_clips_under_cap(tmp_path) -> None:
-    """Distribution ranks by tier-weighted ER instead of raw likes."""
+    """With reach held constant, engagement rate breaks the tie.
+
+    Every clip here has the same view_count, so the reach term of
+    source_fit_score cannot separate them and the ER tiebreaker decides.
+    """
     init_db()
     with get_session() as session:
         (account_id,) = _make_accounts(session, "history", 1)
@@ -88,8 +92,9 @@ def test_distribute_prefers_high_source_er_clips_under_cap(tmp_path) -> None:
             )
         session.commit()
 
-        # Cap 5 with one account and a tier fraction of 0.25 (top tier = 5 clips)
-        # means the 5 highest-ER clips (eng15..eng19) are exactly what's placed.
+        # 5 slots -> a jitter block of round(5 * 1.2) = 6, so the placed clips are
+        # 5 drawn from the 6 highest-ER (eng14..eng19). Which 5 is deliberately
+        # jittered so consecutive runs don't place an identical set.
         created = distribute_niche(session, "history", rng=random.Random(1), max_per_account=5)
         session.commit()
         assert len(created) == 5
@@ -100,10 +105,19 @@ def test_distribute_prefers_high_source_er_clips_under_cap(tmp_path) -> None:
             .all()
         )
         placed_codes = {shortcodes[a.pool_item_id] for a in created}
-        assert placed_codes == {f"eng{i:02d}" for i in range(15, 20)}
+        assert len(placed_codes) == 5
+        assert placed_codes <= {f"eng{i:02d}" for i in range(14, 20)}
 
 
-def test_distribute_prefers_lower_likes_when_source_er_and_tier_are_higher(tmp_path) -> None:
+def test_distribute_prefers_the_clip_that_actually_travelled(tmp_path) -> None:
+    """Reach beats engagement RATE when the two disagree.
+
+    This asserted the opposite until 2026-08-12, when 1,100 of the network's own
+    posted reels were measured against real Instagram insights: ranked by source
+    views the bottom-to-top quartile spread was 3,368 -> 8,256 median views,
+    while ranking by source ER peaked in Q3 and fell in Q4. A 1M-view clip is
+    the better pick than a 10k-view clip with a marginally better ratio.
+    """
     init_db()
     with get_session() as session:
         (account_id,) = _make_accounts(session, "history", 1)
@@ -135,7 +149,7 @@ def test_distribute_prefers_lower_likes_when_source_er_and_tier_are_higher(tmp_p
         created = distribute_niche(session, "history", rng=random.Random(1), max_per_account=1)
         session.commit()
 
-        assert [assignment.pool_item_id for assignment in created] == [pool_ids["conversion"]]
+        assert [assignment.pool_item_id for assignment in created] == [pool_ids["raw-likes"]]
 
 
 def test_distribute_skips_resting_accounts(tmp_path) -> None:

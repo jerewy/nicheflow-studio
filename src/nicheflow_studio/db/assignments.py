@@ -217,6 +217,7 @@ def _engagement_signals_for_pool_items(
             fit_score=source_fit_score(
                 tier=topic_tier,
                 source_er=source_er,
+                source_views=views,
                 published_at=published_at,
                 now=now,
             ),
@@ -368,20 +369,29 @@ def distribute_niche(
     # funnel the same top clip onto every account. plan_first_cycle then places
     # them one-per-account, best-first (shuffle_items=False preserves the rank).
     scores = _engagement_scores_for_pool_items(session, unassigned_ids)
+    # Resolved BEFORE ranking so the jitter block can be sized against the number
+    # of clips this run will actually place. Sizing it against the pool instead
+    # meant a fuller pool discarded more of the ranking (see ranked_clip_order).
+    if existing_counts is None:
+        existing_counts = undrafted_item_counts_by_account(session, niche)
     ranked_ids = ranked_clip_order(
         [(pool_item_id, scores.get(pool_item_id, 0.0)) for pool_item_id in unassigned_ids],
         rng=rng,
+        slots=_slots_to_fill(
+            account_ids,
+            max_per_account=max_per_account,
+            targets_by_account=targets_by_account,
+            existing_counts=existing_counts,
+        ),
     )
-    # Pass each account's existing backlog so max_per_account is a TOTAL target:
-    # re-running "Distribute" only tops up accounts below target and never piles
-    # a second full batch onto accounts that already reached it. With
-    # max_per_account=None this has no effect (uncapped fill).
+    # existing_counts makes max_per_account a TOTAL target: re-running
+    # "Distribute" only tops up accounts below target and never piles a second
+    # full batch onto accounts that already reached it. With max_per_account=None
+    # this has no effect (uncapped fill).
     #
     # Which backlog counts is the caller's choice: the manual button measures
     # "reels still needing a draft" (the default here), while the automatic
     # top-up passes total-unposted counts so it refills only as posts go out.
-    if existing_counts is None:
-        existing_counts = undrafted_item_counts_by_account(session, niche)
     plan = plan_first_cycle(
         ranked_ids,
         account_ids,
@@ -408,6 +418,33 @@ def distribute_niche(
         created.append(assignment)
     session.flush()
     return created
+
+
+def _slots_to_fill(
+    account_ids: list[int],
+    *,
+    max_per_account: int | None,
+    targets_by_account: dict[int, int] | None,
+    existing_counts: dict[int, int],
+) -> int | None:
+    """How many clips this distribute run can still place.
+
+    Mirrors plan_first_cycle's own room check (target minus what the account
+    already holds) so the jitter block is sized against the real placement
+    count. Returns None when the run is uncapped, leaving the pool-fraction
+    fallback in charge.
+    """
+    total = 0
+    for account_id in account_ids:
+        target = (
+            targets_by_account.get(account_id)
+            if targets_by_account is not None
+            else max_per_account
+        )
+        if target is None:
+            return None
+        total += max(0, int(target) - int(existing_counts.get(account_id, 0)))
+    return total
 
 
 def assign_pool_item_to_accounts(
@@ -592,6 +629,47 @@ def fail_assignments_for_source_gone(session: Session, *, media_asset_id: int) -
         assignment.status = ASSIGNMENT_STATUS_FAILED_SOURCE
     session.flush()
     return len(rows)
+
+
+def delete_pending_review_items_for_asset(session: Session, *, media_asset_id: int) -> int:
+    """Drop the untouched Processing rows a permanently-gone source left behind.
+
+    ``_create_pending_review_item`` exposes an assignment in Processing the
+    moment it is created, before the shared footage has downloaded. When that
+    download turns out to be permanently impossible, releasing the assignment
+    alone leaves a pending-review row with no local file: it still occupies a
+    slot in the account's list but can never be drafted or exported, so an
+    account distributed 6 clips reads "5 of 5 draftless" forever.
+
+    Deletes only rows that are still ``pending_review`` AND have no playable
+    file, matched the same way ``_create_pending_review_item`` de-duplicates
+    (shortcode, or the canonical URL with and without its trailing slash).
+    Anything the user advanced past review, or that already has footage from
+    another path, is left alone. Returns the number deleted. Does not commit.
+    """
+    asset = session.get(MediaAsset, media_asset_id)
+    if asset is None:
+        return 0
+    url = (asset.canonical_source_url or "").rstrip("/")
+    match = DownloadItem.source_url.in_([url, url + "/"]) if url else None
+    if asset.source_shortcode:
+        by_shortcode = DownloadItem.video_id == asset.source_shortcode
+        match = by_shortcode if match is None else or_(match, by_shortcode)
+    if match is None:
+        return 0
+    items = (
+        session.query(DownloadItem)
+        .filter(DownloadItem.status == "pending_review", match)
+        .all()
+    )
+    deleted = 0
+    for item in items:
+        if item.file_path and Path(item.file_path).exists():
+            continue
+        session.delete(item)
+        deleted += 1
+    session.flush()
+    return deleted
 
 
 def _active_assignments_for_item(session: Session, item: DownloadItem) -> list[Assignment]:

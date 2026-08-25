@@ -53,6 +53,14 @@ class PoolingError(ServiceError):
     """Raised for invalid pooling queries (e.g. an unknown niche)."""
 
 
+class SourceGoneError(PoolingError):
+    """The clip's original reel is permanently gone (deleted or made private).
+
+    Distinct from a transient download failure so the background loop can tell
+    "this slot is dead, refill it" from "try again later".
+    """
+
+
 def _asset_is_downloaded(asset: MediaAsset) -> bool:
     return bool(
         asset.download_status == "downloaded"
@@ -81,10 +89,23 @@ def _ensure_pool_item_downloaded(pool_item_id: int) -> str | None:
         asset = session.get(MediaAsset, pool_item.media_asset_id)
         if asset is None:
             raise PoolingError(f"Pool item {pool_item_id} has no media asset.")
-        shortcode = asset.source_shortcode
-        if _asset_is_downloaded(asset):
-            return shortcode
         asset_id = asset.id
+    return _ensure_asset_downloaded(asset_id)
+
+
+def _ensure_asset_downloaded(asset_id: int) -> str | None:
+    """Download a shared asset's footage if it isn't already on disk.
+
+    Keyed on the asset rather than the pool item so the retry path
+    (:func:`fetch_missing_pending_media`) can reuse the same download, retire,
+    and fingerprint handling as distribution does.
+    """
+    with get_session() as session:
+        asset = session.get(MediaAsset, asset_id)
+        if asset is None:
+            raise PoolingError(f"No media asset with id {asset_id}.")
+        if _asset_is_downloaded(asset):
+            return asset.source_shortcode
         source_url = asset.canonical_source_url
 
     try:
@@ -105,7 +126,7 @@ def _ensure_pool_item_downloaded(pool_item_id: int) -> str | None:
                 shortcode=None,
                 detail=_download_error_message(exc),
             )
-            raise PoolingError(
+            raise SourceGoneError(
                 "The original reel is gone (deleted or made private). "
                 "It was removed from the pool; re-run Distribute to refill the slot."
             ) from exc
@@ -161,13 +182,56 @@ def _unassigned_pool_item_ids(niche: str) -> list[int]:
 _DOWNLOAD_LOCK = threading.Lock()
 
 
-def _download_pool_assets(pool_item_ids: list[int]) -> None:
+def _pool_item_slot_holders(pool_item_id: int) -> tuple[str | None, list[int]]:
+    """The clip's niche and the accounts currently holding it.
+
+    Read BEFORE the download attempt: if the source turns out to be gone,
+    ``retire_gone_source`` releases these assignments, and these are exactly the
+    accounts that just lost a slot and need one clip back each.
+    """
+    with get_session() as session:
+        pool_item = session.get(PoolItem, pool_item_id)
+        if pool_item is None:
+            return None, []
+        holders = [
+            account_id
+            for (account_id,) in session.query(Assignment.account_id)
+            .filter(
+                Assignment.pool_item_id == pool_item_id,
+                Assignment.status == assignments_db.ASSIGNMENT_STATUS_ASSIGNED,
+            )
+            .all()
+        ]
+        return pool_item.niche, holders
+
+
+def _download_pool_assets(pool_item_ids: list[int], *, refill: bool = True) -> None:
     """Download any not-yet-downloaded footage for these pool items, then link it
-    onto the pending-review Processing rows. Synchronous; best-effort per clip."""
+    onto the pending-review Processing rows. Synchronous; best-effort per clip.
+
+    A clip whose original reel turns out to be gone is retired (its Processing
+    row goes with it, see ``queue.retire_gone_source``), which leaves the account
+    one clip short of what Distribute reported. With ``refill`` each affected
+    account is handed back exactly the number of clips it lost; the refill's own
+    download pass runs with ``refill=False`` so a pool full of dead sources can
+    never loop.
+
+    The replacement is deliberately per-account and count-exact. Re-running the
+    niche-wide ranked distribute instead topped every account up to its full
+    daily target, so a single dead clip after a "Distribute now" of 3 quietly
+    turned into 6 per account (2026-08-16).
+    """
+    dead_slots: dict[str, Counter[int]] = {}
     for pool_item_id in pool_item_ids:
+        niche, holders = _pool_item_slot_holders(pool_item_id)
         with _DOWNLOAD_LOCK:
             try:
                 shortcode = _ensure_pool_item_downloaded(pool_item_id)
+            except SourceGoneError as exc:
+                logger.warning("Pool clip %s retired as gone: %s", pool_item_id, exc)
+                if niche and holders:
+                    dead_slots.setdefault(niche, Counter()).update(holders)
+                continue
             except PoolingError as exc:
                 logger.warning("Background pool download failed for %s: %s", pool_item_id, exc)
                 continue
@@ -182,8 +246,21 @@ def _download_pool_assets(pool_item_ids: list[int]) -> None:
         except Exception:  # noqa: BLE001 - background backfill must not crash the worker
             logger.exception("Linking downloaded footage to pending-review items failed.")
 
+    for niche, lost in sorted(dead_slots.items()) if refill else []:
+        try:
+            result = distribute_niche_explicit(
+                niche, dict(lost), _refill_downloads=False
+            )
+            logger.info(
+                "Refilled %s slot(s) in '%s' after retiring gone sources.",
+                result.get("assigned", 0),
+                niche,
+            )
+        except Exception:  # noqa: BLE001 - the refill is best-effort
+            logger.exception("Refilling '%s' after a gone source failed.", niche)
 
-def _start_background_download(pool_item_ids: list[int]) -> None:
+
+def _start_background_download(pool_item_ids: list[int], *, refill: bool = True) -> None:
     """Fetch the assigned clips' footage on a daemon thread so distribution
     returns instantly. Already-downloaded clips are skipped cheaply."""
     ids = [int(pool_item_id) for pool_item_id in pool_item_ids]
@@ -192,6 +269,7 @@ def _start_background_download(pool_item_ids: list[int]) -> None:
     threading.Thread(
         target=_download_pool_assets,
         args=(ids,),
+        kwargs={"refill": refill},
         name="nicheflow-pool-download",
         daemon=True,
     ).start()
@@ -669,6 +747,7 @@ def distribute_niche(
     max_per_account: int | None = None,
     *,
     publish_ready_only: bool = False,
+    _refill_downloads: bool = True,
 ) -> dict:
     """Auto-distribute a niche's undistributed pool across its accounts.
 
@@ -806,7 +885,9 @@ def distribute_niche(
         }
         if reason is not None:
             result["reason"] = reason
-    _start_background_download(created_pool_item_ids)
+    # ``_refill_downloads=False`` marks this call as itself a refill for clips
+    # that turned out to be gone, so its download pass never starts another one.
+    _start_background_download(created_pool_item_ids, refill=_refill_downloads)
     return result
 
 
@@ -1010,6 +1091,9 @@ def repair_pending_review_media_links(
     ``shortcodes`` narrows the scan to specific source clips, which is what the
     background download loop uses to link one freshly downloaded clip without
     re-walking the whole pending-review backlog on every iteration.
+
+    Cheap enough to call on a read path (Batch Drafts loads it on every refresh),
+    so the asset lookup is one batched query rather than one per pending row.
     """
     repaired: list[dict] = []
     with get_session() as session:
@@ -1019,16 +1103,26 @@ def repair_pending_review_media_links(
         if shortcodes is not None:
             query = query.filter(DownloadItem.video_id.in_(sorted(shortcodes)))
         pending_items = query.all()
-        for item in pending_items:
-            if item.file_path and Path(item.file_path).exists():
-                continue
-            asset = (
-                session.query(MediaAsset)
-                .filter(MediaAsset.source_shortcode == item.video_id)
-                .first()
-                if item.video_id
-                else None
-            )
+        # Only rows with no playable file need an asset at all; resolving them in
+        # one query keeps a 200-row backlog from costing 200 round trips.
+        unlinked = [
+            item
+            for item in pending_items
+            if item.video_id and not (item.file_path and Path(item.file_path).exists())
+        ]
+        wanted = {item.video_id for item in unlinked}
+        assets_by_shortcode = (
+            {
+                asset.source_shortcode: asset
+                for asset in session.query(MediaAsset)
+                .filter(MediaAsset.source_shortcode.in_(sorted(wanted)))
+                .all()
+            }
+            if wanted
+            else {}
+        )
+        for item in unlinked:
+            asset = assets_by_shortcode.get(item.video_id)
             if asset is None or not _asset_is_downloaded(asset):
                 continue
             repaired.append(
@@ -1046,11 +1140,126 @@ def repair_pending_review_media_links(
     return {"dry_run": dry_run, "repaired_items": len(repaired), "items": repaired}
 
 
-def distribute_niche_explicit(niche: str, targets_by_account: dict[int, int]) -> dict:
+def _stuck_pending_media(session, account_ids: list[int] | None) -> list[DownloadItem]:
+    """Distributed rows still showing no playable footage, newest last.
+
+    Rejected and blocked reels are left out to match ``batch_candidates``: a clip
+    the user killed must not be re-fetched just because its file never landed.
+    """
+    query = session.query(DownloadItem).filter(
+        DownloadItem.status == "pending_review",
+        DownloadItem.review_state.notin_(["rejected", "blocked"]),
+    )
+    if account_ids:
+        query = query.filter(DownloadItem.account_id.in_([int(a) for a in account_ids]))
+    return [
+        item
+        for item in query.order_by(DownloadItem.id).all()
+        if not (item.file_path and Path(item.file_path).exists())
+    ]
+
+
+def fetch_missing_pending_media(
+    *, account_ids: list[int] | None = None, progress: Callable | None = None
+) -> dict:
+    """Re-fetch footage for distributed reels the background pass never finished.
+
+    ``_download_pool_assets`` gets exactly one attempt per distribute, on a daemon
+    thread: a clip it fails (rate limit, DNS blip) or never reaches (the app closed
+    while the queue drained) keeps ``file_path`` NULL forever, because nothing else
+    ever retries it. Batch Drafts then reports it as waiting on footage for good,
+    and the only cure was opening each reel in Processing one by one. This is that
+    cure in bulk.
+
+    Cheap when there is nothing to do: rows whose asset is already on disk are
+    linked without a network call, and only what is genuinely absent is fetched.
+    """
+
+    def report(fraction: float, message: str) -> None:
+        if progress is not None:
+            progress(fraction, message)
+
+    report(0.0, "Checking for footage already on disk…")
+    # Free first pass: most stuck rows are a missing LINK, not missing footage —
+    # a sibling account downloaded the same clip and only this row was left out.
+    linked = repair_pending_review_media_links()["repaired_items"]
+
+    with get_session() as session:
+        stuck = _stuck_pending_media(session, account_ids)
+        # One download per shortcode, not per row: the same reel distributed to
+        # three accounts is one shared asset and must not be fetched three times.
+        asset_ids_by_shortcode: dict[str, int] = {}
+        unresolved = 0
+        for item in stuck:
+            if not item.video_id:
+                unresolved += 1
+                continue
+            asset = (
+                session.query(MediaAsset)
+                .filter(MediaAsset.source_shortcode == item.video_id)
+                .first()
+            )
+            if asset is None:
+                unresolved += 1
+                continue
+            asset_ids_by_shortcode.setdefault(asset.source_shortcode, asset.id)
+        stuck_rows = len(stuck)
+
+    targets = list(asset_ids_by_shortcode.items())
+    fetched = 0
+    gone = 0
+    failures: list[dict] = []
+    for index, (shortcode, asset_id) in enumerate(targets):
+        report(
+            index / max(1, len(targets)),
+            f"Fetching footage {index + 1} of {len(targets)}…",
+        )
+        # Same lock distribution uses, so a manual retry and a background
+        # distribute can never run two yt-dlp processes over the same clip.
+        with _DOWNLOAD_LOCK:
+            try:
+                _ensure_asset_downloaded(asset_id)
+            except SourceGoneError as exc:
+                # Already retired by _ensure_asset_downloaded, which also drops
+                # the orphaned pending-review row. Nothing left to link.
+                gone += 1
+                logger.warning("Stuck clip %s retired as gone: %s", shortcode, exc)
+                continue
+            except PoolingError as exc:
+                failures.append({"shortcode": shortcode, "error": str(exc)})
+                logger.warning("Retrying stuck clip %s failed: %s", shortcode, exc)
+                continue
+        fetched += 1
+        try:
+            repair_pending_review_media_links(shortcodes={shortcode})
+        except Exception:  # noqa: BLE001 - a link failure must not abort the run
+            logger.exception("Linking retried footage for %s failed.", shortcode)
+
+    report(1.0, "Done.")
+    return {
+        "stuck_rows": stuck_rows,
+        "linked_from_disk": linked,
+        "fetched": fetched,
+        "retired_gone": gone,
+        # Rows with no shortcode or no registered asset: nothing here can fetch
+        # them, so the UI points at opening the reel in Processing instead.
+        "unresolved": unresolved,
+        "failures": failures,
+    }
+
+
+def distribute_niche_explicit(
+    niche: str,
+    targets_by_account: dict[int, int],
+    *,
+    _refill_downloads: bool = True,
+) -> dict:
     """Add explicit clip counts to selected accounts, ignoring cadence targets.
 
     The chosen clips' footage is fetched in the background, so this returns
-    without waiting on downloads.
+    without waiting on downloads. ``_refill_downloads=False`` is the internal
+    gone-source replacement path: it stops a replacement that is itself dead
+    from kicking off another replacement round.
     """
     requested = {
         int(account_id): max(0, int(target))
@@ -1076,6 +1285,21 @@ def distribute_niche_explicit(niche: str, targets_by_account: dict[int, int]) ->
         except ValueError as exc:
             raise PoolingError(str(exc)) from exc
         created_pool_item_ids = [row.pool_item_id for row in created]
+        # Why nothing was placed, mirroring distribute_niche. The reject-and-
+        # replace path calls this per account, and without a reason its "no
+        # replacement" message had to guess "pool empty" — which pointed the user
+        # at Pool & Distribute even when the real cause was an account already at
+        # its target or not in this niche at all.
+        # "all_at_cap" is unreachable here: an explicit target is existing + N, so
+        # the account is under target by construction. Nothing placed therefore
+        # means either the account isn't in this niche or the pool has nothing
+        # unassigned left to give it.
+        reason: str | None = None
+        if not created:
+            niche_account_ids = set(assignments_db.account_ids_for_niche(session, niche))
+            reason = (
+                "pool_empty" if niche_account_ids & set(requested) else "no_accounts"
+            )
         assigned = Counter(row.account_id for row in created)
         pinned = Counter(
             row.account_id
@@ -1103,6 +1327,7 @@ def distribute_niche_explicit(niche: str, targets_by_account: dict[int, int]) ->
                 }
                 for account_id, target in requested.items()
             ],
+            **({"reason": reason} if reason else {}),
         }
-    _start_background_download(created_pool_item_ids)
+    _start_background_download(created_pool_item_ids, refill=_refill_downloads)
     return result
