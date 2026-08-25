@@ -10,6 +10,7 @@ from typing import Callable
 from nicheflow_studio.core.paths import downloads_dir
 from nicheflow_studio.db.assignments import (
     ASSIGNMENT_STATUS_SKIPPED_DUPLICATE,
+    delete_pending_review_items_for_asset,
     fail_assignments_for_source_gone,
     pending_download_assignments,
 )
@@ -274,8 +275,9 @@ def retire_gone_source(
     """Pull a permanently-gone source out of circulation (best-effort).
 
     Marks the asset unavailable, removes its pool items, releases its active
-    assignments, and blocklists its dedup keys. Never raises: the download loop
-    must keep processing the remaining clips.
+    assignments, deletes the untouched pending-review Processing rows those
+    assignments created, and blocklists its dedup keys. Never raises: the
+    download loop must keep processing the remaining clips.
     """
     try:
         with get_session() as session:
@@ -287,6 +289,11 @@ def retire_gone_source(
                 session, media_asset_id=media_asset_id, reason=f"source gone: {detail}"
             )
             fail_assignments_for_source_gone(session, media_asset_id=media_asset_id)
+            # Releasing the assignment is not enough: distribution already
+            # exposed the clip in Processing, and a row with no downloadable
+            # footage is undraftable dead weight that makes the account look
+            # short of what Distribute reported.
+            delete_pending_review_items_for_asset(session, media_asset_id=media_asset_id)
             block_asset(
                 session,
                 source_url=source_url,

@@ -16,7 +16,9 @@ from __future__ import annotations
 import logging
 import threading
 
-from nicheflow_studio.db.models import Account, DownloadItem
+from sqlalchemy import or_, select
+
+from nicheflow_studio.db.models import Account, DownloadItem, UploadJob
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.services import draft_revisions, export as export_svc, publishing
 from nicheflow_studio.services.draft_revisions import DraftRevisionError
@@ -35,6 +37,39 @@ def _check_cancel(cancel_event: "threading.Event | None") -> None:
         raise JobCanceled("Finish batch canceled.")
 
 
+# Job states that mean the reel is committed to actually go out: booked into a
+# local slot, handed to the Cloudflare Worker, or already published. A "draft"
+# job is only queued, and "failed"/"skipped" are dead ends — none of those block
+# a re-finish.
+_COMMITTED_JOB_STATUSES = ("scheduled", "cloud", "posted")
+
+
+def _committed_item_ids(session, item_ids: list[int]) -> set[int]:
+    """Items in this batch whose export is already queued to publish.
+
+    A batch's item list is PINNED when its prompt is prepared, and the Batch
+    Drafts screen keeps showing that list after a finish. Without this check a
+    second click on the stale list re-applies, re-renders (minutes of FFmpeg),
+    and re-schedules reels that already went out — the same pinned-list hazard
+    the reject check below guards against, on the export side.
+    """
+    if not item_ids:
+        return set()
+    return {
+        row[0]
+        for row in session.execute(
+            select(UploadJob.download_item_id)
+            .where(UploadJob.download_item_id.in_(item_ids))
+            .where(
+                or_(
+                    UploadJob.status.in_(_COMMITTED_JOB_STATUSES),
+                    UploadJob.posted_at.is_not(None),
+                )
+            )
+        ).all()
+    }
+
+
 def plan_batch(item_ids: list[int]) -> list[dict]:
     """What ``finish_batch`` would do, without doing it.
 
@@ -45,7 +80,7 @@ def plan_batch(item_ids: list[int]) -> list[dict]:
     plan: list[dict] = []
     with get_session() as session:
         # Lazy import: keep this module free of library's downloader import chain.
-        from nicheflow_studio.services import cloud_publisher, library
+        from nicheflow_studio.services import cloud_publisher, draft_handoff, library
 
         # The per-account "#N" the Processing table and the batch prompt both use.
         # Carried here so a results view can name a reel the same way even after
@@ -57,10 +92,37 @@ def plan_batch(item_ids: list[int]) -> list[dict]:
         # "scheduled in the cloud" instead of leaving the user to guess whether
         # a post depends on this machine staying open.
         cloud_ready = cloud_publisher.is_configured()
+        committed = _committed_item_ids(session, ids)
         for item_id in ids:
             item = session.get(DownloadItem, item_id)
             if item is None:
                 plan.append({"item_id": item_id, "ready": False, "reason": "item not found"})
+                continue
+            # A batch's item list is pinned when its prompt is prepared, so a
+            # reject made afterwards (from this screen or from Processing) leaves
+            # the reel in the list. Without this check the reel was applied,
+            # exported, and re-scheduled — and since reject_item CANCELS that
+            # clip's publish jobs, finishing the batch silently un-rejected it.
+            if (item.review_state or "") in draft_handoff.UNDRAFTABLE_REVIEW_STATES:
+                plan.append(
+                    {
+                        "item_id": item_id,
+                        "account_seq": seq_by_item.get(item_id),
+                        "ready": False,
+                        "reason": f"{item.review_state} — excluded from this batch",
+                    }
+                )
+                continue
+            if item_id in committed:
+                plan.append(
+                    {
+                        "item_id": item_id,
+                        "account_seq": seq_by_item.get(item_id),
+                        "title": item.title,
+                        "ready": False,
+                        "reason": "already exported and queued to publish",
+                    }
+                )
                 continue
             account = session.get(Account, item.account_id) if item.account_id else None
             entry = {
@@ -139,6 +201,16 @@ def finish_batch(
     plan = plan_batch(ids)
     ready = [entry for entry in plan if entry.get("ready")]
     if not ready:
+        # "Import the reply first" is the wrong instruction when the real cause is
+        # a stale list whose reels this batch already exported, so name that case.
+        if plan and all(
+            entry.get("reason") == "already exported and queued to publish"
+            for entry in plan
+        ):
+            raise BatchFinishError(
+                "These reels were already exported and queued to publish. "
+                "Refresh the batch to pick up what still needs drafting."
+            )
         raise BatchFinishError(
             "None of these reels have a draft revision yet. Import the batch reply first."
         )
