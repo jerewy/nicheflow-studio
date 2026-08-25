@@ -29,6 +29,7 @@ import type {
   ClipTitleSuggestions,
   RegisteredClip,
   CropRect,
+  EffectiveCrop,
   DeleteAccountResult,
   DistributeNicheResult,
   DraftRevision,
@@ -140,6 +141,7 @@ interface PywebviewApi {
   ): Promise<Envelope<{ title_draft: string; caption_draft: string }>>;
   open_item_folder(itemId: number): Promise<Envelope<{ folder: string }>>;
   get_crop_override(itemId: number): Promise<Envelope<CropRect | null>>;
+  get_effective_crop(itemId: number): Promise<Envelope<EffectiveCrop>>;
   get_crop_preview(
     itemId: number,
     atSeconds?: number,
@@ -782,6 +784,17 @@ export const bridge = {
   getCropOverride(itemId: number): Promise<CropRect | null> {
     if (!hasBridge()) return Promise.resolve(null);
     return unwrap(window.pywebview!.api.get_crop_override(itemId));
+  },
+
+  getEffectiveCrop(itemId: number): Promise<EffectiveCrop> {
+    if (!hasBridge()) {
+      return Promise.resolve({
+        item_id: itemId,
+        rect: { x: 0, y: 0, w: 1, h: 1 },
+        source: "none",
+      });
+    }
+    return unwrap(window.pywebview!.api.get_effective_crop(itemId));
   },
 
   getCropPreview(

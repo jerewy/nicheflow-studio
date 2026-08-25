@@ -491,6 +491,96 @@ def test_save_crop_override_rejects_invalid() -> None:
         export_svc.save_crop_override(item_id, {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.5})  # w=0
 
 
+def test_override_from_crop_round_trips_through_crop_from_override() -> None:
+    probe = video.VideoProbe(width=1080, height=1920, duration_seconds=8.0)
+    crop = video.CropSettings(left=70, top=784, right=68, bottom=273)
+
+    rect = export_svc.override_from_crop(crop, probe)
+
+    assert export_svc.crop_from_override(rect, probe) == crop
+
+
+def test_effective_crop_reports_the_manual_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake")
+    item_id = _make_item(file_path=str(source))
+    rect = {"x": 0.0, "y": 0.25, "w": 1.0, "h": 0.5}
+    export_svc.save_crop_override(item_id, rect)
+    # Detection must not even run once the user has fixed the framing by hand.
+    monkeypatch.setattr(
+        video,
+        "suggest_title_replacement_crop",
+        lambda _p, _probe: pytest.fail("detection ran despite a manual override"),
+    )
+
+    result = export_svc.effective_crop(item_id)
+
+    assert result == {"item_id": item_id, "rect": rect, "source": "manual"}
+
+
+def test_effective_crop_reports_the_detected_rectangle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake")
+    item_id = _make_item(file_path=str(source))
+    probe = video.VideoProbe(width=1080, height=1920, duration_seconds=8.0)
+    detected = video.CropSettings(left=70, top=784, right=68, bottom=273)
+    monkeypatch.setattr(video, "probe_video", lambda _p: probe)
+    monkeypatch.setattr(video, "suggest_title_replacement_crop", lambda _p, _probe: detected)
+
+    result = export_svc.effective_crop(item_id)
+
+    assert result["source"] == "auto"
+    # The rect the UI draws must be the one the export actually renders.
+    assert export_svc.crop_from_override(result["rect"], probe) == detected
+
+
+def test_effective_crop_reports_full_frame_when_nothing_detected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake")
+    item_id = _make_item(file_path=str(source))
+    probe = video.VideoProbe(width=1080, height=1920, duration_seconds=8.0)
+    monkeypatch.setattr(video, "probe_video", lambda _p: probe)
+    monkeypatch.setattr(
+        video, "suggest_title_replacement_crop", lambda _p, _probe: video.CropSettings()
+    )
+
+    result = export_svc.effective_crop(item_id)
+
+    assert result["source"] == "none"
+    assert result["rect"] == {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
+
+
+def test_effective_crop_survives_a_detection_crash(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A detector crash must not block review, matching ``export_item``."""
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake")
+    item_id = _make_item(file_path=str(source))
+    probe = video.VideoProbe(width=1080, height=1920, duration_seconds=8.0)
+    monkeypatch.setattr(video, "probe_video", lambda _p: probe)
+
+    def boom(_p, _probe):
+        raise RuntimeError("ffmpeg exploded")
+
+    monkeypatch.setattr(video, "suggest_title_replacement_crop", boom)
+
+    assert export_svc.effective_crop(item_id)["source"] == "none"
+
+
+def test_effective_crop_requires_a_downloaded_file() -> None:
+    item_id = _make_item(file_path=None)
+
+    with pytest.raises(ExportError):
+        export_svc.effective_crop(item_id)
+
+
 def test_export_uses_crop_override_over_auto(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

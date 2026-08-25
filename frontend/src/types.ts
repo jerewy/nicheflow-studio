@@ -372,6 +372,17 @@ export interface CropRect {
   h: number;
 }
 
+// The keep-region an export will actually use. "manual" is a saved override,
+// "auto" a detected footage rectangle, "none" a clip kept whole because
+// detection found nothing.
+export type CropSource = "manual" | "auto" | "none";
+
+export interface EffectiveCrop {
+  item_id: number;
+  rect: CropRect;
+  source: CropSource;
+}
+
 export interface ApifyUsage {
   month: string;
   used: number;

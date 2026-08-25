@@ -744,6 +744,15 @@ class ProcessingBridge:
         return export_svc.get_crop_override(item_id)
 
     @_guard
+    def get_effective_crop(self, item_id: int) -> dict:
+        """The keep-region the export will use, manual or auto-detected.
+
+        Detection decodes frames, so this is slower than ``get_crop_override``;
+        callers should fetch it once per item rather than per render.
+        """
+        return export_svc.effective_crop(item_id)
+
+    @_guard
     def get_crop_preview(self, item_id: int, at_seconds: float | None = None) -> dict:
         """A still-frame URL for the crop editor; avoids WebView video crashes.
 

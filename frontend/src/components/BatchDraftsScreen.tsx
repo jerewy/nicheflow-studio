@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { CropEditor } from "@/components/CropEditor";
+import { CropPreview } from "@/components/CropPreview";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { useToast } from "@/components/ui/Toast";
@@ -1058,6 +1059,17 @@ export function BatchDraftsScreen({
                   preview_url would hide it whenever the WebView media mapping
                   simply hasn't finished installing yet. */}
               <div className="rounded-md border border-border">
+                {/* Shown without asking: the automatic crop is what ships when
+                    nobody opens the editor, so it has to be visible by default
+                    rather than behind the disclosure below. */}
+                {!cropOpen && (
+                  <div className="border-b border-border p-3">
+                    <CropPreview
+                      itemId={reviewing.id}
+                      onAdjust={() => setCropOpen(true)}
+                    />
+                  </div>
+                )}
                 <button
                   type="button"
                   className="flex w-full items-center justify-between px-3 py-2 text-left text-sm hover:bg-muted/50"
