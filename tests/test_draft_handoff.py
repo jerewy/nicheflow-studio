@@ -3,7 +3,13 @@ import datetime as dt
 
 import pytest
 
-from nicheflow_studio.db.models import AccountPostMetric, Account, DownloadItem, UploadJob
+from nicheflow_studio.db.models import (
+    AccountPostMetric,
+    Account,
+    DownloadItem,
+    MediaAsset,
+    UploadJob,
+)
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.processing import smart_drafts
 from nicheflow_studio.services import draft_handoff, draft_revisions, library
@@ -231,6 +237,7 @@ def test_build_chat_prompt_uses_accounts_measured_top_titles() -> None:
                 AccountPostMetric(
                     account_key="pastmomentsdaily",
                     shortcode="winner-one",
+                    reach=50_000,
                     caption="Measured winner one",
                     conversion_score=0.8,
                     pulled_at=dt.datetime.now(dt.timezone.utc),
@@ -238,6 +245,7 @@ def test_build_chat_prompt_uses_accounts_measured_top_titles() -> None:
                 AccountPostMetric(
                     account_key="pastmomentsdaily",
                     shortcode="winner-two",
+                    reach=50_000,
                     caption="Measured winner two",
                     conversion_score=0.5,
                     pulled_at=dt.datetime.now(dt.timezone.utc),
@@ -403,6 +411,7 @@ def test_build_account_batch_chat_prompt_uses_measured_winners_and_title_length(
             AccountPostMetric(
                 account_key="pastmomentsdaily",
                 shortcode="batch-winner",
+                reach=50_000,
                 caption="Measured batch winner",
                 conversion_score=0.9,
                 pulled_at=dt.datetime.now(dt.timezone.utc),
@@ -466,7 +475,12 @@ Caption Option 1: Second caption
         item_ids,
     )
 
-    assert result == {"imported": [first, second], "failed": [], "unmatched": []}
+    assert result == {
+        "imported": [first, second],
+        "failed": [],
+        "skipped": [],
+        "unmatched": [],
+    }
     assert draft_revisions.latest_revision(first).title_options == ["First title"]
     second_revision = draft_revisions.latest_revision(second)
     assert second_revision.title_options == ["Second title"]
@@ -490,7 +504,12 @@ Caption Option 1: First caption
         item_ids,
     )
 
-    assert result == {"imported": [first, second], "failed": [], "unmatched": []}
+    assert result == {
+        "imported": [first, second],
+        "failed": [],
+        "skipped": [],
+        "unmatched": [],
+    }
     assert draft_revisions.latest_revision(first).title_options == ["First title"]
     assert draft_revisions.latest_revision(second).title_options == ["Second title"]
 
@@ -566,7 +585,12 @@ Caption Option 1: Second caption
         item_ids,
     )
 
-    assert result == {"imported": [first, second], "failed": [], "unmatched": []}
+    assert result == {
+        "imported": [first, second],
+        "failed": [],
+        "skipped": [],
+        "unmatched": [],
+    }
     assert draft_revisions.latest_revision(first).title_options == ["First title"]
     assert draft_revisions.latest_revision(second).title_options == ["Second title"]
 
@@ -599,7 +623,12 @@ Caption Option 1: Second caption
         item_ids,
     )
 
-    assert result == {"imported": [first, second], "failed": [], "unmatched": []}
+    assert result == {
+        "imported": [first, second],
+        "failed": [],
+        "skipped": [],
+        "unmatched": [],
+    }
     assert draft_revisions.latest_revision(first).title_options == ["First title"]
     assert draft_revisions.latest_revision(second).title_options == ["Second title"]
 
@@ -1558,6 +1587,69 @@ def test_batch_candidates_never_count_retired_reels_as_still_downloading() -> No
     assert mine["pending_media"] == 0
 
 
+def test_batch_candidates_relink_footage_that_is_already_on_disk(tmp_path) -> None:
+    # The regression this screen kept hitting: distribution writes the row before
+    # the shared asset downloads, and the only backfill is a one-shot daemon
+    # thread. When that thread dies (app closed, transient failure) the row keeps
+    # a NULL file_path forever, so the screen reported "waiting on footage" on
+    # every refresh even though a sibling account had already pulled the footage.
+    # Loading the screen must re-link it instead of stalling until the user opens
+    # each reel in Processing by hand.
+    media_file = tmp_path / "sibling.mp4"
+    media_file.write_bytes(b"video")
+    account_id, item_ids = _make_second_account_items("SigmaHistory", 2)
+    with get_session() as session:
+        stalled = session.get(DownloadItem, item_ids[0])
+        stalled.file_path = None
+        stalled.status = "pending_review"
+        stalled.review_state = "pending_review"
+        stalled.video_id = "sigma1"
+        session.add(
+            MediaAsset(
+                canonical_source_url=stalled.source_url,
+                source_shortcode="sigma1",
+                download_status="downloaded",
+                original_download_path=str(media_file),
+            )
+        )
+        session.commit()
+
+    groups = draft_handoff.batch_candidates(niche="history", per_account=10)
+    mine = next(g for g in groups if g["account_id"] == account_id)
+
+    assert mine["pending_media"] == 0
+    assert [item["id"] for item in mine["items"]] == item_ids
+    assert mine["available"] == 2
+    with get_session() as session:
+        assert session.get(DownloadItem, item_ids[0]).file_path == str(media_file)
+
+
+def test_batch_candidates_still_report_footage_that_is_genuinely_absent() -> None:
+    # The counterpart: re-linking must not paper over a clip whose footage was
+    # never downloaded at all. Those stay counted so the retry button appears.
+    account_id, item_ids = _make_second_account_items("TauHistory", 2)
+    with get_session() as session:
+        stalled = session.get(DownloadItem, item_ids[0])
+        stalled.file_path = None
+        stalled.status = "pending_review"
+        stalled.review_state = "pending_review"
+        stalled.video_id = "tau1"
+        session.add(
+            MediaAsset(
+                canonical_source_url=stalled.source_url,
+                source_shortcode="tau1",
+                download_status="pending",
+            )
+        )
+        session.commit()
+
+    groups = draft_handoff.batch_candidates(niche="history", per_account=10)
+    mine = next(g for g in groups if g["account_id"] == account_id)
+
+    assert mine["pending_media"] == 1
+    assert [item["id"] for item in mine["items"]] == item_ids[1:]
+
+
 def test_batch_candidates_expose_a_preview_path_and_source_url() -> None:
     # The review player needs both: the bridge maps file_path to a media URL.
     account_id, item_ids = _make_second_account_items("LambdaHistory", 1)
@@ -1625,3 +1717,176 @@ def test_batch_header_requires_the_recommended_register_to_vary() -> None:
     assert "Vary the RECOMMENDED register across reels" in prompt
     assert "no single register may take more than about half" in prompt
     assert "the option number you recommend must change between" in prompt
+
+
+def test_import_batch_skips_a_reel_rejected_after_prepare() -> None:
+    # The batch's item list is pinned when the prompt is copied, so a reject made
+    # afterwards still has a block in the pasted reply. That block must not
+    # become a draft revision, or the reel reads as "ready" in the finish plan
+    # and gets exported and re-scheduled — undoing the reject.
+    _account_id, ids = _make_second_account_items("RejectAfterPrepare", 3)
+    with get_session() as session:
+        session.get(DownloadItem, ids[1]).review_state = "rejected"
+        session.commit()
+
+    reply = "\n".join(
+        line
+        for index, item_id in enumerate(ids, start=1)
+        for line in (
+            f"===== REEL {index} (#{item_id}) =====",
+            "Title Option 1:",
+            f"Hook {index}",
+            "Recommended Pick: Title Option 1",
+            "Shared Caption:",
+            f"Caption body {index}.",
+        )
+    )
+
+    result = draft_handoff.import_multi_account_batch_draft(reply, ids)
+
+    assert result["imported"] == [ids[0], ids[2]]
+    assert result["skipped"] == [
+        {"item_id": ids[1], "reason": "rejected since this batch was prepared"}
+    ]
+    # A rejected reel is a deliberate exclusion, not a lost block.
+    assert result["unmatched"] == []
+    assert draft_revisions.latest_revision(ids[1]) is None
+    # The reels either side still get THEIR own draft: the rejected reel keeps
+    # its slot in the pinned list, so positional routing never shifts.
+    assert draft_revisions.latest_revision(ids[0]).title_options == ["Hook 1"]
+    assert draft_revisions.latest_revision(ids[2]).title_options == ["Hook 3"]
+
+
+def test_import_batch_keeps_positional_routing_when_ids_are_dropped() -> None:
+    # Same as above but the model dropped every "(#id)", so routing falls back to
+    # reel NUMBER position. This is the case that breaks if a rejected reel is
+    # removed from the pinned list instead of skipped at the save step.
+    _account_id, ids = _make_second_account_items("RejectNoEchoedId", 3)
+    with get_session() as session:
+        session.get(DownloadItem, ids[0]).review_state = "rejected"
+        session.commit()
+
+    reply = "\n".join(
+        line
+        for index in range(1, 4)
+        for line in (
+            f"===== REEL {index} =====",
+            "Title Option 1:",
+            f"Hook {index}",
+            "Recommended Pick: Title Option 1",
+            "Shared Caption:",
+            f"Caption body {index}.",
+        )
+    )
+
+    result = draft_handoff.import_multi_account_batch_draft(reply, ids)
+
+    assert result["imported"] == [ids[1], ids[2]]
+    assert draft_revisions.latest_revision(ids[1]).title_options == ["Hook 2"]
+    assert draft_revisions.latest_revision(ids[2]).title_options == ["Hook 3"]
+
+
+# --- Clip Studio title handoff ---------------------------------------------- #
+
+
+def _clip_account() -> int:
+    with get_session() as session:
+        account = Account(
+            name="Resurfaced History",
+            platform="instagram",
+            niche="history",
+            niche_label="History moments and forgotten stories",
+            hook_style="specific subject-first history hooks",
+        )
+        session.add(account)
+        session.commit()
+        return account.id
+
+
+def test_clip_title_prompt_separates_the_clip_from_its_context() -> None:
+    """The model needs the surrounding minute to know the subject, but the title
+    still has to be delivered by the clip — so the two are labelled apart."""
+    prompt = draft_handoff.build_clip_title_prompt(
+        account_id=_clip_account(),
+        clip_words="This card is $400,000.",
+        surrounding_context="They discuss a rare Pikachu card collection.",
+        source_title="The Pokemon Card Scandal",
+        range_label="49:40-49:55",
+    )
+
+    assert "WHAT THE CLIP ITSELF SAYS" in prompt
+    assert "SURROUNDING CONTEXT" in prompt
+    assert "This card is $400,000." in prompt
+    assert "rare Pikachu card collection" in prompt
+    assert "The Pokemon Card Scandal" in prompt
+    # The paste parser matches these at line start; a prefix breaks the import.
+    for header in ("Title Option 1:", "Title Option 2:", "Title Option 3:"):
+        assert f"\n{header}" in prompt
+    # Captions are built from the campaign template, never written by the model.
+    assert "Caption Option" not in prompt
+
+
+def test_clip_title_prompt_carries_the_accounts_own_voice() -> None:
+    prompt = draft_handoff.build_clip_title_prompt(
+        account_id=_clip_account(), clip_words="This card is $400,000."
+    )
+
+    assert "Resurfaced History" in prompt
+    assert "specific subject-first history hooks" in prompt
+    # Same rule source as the live API prompt, keyed off the account's style.
+    assert "historytrails" in prompt.lower() or "documentary" in prompt.lower()
+
+
+def test_clip_batch_prompt_states_the_rules_once_for_every_clip() -> None:
+    """An earlier version derived the batch prompt by slicing the single-clip
+    one, which silently dropped every title rule: they sit after the per-clip
+    material, so the slice kept only the account header."""
+    account_id = _clip_account()
+    single = draft_handoff.build_clip_title_prompt(
+        account_id=account_id, clip_words="This card is $400,000."
+    )
+    batch = draft_handoff.build_clip_batch_title_prompt(
+        account_id=account_id,
+        clips=[
+            {"number": 1, "words": "This card is $400,000.", "range_label": "49:40-49:55"},
+            {"number": 2, "words": "Around $60 million of fraud.", "range_label": "27:12"},
+        ],
+    )
+
+    assert "On-screen title rules" in batch
+    assert "Hook framing" in batch
+    # The rule block is the bulk of the prompt; a batch of two must not be
+    # dramatically smaller than one clip's prompt.
+    assert len(batch) > len(single) * 0.8
+    assert "There are 2 clips below" in batch
+    assert "\nClip 1: 49:40-49:55" in batch
+    assert "\nClip 2: 27:12" in batch
+
+
+def test_clip_batch_reply_routes_by_number_not_position() -> None:
+    """A reply that reorders or omits clips must still land each block on the
+    right candidate rather than shifting every one of them along."""
+    reply = "\n".join(
+        [
+            "Clip 3:",
+            "Title Option 1:",
+            "Third clip title",
+            "Recommended Pick: Title Option 1",
+            "",
+            "Clip 1:",
+            "Title Option 1:",
+            "First clip title",
+            "Recommended Pick: Title Option 1",
+        ]
+    )
+
+    parsed = draft_handoff.parse_clip_batch_titles(reply)
+
+    assert sorted(parsed) == [1, 3]
+    assert parsed[1].title_options == ["First clip title"]
+    assert parsed[3].title_options == ["Third clip title"]
+
+
+def test_clip_batch_reply_ignores_blocks_with_no_titles() -> None:
+    reply = "Clip 1:\nSorry, I could not write titles for this one.\n"
+    assert draft_handoff.parse_clip_batch_titles(reply) == {}
