@@ -1185,17 +1185,31 @@ def test_historytrails_title_rules_require_two_reactive_options() -> None:
     assert "must be DIFFERENT shapes" in joined
 
 
-def test_historytrails_title_rules_require_a_first_person_option() -> None:
+def test_historytrails_title_rules_require_a_collective_first_person_option() -> None:
     # Regression: a real six-reel batch produced one question per reel and ZERO
     # first-person titles across all 18 options, because "reactive" was stated as
     # a menu of three shapes and the model read it as "question". First person
-    # measures 95k median views against 73k, so it is now named as required and
+    # measures 95k median views against 73k, so it is named as required and
     # second person is explicitly not a substitute.
     joined = "\n".join(smart_drafts._historytrails_title_rules())
 
     assert "exactly one of them MUST be first-person" in joined
-    assert "I, my, me, we, our, or us" in joined
+    assert "we, our, or us" in joined
     assert "second person is not first person" in joined
+
+
+def test_historytrails_first_person_is_collective_never_singular() -> None:
+    # These accounts repost other people's footage, so a singular "I" claims the
+    # experience of whoever is on screen: "I was just offered a quarter million"
+    # reads as the page being offered it, when it was the collector in the clip.
+    # Collective "we" speaks as the audience watching, which is true of the page.
+    joined = "\n".join(smart_drafts._historytrails_title_rules())
+
+    assert "COLLECTIVE ONLY" in joined
+    assert "singular first person is BANNED" in joined
+    assert "never I, me, my, or mine" in joined
+    # The shapes list must not re-open the door the register rule just closed.
+    assert "a first-person or 'we' reaction" not in joined
 
 
 def test_historytrails_recommender_leads_on_register_not_concreteness() -> None:
