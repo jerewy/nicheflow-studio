@@ -174,10 +174,16 @@ def _detect(monkeypatch, build) -> video.CropSettings | None:
     return video.detect_content_rectangle(Path("layout.mp4"), probe)
 
 
+_KNOWN_ANIMATED_CARD = pytest.mark.xfail(
+    strict=True,
+    reason="Gap bridging welds an animated repost card's rows onto the footage "
+    "band. The leading-run trim that fixed this was reverted after a 2,531-clip "
+    "sweep scored it ~19 better against ~17 worse.",
+)
 _KNOWN_CONTIGUOUS = pytest.mark.xfail(
     strict=True,
-    reason="A caption block with no internal gaps is one run longer than "
-    "CONTENT_RECT_TOP_LINE_MAX_RATIO, so the leading-run walk stops on it.",
+    reason="A caption block with no internal gaps is welded onto the footage "
+    "band the same way, and reads as one tall run rather than stacked lines.",
 )
 _KNOWN_TALL_TEXT = pytest.mark.xfail(
     strict=True,
@@ -195,7 +201,9 @@ _KNOWN_STATIC_FOOTAGE = pytest.mark.xfail(
     ("build", "expected_top"),
     [
         pytest.param(_plain_letterbox, 200, id="plain_letterbox"),
-        pytest.param(_repost_card_gapped, 185, id="repost_card_gapped"),
+        pytest.param(
+            _repost_card_gapped, 185, id="repost_card_gapped", marks=_KNOWN_ANIMATED_CARD
+        ),
         pytest.param(
             _repost_card_contiguous, 185, id="repost_card_contiguous", marks=_KNOWN_CONTIGUOUS
         ),
@@ -229,27 +237,10 @@ def test_content_rectangle_returns_empty_for_full_frame_footage(monkeypatch) -> 
     assert crop == video.CropSettings()
 
 
-def test_repost_card_regresses_without_the_leading_run_trim(monkeypatch) -> None:
-    """The card layout must stay broken with the trim disabled.
-
-    Guards the guard: a ratio of 0 caps the allowed run length at one row, so the
-    walk breaks on the first run and the band keeps its bridged top edge — the
-    behaviour that shipped a card-framed reel to a live post. If this ever stops
-    failing, the matrix above has gone blind to the bug it exists to catch.
-    """
-    monkeypatch.setattr(video, "CONTENT_RECT_TOP_LINE_MAX_RATIO", 0.0)
-
-    crop = _detect(monkeypatch, _repost_card_gapped)
-
-    assert crop is not None
-    # Lands on the avatar row at 60 rather than the footage at 185.
-    assert crop.top < 100
-
-
 @pytest.mark.xfail(
     strict=True,
-    reason="The leading-thin-run trim is applied to the top edge only, so a "
-    "gapped caption under the footage is still bridged into the band.",
+    reason="Gap bridging welds a caption under the footage onto the band, and "
+    "nothing trims the bottom edge back off it.",
 )
 def test_content_rectangle_drops_bottom_caption_line(monkeypatch) -> None:
     crop = _detect(monkeypatch, _bottom_caption_gapped)

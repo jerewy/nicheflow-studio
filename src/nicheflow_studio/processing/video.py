@@ -396,15 +396,16 @@ CONTENT_RECT_MIN_REMAINING_RATIO = 0.08  # reject crops that leave < 8% of a dim
 # get fragmented into separate bands. Static title/canvas bands have ~0
 # coverage and produce gaps far larger than this, so they remain excluded.
 CONTENT_RECT_MAX_GAP_RATIO = 0.08
-# Card-repost text lines above the footage. Screenshot-style reposts stack an
-# avatar row and two or three caption lines on the canvas above the embedded
-# clip. When the source animates that card (fade-in, or copy that changes over
-# the clip), those rows carry real temporal motion, so the overlay-bar and
-# static-white-text guards below never fire and gap bridging welds every line
-# onto the footage band — the crop then keeps the whole card. Each such line is
-# a thin run separated from the footage by an empty gap, so leading runs shorter
-# than this fraction of the band are dropped before the band is used.
-CONTENT_RECT_TOP_LINE_MAX_RATIO = 0.12
+# A leading-run trim was tried here and reverted (2026-08-25). Screenshot-repost
+# cards whose rows animate defeat the overlay-bar and static-text guards below,
+# so gap bridging welds the handle row and caption lines onto the footage band
+# and the crop keeps the whole card. Dropping short leading runs fixed that, but
+# a full-library sweep of 2,531 clips changed 37 crops and hand review scored
+# roughly 19 better against 17 worse: footage that simply opens dark and slow
+# (a dim stage, a held wide) looks exactly like a caption line at row-statistics
+# level, so the trim cut into real picture as often as it removed a card.
+# Coverage ratio and gap-deadness were both tried as discriminators; each
+# separates one case and breaks the other. Do not re-add without a sweep.
 # Top-edge overlay-text trim. Static white-on-canvas overlay text (e.g. a
 # meme caption sitting just above the embedded clip) leaks tiny pixel-edge
 # motion across to the rows that contain it, so the activity band's top
@@ -519,43 +520,6 @@ def _largest_coverage_band(
     if best is None or best_len < min_len:
         return None
     return best
-
-
-def _drop_leading_thin_runs(
-    coverage,  # noqa: ANN001
-    band: tuple[int, int],
-    min_cov: float,
-    *,
-    max_run_ratio: float,
-    min_len: int,
-) -> tuple[int, int]:
-    """Move a band's top edge past thin leading runs bridged in by ``max_gap``.
-
-    ``_largest_coverage_band`` welds runs together across short inactive gaps,
-    which is right for footage broken up by low-motion sub-regions but wrong for
-    a repost card whose caption lines sit above the clip on the same canvas. The
-    footage is one long run; each caption line is a short one with a real gap
-    under it. Leading runs below ``max_run_ratio`` of the band length are dropped
-    while enough band remains, and the first run that is long enough stops the
-    walk — so a genuine footage band is never trimmed into.
-    """
-    start, end = band
-    band_length = end - start + 1
-    max_run_length = max(1, int(band_length * max_run_ratio))
-    cursor = start
-    while cursor <= end:
-        run_end = cursor
-        while run_end + 1 <= end and coverage[run_end + 1] >= min_cov:
-            run_end += 1
-        if run_end - cursor + 1 > max_run_length:
-            break
-        next_start = run_end + 1
-        while next_start <= end and coverage[next_start] < min_cov:
-            next_start += 1
-        if next_start > end or end - next_start + 1 < min_len:
-            break
-        cursor = next_start
-    return (cursor, end)
 
 
 def _trim_uniform_static_margins(
@@ -761,17 +725,6 @@ def detect_content_rectangle(input_path: Path, probe: VideoProbe) -> CropSetting
         )
         if row_band is None:
             return None
-        # Drop repost-card caption lines that gap bridging welded onto the top
-        # of the footage band. Done before the sharp-row extension below so the
-        # extension starts at the real footage edge and stops at the canvas gap
-        # under the last caption line instead of walking back up into it.
-        row_band = _drop_leading_thin_runs(
-            motion_signal,
-            row_band,
-            0.5,
-            max_run_ratio=CONTENT_RECT_TOP_LINE_MAX_RATIO,
-            min_len=max(1, int(min_h * CONTENT_RECT_MIN_BAND_RATIO)),
-        )
         # Extend through adjacent sharp rows in both directions. A single
         # blank/low-signal row breaks the extension so meme overlay text
         # separated from the footage by a black canvas gap is NOT absorbed.

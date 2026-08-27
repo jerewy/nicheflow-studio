@@ -761,15 +761,22 @@ def test_detect_content_rectangle_finds_moving_footage(monkeypatch, tmp_path: Pa
     assert abs(rect.right - 40) <= 30
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="Known: an animated repost card is welded onto the footage band by "
+    "gap bridging. The leading-run trim that fixed it was reverted after a "
+    "2,531-clip sweep showed it cut into dark, slow footage about as often as "
+    "it removed a card. See the note at CONTENT_RECT_MAX_GAP_RATIO.",
+)
 def test_detect_content_rectangle_drops_animated_repost_card_lines(
     monkeypatch, tmp_path: Path
 ) -> None:
-    """A screenshot-style repost card above the clip must not be kept.
+    """A screenshot-style repost card above the clip should not be kept.
 
     The handle row and caption lines of these reposts animate, so they carry
     real motion and survive the static-text guards; the narrow canvas gaps
     between them are short enough for gap bridging to weld the whole card onto
-    the footage band. The crop must still start at the footage.
+    the footage band. The crop should start at the footage — it does not.
     """
     import numpy as np
 
