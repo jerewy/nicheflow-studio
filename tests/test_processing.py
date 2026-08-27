@@ -761,6 +761,42 @@ def test_detect_content_rectangle_finds_moving_footage(monkeypatch, tmp_path: Pa
     assert abs(rect.right - 40) <= 30
 
 
+def test_detect_content_rectangle_drops_animated_repost_card_lines(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A screenshot-style repost card above the clip must not be kept.
+
+    The handle row and caption lines of these reposts animate, so they carry
+    real motion and survive the static-text guards; the narrow canvas gaps
+    between them are short enough for gap bridging to weld the whole card onto
+    the footage band. The leading-run trim removes them, and the dead-row gate
+    is what lets it do so without eating footage that merely opens dark.
+    """
+    import numpy as np
+
+    input_path = tmp_path / "repost.mp4"
+    input_path.write_bytes(b"video")
+    probe = VideoProbe(width=200, height=400, duration_seconds=20.0)
+    rng = np.random.default_rng(1)
+
+    def fake_load(path, timestamp):  # noqa: ANN001, ARG001
+        frame = np.zeros((400, 200, 3), dtype=np.uint8)
+        # Three animated card text lines, each separated by a 10px canvas gap.
+        for line_top in (30, 50, 70):
+            frame[line_top : line_top + 10, 20:90, :] = rng.integers(
+                60, 255, size=(10, 70, 3), dtype=np.uint8
+            )
+        frame[90:340, 20:180, :] = rng.integers(60, 255, size=(250, 160, 3), dtype=np.uint8)
+        return frame
+
+    monkeypatch.setattr(video, "_load_video_frame_at", fake_load)
+
+    rect = video.detect_content_rectangle(input_path, probe)
+
+    assert rect is not None
+    assert abs(rect.top - 90) <= 12
+
+
 @pytest.mark.parametrize(
     ("canvas_color", "label"),
     [
@@ -2254,3 +2290,31 @@ def test_spread_timestamps_walks_evenly_through_clustered_cuts() -> None:
 
 def test_spread_timestamps_ignores_cuts_past_the_end() -> None:
     assert video._spread_timestamps([1.0, 99.0], count=3, duration=10.0) == [1.0]
+
+
+def test_default_caption_style_sits_on_the_footage_and_wraps() -> None:
+    """Captions are placed from the composed footage rect, not the crop.
+
+    Regression: deriving the rect from the crop's aspect ratio put lines in the
+    black bar below the picture, because the band layout scales the footage down
+    to fit under the title.
+    """
+    # Footage 1080 wide ending 1263px down a 1920 canvas.
+    style = video.default_caption_style(1080, 1920, 1080, 1263)
+
+    values = dict(pair.split("=", 1) for pair in style.split(",") if "=" in pair)
+    # Bottom margin measured up from the canvas floor to just inside the footage.
+    assert int(values["MarginV"]) == round((1920 - 1263 + 30) * 288 / 1920)
+    # Side margins are what force a long line to wrap instead of running the
+    # full canvas width.
+    assert int(values["MarginL"]) > 0 and values["MarginL"] == values["MarginR"]
+    assert values["Shadow"] == "0", "a drop shadow under the outline reads as a smudge"
+    assert values["WrapStyle"] == "0"
+
+
+def test_default_caption_style_scales_margins_with_a_narrower_footage() -> None:
+    wide = video.default_caption_style(1080, 1920, 1080, 1263)
+    narrow = video.default_caption_style(1080, 1920, 720, 1263)
+    wide_margin = int(dict(p.split("=", 1) for p in wide.split(",") if "=" in p)["MarginL"])
+    narrow_margin = int(dict(p.split("=", 1) for p in narrow.split(",") if "=" in p)["MarginL"])
+    assert narrow_margin > wide_margin, "pillarboxed footage needs wider side margins"

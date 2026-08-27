@@ -445,3 +445,93 @@ def test_iso_serialization_attaches_utc_offset_to_naive_db_datetimes() -> None:
         assert rendered is not None and rendered.endswith("+00:00"), (service.__name__, rendered)
         parsed = dt.datetime.fromisoformat(rendered)
         assert parsed.utcoffset() == dt.timedelta(0)
+
+
+# --- Slot swap: put a campaign clip into an already-scheduled slot ----------- #
+
+
+def _account_with_jobs(count: int = 2) -> tuple[int, list[int]]:
+    """One account and ``count`` draft jobs on it (``_make_job`` makes a new account each time)."""
+    import datetime as dt
+
+    with get_session() as session:
+        account = Account(name="History", platform="instagram")
+        session.add(account)
+        session.commit()
+        job_ids = []
+        for index in range(count):
+            job = UploadJob(
+                account_id=account.id,
+                processed_path=f"C:/out{index}.mp4",
+                title=f"Reel {index}",
+                status="draft",
+            )
+            session.add(job)
+            session.commit()
+            job_ids.append(job.id)
+        return account.id, job_ids
+
+
+def _schedule(job_id: int, when: str = "2026-08-20T09:00:00+00:00") -> None:
+    publish_queue.reschedule(job_id, when)
+
+
+def test_swap_moves_the_slot_to_the_replacement_and_frees_the_old_reel() -> None:
+    import datetime as dt
+
+    _account_id, (sitting, campaign_clip) = _account_with_jobs()
+    _schedule(sitting)
+
+    result = publish_queue.swap_scheduled_job(sitting, campaign_clip)
+
+    assert result["slot_at"] == "2026-08-20T09:00:00+00:00"
+    with get_session() as session:
+        old = session.get(UploadJob, sitting)
+        new = session.get(UploadJob, campaign_clip)
+        assert old.status == "draft" and old.scheduled_at is None
+        assert new.status == "scheduled"
+        assert new.scheduled_at.replace(tzinfo=dt.timezone.utc) == dt.datetime(
+            2026, 8, 20, 9, 0, tzinfo=dt.timezone.utc
+        )
+
+
+def test_swap_refuses_a_reel_from_another_account() -> None:
+    _account_a, (sitting,) = _account_with_jobs(1)
+    _account_b, (foreign,) = _account_with_jobs(1)
+    _schedule(sitting)
+
+    with pytest.raises(PublishQueueError, match="same account"):
+        publish_queue.swap_scheduled_job(sitting, foreign)
+
+
+def test_swap_refuses_an_unscheduled_slot() -> None:
+    _account_id, (unscheduled, replacement) = _account_with_jobs()
+
+    with pytest.raises(PublishQueueError, match="not scheduled"):
+        publish_queue.swap_scheduled_job(unscheduled, replacement)
+
+
+def test_swap_refuses_a_posted_slot() -> None:
+    _account_id, (sitting, replacement) = _account_with_jobs()
+    _schedule(sitting)
+    publish_queue.mark_posted(sitting, {"posted_url": "https://instagram.com/p/abc"})
+
+    with pytest.raises(PublishQueueError, match="already posted"):
+        publish_queue.swap_scheduled_job(sitting, replacement)
+
+
+def test_swap_refuses_an_already_posted_replacement() -> None:
+    _account_id, (sitting, replacement) = _account_with_jobs()
+    _schedule(sitting)
+    publish_queue.mark_posted(replacement, {"posted_url": "https://instagram.com/p/abc"})
+
+    with pytest.raises(PublishQueueError, match="already been posted"):
+        publish_queue.swap_scheduled_job(sitting, replacement)
+
+
+def test_swap_refuses_a_reel_with_itself() -> None:
+    _account_id, (sitting, _replacement) = _account_with_jobs()
+    _schedule(sitting)
+
+    with pytest.raises(PublishQueueError):
+        publish_queue.swap_scheduled_job(sitting, sitting)

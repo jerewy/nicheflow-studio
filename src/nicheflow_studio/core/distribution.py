@@ -75,6 +75,16 @@ DEFAULT_RECENCY_HALF_LIFE_DAYS = 180.0
 # network doesn't funnel the single top clip onto every account (which would
 # maximize cross-account duplication — the main originality risk).
 DEFAULT_TIER_FRACTION = 0.25
+# Preferred jitter sizing, used whenever the caller knows how many clips this run
+# will place (``ranked_clip_order(slots=...)``). The shuffled block is sized
+# against the RUN, not the pool, so a better-stocked pool no longer dilutes the
+# ranking. 1.2x leaves enough spare candidates that two consecutive runs do not
+# place an identical set, while keeping the block genuinely near the top.
+#
+# ROUNDED, not ceiled, on purpose: a run placing one or two clips rounds back to
+# its own size and becomes deterministic, so the single best clip actually wins.
+# Ceiling (or a fixed floor) turned a 2-clip pool into a coin flip.
+JITTER_SLOT_MULTIPLIER = 1.2
 
 
 def _age_days(published_at: dt.datetime | None, now: dt.datetime) -> float:
@@ -128,6 +138,7 @@ def ranked_clip_order(
     *,
     rng: _random.Random | None = None,
     tier_fraction: float = DEFAULT_TIER_FRACTION,
+    slots: int | None = None,
 ) -> list[int]:
     """Order pool-item ids best-first, randomized WITHIN score tiers.
 
@@ -138,6 +149,14 @@ def ranked_clip_order(
     the front for every account — combined with one-clip-one-account assignment
     this spreads unique strong clips instead of cloning the top viral one.
 
+    ``slots`` is how many clips this run will actually place. Pass it whenever
+    it is known: sizing the shuffled block against the pool instead
+    (``tier_fraction``) means the block GROWS with the pool, so the better
+    stocked you are, the more of the ranking is thrown away. Measured on a real
+    805-clip pool placing 33 clips: the 25% block was 201 clips, and the 33
+    drawn from it had a median source reach of 14,552 against 243,611 for the
+    genuine top 33 — the jitter was discarding ~94% of the ranking's signal.
+
     ``scored`` is ``(pool_item_id, score)`` pairs. Returns just the ordered ids.
     """
     rng = rng or _random.Random()
@@ -145,7 +164,15 @@ def ranked_clip_order(
         return []
     ordered = sorted(scored, key=lambda pair: pair[1], reverse=True)
     count = len(ordered)
-    tier_size = max(1, round(count * tier_fraction)) if tier_fraction > 0 else count
+    if slots is not None and slots > 0:
+        # Enough headroom that consecutive runs don't place an identical set,
+        # but small enough that the block is still genuinely the top of the
+        # ranking.
+        tier_size = max(1, round(slots * JITTER_SLOT_MULTIPLIER))
+    elif tier_fraction > 0:
+        tier_size = max(1, round(count * tier_fraction))
+    else:
+        tier_size = count
     result: list[int] = []
     for start in range(0, count, tier_size):
         tier_ids = [pool_item_id for pool_item_id, _ in ordered[start : start + tier_size]]

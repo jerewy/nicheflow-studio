@@ -47,12 +47,75 @@ def apify_usage() -> dict:
     return monthly_apify_usage()
 
 
-def _record_run(source_id: int, *, ok: bool, error: str | None = None) -> None:
+# How far the oldest returned post may sit beyond the previous watermark before
+# the run is treated as incomplete. The rescrape buffer already re-asks for one
+# day, so anything past that is either a genuine quiet spell or a truncated
+# fetch — and we cannot tell which from the results alone. Erring toward "did
+# not advance" costs a few duplicate rows on the next run (deduped, pennies);
+# erring the other way loses the posts permanently.
+_WATERMARK_GAP_TOLERANCE = dt.timedelta(days=3)
+
+
+def _as_naive_utc(value: dt.datetime | None) -> dt.datetime | None:
+    """SQLite hands back naive datetimes while Apify's are aware; compare flat."""
+    if value is None:
+        return None
+    return value.replace(tzinfo=None) if value.tzinfo else value
+
+
+def _resolve_watermark(
+    previous: dt.datetime | None, results: list
+) -> tuple[dt.datetime | None, bool]:
+    """New ``last_scraped_at`` for a completed run, and whether it looked partial.
+
+    Returns ``(None, True)`` when the watermark must NOT move.
+
+    ``last_scraped_at`` is a high-water mark: the next run asks Apify for posts
+    newer than it, so advancing it declares "everything up to here is already
+    pooled". A high-water mark cannot express a HOLE, and Apify returns
+    newest-first — so a truncated fetch hands back the most recent few posts and
+    nothing in between. Stamping wall-clock ``now`` after that (the old
+    behaviour) silently made the skipped posts unreachable forever: a real run
+    returned 17 posts covering 2 days, advanced the watermark by 54 days, and
+    orphaned ~436 posts that were only recoverable because a duplicate source
+    row happened to still hold the older watermark.
+
+    So the run is only trusted when what came back CONTINUES from where we left
+    off. If the oldest returned post sits well beyond the previous watermark,
+    there is a gap between the two and the watermark stays put.
+    """
+    published = sorted(
+        stamp
+        for stamp in (_as_naive_utc(getattr(r, "published_at", None)) for r in results)
+        if stamp is not None
+    )
+    if not published:
+        # Nothing dated came back (empty run, or an actor that dropped
+        # timestamps). Either way there is nothing to justify moving on.
+        return None, bool(results)
+    previous_naive = _as_naive_utc(previous)
+    if previous_naive is not None and published[0] - previous_naive > _WATERMARK_GAP_TOLERANCE:
+        return None, True
+    return published[-1], False
+
+
+def _record_run(
+    source_id: int,
+    *,
+    ok: bool,
+    error: str | None = None,
+    watermark: dt.datetime | None = None,
+    advance: bool = True,
+) -> None:
     with get_session() as session:
         source = session.get(Source, source_id)
         if source is None:
             return
-        source.last_scraped_at = dt.datetime.now(dt.timezone.utc)
+        # Only move the high-water mark when the run actually proved coverage up
+        # to that point (see _resolve_watermark). A failed or partial run leaves
+        # it alone so the next attempt re-asks from the same place.
+        if ok and advance and watermark is not None:
+            source.last_scraped_at = watermark
         source.last_run_status = "completed" if ok else "error"
         source.last_error_summary = (error or None) and error[:500]
         session.commit()
@@ -134,7 +197,8 @@ def scrape_source_to_pool(
                 progress(0.5 + 0.45 * ((index + 1) / len(results)), "")
         session.commit()
 
-    _record_run(source_id, ok=True)
+    watermark, partial = _resolve_watermark(since, results)
+    _record_run(source_id, ok=True, watermark=watermark, advance=not partial)
 
     if progress:
         progress(1.0, f"Done — {added} added, {duplicates} duplicate(s).")
@@ -146,6 +210,11 @@ def scrape_source_to_pool(
         "duplicates": duplicates,
         "blocked": blocked,
         "no_account": no_account,
+        # True when the results did not continue from the previous watermark, so
+        # posts in between were missed and the watermark was left where it was.
+        # Re-run to pick them up; the caller should say so rather than reporting
+        # a clean "Done".
+        "partial": partial,
         "apify_usage": monthly_apify_usage(),
     }
 

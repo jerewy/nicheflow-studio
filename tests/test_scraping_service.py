@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import datetime as dt
+
 import pytest
 
 from nicheflow_studio.core.apify_usage import record_apify_results
@@ -27,7 +29,14 @@ def _make_source(niche: str | None = "history") -> int:
         return source.id
 
 
-def _fake_candidate(shortcode: str) -> ScrapedVideoCandidate:
+_DEFAULT_PUBLISHED_AT = dt.datetime(2026, 6, 19, 8, 0)
+
+
+def _fake_candidate(
+    shortcode: str, published_at: dt.datetime | None = _DEFAULT_PUBLISHED_AT
+) -> ScrapedVideoCandidate:
+    """A scraped row. ``published_at`` is set by default because every real
+    Apify row carries one, and the scrape watermark is derived from it."""
     return ScrapedVideoCandidate(
         scrape_source_url="https://www.instagram.com/thehistologian/",
         source_url=f"https://www.instagram.com/reel/{shortcode}/",
@@ -35,7 +44,7 @@ def _fake_candidate(shortcode: str) -> ScrapedVideoCandidate:
         video_id=shortcode,
         title=f"Clip {shortcode}",
         channel_name="thehistologian",
-        published_at=None,
+        published_at=published_at,
     )
 
 
@@ -226,3 +235,46 @@ def test_add_candidate_idempotent_when_already_queued(
 def test_add_candidate_unknown_raises() -> None:
     with pytest.raises(ScrapingError):
         scraping.add_candidate_to_processing(999999)
+
+
+def test_scrape_sets_the_watermark_from_the_newest_post_not_the_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_id = _make_source()
+    monkeypatch.setattr(
+        scraping,
+        "scrape_instagram_source_apify",
+        lambda **kwargs: [
+            _fake_candidate("AAA", dt.datetime(2026, 6, 18, 8, 0)),
+            _fake_candidate("BBB", dt.datetime(2026, 6, 19, 8, 0)),
+        ],
+    )
+
+    result = scraping.scrape_source_to_pool(source_id)
+
+    assert result["partial"] is False
+    with get_session() as session:
+        # Wall-clock "now" would have declared coverage the run never proved.
+        assert session.get(Source, source_id).last_scraped_at == dt.datetime(2026, 6, 19, 8, 0)
+
+
+def test_scrape_leaves_the_watermark_alone_when_results_skip_a_gap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_id = _make_source()
+    with get_session() as session:
+        session.get(Source, source_id).last_scraped_at = dt.datetime(2026, 6, 18, 9, 0)
+        session.commit()
+    # Truncated fetch: only the two most recent days came back.
+    monkeypatch.setattr(
+        scraping,
+        "scrape_instagram_source_apify",
+        lambda **kwargs: [_fake_candidate("ZZZ", dt.datetime(2026, 8, 12, 21, 0))],
+    )
+
+    result = scraping.scrape_source_to_pool(source_id)
+
+    assert result["partial"] is True
+    with get_session() as session:
+        # Unmoved, so the next run re-asks from 06-18 and recovers the gap.
+        assert session.get(Source, source_id).last_scraped_at == dt.datetime(2026, 6, 18, 9, 0)

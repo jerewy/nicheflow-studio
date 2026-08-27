@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 import datetime as dt
 import json
 import urllib.error
@@ -15,6 +15,17 @@ INSIGHT_METRIC_SETS = (
     "reach,likes,comments,saved,shares,total_interactions",
     "reach,likes,comments,saved",
 )
+
+
+# Graph error subcodes meaning "this media can never have insights", as opposed
+# to a transient failure worth retrying or aborting on:
+#   2108006 - the post predates the account's conversion from personal to
+#             business/creator, so Instagram never recorded insights for it.
+_UNAVAILABLE_SUBCODES = ("2108006",)
+
+
+def _is_permanently_unavailable(body: str) -> bool:
+    return any(subcode in (body or "") for subcode in _UNAVAILABLE_SUBCODES)
 
 
 class GraphAPIError(RuntimeError):
@@ -58,7 +69,16 @@ def collect_account_metrics(
     token: str,
     fetch_json: Callable[[str], dict[str, object]],
     pulled_at: dt.datetime,
+    on_page: Callable[[list[dict[str, object]]], None] | None = None,
 ) -> tuple[dict[str, object], list[dict[str, object]]]:
+    """Pull every post's insights for one owned account.
+
+    Costs one request per post, and Graph API quotas are per-user-per-hour, so a
+    few-hundred-post account can be throttled part way through. ``on_page`` is
+    called with each page's rows as they are built, letting the caller persist
+    incrementally: a throttle then costs the current page instead of the whole
+    run. Without it a 300-post account that failed at post 290 saved nothing.
+    """
     me_query = urllib.parse.urlencode(
         {
             "fields": "user_id,username,account_type,media_count",
@@ -73,27 +93,39 @@ def collect_account_metrics(
         )
 
     rows: list[dict[str, object]] = []
-    for media in fetch_account_media(
+    skipped = 0
+    for page in iter_account_media_pages(
         user_id=user_id,
         token=token,
         fetch_json=fetch_json,
     ):
-        media_id = str(media.get("id") or "")
-        if not media_id:
-            continue
-        insights = fetch_media_insights(
-            media_id=media_id,
-            token=token,
-            fetch_json=fetch_json,
-        )
-        rows.append(
-            build_metric_row(
-                account_key=account_key,
-                media=media,
-                insights=insights,
-                pulled_at=pulled_at,
+        page_rows: list[dict[str, object]] = []
+        for media in page:
+            media_id = str(media.get("id") or "")
+            if not media_id:
+                continue
+            insights = fetch_media_insights(
+                media_id=media_id,
+                token=token,
+                fetch_json=fetch_json,
             )
-        )
+            if insights is None:
+                # Predates the business-account conversion; no insights exist and
+                # never will. Skipped rather than stored as zeros.
+                skipped += 1
+                continue
+            page_rows.append(
+                build_metric_row(
+                    account_key=account_key,
+                    media=media,
+                    insights=insights,
+                    pulled_at=pulled_at,
+                )
+            )
+        rows.extend(page_rows)
+        if on_page is not None and page_rows:
+            on_page(page_rows)
+    account = {**account, "insights_unavailable": skipped}
     return account, rows
 
 
@@ -107,12 +139,17 @@ def extract_shortcode(permalink: str) -> str:
     raise ValueError(f"Instagram permalink does not contain a shortcode: {permalink}")
 
 
-def fetch_account_media(
+def iter_account_media_pages(
     *,
     user_id: str,
     token: str,
     fetch_json: Callable[[str], dict[str, object]],
-) -> list[dict[str, object]]:
+) -> Iterator[list[dict[str, object]]]:
+    """Yield the account's media one API page at a time, following ``paging.next``.
+
+    Paged rather than flattened so callers can checkpoint per page (see
+    ``collect_account_metrics``).
+    """
     query = urllib.parse.urlencode(
         {
             "fields": "id,caption,media_type,media_product_type,permalink,timestamp",
@@ -121,16 +158,30 @@ def fetch_account_media(
         }
     )
     url: str | None = f"https://{GRAPH_HOST}/{GRAPH_VERSION}/{user_id}/media?{query}"
-    media: list[dict[str, object]] = []
     while url:
         payload = fetch_json(url)
         page = payload.get("data")
         if isinstance(page, list):
-            media.extend(item for item in page if isinstance(item, dict))
+            yield [item for item in page if isinstance(item, dict)]
         paging = payload.get("paging")
         next_url = paging.get("next") if isinstance(paging, dict) else None
         url = next_url if isinstance(next_url, str) and next_url else None
-    return media
+
+
+def fetch_account_media(
+    *,
+    user_id: str,
+    token: str,
+    fetch_json: Callable[[str], dict[str, object]],
+) -> list[dict[str, object]]:
+    """Every media item for the account, flattened across pages."""
+    return [
+        item
+        for page in iter_account_media_pages(
+            user_id=user_id, token=token, fetch_json=fetch_json
+        )
+        for item in page
+    ]
 
 
 def build_metric_row(
@@ -161,6 +212,7 @@ def build_metric_row(
     return {
         "account_key": account_key,
         "shortcode": extract_shortcode(permalink),
+        "media_id": str(media.get("id") or "") or None,
         "caption": str(media.get("caption") or ""),
         "timestamp": timestamp,
         **normalized,
@@ -186,13 +238,23 @@ def fetch_media_insights(
     media_id: str,
     token: str,
     fetch_json: Callable[[str], dict[str, object]],
-) -> dict[str, int]:
+) -> dict[str, int] | None:
+    """This media's insights, or None when Instagram will never provide them.
+
+    Returning None (rather than raising) matters for accounts that predate their
+    own conversion to a Business/Creator profile: Instagram refuses insights for
+    that older media permanently, so one such post would otherwise abort the
+    whole account's pull. The caller skips those posts instead — storing zeros
+    would make an unmeasurable post look like a flop in the analysis.
+    """
     for index, metrics in enumerate(INSIGHT_METRIC_SETS):
         query = urllib.parse.urlencode({"metric": metrics, "access_token": token})
         url = f"https://{GRAPH_HOST}/{GRAPH_VERSION}/{media_id}/insights?{query}"
         try:
             payload = fetch_json(url)
         except GraphAPIError as exc:
+            if exc.status_code == 400 and _is_permanently_unavailable(exc.body):
+                return None
             if exc.status_code == 400 and index < len(INSIGHT_METRIC_SETS) - 1:
                 continue
             raise

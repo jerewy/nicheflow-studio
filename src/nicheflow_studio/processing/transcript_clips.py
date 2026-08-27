@@ -234,6 +234,55 @@ def snap_to_sentences(
     return ClipWindow(sentences[lo].start, sentences[hi].end, text)
 
 
+# Words that make a sentence continue something the viewer never heard. A clip
+# opening on one of these lands mid-conversation, which is fatal on short-form
+# where the first second decides the scroll. Two kinds are listed:
+#
+# * joining words ("and", "but", "because") — the sentence is grammatically the
+#   back half of a thought that started earlier;
+# * fillers and discourse markers ("um", "I mean", "you know") — the speaker is
+#   still winding up and says nothing in the opening beat.
+#
+# Deliberately NOT listed: "so". It joins as often as it opens ("So I borrowed
+# $10,000 cash" is a perfectly good cold open), and flagging it turned out to be
+# noise rather than signal on real transcripts.
+_MID_THOUGHT_OPENERS = (
+    r"and|but|or|nor|yet|because|which|therefore|then|anyway|also|plus|though"
+    r"|um+|uh+|er|like|well|yeah|okay|right|actually|i mean|you know|sort of|kind of"
+)
+# Referring words with nothing to refer back to: "That's why he left" opens on a
+# reason for something unstated. Included as a flag only — a demonstrative can
+# be legitimately pointing at what is on screen ("This card is $400,000").
+_DANGLING_REFERENTS = r"he|she|they|them|it|its|this|that|these|those|that's|it's|this is"
+
+_MID_THOUGHT_RE = re.compile(
+    rf"^\W*(?:{_MID_THOUGHT_OPENERS}|{_DANGLING_REFERENTS})\b",
+    re.IGNORECASE,
+)
+
+
+def opens_mid_thought(text: str) -> bool:
+    """Whether ``text`` starts as the continuation of an unheard sentence.
+
+    Advisory, not a verdict: it reads the first word only, so it cannot tell a
+    dangling "that" from one pointing at what is on screen. Callers use it to
+    flag a clip's entry point for review, and to decide whether a signal-free
+    opening line is worth dropping from a window.
+    """
+    return bool(_MID_THOUGHT_RE.match(text.strip()))
+
+
+def ends_mid_thought(text: str) -> bool:
+    """Whether ``text`` stops before its sentence finishes.
+
+    The counterpart to :func:`opens_mid_thought`, and the reason a clip can feel
+    like it hangs. A window ends on a *segment* boundary, and a segment is not
+    always a sentence: ``build_sentences`` also flushes on a speaker change or a
+    silent gap, so the last piece can trail off with no terminal punctuation.
+    """
+    return not bool(_SENTENCE_END_RE.search(text.strip()))
+
+
 def _anchor_index(sentences: list[TranscriptSentence], at_seconds: float) -> int:
     anchor = 0
     for index, sentence in enumerate(sentences):
@@ -290,6 +339,61 @@ def clip_window_around(
         else:
             lo -= 1
         prefer_forward = not prefer_forward
+
+    text = " ".join(sentence.text for sentence in sentences[lo : hi + 1])
+    return ClipWindow(sentences[lo].start, sentences[hi].end, text)
+
+
+def clip_window_from(
+    sentences: list[TranscriptSentence],
+    index: int,
+    *,
+    target_seconds: float = DEFAULT_TARGET_SECONDS,
+    min_seconds: float = DEFAULT_MIN_SECONDS,
+    max_seconds: float = DEFAULT_MAX_SECONDS,
+    max_join_gap_seconds: float = 2.0,
+) -> ClipWindow:
+    """Build a clip window that *opens* on ``sentences[index]``.
+
+    The difference from :func:`clip_window_around` is where the anchor sentence
+    lands. That function grows outward in both directions, which leaves the
+    anchor in the middle of the clip: on a ranked moment the line that earned
+    the ranking ends up seven seconds in, behind whatever filler preceded it
+    ("I think he's a very standup guy, but at the same time..."). Short-form is
+    decided in the first second, so a hook buried mid-clip is a wasted pick.
+
+    Here the anchor is the opening line and growth is forward only, into the
+    payoff. Use this when the anchor is the reason the clip exists; use
+    :func:`clip_window_around` when the user picked a point and expects context
+    on both sides of it.
+    """
+    if not sentences:
+        raise ValueError("No sentences to build a window from.")
+    if not 0 <= index < len(sentences):
+        raise IndexError(f"Sentence index {index} is out of range.")
+
+    lo = hi = index
+
+    def duration() -> float:
+        return sentences[hi].end - sentences[lo].start
+
+    while duration() < target_seconds and hi + 1 < len(sentences):
+        if sentences[hi + 1].end - sentences[lo].start > max_seconds:
+            break
+        if sentences[hi + 1].start - sentences[hi].end > max_join_gap_seconds:
+            break
+        hi += 1
+
+    # Fallback, and only that: a hook in the closing lines of a source has
+    # nothing left to grow into, and a clip under the campaign floor cannot be
+    # submitted at all. Reaching backward costs the hook-first opening but
+    # produces a usable clip, which beats producing none.
+    while duration() < min_seconds and lo > 0:
+        if sentences[hi].end - sentences[lo - 1].start > max_seconds:
+            break
+        if sentences[lo].start - sentences[lo - 1].end > max_join_gap_seconds:
+            break
+        lo -= 1
 
     text = " ".join(sentence.text for sentence in sentences[lo : hi + 1])
     return ClipWindow(sentences[lo].start, sentences[hi].end, text)

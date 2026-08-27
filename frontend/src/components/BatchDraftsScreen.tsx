@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { CropEditor } from "@/components/CropEditor";
+import { CropPreview } from "@/components/CropPreview";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { useToast } from "@/components/ui/Toast";
@@ -10,6 +11,7 @@ import type {
   BatchCandidateGroup,
   BatchCandidateItem,
   BatchDraftImportResult,
+  FetchMissingMediaResult,
   FinishBatchPlanEntry,
   FinishBatchResult,
   FinishBatchSchedule,
@@ -18,6 +20,9 @@ import type {
 
 const DEFAULT_PER_ACCOUNT = 6;
 const POLL_INTERVAL_MS = 900;
+// Consecutive getJob failures tolerated before a wait gives up. The job outlives
+// the poller, so a brief bridge outage must not be read as the job dying.
+const MAX_POLL_FAILURES = 5;
 
 // Whether a reel's post is the Worker's job rather than this machine's. A
 // deferred handoff still reads status "scheduled" because the upload is running
@@ -37,6 +42,22 @@ const REJECT_REASONS: { value: string; label: string }[] = [
 ];
 
 type Stage = "pick" | "prepared" | "imported";
+
+// How often to re-check while distributed reels are still downloading. A shared
+// asset is a few seconds to a couple of minutes, so 6s clears the list promptly
+// without hammering the bridge; the poll stops the moment nothing is pending.
+const PENDING_MEDIA_POLL_MS = 6000;
+
+// distribute reports WHY it placed nothing. The old message assumed an empty
+// pool for every case, which pointed the user at Pool & Distribute even when the
+// real cause was an account already at its target or not publish-ready.
+const DISTRIBUTE_BLOCKED_REASON: Record<string, string> = {
+  no_accounts: "no accounts in this niche.",
+  no_ready_accounts: "the account isn't publish-ready (log its Instagram profile in).",
+  all_at_cap: "the account is already at its distribute target.",
+  pool_empty: "nothing unassigned left in this niche's pool.",
+  download_failed: "the replacement clip's footage failed to download.",
+};
 
 // Remembered choices live in the app DB via the bridge, NOT in localStorage:
 // pywebview runs the window in private mode on a port that changes per launch,
@@ -193,18 +214,40 @@ export function BatchDraftsScreen({
   // Crop is opened per review, so it never stays open across clips.
   const [cropOpen, setCropOpen] = useState(false);
 
-  const load = useCallback(async () => {
-    try {
-      const { groups: next } = await bridge.batchDraftCandidates(niche, perAccount);
-      setGroups(next);
-      setLoadError(null);
-      // Default to everything on offer: the common case is "draft the next N
-      // for every account", and un-ticking is faster than ticking 36 boxes.
-      setSelected(new Set(next.flatMap((group) => group.items.map((item) => item.id))));
-    } catch (err: unknown) {
-      setLoadError(err instanceof Error ? err.message : String(err));
-    }
-  }, [niche, perAccount]);
+  // Item ids the list last showed, so a background reload can tell an arriving
+  // reel from one the user deliberately un-ticked.
+  const knownItemIds = useRef<Set<number>>(new Set());
+
+  /** Reload the candidate list. Returns the item ids still on offer, or null if
+   *  the reload itself failed — callers use it to reconcile stale batch state. */
+  const load = useCallback(
+    async ({
+      preserveSelection = false,
+    }: { preserveSelection?: boolean } = {}): Promise<number[] | null> => {
+      try {
+        const { groups: next } = await bridge.batchDraftCandidates(niche, perAccount);
+        const ids = next.flatMap((group) => group.items.map((item) => item.id));
+        const known = knownItemIds.current;
+        knownItemIds.current = new Set(ids);
+        setGroups(next);
+        setLoadError(null);
+        if (preserveSelection) {
+          // A reload the user did not ask for must not undo their ticking: keep
+          // every current choice and tick only the reels that just appeared.
+          setSelected((prev) => new Set(ids.filter((id) => prev.has(id) || !known.has(id))));
+          return ids;
+        }
+        // Default to everything on offer: the common case is "draft the next N
+        // for every account", and un-ticking is faster than ticking 36 boxes.
+        setSelected(new Set(ids));
+        return ids;
+      } catch (err: unknown) {
+        setLoadError(err instanceof Error ? err.message : String(err));
+        return null;
+      }
+    },
+    [niche, perAccount],
+  );
 
   // Wait for the stored niche before fetching, or the first paint would show
   // every account and then visibly re-filter once the preference arrives.
@@ -301,6 +344,31 @@ export function BatchDraftsScreen({
       ),
     [includedGroups, selected],
   );
+  // Counted across ALL groups, not just included ones: the retry is global, and
+  // an excluded account's stuck footage is still worth recovering.
+  const pendingMediaTotal = useMemo(
+    () => groups.reduce((total, group) => total + group.pending_media, 0),
+    [groups],
+  );
+
+  // Distribution returns as soon as the rows exist; the footage lands seconds to
+  // minutes later on a background thread that never notifies this screen. Without
+  // a poll the counts a distribute produced stay frozen ("1 of 1 draftless · 2
+  // waiting on footage") until the user happens to press Refresh, which reads as
+  // the fix not working rather than as a download still in flight.
+  //
+  // Only runs while something is actually pending, so a settled screen makes no
+  // requests, and pauses while `busy` so a poll can never reset `selected` out
+  // from under a prepare/import/finish that is mid-flight.
+  useEffect(() => {
+    if (!active || !settingsLoaded || busy || pendingMediaTotal === 0) return;
+    const timer = window.setInterval(
+      () => void load({ preserveSelection: true }),
+      PENDING_MEDIA_POLL_MS,
+    );
+    return () => window.clearInterval(timer);
+  }, [active, settingsLoaded, busy, pendingMediaTotal, load]);
+
   const visionBacked = useMemo(
     () =>
       includedGroups.flatMap((group) =>
@@ -381,22 +449,37 @@ export function BatchDraftsScreen({
         next.delete(item.id);
         return next;
       });
+      // preparedIds is deliberately NOT shrunk here. Import's reel-number
+      // fallback routes by POSITION in that list, so removing an entry would
+      // shift every later reel onto the wrong clip. The rejected reel keeps its
+      // slot and is dropped by review state on the Python side instead (see
+      // draft_handoff._rejected_in_batch and batch_finish.plan_batch).
+      //
+      // A plan already on screen is safe to filter: it drives the Finish count
+      // and nothing routes by its position.
+      setPlan((prev) => prev?.filter((entry) => entry.item_id !== item.id) ?? prev);
       setReviewing(null);
       setCropOpen(false);
 
       // Rejecting released this clip's slot, so the account is now one under
       // target. Topping up here saves a trip to Pool & Distribute per reject.
       const niche = reviewingGroup?.niche;
-      if (autoDistributeOnReject && niche) {
+      const accountId = reviewingGroup?.account_id;
+      if (autoDistributeOnReject && niche && accountId != null) {
         try {
-          const result = await bridge.distributeNiche(niche, null);
+          // Scoped to THIS account, one clip: replace what was rejected, nothing
+          // more. distributeNiche would top up every account in the niche, so a
+          // single reject could pull dozens of clips into the network and kick
+          // off their downloads — a surprise the user never asked for.
+          const result = await bridge.distributeNicheExplicit(niche, { [accountId]: 1 });
           // Reload either way: reject already changed the list, and a successful
           // distribute adds clips that only a refetch will show.
           await load();
           pushToast(
             result.assigned > 0
               ? `Rejected #${item.account_seq ?? item.id}. Distributed ${result.assigned} replacement clip(s).`
-              : `Rejected #${item.account_seq ?? item.id}. Nothing left in the ${niche} pool to replace it.`,
+              : `Rejected #${item.account_seq ?? item.id}. No replacement: ` +
+                `${DISTRIBUTE_BLOCKED_REASON[result.reason ?? "pool_empty"]}`,
             "success",
           );
           return;
@@ -421,8 +504,23 @@ export function BatchDraftsScreen({
   };
 
   const waitForJob = useCallback(async (jobId: string): Promise<unknown> => {
+    let pollFailures = 0;
     for (;;) {
-      const snapshot: JobSnapshot = await bridge.getJob(jobId);
+      let snapshot: JobSnapshot;
+      try {
+        snapshot = await bridge.getJob(jobId);
+        pollFailures = 0;
+      } catch (err: unknown) {
+        // A failed POLL says nothing about the JOB. finish_batch renders for
+        // minutes (18 reels ran ~6 minutes = ~400 polls at this interval) and
+        // the Python side keeps going regardless of who is watching. Aborting on
+        // the first bridge hiccup left the screen showing the pre-finish picker
+        // while every reel had in fact been exported and scheduled, which reads
+        // as "finish batch did nothing". Ride out a short outage instead.
+        if ((pollFailures += 1) > MAX_POLL_FAILURES) throw err;
+        await new Promise((resolve) => window.setTimeout(resolve, POLL_INTERVAL_MS));
+        continue;
+      }
       setProgress({ value: snapshot.progress, message: snapshot.message });
       if (snapshot.status === "succeeded") return snapshot.result;
       if (snapshot.status === "canceled") throw new Error(snapshot.message || "Canceled.");
@@ -430,6 +528,39 @@ export function BatchDraftsScreen({
       await new Promise((resolve) => window.setTimeout(resolve, POLL_INTERVAL_MS));
     }
   }, []);
+
+  // Distribution creates the Processing row before its footage lands, and the
+  // background download gets exactly one attempt. When it fails or the app closes
+  // mid-queue, the row keeps no local file and no retry ever runs — so this is a
+  // manual retry rather than a spinner the user is told to wait on.
+  const fetchMissingMedia = async () => {
+    setBusy(true);
+    setProgress({ value: 0, message: "Looking for missing footage…" });
+    try {
+      const { job_id } = await bridge.startFetchMissingBatchMedia(null);
+      const result = (await waitForJob(job_id)) as FetchMissingMediaResult;
+      await load();
+      const recovered = result.linked_from_disk + result.fetched;
+      const notes = [
+        result.retired_gone ? `${result.retired_gone} gone source(s) retired` : "",
+        result.failures.length ? `${result.failures.length} still failing` : "",
+        result.unresolved ? `${result.unresolved} need opening in Processing` : "",
+      ].filter(Boolean);
+      pushToast(
+        recovered
+          ? `Recovered ${recovered} reel(s).${notes.length ? ` ${notes.join(", ")}.` : ""}`
+          : notes.length
+            ? `Nothing recovered: ${notes.join(", ")}.`
+            : "Nothing was waiting on footage.",
+        recovered || !notes.length ? "success" : "error",
+      );
+    } catch (err: unknown) {
+      pushToast(err instanceof Error ? err.message : String(err), "error");
+    } finally {
+      setBusy(false);
+      setProgress(null);
+    }
+  };
 
   const prepare = async () => {
     if (!selectedIds.length) {
@@ -575,6 +706,14 @@ export function BatchDraftsScreen({
       const { job_id } = await bridge.startFinishBatch(readyPlan.map((entry) => entry.item_id));
       const result = (await waitForJob(job_id)) as FinishBatchResult;
       setFinishResult(result);
+      // Every exported reel now has a draft revision and a publish job, so it is
+      // no longer a candidate. Without this the picker kept offering the reels it
+      // had just exported, still ticked, and a second "Finish batch" would
+      // re-render and re-schedule the lot.
+      setPreparedIds(null);
+      setPlan(null);
+      setStage("pick");
+      await load();
       pushToast(
         `Exported ${result.exported.length}, scheduled ${result.scheduled.length}, failed ${result.failed.length}.` +
           // Uploads are pipelined against the renders, so the last few are still
@@ -585,6 +724,32 @@ export function BatchDraftsScreen({
         result.failed.length ? "error" : "success",
       );
     } catch (err: unknown) {
+      // Losing sight of the job does NOT mean the job stopped: the export runs
+      // on a Python thread that finishes whether or not anyone is polling. So
+      // reconcile against the database rather than leaving the pre-finish picker
+      // on screen — that is what made a fully successful 18-reel export read as
+      // "finish batch did nothing". Reels that did export drop out of the
+      // candidate list, so pruning the plan to what is still a candidate also
+      // stops a retry from re-rendering and re-scheduling them.
+      const stillCandidates = await load();
+      if (stillCandidates) {
+        const remaining = new Set(stillCandidates);
+        const prunedPlan = plan?.filter((entry) => remaining.has(entry.item_id)) ?? null;
+        const exported = (plan?.length ?? 0) - (prunedPlan?.length ?? 0);
+        setPlan(prunedPlan?.length ? prunedPlan : null);
+        if (!prunedPlan?.length) {
+          setPreparedIds(null);
+          setStage("pick");
+        }
+        if (exported > 0) {
+          pushToast(
+            `Lost track of the export job, but ${exported} reel(s) did finish and are no ` +
+              "longer pending. Check Multi-Account Publish before re-running.",
+            "error",
+          );
+          return;
+        }
+      }
       pushToast(err instanceof Error ? err.message : String(err), "error");
     } finally {
       setBusy(false);
@@ -642,7 +807,7 @@ export function BatchDraftsScreen({
             <span className="text-muted-foreground">
               {visionBacked} vision-backed · {selectedIds.length - visionBacked} need a frame
             </span>
-            <Button size="sm" variant="secondary" onClick={load} disabled={busy}>
+            <Button size="sm" variant="secondary" onClick={() => void load()} disabled={busy}>
               Refresh
             </Button>
             <label
@@ -659,6 +824,21 @@ export function BatchDraftsScreen({
                 Cover foreign watermarks
                 {!watermarkScan && " (off — exports ~17s/reel faster)"}
               </span>
+            </label>
+            {/* Lives here rather than inside the review popup: it is a remembered
+                batch preference like the one above, and buried in the modal it
+                read as "the feature doesn't exist". */}
+            <label
+              className="flex items-center gap-2 text-muted-foreground"
+              title="After you reject a clip, pull one replacement into that same account from its niche pool."
+            >
+              <input
+                type="checkbox"
+                checked={autoDistributeOnReject}
+                disabled={busy}
+                onChange={(event) => setAutoDistributeOnReject(event.target.checked)}
+              />
+              <span>Replace rejected clips automatically</span>
             </label>
           </div>
 
@@ -731,6 +911,18 @@ export function BatchDraftsScreen({
         >
           {excludedAccounts.size > 0 ? "include all" : "clear all"}
         </button>
+        {pendingMediaTotal > 0 && (
+          <Button
+            size="sm"
+            variant="outline"
+            className="ml-auto"
+            disabled={busy}
+            onClick={fetchMissingMedia}
+            title="Re-download footage for distributed reels that never finished downloading"
+          >
+            Fetch footage ({pendingMediaTotal})
+          </Button>
+        )}
       </div>
 
       <div className="grid gap-3 md:grid-cols-2">
@@ -759,7 +951,7 @@ export function BatchDraftsScreen({
                         {group.items.length} of {group.available} draftless
                         {more > 0 ? ` · ${more} more available` : ""}
                         {group.pending_media > 0
-                          ? ` · ${group.pending_media} still downloading`
+                          ? ` · ${group.pending_media} waiting on footage`
                           : ""}
                         {group.auto_schedules ? " · auto-schedules on export" : ""}
                       </span>
@@ -777,7 +969,7 @@ export function BatchDraftsScreen({
                 {group.items.length === 0 ? (
                   <p className="text-xs text-muted-foreground">
                     {group.pending_media > 0
-                      ? `${group.pending_media} distributed reel(s) still downloading. Refresh in a moment.`
+                      ? `${group.pending_media} distributed reel(s) have no footage yet. If this doesn't clear on its own, use "Fetch footage" above.`
                       : "No undrafted reels with a downloaded file. Distribute more from Pool & Distribute."}
                   </p>
                 ) : (
@@ -867,6 +1059,17 @@ export function BatchDraftsScreen({
                   preview_url would hide it whenever the WebView media mapping
                   simply hasn't finished installing yet. */}
               <div className="rounded-md border border-border">
+                {/* Shown without asking: the automatic crop is what ships when
+                    nobody opens the editor, so it has to be visible by default
+                    rather than behind the disclosure below. */}
+                {!cropOpen && (
+                  <div className="border-b border-border p-3">
+                    <CropPreview
+                      itemId={reviewing.id}
+                      onAdjust={() => setCropOpen(true)}
+                    />
+                  </div>
+                )}
                 <button
                   type="button"
                   className="flex w-full items-center justify-between px-3 py-2 text-left text-sm hover:bg-muted/50"
@@ -913,16 +1116,14 @@ export function BatchDraftsScreen({
                 </span>
               </div>
 
-              <label className="flex items-center gap-2 text-xs text-muted-foreground">
-                <input
-                  type="checkbox"
-                  checked={autoDistributeOnReject}
-                  disabled={busy}
-                  onChange={(event) => setAutoDistributeOnReject(event.target.checked)}
-                />
-                Distribute a replacement automatically after rejecting
-                {reviewingGroup?.niche ? ` (${reviewingGroup.niche} pool)` : ""}
-              </label>
+              {/* The control itself sits in the toolbar; this just says what
+                  rejecting will do right now, with the pool named. */}
+              <p className="text-xs text-muted-foreground">
+                {autoDistributeOnReject
+                  ? `A replacement clip will be pulled into ${reviewingGroup?.account_name ?? "this account"}` +
+                    `${reviewingGroup?.niche ? ` from the ${reviewingGroup.niche} pool` : ""}.`
+                  : "No replacement will be pulled in. Turn on “Replace rejected clips automatically” above to change that."}
+              </p>
             </CardContent>
           </Card>
         </div>
@@ -945,6 +1146,12 @@ export function BatchDraftsScreen({
                 <span className={importResult.unmatched.length ? "text-amber-500" : ""}>
                   {importResult.unmatched.length} unmatched
                 </span>
+                {importResult.skipped.length > 0 && (
+                  <>
+                    {" · "}
+                    <span>{importResult.skipped.length} rejected</span>
+                  </>
+                )}
               </p>
             </div>
 
@@ -978,6 +1185,17 @@ export function BatchDraftsScreen({
                 note: row.error,
               }))}
               heading="Failed"
+              itemMeta={itemMeta}
+              labelFor={labelFor}
+              onOpen={onOpenInProcessing ? openInProcessing : undefined}
+            />
+            <ResultList
+              rows={importResult.skipped.map((row) => ({
+                itemId: row.item_id,
+                tone: "info" as const,
+                note: row.reason,
+              }))}
+              heading="Skipped (rejected)"
               itemMeta={itemMeta}
               labelFor={labelFor}
               onOpen={onOpenInProcessing ? openInProcessing : undefined}

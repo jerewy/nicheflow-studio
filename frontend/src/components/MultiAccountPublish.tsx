@@ -431,6 +431,7 @@ function SlotActionsPopover({
   slot,
   fillableJobs,
   onFill,
+  onSwap,
   onChangeTime,
   onRemove,
   onOpenVideo,
@@ -441,6 +442,7 @@ function SlotActionsPopover({
   slot: ScheduleCoverageSlot;
   fillableJobs: DashboardPublishJob[];
   onFill: (jobId: number, slotAt: string) => void;
+  onSwap: (jobId: number, replacementJobId: number) => void;
   onChangeTime: (jobId: number, iso: string) => void;
   onRemove: (jobId: number) => void;
   onOpenVideo: (jobId: number) => void;
@@ -449,6 +451,7 @@ function SlotActionsPopover({
   onClose: () => void;
 }) {
   const [fillJobId, setFillJobId] = useState("");
+  const [swapJobId, setSwapJobId] = useState("");
   const [timeValue, setTimeValue] = useState(() =>
     toDatetimeLocalValue(slot.scheduled_at ?? slot.slot_at),
   );
@@ -576,6 +579,43 @@ function SlotActionsPopover({
             Remove
           </Button>
         </div>
+        {/* Swap, not "remove then fill": a campaign clip that has to go out today
+            takes the slot, and the reel it displaced returns to the unscheduled
+            pool for a later one instead of being thrown away. */}
+        {fillableJobs.length ? (
+          <div className="space-y-2 border-t border-border pt-2">
+            <label className="grid gap-1 text-xs text-muted-foreground">
+              Swap in another reel
+              <select
+                className="h-8 w-full rounded-md border border-input bg-background px-2 text-xs text-foreground"
+                value={swapJobId}
+                onChange={(event) => setSwapJobId(event.target.value)}
+              >
+                <option value="">Select a reel…</option>
+                {fillableJobs.map((job) => (
+                  <option key={job.id} value={job.id}>
+                    {job.title ?? job.video}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <Button
+              size="sm"
+              variant="outline"
+              className="w-full"
+              disabled={!swapJobId}
+              onClick={() => {
+                onSwap(jobId, Number(swapJobId));
+                onClose();
+              }}
+            >
+              Take over this slot
+            </Button>
+            <p className="text-xs text-muted-foreground">
+              The reel here now goes back to unscheduled — nothing is deleted.
+            </p>
+          </div>
+        ) : null}
         <Button
           size="sm"
           variant="ghost"
@@ -746,6 +786,7 @@ function ScheduleCoveragePanel({
   fillableJobs,
   onSelectAccount,
   onFillSlot,
+  onSwapSlot,
   onChangeSlotTime,
   onRemoveSlot,
   onOpenVideo,
@@ -757,6 +798,7 @@ function ScheduleCoveragePanel({
   fillableJobs: DashboardPublishJob[];
   onSelectAccount: (accountId: number) => void;
   onFillSlot: (jobId: number, slotAt: string) => void;
+  onSwapSlot: (jobId: number, replacementJobId: number) => void;
   onChangeSlotTime: (jobId: number, iso: string) => void;
   onRemoveSlot: (jobId: number) => void;
   onOpenVideo: (jobId: number) => void;
@@ -877,6 +919,7 @@ function ScheduleCoveragePanel({
                       slot={slot}
                       fillableJobs={fillableJobs}
                       onFill={onFillSlot}
+                      onSwap={onSwapSlot}
                       onChangeTime={onChangeSlotTime}
                       onRemove={onRemoveSlot}
                       onOpenVideo={onOpenVideo}
@@ -1200,6 +1243,12 @@ export function MultiAccountPublish({
         }}
         onFillSlot={(jobId, slotAt) =>
           run(() => bridge.rescheduleJob(jobId, slotAt), "Slot filled.")
+        }
+        onSwapSlot={(jobId, replacementJobId) =>
+          run(
+            () => bridge.swapScheduledJob(jobId, replacementJobId),
+            "Slot swapped — the previous reel is back in the unscheduled pool.",
+          )
         }
         onChangeSlotTime={(jobId, iso) =>
           run(() => bridge.rescheduleJob(jobId, iso), "Slot time updated.")

@@ -4,6 +4,7 @@ import { AccountManager } from "@/components/AccountManager";
 import { Dashboard } from "@/components/Dashboard";
 import { ProcessingScreen, type ProcessingDeepLink } from "@/components/ProcessingScreen";
 import { PublishEventToaster } from "@/components/PublishEventToaster";
+import ClipStudioScreen from "@/components/ClipStudioScreen";
 import { ScrapingScreen } from "@/components/ScrapingScreen";
 import { ToastProvider } from "@/components/ui/Toast";
 import { usePauseHiddenMedia } from "@/hooks/useKeepAlive";
@@ -11,13 +12,16 @@ import { bridge, whenBridgeReady } from "@/lib/bridge";
 import { cn } from "@/lib/utils";
 import type { AccountSummary } from "@/types";
 
-type Tab = "accounts" | "dashboard" | "scraping" | "processing";
+type Tab = "accounts" | "dashboard" | "scraping" | "processing" | "clipstudio";
 
 const TABS: { id: Tab; label: string; gated: boolean }[] = [
   { id: "accounts", label: "Accounts", gated: false },
   { id: "dashboard", label: "Dashboard", gated: true },
   { id: "scraping", label: "Scraping", gated: true },
   { id: "processing", label: "Processing", gated: true },
+  // Campaign clipping runs on dedicated clip accounts, so it is not gated on
+  // the active niche account the way the network screens are.
+  { id: "clipstudio", label: "Clip Studio", gated: false },
 ];
 
 function App() {
@@ -186,6 +190,11 @@ function App() {
               activeAccountName={activeName}
               active={effectiveTab === "scraping"}
             />
+          </div>
+        )}
+        {isTabMounted("clipstudio") && (
+          <div hidden={effectiveTab !== "clipstudio"}>
+            <ClipStudioScreen active={effectiveTab === "clipstudio"} />
           </div>
         )}
       </div>

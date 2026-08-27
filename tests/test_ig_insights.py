@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import io
 from pathlib import Path
+import pytest
 import subprocess
 import sys
 import urllib.error
@@ -99,14 +100,16 @@ def test_top_titles_for_account_returns_highest_conversion_scores_only() -> None
     pulled_at = dt.datetime(2026, 6, 20, 2, tzinfo=dt.timezone.utc)
     timestamp = dt.datetime(2026, 6, 1, tzinfo=dt.timezone.utc)
 
-    def metric(account_key: str, shortcode: str, caption: str, score: float) -> dict:
+    def metric(
+        account_key: str, shortcode: str, caption: str, score: float, reach: int = 5_000
+    ) -> dict:
         return {
             "account_key": account_key,
             "shortcode": shortcode,
             "caption": caption,
             "timestamp": timestamp,
-            "reach": 100,
-            "views": 100,
+            "reach": reach,
+            "views": reach,
             "likes": 0,
             "comments": 0,
             "saved": 0,
@@ -233,6 +236,7 @@ def test_build_metric_row_normalizes_missing_metrics_and_calculates_score() -> N
     assert row == {
         "account_key": "pastmomentsdaily",
         "shortcode": "ABC123",
+        "media_id": None,  # this fixture media carries no Graph id
         "caption": "A real caption",
         "timestamp": dt.datetime(2026, 6, 1, 12, 30, tzinfo=dt.timezone.utc),
         "reach": 100,
@@ -331,3 +335,169 @@ def test_ig_insights_cli_help_does_not_require_credentials() -> None:
 
     assert result.returncode == 0
     assert "account_key" in result.stdout
+
+
+def test_top_titles_for_account_ignores_barely_distributed_posts() -> None:
+    # conversion_score is interactions/reach, so a post Instagram never pushed
+    # scores on a tiny denominator. On a real account the WORST post (163 views,
+    # reach 75) outranked everything but the one viral hit. Few-shot examples
+    # teach register, so that would train the model on the posts that failed.
+    pulled_at = dt.datetime(2026, 6, 20, 2, tzinfo=dt.timezone.utc)
+    timestamp = dt.datetime(2026, 6, 1, tzinfo=dt.timezone.utc)
+
+    def metric(shortcode: str, caption: str, score: float, reach: int) -> dict:
+        return {
+            "account_key": "floortest",
+            "shortcode": shortcode,
+            "caption": caption,
+            "timestamp": timestamp,
+            "reach": reach,
+            "views": reach,
+            "likes": 0,
+            "comments": 0,
+            "saved": 0,
+            "shares": 0,
+            "total_interactions": 0,
+            "conversion_score": score,
+            "pulled_at": pulled_at,
+        }
+
+    upsert_account_post_metrics(
+        [
+            metric("FLOP", "Flop that nobody saw", 0.99, reach=75),
+            metric("REAL", "Real winner", 0.20, reach=50_000),
+        ]
+    )
+
+    assert top_titles_for_account("floortest") == ["Real winner"]
+
+
+def test_collect_account_metrics_checkpoints_each_page() -> None:
+    # One request per post against a per-hour quota means a large account can be
+    # throttled part way through. Rows must be handed over per page so a failure
+    # keeps what was already pulled instead of discarding the whole run.
+    saved_pages: list[list[dict[str, object]]] = []
+
+    def fake_fetch_json(url: str) -> dict[str, object]:
+        if "/media?" in url:
+            return {
+                "data": [{"id": "1", "permalink": "https://www.instagram.com/reel/AAA/"}],
+                "paging": {"next": "https://graph.instagram.com/page2"},
+            }
+        if url == "https://graph.instagram.com/page2":
+            return {"data": [{"id": "2", "permalink": "https://www.instagram.com/reel/BBB/"}]}
+        if "/insights?" in url:
+            return {"data": [{"name": "reach", "values": [{"value": 10}]}]}
+        return {"user_id": "12345", "username": "acct", "media_count": 2}
+
+    _account, rows = collect_account_metrics(
+        account_key="acct",
+        user_id="12345",
+        token="secret-token",
+        fetch_json=fake_fetch_json,
+        pulled_at=dt.datetime(2026, 8, 12, tzinfo=dt.timezone.utc),
+        on_page=saved_pages.append,
+    )
+
+    assert [row["shortcode"] for row in rows] == ["AAA", "BBB"]
+    # Two pages checkpointed separately, not one flush at the end.
+    assert [[row["shortcode"] for row in page] for page in saved_pages] == [["AAA"], ["BBB"]]
+
+
+def test_collect_account_metrics_keeps_earlier_pages_when_a_later_one_fails() -> None:
+    def fake_fetch_json(url: str) -> dict[str, object]:
+        if "/media?" in url:
+            return {
+                "data": [{"id": "1", "permalink": "https://www.instagram.com/reel/AAA/"}],
+                "paging": {"next": "https://graph.instagram.com/page2"},
+            }
+        if url == "https://graph.instagram.com/page2":
+            raise GraphAPIError(429, "rate limited")
+        if "/insights?" in url:
+            return {"data": [{"name": "reach", "values": [{"value": 10}]}]}
+        return {"user_id": "12345", "username": "acct", "media_count": 2}
+
+    saved_pages: list[list[dict[str, object]]] = []
+    with pytest.raises(GraphAPIError):
+        collect_account_metrics(
+            account_key="acct",
+            user_id="12345",
+            token="secret-token",
+            fetch_json=fake_fetch_json,
+            pulled_at=dt.datetime(2026, 8, 12, tzinfo=dt.timezone.utc),
+            on_page=saved_pages.append,
+        )
+
+    assert [[row["shortcode"] for row in page] for page in saved_pages] == [["AAA"]]
+
+
+def test_fetch_media_insights_returns_none_for_pre_conversion_media() -> None:
+    # Instagram permanently refuses insights for media posted before the account
+    # became a business/creator profile (subcode 2108006). Raising there aborted
+    # a real 329-post account at post 300; those posts must be skipped instead.
+    def fake_fetch_json(url: str) -> dict[str, object]:
+        raise GraphAPIError(
+            400,
+            '{"error":{"message":"Media posted before...","code":100,'
+            '"error_subcode":2108006}}',
+        )
+
+    assert (
+        fetch_media_insights(
+            media_id="17890000000000000",
+            token="secret-token",
+            fetch_json=fake_fetch_json,
+        )
+        is None
+    )
+
+
+def test_collect_account_metrics_skips_media_without_insights() -> None:
+    def fake_fetch_json(url: str) -> dict[str, object]:
+        if "/media?" in url:
+            return {
+                "data": [
+                    {"id": "1", "permalink": "https://www.instagram.com/reel/AAA/"},
+                    {"id": "2", "permalink": "https://www.instagram.com/reel/BBB/"},
+                ]
+            }
+        if "/2/insights?" in url:
+            raise GraphAPIError(400, '{"error":{"error_subcode":2108006}}')
+        if "/insights?" in url:
+            return {"data": [{"name": "reach", "values": [{"value": 10}]}]}
+        return {"user_id": "12345", "username": "acct", "media_count": 2}
+
+    account, rows = collect_account_metrics(
+        account_key="acct",
+        user_id="12345",
+        token="secret-token",
+        fetch_json=fake_fetch_json,
+        pulled_at=dt.datetime(2026, 8, 12, tzinfo=dt.timezone.utc),
+    )
+
+    # The measurable post survives; the unmeasurable one is skipped, not stored
+    # as zeros (which would read as a flop in the analysis).
+    assert [row["shortcode"] for row in rows] == ["AAA"]
+    assert account["insights_unavailable"] == 1
+
+
+def test_build_metric_row_carries_the_graph_media_id() -> None:
+    """The media id is the join key back to the UploadJob that wrote the title.
+
+    Without it, a cloud-published post's metrics can only be matched to its
+    draft by caption text, which breaks on edits, reposts, and duplicates.
+    """
+    row = build_metric_row(
+        account_key="pastmomentsdaily",
+        media={
+            "id": "17912345678901234",
+            "permalink": "https://www.instagram.com/reel/ABC123/",
+            "caption": "A real caption",
+            "timestamp": "2026-06-01T12:30:00+0000",
+        },
+        insights={"reach": 100, "likes": 10},
+        pulled_at=dt.datetime(2026, 6, 20, 3, tzinfo=dt.timezone.utc),
+    )
+
+    assert row["media_id"] == "17912345678901234"
+    assert row["shortcode"] == "ABC123"

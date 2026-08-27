@@ -95,12 +95,17 @@ export function CropEditor({ itemId, onClose, onSaved }: CropEditorProps) {
     rectRef.current = rect;
   }, [rect]);
 
-  // Load any existing override so the box opens where the user last left it.
+  // Open on the crop the export would actually use: a saved override when there
+  // is one, otherwise the auto-detected rectangle. Seeding from FULL made the
+  // editor useless for checking automatic framing — the box never matched what
+  // was about to be rendered, so a wrong detection looked the same as a right
+  // one and the only way to see it was to export.
   useEffect(() => {
     let cancelled = false;
-    Promise.all([bridge.getCropOverride(itemId), bridge.getCropPreview(itemId)])
-      .then(([saved, preview]) => {
+    Promise.all([bridge.getEffectiveCrop(itemId), bridge.getCropPreview(itemId)])
+      .then(([effective, preview]) => {
         if (cancelled) return;
+        const saved = effective.source === "none" ? null : effective.rect;
         if (saved) setRect(saved);
         setPreviewUrl(preview.preview_url);
         const dur = preview.duration_seconds ?? null;

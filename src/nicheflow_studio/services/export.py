@@ -209,6 +209,63 @@ def crop_from_override(rect: dict, probe: "video.VideoProbe") -> "video.CropSett
     return video.CropSettings(left=left, top=top, right=right, bottom=bottom)
 
 
+def override_from_crop(crop: "video.CropSettings", probe: "video.VideoProbe") -> dict:
+    """Convert pixel-inset ``CropSettings`` back to a normalized keep-region.
+
+    The inverse of :func:`crop_from_override`, so a detected rectangle can be
+    shown in — and edited by — the same UI that stores manual crops.
+    """
+    width, height = probe.width, probe.height
+    keep_width = max(0, width - crop.left - crop.right)
+    keep_height = max(0, height - crop.top - crop.bottom)
+    return {
+        "x": round(crop.left / width, 5),
+        "y": round(crop.top / height, 5),
+        "w": round(keep_width / width, 5),
+        "h": round(keep_height / height, 5),
+    }
+
+
+def effective_crop(item_id: int) -> dict:
+    """The keep-region ``export_item`` will actually use, and where it came from.
+
+    Until this existed nothing surfaced the *automatic* crop: ``get_crop_override``
+    returns ``None`` when an item auto-crops, so the editor opened on the full
+    frame and a mis-detected rectangle stayed invisible until the reel was
+    rendered — or, in one case, published. ``source`` is ``manual`` when the user
+    has fixed the framing by hand, ``auto`` when detection found a rectangle, and
+    ``none`` when it found nothing and the whole frame is kept.
+    """
+    with get_session() as session:
+        item = session.get(DownloadItem, item_id)
+        if item is None:
+            raise ExportError(f"No download item with id {item_id}.")
+        override = _parse_crop_override(item.crop_override)
+        file_path = item.file_path
+
+    if override is not None:
+        return {"item_id": item_id, "rect": override, "source": "manual"}
+
+    if not file_path:
+        raise ExportError("This item has no downloaded video file to inspect.")
+    input_path = Path(file_path).expanduser().resolve()
+    if not input_path.exists():
+        raise ExportError(f"Video file not found: {input_path}")
+
+    probe = video.probe_video(input_path)
+    try:
+        crop = video.suggest_title_replacement_crop(input_path, probe)
+    except Exception:  # noqa: BLE001 - mirror export_item: detection is best-effort
+        crop = video.CropSettings()
+    if crop == video.CropSettings():
+        return {
+            "item_id": item_id,
+            "rect": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+            "source": "none",
+        }
+    return {"item_id": item_id, "rect": override_from_crop(crop, probe), "source": "auto"}
+
+
 def get_crop_override(item_id: int) -> dict | None:
     """The item's saved crop keep-region, or ``None`` if it auto-crops."""
     with get_session() as session:

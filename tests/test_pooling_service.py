@@ -545,7 +545,12 @@ def test_approve_pool_items_makes_clip_distributable() -> None:
         assert session.query(Assignment).count() == 1
 
 
-def test_review_queue_ranks_by_source_er_and_exposes_advisory_topic_metadata() -> None:
+def test_review_queue_ranks_by_source_reach_and_exposes_advisory_topic_metadata() -> None:
+    """Ranked by how far the footage travelled, not by engagement rate.
+
+    See source_fit_score: measured on 1,100 posted reels, source views separate
+    outcomes monotonically (2.45x across quartiles) where source ER does not.
+    """
     with get_session() as session:
         account = Account(name="History", platform="instagram", niche="history")
         session.add(account)
@@ -590,12 +595,16 @@ def test_review_queue_ranks_by_source_er_and_exposes_advisory_topic_metadata() -
 
     rows = pooling.review_queue("history")
 
-    assert [row["pool_item_id"] for row in rows] == [ids["focused"], ids["large"]]
-    assert rows[0]["source_er"] == pytest.approx(0.055)
-    assert rows[0]["topic_tier"] == "S"
+    assert [row["pool_item_id"] for row in rows] == [ids["large"], ids["focused"]]
+    # The 1M-view clip now leads despite the marginally lower rate and the C label.
+    assert rows[0]["topic_tier"] == "C"
+    assert rows[0]["source_er"] == pytest.approx(0.05)
+    # C is no longer auto-rejected on the label: it earns its advice from
+    # engagement and length like any other clip (tier C measured best of all).
     assert rows[0]["suggested_action"] == "accept"
-    assert rows[1]["topic_tier"] == "C"
-    assert rows[1]["suggested_action"] == "reject"
+    assert rows[1]["source_er"] == pytest.approx(0.055)
+    assert rows[1]["topic_tier"] == "S"
+    assert rows[1]["suggested_action"] == "accept"
     with get_session() as session:
         focused = session.get(PoolItem, ids["focused"])
         large = session.get(PoolItem, ids["large"])
@@ -1389,6 +1398,154 @@ def test_repair_pending_review_media_links_reuses_shared_download(tmp_path: Path
         assert session.get(DownloadItem, item_id).file_path == str(media_file)
 
 
+def _stalled_row(shortcode: str, *, account_id: int | None = None) -> int:
+    """A distributed row the one-shot background download never finished."""
+    with get_session() as session:
+        asset = MediaAsset(
+            canonical_source_url=f"https://instagram.com/reel/{shortcode}/",
+            source_shortcode=shortcode,
+            download_status="pending",
+        )
+        item = DownloadItem(
+            source_url=asset.canonical_source_url,
+            video_id=shortcode,
+            status="pending_review",
+            review_state="pending_review",
+            account_id=account_id,
+        )
+        session.add_all([asset, item])
+        session.commit()
+        return item.id
+
+
+def test_fetch_missing_pending_media_downloads_what_never_landed() -> None:
+    # The background download gets exactly one attempt per distribute, on a
+    # daemon thread. A clip it fails or never reaches keeps file_path NULL with
+    # nothing to retry it, so Batch Drafts reported "waiting on footage" forever
+    # and the only cure was opening every reel in Processing. This is the retry.
+    item_id = _stalled_row("stalled")
+
+    result = pooling.fetch_missing_pending_media()
+
+    assert result["stuck_rows"] == 1
+    assert result["fetched"] == 1
+    assert not result["failures"]
+    with get_session() as session:
+        item = session.get(DownloadItem, item_id)
+        assert item.file_path and Path(item.file_path).exists()
+
+
+def test_fetch_missing_pending_media_prefers_footage_already_on_disk(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Most stuck rows are a missing LINK, not missing footage: a sibling account
+    # pulled the same clip and only this row was left out. Re-downloading it
+    # would be a pointless Instagram hit on an account-safety-sensitive path.
+    media_file = tmp_path / "already.mp4"
+    media_file.write_bytes(b"video")
+    item_id = _stalled_row("already")
+    with get_session() as session:
+        asset = (
+            session.query(MediaAsset)
+            .filter(MediaAsset.source_shortcode == "already")
+            .one()
+        )
+        asset.download_status = "downloaded"
+        asset.original_download_path = str(media_file)
+        session.commit()
+
+    def fail(**kwargs):
+        raise AssertionError("Footage already on disk must not be re-downloaded.")
+
+    monkeypatch.setattr(pooling, "download_instagram_url", fail)
+
+    result = pooling.fetch_missing_pending_media()
+
+    assert result["linked_from_disk"] == 1
+    assert result["fetched"] == 0
+    with get_session() as session:
+        assert session.get(DownloadItem, item_id).file_path == str(media_file)
+
+
+def test_fetch_missing_pending_media_leaves_rejected_reels_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A clip the user killed must not be re-fetched just because its footage
+    # never landed — same rule batch_candidates applies when counting.
+    item_id = _stalled_row("killed")
+    with get_session() as session:
+        session.get(DownloadItem, item_id).review_state = "rejected"
+        session.commit()
+
+    def fail(**kwargs):
+        raise AssertionError("A rejected reel must not be re-downloaded.")
+
+    monkeypatch.setattr(pooling, "download_instagram_url", fail)
+
+    result = pooling.fetch_missing_pending_media()
+
+    assert result["stuck_rows"] == 0
+    assert result["fetched"] == 0
+
+
+def test_fetch_missing_pending_media_fetches_a_shared_clip_once() -> None:
+    # The same reel distributed to three accounts is ONE shared asset. Fetching
+    # per row would run three yt-dlp passes over the same source.
+    calls: list[str] = []
+    with get_session() as session:
+        accounts = [
+            Account(name=f"Shared {i}", platform="instagram", niche="history")
+            for i in range(3)
+        ]
+        session.add_all(accounts)
+        session.commit()
+        account_ids = [account.id for account in accounts]
+
+    asset_url = "https://instagram.com/reel/sharedclip/"
+    with get_session() as session:
+        session.add(
+            MediaAsset(
+                canonical_source_url=asset_url,
+                source_shortcode="sharedclip",
+                download_status="pending",
+            )
+        )
+        for account_id in account_ids:
+            session.add(
+                DownloadItem(
+                    source_url=asset_url,
+                    video_id="sharedclip",
+                    status="pending_review",
+                    review_state="pending_review",
+                    account_id=account_id,
+                )
+            )
+        session.commit()
+
+    original = pooling.download_instagram_url
+
+    def counting(*, url, output_dir):
+        calls.append(url)
+        return original(url=url, output_dir=output_dir)
+
+    pooling.download_instagram_url = counting
+    try:
+        result = pooling.fetch_missing_pending_media()
+    finally:
+        pooling.download_instagram_url = original
+
+    assert result["stuck_rows"] == 3
+    assert len(calls) == 1
+    assert result["fetched"] == 1
+    with get_session() as session:
+        linked = (
+            session.query(DownloadItem)
+            .filter(DownloadItem.video_id == "sharedclip")
+            .all()
+        )
+        assert all(item.file_path for item in linked)
+
+
 def test_background_download_links_each_clip_as_soon_as_it_lands(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1444,3 +1601,160 @@ def test_background_download_links_each_clip_as_soon_as_it_lands(
     assert first_row_paths[1] is not None
     with get_session() as session:
         assert session.get(DownloadItem, item_ids[1]).file_path is not None
+
+
+def test_gone_source_does_not_leave_an_undraftable_row_behind(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Distribution exposes a clip in Processing before its footage downloads.
+    # When that download turns out to be permanently impossible, the row used to
+    # survive with no file: undraftable, unexportable, and counted against the
+    # account's slot, so an account distributed 6 clips read "5 of 5 draftless"
+    # forever (beneathhistory/vaultedhistory, 2026-08-10).
+    with get_session() as session:
+        session.add(Account(name="Gone Hist", platform="instagram", niche="history"))
+        session.flush()
+        asset = MediaAsset(
+            platform="instagram",
+            canonical_source_url="https://instagram.com/reel/gone",
+            source_shortcode="gone",
+            download_status="pending",
+        )
+        session.add(asset)
+        session.flush()
+        session.add(
+            PoolItem(media_asset_id=asset.id, niche="history", acceptance_status="accepted")
+        )
+        session.commit()
+
+    def download(*, url, output_dir):
+        raise RuntimeError("Instagram sent an empty media response")
+
+    monkeypatch.setattr(pooling, "download_instagram_url", download)
+
+    pooling.distribute_niche("history", max_per_account=1)
+
+    with get_session() as session:
+        assert session.query(DownloadItem).count() == 0
+        assert session.query(MediaAsset).one().download_status == "unavailable"
+
+
+def test_gone_source_slot_is_refilled_from_the_pool(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Retiring the dead clip leaves the account one short of what Distribute
+    # just reported. The background pass must top it back up from the pool
+    # rather than waiting for the user to press Distribute again.
+    with get_session() as session:
+        session.add(Account(name="Refill Hist", platform="instagram", niche="history"))
+        for shortcode in ("gone", "spare"):
+            asset = MediaAsset(
+                platform="instagram",
+                canonical_source_url=f"https://instagram.com/reel/{shortcode}",
+                source_shortcode=shortcode,
+                download_status="pending",
+            )
+            session.add(asset)
+            session.flush()
+            session.add(
+                PoolItem(media_asset_id=asset.id, niche="history", acceptance_status="accepted")
+            )
+        session.commit()
+
+    live = tmp_path / "spare.mp4"
+    live.write_bytes(b"video")
+
+    def download(*, url, output_dir):
+        if url.endswith("/gone"):
+            raise RuntimeError("Instagram sent an empty media response")
+        return SimpleNamespace(file_path=live)
+
+    monkeypatch.setattr(pooling, "download_instagram_url", download)
+
+    # Ranking is jittered, so the dead clip may be placed first or second; asking
+    # for one clip and refilling must end with exactly one usable row either way.
+    pooling.distribute_niche("history", max_per_account=1)
+
+    with get_session() as session:
+        rows = session.query(DownloadItem).all()
+        assert [row.video_id for row in rows] == ["spare"]
+        assert rows[0].file_path == str(live)
+
+
+def test_gone_source_refill_replaces_only_the_lost_slot(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # "Distribute now" for 3 handed out 6 per account (2026-08-16): one dead clip
+    # in the batch made the background pass re-run the niche-wide ranked
+    # distribute, which tops every account up to its full daily target (6)
+    # instead of replacing the single slot that was lost.
+    with get_session() as session:
+        account = Account(name="Refill Exact", platform="instagram", niche="history")
+        session.add(account)
+        for i in range(8):
+            asset = MediaAsset(
+                platform="instagram",
+                canonical_source_url=f"https://instagram.com/reel/refill{i}",
+                source_shortcode=f"refill{i}",
+                download_status="pending",
+            )
+            session.add(asset)
+            session.flush()
+            session.add(
+                PoolItem(media_asset_id=asset.id, niche="history", acceptance_status="accepted")
+            )
+        session.commit()
+        account_id = account.id
+
+    # Ranking is jittered, so target the FIRST download rather than a named clip:
+    # whichever clip that is, it was one of the two just placed.
+    calls: list[str] = []
+
+    def download(*, url, output_dir):
+        calls.append(url)
+        if len(calls) == 1:
+            raise RuntimeError("Instagram sent an empty media response")
+        path = tmp_path / f"{url.rstrip('/').rsplit('/', 1)[-1]}.mp4"
+        path.write_bytes(b"video")
+        return SimpleNamespace(file_path=path)
+
+    monkeypatch.setattr(pooling, "download_instagram_url", download)
+
+    result = pooling.distribute_niche_explicit("history", {account_id: 2})
+
+    assert result["assigned"] == 2
+    with get_session() as session:
+        # One dead clip retired and replaced: exactly the 2 clips asked for, not
+        # a top-up to the account's daily target.
+        assert session.query(DownloadItem).filter(DownloadItem.account_id == account_id).count() == 2
+        assert (
+            session.query(Assignment)
+            .filter(
+                Assignment.account_id == account_id,
+                Assignment.status == assignments_db.ASSIGNMENT_STATUS_ASSIGNED,
+            )
+            .count()
+            == 2
+        )
+
+
+def test_distribute_niche_explicit_reports_why_nothing_was_placed() -> None:
+    # The reject-and-replace path calls this per account and has to tell the user
+    # WHY no replacement arrived; without a reason it had to guess "pool empty".
+    with get_session() as session:
+        account = Account(name="Explicit Reason", platform="instagram", niche="history")
+        session.add(account)
+        session.commit()
+        account_id = account.id
+
+    result = pooling.distribute_niche_explicit("history", {account_id: 1})
+
+    assert result["assigned"] == 0
+    assert result["reason"] == "pool_empty"
+
+
+def test_distribute_niche_explicit_flags_an_account_outside_the_niche() -> None:
+    result = pooling.distribute_niche_explicit("history", {999_999: 1})
+
+    assert result["assigned"] == 0
+    assert result["reason"] == "no_accounts"

@@ -21,6 +21,10 @@ class AccountPostMetric(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     account_key: Mapped[str] = mapped_column(String(128))
     shortcode: Mapped[str] = mapped_column(String(128))
+    # Graph API media id. Same value the cloud Worker records as meta_media_id
+    # when it publishes, so this is the exact key that links a post's metrics
+    # back to the UploadJob that wrote its title (see UploadJob.posted_media_id).
+    media_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     caption: Mapped[str | None] = mapped_column(String(65535), nullable=True)
     timestamp: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     reach: Mapped[int] = mapped_column(Integer, default=0)
@@ -160,6 +164,16 @@ class DownloadItem(Base):
     # When the user first opened this item in Processing. Used to clear the "NEW"
     # badge once a clip has been looked at (the badge is "recent AND unseen").
     seen_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Which Clip Studio source this clip was cut from (``ClipSource.source_ref``).
+    # Distinct from ``source_url``: a clip taken from a local file gets a
+    # ``local://<filename>`` source_url that points at its own copy, so grouping
+    # by source_url cannot tell which long video it came out of.
+    clip_source_ref: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    # The window this clip was cut from, in source seconds. Stored so a second
+    # send of the same moment is recognisable: the filename carries the start
+    # but is renamed on the way into the library, so it cannot be read back.
+    clip_start_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    clip_end_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
     account_id: Mapped[int | None] = mapped_column(ForeignKey("accounts.id"), nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="queued")
 
@@ -196,6 +210,11 @@ class UploadJob(Base):
     status: Mapped[str] = mapped_column(String(32), default="draft")
     youtube_video_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     posted_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    # Graph API media id returned by the cloud Worker's media_publish call. The
+    # local browser publisher captures a permalink into posted_url instead; the
+    # cloud path has no permalink, so this is how a cloud-published job is
+    # matched to its AccountPostMetric row.
+    posted_media_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     posted_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     posted_views: Mapped[int | None] = mapped_column(Integer, nullable=True)
     posted_likes: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -518,6 +537,45 @@ class DraftRevision(Base):
     applied_caption_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     download_item: Mapped["DownloadItem"] = relationship()
+
+
+class ClipSource(Base):
+    """A long video Clip Studio has been pointed at, and what came out of it.
+
+    Without this there is no record of the *source*: the cut clips land as
+    ``DownloadItem`` rows and the downloaded footage sits in an opaque
+    ``data/clips/<sha1>`` workspace, so "have I already mined this video?" had no
+    answer and a source that produced nothing left no trace at all.
+
+    One row per source, keyed by :attr:`source_ref` — the URL for a link, or
+    ``file://<resolved path>`` for a local file. ``DownloadItem.clip_source_ref``
+    points back here, which is what makes the drill-in list possible.
+
+    New table, so ``Base.metadata.create_all`` adds it to existing databases.
+    """
+
+    __tablename__ = "clip_sources"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: dt.datetime.now(dt.timezone.utc)
+    )
+    # Bumped every time the source is analyzed again, so the history list can be
+    # ordered by "what was I last working on".
+    last_analyzed_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: dt.datetime.now(dt.timezone.utc)
+    )
+
+    source_ref: Mapped[str] = mapped_column(String(2048), unique=True, index=True)
+    # "url" or "file" — decides whether source_ref is clickable.
+    kind: Mapped[str] = mapped_column(String(16), default="url")
+    title: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    # data/clips/<digest>: holds the cached download, transcript and previews, so
+    # reopening a source is instant and deleting it reclaims the disk.
+    workspace_path: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    transcript_available: Mapped[int] = mapped_column(Integer, default=0)
+    preview_count: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class UiSetting(Base):

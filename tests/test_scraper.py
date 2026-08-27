@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import datetime as dt
+from types import SimpleNamespace
 
+from nicheflow_studio.services import scraping
 from nicheflow_studio.scraper.youtube import (
     DiscoveryWeights,
     normalize_youtube_source_url,
@@ -397,3 +399,77 @@ def test_scrape_instagram_source_returns_video_candidates(monkeypatch) -> None:
     assert candidates[0].video_id == "abc123"
     assert candidates[0].view_count == 120000
     assert candidates[0].comment_count == 52
+
+
+# --- scrape watermark safety (services.scraping._resolve_watermark) ---------
+
+def _stub(published_at):
+    return SimpleNamespace(published_at=published_at)
+
+
+def test_watermark_advances_when_results_continue_from_the_previous_run() -> None:
+    previous = dt.datetime(2026, 6, 18, 9, 0)
+    results = [
+        _stub(dt.datetime(2026, 6, 19, 8, 0)),
+        _stub(dt.datetime(2026, 6, 20, 8, 0)),
+    ]
+
+    watermark, partial = scraping._resolve_watermark(previous, results)
+
+    assert partial is False
+    assert watermark == dt.datetime(2026, 6, 20, 8, 0)
+
+
+def test_watermark_refuses_to_advance_over_a_gap() -> None:
+    # The real failure: Apify returned 17 posts covering the two most recent
+    # days while skipping the 54 days in between. Stamping wall-clock now made
+    # those posts permanently unreachable, because a high-water mark cannot
+    # express a hole.
+    previous = dt.datetime(2026, 6, 18, 9, 0)
+    results = [
+        _stub(dt.datetime(2026, 8, 11, 7, 0)),
+        _stub(dt.datetime(2026, 8, 12, 21, 0)),
+    ]
+
+    watermark, partial = scraping._resolve_watermark(previous, results)
+
+    assert partial is True
+    assert watermark is None
+
+
+def test_watermark_tolerates_a_short_quiet_spell() -> None:
+    # An account that simply didn't post for a couple of days must not be
+    # mistaken for a truncated fetch.
+    previous = dt.datetime(2026, 6, 18, 9, 0)
+    results = [_stub(dt.datetime(2026, 6, 20, 9, 0))]
+
+    watermark, partial = scraping._resolve_watermark(previous, results)
+
+    assert partial is False
+    assert watermark == dt.datetime(2026, 6, 20, 9, 0)
+
+
+def test_watermark_handles_a_first_ever_scrape() -> None:
+    results = [_stub(dt.datetime(2026, 3, 27, 12, 0)), _stub(dt.datetime(2026, 6, 19, 8, 0))]
+
+    watermark, partial = scraping._resolve_watermark(None, results)
+
+    assert partial is False
+    assert watermark == dt.datetime(2026, 6, 19, 8, 0)
+
+
+def test_watermark_does_not_move_on_an_empty_run() -> None:
+    previous = dt.datetime(2026, 6, 18, 9, 0)
+
+    assert scraping._resolve_watermark(previous, []) == (None, False)
+
+
+def test_watermark_compares_aware_results_against_a_naive_stored_value() -> None:
+    # SQLite returns naive datetimes; Apify's carry UTC offsets.
+    previous = dt.datetime(2026, 6, 18, 9, 0)
+    results = [_stub(dt.datetime(2026, 6, 19, 8, 0, tzinfo=dt.timezone.utc))]
+
+    watermark, partial = scraping._resolve_watermark(previous, results)
+
+    assert partial is False
+    assert watermark == dt.datetime(2026, 6, 19, 8, 0)

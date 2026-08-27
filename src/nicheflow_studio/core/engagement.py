@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import math
 from typing import Literal
 
 from nicheflow_studio.core.distribution import DEFAULT_RECENCY_HALF_LIFE_DAYS
@@ -10,13 +11,34 @@ from nicheflow_studio.core.distribution import DEFAULT_RECENCY_HALF_LIFE_DAYS
 TopicTier = Literal["S", "A", "B", "C", "D"]
 SuggestedAction = Literal["accept", "review", "reject"]
 
+# Graded tier weights are retired. Measured over 1,100 posted reels with real
+# Instagram insights (2026-08-12), the tiers do not separate outcomes at all:
+#
+#   tier A  n=200  median 4,852     tier B  n=381  median 4,678
+#   tier C  n= 40  median 5,009     tier S  n=324  median 4,592
+#
+# C was penalised x0.5 and performed BEST; S was boosted x1.6 and performed
+# worst. The weights were amplifying a hand-seeded ~40-keyword guess, so they
+# are flattened to 1.0 rather than re-fitted to noise.
+#
+# D stays 0.0: that is a deliberate content exclusion ("hydraulic press",
+# "physics demo", "oscilloscope", "raw trivia" — off-niche formats), not a
+# performance prediction, so the measurement above does not bear on it.
 TOPIC_TIER_WEIGHTS: dict[TopicTier, float] = {
-    "S": 1.6,
-    "A": 1.3,
+    "S": 1.0,
+    "A": 1.0,
     "B": 1.0,
-    "C": 0.5,
+    "C": 1.0,
     "D": 0.0,
 }
+
+# How much the source's engagement RATE may swing a score, as a multiplier on
+# top of reach. Source ER does carry signal (Spearman +0.173 against real
+# views), but less than absolute reach (+0.288) and it is not monotonic: its
+# top quartile underperforms its third. So it is a tiebreaker, capped, never a
+# primary term.
+_ER_TIEBREAK_WEIGHT = 2.0
+_ER_TIEBREAK_CAP = 0.10
 
 _TOPIC_KEYWORDS: tuple[tuple[TopicTier, tuple[str, ...]], ...] = (
     ("D", ("hydraulic press", "physics demo", "oscilloscope", "raw trivia")),
@@ -108,11 +130,38 @@ def source_fit_score(
     *,
     tier: TopicTier,
     source_er: float,
+    source_views: int | None = None,
     published_at: dt.datetime | None = None,
     now: dt.datetime | None = None,
 ) -> float:
-    """Rank source candidates by topic weight, public ER, and recency."""
-    return TOPIC_TIER_WEIGHTS[tier] * max(0.0, source_er) * recency_weight(published_at, now=now)
+    """Rank source candidates by how far the footage already travelled.
+
+    Reach-first. The previous formula was ``tier x source_er x recency``, which
+    made engagement RATE the only real term — and rate divides reach away, so a
+    300-view clip with 60 likes outranked a 2M-view clip. Measured against 1,100
+    of the network's own posted reels (2026-08-12), that was backwards:
+
+        ranked by source ER      Q1 3,634  Q2 4,449  Q3 6,010  Q4 5,360
+        ranked by source VIEWS   Q1 3,368  Q2 4,271  Q3 5,595  Q4 8,256
+
+    Source views is monotonic and spreads 2.45x bottom-to-top quartile; source
+    ER peaks in Q3 and falls. Correlations against real views: source likes
+    +0.293, source views +0.288, source ER +0.173.
+
+    Reach enters as log10 so the term compresses: a 1000x reach difference is
+    worth ~2x score, which keeps one viral source clip from monopolising the
+    whole distribution. ER survives only as a capped tiebreaker.
+
+    ``source_views`` is optional so a candidate whose public metrics never
+    scraped still ranks (on ER and recency alone) instead of scoring zero and
+    sinking below every measured clip.
+    """
+    if source_views is None:
+        reach = 1.0
+    else:
+        reach = math.log10(1.0 + max(0, int(source_views)))
+    tiebreak = 1.0 + _ER_TIEBREAK_WEIGHT * min(max(0.0, source_er), _ER_TIEBREAK_CAP)
+    return TOPIC_TIER_WEIGHTS[tier] * reach * tiebreak * recency_weight(published_at, now=now)
 
 
 # Advisory thresholds for suggested_action. A clip past SHORT_MAX_SECONDS is no
@@ -132,7 +181,14 @@ def suggested_action(
     duration_seconds: int | None = None,
 ) -> SuggestedAction:
     """Return an advisory action; callers must not mutate acceptance state."""
-    if tier in {"C", "D"}:
+    # C used to be auto-rejected alongside D. Measured over 1,100 posted reels
+    # (2026-08-12), tier C posts had the HIGHEST median views of any tier
+    # (5,009 vs S 4,592), so rejecting them on the keyword label alone was
+    # advice against the evidence. C now falls through to the engagement and
+    # length checks like any other clip. D remains an outright reject: it is a
+    # content exclusion (hydraulic press, physics demos, raw trivia), not a
+    # performance call.
+    if tier == "D":
         return "reject"
     strong_engagement = source_er >= STRONG_SOURCE_ER
     is_long = duration_seconds is not None and duration_seconds > SHORT_MAX_SECONDS

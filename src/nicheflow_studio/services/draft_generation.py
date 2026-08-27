@@ -36,6 +36,167 @@ def can_generate() -> bool:
     return smart_drafts.can_generate_smart_drafts()
 
 
+def guard_clip_titles(
+    *,
+    titles: list[str],
+    grounding_text: str,
+    source_title: str | None = None,
+    niche_label: str | None = None,
+    recommended_index: int | None = None,
+    recommendation_reason: str | None = None,
+    provider_label: str = "Pasted",
+) -> dict:
+    """Score already-written titles against the clip, in the API path's shape.
+
+    Titles pasted back from a chat model get the same grounding check the Groq
+    ones do — the check is about whether the clip supports the claim, not about
+    who wrote it — so both routes hand the UI the same green/amber/red verdicts.
+    """
+    cleaned = [title.strip() for title in titles if title and title.strip()]
+    if not cleaned:
+        raise DraftRevisionError(
+            "No 'Title Option' lines found. The reply must use plain-text headers "
+            "(Title Option 1:) — a bolded or prefixed header breaks the parser."
+        )
+    guarded = draft_guard.guard_options(
+        title_options=cleaned,
+        signals_text=draft_guard.build_signals_text(
+            grounding_text, source_title, niche_label, None
+        ),
+        recommended_index=recommended_index,
+        recommendation_reason=recommendation_reason,
+    )
+    return {
+        "titles": cleaned,
+        "tiers": list(guarded.option_tiers),
+        "notes": list(guarded.option_notes or []),
+        "flagged_terms": {
+            str(index): terms for index, terms in guarded.flagged_terms.items()
+        },
+        "recommended_index": guarded.recommended_index,
+        "recommendation_shifted": bool(guarded.recommendation_shifted),
+        "reason": guarded.recommendation_reason,
+        "summary": "",
+        "provider_label": provider_label,
+        "used_fallback": False,
+    }
+
+
+def generate_titles_for_clip(
+    *,
+    account_id: int,
+    transcript_text: str,
+    video_path: str | None = None,
+    source_title: str | None = None,
+    source_description: str | None = None,
+    grounding_text: str | None = None,
+    title_style: str | None = None,
+    title_length: str | None = None,
+) -> dict:
+    """Title options for a Clip Studio candidate, before any library item exists.
+
+    Clip Studio ranks moments and renders them, but had nothing to put in the
+    title band: the hook was typed by hand, and a candidate rendered without one
+    is exactly as hard to judge as the raw cut. Meanwhile the same generator has
+    been writing titles for Processing all along, and a candidate already carries
+    the one thing it needs — the words spoken inside the window.
+
+    Deliberately not :func:`generate_revision_for_item`: that one is keyed on a
+    ``DownloadItem`` and persists a revision, and a candidate is neither. This
+    borrows only the account's voice, so a suggested title lands in the same
+    register the account actually publishes in, and returns options rather than
+    saving anything — most candidates in a batch are never sent anywhere.
+
+    ``video_path`` is the cut preview: passing it lets the generator ground on
+    the frames as well as the words, which is what stops a title describing
+    something the clip never shows.
+
+    ``grounding_text`` is what the result is *checked* against, and is
+    deliberately allowed to differ from what it was written from. The clip window
+    alone is too thin to write a good title from, but it is exactly the right
+    thing to verify one against: the title has to be delivered by the fifteen
+    seconds a viewer actually sees. So the writer reads the surrounding minute
+    and the guard reads only the clip — a title that drifts onto something the
+    clip never shows ("a secret global handoff") comes back flagged rather than
+    recommended.
+    """
+    cleaned_transcript = (transcript_text or "").strip()
+    with get_session() as session:
+        account = session.get(Account, int(account_id))
+        if account is None:
+            raise DraftRevisionError(f"No account with id {account_id}.")
+        niche_label = account.niche_label
+        voice = _account_voice(account, None)
+        account_key = account.instagram_handle
+        # The account's saved prompt style, the same fields processing_workflow's
+        # get_settings reads for an item. Without them a history account's clip
+        # came back in a flat reporting register ("Around $60 million of fraud may
+        # have occurred") instead of the one it actually publishes in — the style
+        # is the whole difference between a usable title and a caption.
+        try:
+            prefs = json.loads(account.processing_preferences or "{}")
+        except ValueError:
+            prefs = {}
+        if not isinstance(prefs, dict):
+            prefs = {}
+        title_style = title_style or prefs.get("prompt_title_style") or None
+        title_length = title_length or prefs.get("title_length") or None
+        has_context = bool(cleaned_transcript or niche_label or voice)
+    if not has_context:
+        raise DraftRevisionError(
+            "Nothing to write a title from — this clip has no transcribed speech "
+            "and the account has no niche or voice set."
+        )
+
+    clip_path = Path(video_path) if video_path else None
+    drafts = smart_drafts.generate_smart_drafts(
+        transcript_text=cleaned_transcript,
+        source_title=source_title,
+        source_description=source_description,
+        niche_label=niche_label,
+        input_path=clip_path if clip_path and clip_path.exists() else None,
+        account_voice=voice,
+        title_style=title_style,
+        title_length=title_length,
+        few_shot_winners=(top_titles_for_account(account_key) or None) if account_key else None,
+        # A clip with speech is already grounded in its own words, and a hard
+        # vision requirement would fail the whole suggestion on a source whose
+        # frames cannot be sampled — worse than a slightly weaker title.
+        require_vision=False,
+    )
+    # Checked against the clip alone, whatever it was written from.
+    guarded = draft_guard.guard_options(
+        title_options=drafts.title_options,
+        signals_text=draft_guard.build_signals_text(
+            (grounding_text or cleaned_transcript),
+            source_title,
+            niche_label,
+            drafts.vision_payload,
+        ),
+        option_tiers=drafts.option_tiers,
+        option_notes=drafts.option_notes,
+        claim_supports=drafts.claim_supports,
+        recommended_index=drafts.recommended_title_index,
+        recommendation_reason=drafts.recommendation_reason,
+    )
+    return {
+        "titles": list(drafts.title_options),
+        # "green" (no checkable claim), "yellow" (claims supported), "red"
+        # (a claim the clip does not back up).
+        "tiers": list(guarded.option_tiers),
+        "notes": list(guarded.option_notes or []),
+        "flagged_terms": {
+            str(index): terms for index, terms in guarded.flagged_terms.items()
+        },
+        "recommended_index": guarded.recommended_index,
+        "recommendation_shifted": bool(guarded.recommendation_shifted),
+        "reason": guarded.recommendation_reason,
+        "summary": drafts.summary,
+        "provider_label": drafts.provider_label,
+        "used_fallback": bool(drafts.used_fallback),
+    }
+
+
 # A provider-level vision failure (model_not_found, revoked key, no key at all)
 # fails identically for every item in a batch, and each attempt costs a full
 # round-trip. Recognising those lets a batch stop after the first one instead of
@@ -331,10 +492,12 @@ def generate_revision_for_item(
         signals_text=draft_guard.build_signals_text(
             gen_kwargs["transcript_text"],
             gen_kwargs["source_title"],
-            gen_kwargs["source_description"],
             gen_kwargs["niche_label"],
             account_voice.get("clip_context"),
             drafts.vision_payload,
+        ),
+        asserted_signals_text=draft_guard.build_signals_text(
+            gen_kwargs["source_description"],
         ),
         option_tiers=drafts.option_tiers,
         option_notes=drafts.option_notes,

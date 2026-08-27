@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import threading
+from pathlib import Path
 
 from nicheflow_studio.services.jobs import (
     CANCELED,
@@ -116,3 +118,34 @@ def test_job_without_cancel_event_param_runs_unchanged() -> None:
     snapshot = manager.join(job_id)
     assert snapshot["status"] == SUCCEEDED
     assert snapshot["result"] == 9
+
+
+def test_snapshot_serializes_a_path_result() -> None:
+    """A job that writes a file naturally returns a Path.
+
+    Left raw, that raised inside pywebview's own JSON serializer *after* the work
+    had succeeded, so every Clip Studio card reported "Render failed" with no
+    error message while the finished file sat on disk.
+    """
+    manager = JobManager()
+    job_id = manager.start(lambda: Path("C:/out/clip.mp4"))
+
+    snapshot = manager.join(job_id)
+
+    assert snapshot is not None
+    assert snapshot["status"] == SUCCEEDED
+    assert isinstance(snapshot["result"], str)
+    # The actual requirement: it survives the serializer that broke.
+    json.dumps(snapshot)
+
+
+def test_snapshot_serializes_paths_nested_in_a_result() -> None:
+    manager = JobManager()
+    job_id = manager.start(lambda: {"video": Path("a.mp4"), "extras": [Path("b.srt")]})
+
+    snapshot = manager.join(job_id)
+
+    assert snapshot is not None
+    json.dumps(snapshot)
+    assert isinstance(snapshot["result"]["video"], str)
+    assert isinstance(snapshot["result"]["extras"][0], str)

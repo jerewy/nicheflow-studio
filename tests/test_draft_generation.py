@@ -90,6 +90,7 @@ def test_generate_passes_accounts_measured_top_titles(
                 AccountPostMetric(
                     account_key="pastmomentsdaily",
                     shortcode="winner-one",
+                    reach=50_000,
                     caption="Measured winner one",
                     conversion_score=0.8,
                     pulled_at=dt.datetime.now(dt.timezone.utc),
@@ -97,6 +98,7 @@ def test_generate_passes_accounts_measured_top_titles(
                 AccountPostMetric(
                     account_key="pastmomentsdaily",
                     shortcode="winner-two",
+                    reach=50_000,
                     caption="Measured winner two",
                     conversion_score=0.5,
                     pulled_at=dt.datetime.now(dt.timezone.utc),
@@ -411,3 +413,27 @@ def test_ensure_vision_payload_reuses_stored_evidence(monkeypatch) -> None:
     monkeypatch.setattr(smart_drafts, "describe_video_frames", fail)
 
     assert draft_generation.ensure_vision_payload(item_id) == {"main_subject": "a bridge"}
+
+
+def test_guard_clip_titles_flags_a_claim_the_clip_does_not_support() -> None:
+    """Pasted titles get the same grounding check the generated ones do."""
+    result = draft_generation.guard_clip_titles(
+        titles=[
+            "He offered 400,000 dollars for a single card",
+            "A secret global handoff nobody has ever seen",
+        ],
+        grounding_text="All I want is 400K. My house was 215,000. This card is 400,000.",
+        recommended_index=1,
+    )
+
+    assert result["tiers"][0] != "red"
+    assert result["tiers"][1] == "red"
+    assert "secret" in result["flagged_terms"]["1"]
+    # The pasted pick was the flagged one, so the recommendation must move.
+    assert result["recommendation_shifted"] is True
+    assert result["recommended_index"] == 0
+
+
+def test_guard_clip_titles_rejects_an_empty_paste() -> None:
+    with pytest.raises(DraftRevisionError, match="Title Option"):
+        draft_generation.guard_clip_titles(titles=[], grounding_text="anything")

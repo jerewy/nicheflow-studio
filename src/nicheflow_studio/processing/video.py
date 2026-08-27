@@ -396,6 +396,25 @@ CONTENT_RECT_MIN_REMAINING_RATIO = 0.08  # reject crops that leave < 8% of a dim
 # get fragmented into separate bands. Static title/canvas bands have ~0
 # coverage and produce gaps far larger than this, so they remain excluded.
 CONTENT_RECT_MAX_GAP_RATIO = 0.08
+# Screenshot-repost cards whose rows animate defeat the overlay-bar and
+# static-text guards below, so gap bridging welds the handle row and caption
+# lines onto the footage band and the crop keeps the whole card. Dropping short
+# leading runs fixes that — but on its own it also cuts into footage that simply
+# opens dark and slow (a dim stage, a held wide), which produces the same run
+# pattern. A sweep of all 2,531 clips scored the ungated trim 15 better against
+# 20 worse by hand review.
+#
+# What separates the two is what sits BETWEEN the runs. A card's caption lines
+# are stacked on canvas, so the strip being dropped is largely rows with zero
+# motion anywhere across the clip. A dark opening shot is still a picture: every
+# row carries some motion, and the strip has no dead rows at all. On the 35
+# hand-labelled clips the dead-row fraction of the dropped strip was a median
+# 0.43 for the good trims and 0.00 for the bad ones, and no clip judged worse
+# exceeded 0.21. Peak coverage and first-gap deadness were both tried first and
+# neither separates: each fixes one case and breaks the other.
+CONTENT_RECT_TOP_LINE_MAX_RATIO = 0.12
+# Set above the 0.21 ceiling of every clip the ungated trim damaged, with margin.
+CONTENT_RECT_TOP_LINE_DEAD_ROW_MIN = 0.30
 # Top-edge overlay-text trim. Static white-on-canvas overlay text (e.g. a
 # meme caption sitting just above the embedded clip) leaks tiny pixel-edge
 # motion across to the rows that contain it, so the activity band's top
@@ -510,6 +529,52 @@ def _largest_coverage_band(
     if best is None or best_len < min_len:
         return None
     return best
+
+
+def _drop_leading_thin_runs(
+    signal,  # noqa: ANN001 - thresholded 0/1 rows, used to find the runs
+    coverage,  # noqa: ANN001 - raw row coverage, used for the dead-row gate
+    band: tuple[int, int],
+    min_cov: float,
+    *,
+    max_run_ratio: float,
+    min_len: int,
+    dead_row_min: float,
+) -> tuple[int, int]:
+    """Move a band's top edge past stacked caption lines welded on by ``max_gap``.
+
+    ``_largest_coverage_band`` bridges short inactive gaps, which is right for
+    footage broken up by low-motion sub-regions and wrong for a repost card whose
+    caption lines sit above the clip on the same canvas. Both look identical as
+    runs: a few short active stretches, then the long one that is the footage.
+
+    The strip between them is what tells them apart, so the walk's result is only
+    accepted when at least ``dead_row_min`` of the rows it would drop carry no
+    motion at all. Canvas between caption lines is dead by definition; a dark
+    opening shot is still a picture and has no dead rows, so it is left alone.
+    """
+    start, end = band
+    band_length = end - start + 1
+    max_run_length = max(1, int(band_length * max_run_ratio))
+    cursor = start
+    while cursor <= end:
+        run_end = cursor
+        while run_end + 1 <= end and signal[run_end + 1] >= min_cov:
+            run_end += 1
+        if run_end - cursor + 1 > max_run_length:
+            break
+        next_start = run_end + 1
+        while next_start <= end and signal[next_start] < min_cov:
+            next_start += 1
+        if next_start > end or end - next_start + 1 < min_len:
+            break
+        cursor = next_start
+    if cursor == start:
+        return band
+    dropped = coverage[start:cursor]
+    if dropped.size == 0 or float((dropped == 0).mean()) < dead_row_min:
+        return band
+    return (cursor, end)
 
 
 def _trim_uniform_static_margins(
@@ -715,6 +780,19 @@ def detect_content_rectangle(input_path: Path, probe: VideoProbe) -> CropSetting
         )
         if row_band is None:
             return None
+        # Drop repost-card caption lines that gap bridging welded onto the top of
+        # the footage band. Before the sharp-row extension below, so it starts at
+        # the real footage edge and stops at the canvas gap under the last
+        # caption line instead of walking back up into it.
+        row_band = _drop_leading_thin_runs(
+            motion_signal,
+            row_coverage,
+            row_band,
+            0.5,
+            max_run_ratio=CONTENT_RECT_TOP_LINE_MAX_RATIO,
+            min_len=max(1, int(min_h * CONTENT_RECT_MIN_BAND_RATIO)),
+            dead_row_min=CONTENT_RECT_TOP_LINE_DEAD_ROW_MIN,
+        )
         # Extend through adjacent sharp rows in both directions. A single
         # blank/low-signal row breaks the extension so meme overlay text
         # separated from the footage by a black canvas gap is NOT absorbed.
@@ -917,20 +995,34 @@ def diagnose_preprocessing_ocr(
     )
 
 
+# Frames fed to cropdetect. The median of these decides the crop, so they have
+# to be representative of the whole clip rather than of whatever it opens on.
+_BORDER_CROP_SAMPLES = 12
+
+
 def detect_border_crop(input_path: Path, probe: VideoProbe) -> CropSettings | None:
     ffmpeg_path = ffmpeg_binary()
     if ffmpeg_path is None:
         return None
 
+    # Spread the samples across the clip. At a fixed fps=1 these twelve frames
+    # were the first twelve *seconds*, so on anything longer the crop was decided
+    # by the opening shot and applied to the rest — visible on a Clip Studio cut
+    # that starts on a talking head and cuts away to the thing being discussed:
+    # the reveal gets framed for the interview it followed.
+    duration = probe.duration_seconds or 0.0
+    sample_fps = (
+        min(1.0, _BORDER_CROP_SAMPLES / duration) if duration > _BORDER_CROP_SAMPLES else 1.0
+    )
     command = [
         str(ffmpeg_path),
         "-hide_banner",
         "-i",
         str(input_path),
         "-vf",
-        "fps=1,cropdetect=limit=0.08:round=2:reset=0",
+        f"fps={sample_fps:.4f},cropdetect=limit=0.08:round=2:reset=0",
         "-frames:v",
-        "12",
+        str(_BORDER_CROP_SAMPLES),
         "-f",
         "null",
         "-",
@@ -1808,6 +1900,54 @@ def _run_render(command: list[str], cancel_event: "threading.Event | None") -> N
         )
 
 
+# ffmpeg converts an SRT to ASS on a fixed 384x288 reference canvas, so every
+# style value in force_style is in those units, not pixels. Without this
+# conversion a "size 15" caption renders 100px tall on a 1920 canvas.
+_ASS_REFERENCE_WIDTH = 384
+_ASS_REFERENCE_HEIGHT = 288
+_CAPTION_HEIGHT_PX = 44
+# How far above the bottom edge of the footage the caption block sits.
+_CAPTION_BOTTOM_INSET_PX = 30
+# Kept clear of the footage's own side edges. This is also what forces wrapping:
+# ASS breaks a line at the usable width, so without side margins a long line
+# runs the full canvas and spills off the picture instead of becoming two rows.
+_CAPTION_SIDE_INSET_PX = 70
+
+
+def default_caption_style(
+    canvas_width: int,
+    canvas_height: int,
+    content_width: int,
+    content_bottom_y: int,
+) -> str:
+    """Caption style that keeps lines on the footage and wraps them to fit.
+
+    Positioned from the footage rectangle the compositor actually produced, not
+    from the crop's aspect ratio: the band layout scales the picture down to fit
+    under a title band, so a rectangle derived from the crop alone sits too low
+    and the captions land in the black bar below the video.
+    """
+    def to_ass_y(pixels: float) -> int:
+        return max(0, round(pixels * _ASS_REFERENCE_HEIGHT / canvas_height))
+
+    def to_ass_x(pixels: float) -> int:
+        return max(0, round(pixels * _ASS_REFERENCE_WIDTH / canvas_width))
+
+    bottom_margin = max(0, canvas_height - content_bottom_y) + _CAPTION_BOTTOM_INSET_PX
+    side_margin = max(0, (canvas_width - content_width) // 2) + _CAPTION_SIDE_INSET_PX
+    return (
+        "FontName=Arial,"
+        f"Fontsize={to_ass_y(_CAPTION_HEIGHT_PX)},"
+        "Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
+        # Thin outline, no shadow — matching the clean subtitle look of the
+        # sources these clips come from. A thick outline plus a shadow fuses
+        # into a black blob behind the words at this size.
+        "BorderStyle=1,Outline=1,Shadow=0,Alignment=2,WrapStyle=0,"
+        f"MarginV={to_ass_y(bottom_margin)},"
+        f"MarginL={to_ass_x(side_margin)},MarginR={to_ass_x(side_margin)}"
+    )
+
+
 def export_cropped_video(
     *,
     input_path: Path,
@@ -1823,6 +1963,8 @@ def export_cropped_video(
     title_align: str = "center",
     title_line_gap_scale: float | None = None,
     post_header: PostHeader | None = None,
+    subtitles_path: Path | None = None,
+    subtitle_style: str | None = None,
     audio_mode: str = "keep",
     audio_alter_params: AudioAlterParams | None = None,
     cancel_event: "threading.Event | None" = None,
@@ -1838,6 +1980,8 @@ def export_cropped_video(
         raise RuntimeError("ffmpeg is not installed.")
     if not resolved_input.exists():
         raise FileNotFoundError(f"Video file not found: {resolved_input}")
+    if subtitles_path is not None and not subtitles_path.expanduser().resolve().exists():
+        raise FileNotFoundError(f"Subtitle file not found: {subtitles_path}")
 
     probe = probe_video(resolved_input)
     crop_width, crop_height = output_dimensions(probe, crop)
@@ -1865,6 +2009,9 @@ def export_cropped_video(
         crop_filter = f"{normalize_scale},crop={crop_width}:{crop_height}:{crop.left}:{crop.top}"
         filter_parts = [crop_filter]
         complex_filter: str | None = None
+        # Filled by the band compositor with where the footage landed; burn-in
+        # captions are positioned from it.
+        band_layout: dict = {}
         emoji_font_path = windows_emoji_font_file()
         if normalized_title and font_path is not None:
             if title_layout == "no_title":
@@ -1885,6 +2032,7 @@ def export_cropped_video(
                     title_align=title_align,
                     title_line_gap_scale=title_line_gap_scale,
                     post_header=post_header,
+                    layout_out=band_layout,
                 )
             elif _text_has_emoji(normalized_title) and emoji_font_path is not None:
                 # Overlay layout with emoji needs filter_complex too — the
@@ -1928,15 +2076,40 @@ def export_cropped_video(
             "-i",
             str(resolved_input),
         ]
+        # Burn-in captions go on LAST, over the finished canvas. Applying them
+        # before the title band would scale the text with the footage and can
+        # push lines under the band; over the canvas they sit where a viewer
+        # expects subtitles regardless of how the template is laid out.
+        subtitle_chain = ""
+        if subtitles_path is not None:
+            escaped = _escape_ffmpeg_path(subtitles_path.expanduser().resolve())
+            subtitle_chain = f"subtitles='{escaped}'"
+            style = subtitle_style
+            if style is None and band_layout:
+                style = default_caption_style(
+                    1080,
+                    1920,
+                    band_layout["content_width"],
+                    band_layout["content_bottom_y"],
+                )
+            if style:
+                subtitle_chain += f":force_style='{style}'"
+
         if complex_filter is not None:
             graph = complex_filter
+            video_label = "[vout]"
+            if subtitle_chain:
+                graph = f"{graph};[vout]{subtitle_chain}[vsub]"
+                video_label = "[vsub]"
             if audio_filter is not None:
-                graph = f"{complex_filter};[0:a]{audio_filter}[aout]"
+                graph = f"{graph};[0:a]{audio_filter}[aout]"
                 audio_map = ["-map", "[aout]"]
             else:
                 audio_map = ["-map", "0:a?"]
-            command.extend(["-filter_complex", graph, "-map", "[vout]", *audio_map])
+            command.extend(["-filter_complex", graph, "-map", video_label, *audio_map])
         else:
+            if subtitle_chain:
+                filter_parts.append(subtitle_chain)
             command.extend(["-vf", ",".join(filter_parts)])
             if audio_filter is not None:
                 command.extend(["-af", audio_filter])
@@ -2494,6 +2667,11 @@ def _escape_ffmpeg_path(path: Path) -> str:
     return str(path).replace("\\", "/").replace(":", r"\:")
 
 
+def escape_ffmpeg_path(path: Path) -> str:
+    """Public alias: callers outside this module burn subtitles too."""
+    return _escape_ffmpeg_path(path)
+
+
 def _ffmpeg_drawtext_color(color: str) -> str:
     cleaned = color.strip()
     if re.fullmatch(r"#[0-9A-Fa-f]{6}", cleaned):
@@ -2669,7 +2847,17 @@ def _title_band_filter_complex(
     title_align: str = "center",
     title_line_gap_scale: float | None = None,
     post_header: PostHeader | None = None,
+    layout_out: dict | None = None,
 ) -> str:
+    """Build the top-band composition graph; returns the ``filter_complex``.
+
+    ``layout_out``, when given, is filled with where the footage ended up on the
+    canvas (``content_width``/``content_height``/``content_bottom_y``). Burn-in
+    captions need that rectangle to sit on the picture, and it cannot be derived
+    from the crop alone: the footage is scaled to fit under a title band whose
+    height depends on how many lines the title wrapped to. An out-parameter
+    rather than a richer return type because a dozen tests assert on the string.
+    """
     canvas_width = 1080
     canvas_height = 1920
     emoji_font_path = windows_emoji_font_file()
@@ -2768,6 +2956,9 @@ def _title_band_filter_complex(
         # inset panel width — the side pillarboxing disappears without crossing
         # mobile safe-area edges.
         safe_w = content_max_width
+        # The visible footage is this wide; the chain pads out to the canvas
+        # with black, which captions must not wrap into.
+        content_width = safe_w
         safe_scale = safe_w / max(1, crop_width)
         raw_h = int(crop_height * safe_scale)
         content_x = _safe_inset_margin_px(canvas_width, side_margin_px=safe_side_margin)
@@ -2892,6 +3083,9 @@ def _title_band_filter_complex(
         overlay_chain = (
             f"[titlebase][titletext]overlay=0:0:format=auto,format=yuv420p[{title_label}]"
         )
+        _record_band_layout(
+            layout_out, content_width, content_height, block_y, title_band_height
+        )
         return ";".join(
             [
                 content_chain,
@@ -2957,7 +3151,26 @@ def _title_band_filter_complex(
     filter_parts.append(
         f"[block]pad={canvas_width}:{canvas_height}:(ow-iw)/2:{block_y}:color=black[vout]"
     )
+    _record_band_layout(layout_out, content_width, content_height, block_y, title_band_height)
     return ";".join(filter_parts)
+
+
+def _record_band_layout(
+    layout_out: dict | None,
+    content_width: int,
+    content_height: int,
+    block_y: int,
+    title_band_height: int,
+) -> None:
+    if layout_out is None:
+        return
+    layout_out.update(
+        {
+            "content_width": content_width,
+            "content_height": content_height,
+            "content_bottom_y": block_y + title_band_height + content_height,
+        }
+    )
 
 
 def _title_outline_width(title_font_name: str | None) -> int:

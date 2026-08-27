@@ -191,6 +191,18 @@ def _ensure_compatibility() -> None:
             )
         if "seen_at" not in columns:
             connection.execute(text("ALTER TABLE download_items ADD COLUMN seen_at DATETIME"))
+        if "clip_source_ref" not in columns:
+            connection.execute(
+                text("ALTER TABLE download_items ADD COLUMN clip_source_ref VARCHAR(2048)")
+            )
+        if "clip_start_seconds" not in columns:
+            connection.execute(
+                text("ALTER TABLE download_items ADD COLUMN clip_start_seconds FLOAT")
+            )
+        if "clip_end_seconds" not in columns:
+            connection.execute(
+                text("ALTER TABLE download_items ADD COLUMN clip_end_seconds FLOAT")
+            )
 
         account_columns = {column["name"] for column in inspect(connection).get_columns("accounts")}
         if "scrape_source_urls" not in account_columns:
@@ -334,6 +346,18 @@ def _ensure_compatibility() -> None:
             connection.execute(text("ALTER TABLE upload_jobs ADD COLUMN cloud_status VARCHAR(64)"))
         if "cloud_error" not in upload_job_columns:
             connection.execute(text("ALTER TABLE upload_jobs ADD COLUMN cloud_error VARCHAR(1024)"))
+        if "posted_media_id" not in upload_job_columns:
+            connection.execute(
+                text("ALTER TABLE upload_jobs ADD COLUMN posted_media_id VARCHAR(128)")
+            )
+
+        metric_columns = {
+            column["name"] for column in inspect(connection).get_columns("account_post_metrics")
+        }
+        if "media_id" not in metric_columns:
+            connection.execute(
+                text("ALTER TABLE account_post_metrics ADD COLUMN media_id VARCHAR(128)")
+            )
 
         candidate_columns = {
             column["name"] for column in inspect(connection).get_columns("scrape_candidates")

@@ -7,6 +7,11 @@ Run with the project venv:
   # optional 6th arg = template (default historytrails_left):
   #   ... "Title" gaming_meme_black
 
+  # Review pipeline — rank the moments, download the source once, and cut the
+  # top candidates to short files you can actually watch before choosing:
+  .venv\\Scripts\\python.exe scripts\\clip_studio_try.py previews https://youtu.be/HmY-G_DAHDI
+  # optional 3rd arg = how many candidates (default 8)
+
   # Full pipeline — download a URL, transcribe it, and rank the moments
   # (downloads the whole source; best on a talky video like a documentary):
   .venv\\Scripts\\python.exe scripts\\clip_studio_try.py analyze https://youtu.be/HmY-G_DAHDI
@@ -53,12 +58,57 @@ def _analyze(args: list[str]) -> None:
         print("(no ranked moments — source has no usable transcript, e.g. a wordless trailer)")
 
 
+def _previews(args: list[str]) -> None:
+    url = args[0]
+    count = int(args[1]) if len(args) > 1 else clip_studio.DEFAULT_PREVIEW_COUNT
+    # One workspace per source so the cached download is reused across runs.
+    workspace = Path("data/clips/_review") / _workspace_name(url)
+    print(f"ranking + cutting {count} previews from {url} …")
+    result = clip_studio.plan_and_preview(url, workspace, top_n=count)
+
+    if not result["transcript_available"]:
+        print("\nno usable English captions on this source, so nothing can be ranked.")
+        print("cut it by hand instead:  clip_studio_try.py render <video> <start> <end> \"Title\"")
+        return
+    if not result["previews"]:
+        print("\ntranscript found, but no moment cleared the length floor.")
+        return
+
+    source = result["source"]
+    print(
+        f"\nsource {source['width']}x{source['height']} "
+        f"({'cached' if source['from_cache'] else 'downloaded now'}) -> {source['video_path']}"
+    )
+    print(f"previews in {workspace / 'previews'}\n")
+    for preview in result["previews"]:
+        activity = preview["visual_activity"]
+        flag = "  [STATIC: probably one locked-off shot]" if activity["looks_static"] else ""
+        print(
+            f"#{preview['index'] + 1}  score {preview['score']:>5}  "
+            f"{preview['range_label']} ({preview['duration']:.0f}s){flag}"
+        )
+        print(f"     why: {' | '.join(preview['reasons'])}")
+        print(f"     ctx: {preview['context'][:130]}")
+        print(f"     watch: {preview['video_path']}\n")
+    print("watch them, then render the one you want:")
+    print(
+        f'  clip_studio_try.py render "{source["video_path"]}" <start> <end> "Your hook"'
+    )
+
+
+def _workspace_name(url: str) -> str:
+    """A filesystem-safe folder name for one source URL."""
+    safe = "".join(char if char.isalnum() else "_" for char in url)
+    return safe[-60:].strip("_") or "source"
+
+
 def main() -> None:
     args = sys.argv[1:]
-    if not args or args[0] not in {"render", "analyze"}:
+    commands = {"render": _render, "analyze": _analyze, "previews": _previews}
+    if not args or args[0] not in commands:
         print(__doc__)
         return
-    (_render if args[0] == "render" else _analyze)(args[1:])
+    commands[args[0]](args[1:])
 
 
 if __name__ == "__main__":

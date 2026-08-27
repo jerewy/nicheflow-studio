@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from nicheflow_studio.db.models import Account, DownloadItem
+from nicheflow_studio.db.models import Account, DownloadItem, UploadJob
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.services import batch_finish, draft_revisions, export as export_svc
 from nicheflow_studio.services.batch_finish import BatchFinishError
@@ -324,3 +324,131 @@ def test_finish_batch_refuses_a_batch_with_no_revisions() -> None:
         batch_finish.finish_batch([item_id])
 
     assert "Import the batch reply first" in str(excinfo.value)
+
+
+def test_plan_batch_blocks_a_reel_rejected_after_the_batch_was_prepared() -> None:
+    # reject_item cancels the clip's publish jobs, so finishing the batch anyway
+    # would export it AND re-schedule it — silently un-rejecting the clip.
+    account_id = _make_account(name="Reject History", auto_schedule=True)
+    keep = _make_item(account_id, title="keep")
+    rejected = _make_item(account_id, title="rejected")
+    _give_revision(keep)
+    _give_revision(rejected)
+    with get_session() as session:
+        session.get(DownloadItem, rejected).review_state = "rejected"
+        session.commit()
+
+    plan = batch_finish.plan_batch([keep, rejected])
+    by_item = {entry["item_id"]: entry for entry in plan}
+
+    assert by_item[keep]["ready"] is True
+    assert by_item[rejected]["ready"] is False
+    assert "rejected" in by_item[rejected]["reason"]
+
+
+def _queue_job(item_id: int, account_id: int, *, status: str) -> None:
+    with get_session() as session:
+        session.add(
+            UploadJob(
+                download_item_id=item_id,
+                account_id=account_id,
+                processed_path=f"C:/exports/{item_id}.mp4",
+                status=status,
+            )
+        )
+        session.commit()
+
+
+@pytest.mark.parametrize("status", ["scheduled", "cloud", "posted"])
+def test_plan_batch_blocks_a_reel_this_batch_already_exported(status: str) -> None:
+    # The batch's item list is pinned when the prompt is prepared and the screen
+    # kept showing it after a finish, still ticked. A second click therefore
+    # re-applied, re-rendered (minutes of FFmpeg) and re-scheduled reels that
+    # were already booked to publish. Committed reels must drop out of the plan.
+    account_id = _make_account(name=f"Exported History {status}", auto_schedule=True)
+    keep = _make_item(account_id, title=f"keep-{status}")
+    done = _make_item(account_id, title=f"done-{status}")
+    _give_revision(keep)
+    _give_revision(done)
+    _queue_job(done, account_id, status=status)
+
+    plan = batch_finish.plan_batch([keep, done])
+    by_item = {entry["item_id"]: entry for entry in plan}
+
+    assert by_item[keep]["ready"] is True
+    assert by_item[done]["ready"] is False
+    assert by_item[done]["reason"] == "already exported and queued to publish"
+
+
+@pytest.mark.parametrize("status", ["failed", "skipped", "draft"])
+def test_plan_batch_still_offers_a_reel_whose_job_never_committed(status: str) -> None:
+    # A failed or skipped upload is a dead end and a "draft" job is only queued,
+    # never booked. Blocking those would strand a reel the user needs to retry.
+    account_id = _make_account(name=f"Retry History {status}", auto_schedule=True)
+    item_id = _make_item(account_id, title=f"retry-{status}")
+    _give_revision(item_id)
+    _queue_job(item_id, account_id, status=status)
+
+    (entry,) = batch_finish.plan_batch([item_id])
+
+    assert entry["ready"] is True
+
+
+def test_finish_batch_skips_a_reel_that_already_went_out(monkeypatch) -> None:
+    # End to end: the export chain must not run at all for a committed reel.
+    account_id = _make_account(name="Committed Finish History")
+    keep = _make_item(account_id, title="finish-keep-committed")
+    done = _make_item(account_id, title="finish-done-committed")
+    _give_revision(keep)
+    _give_revision(done)
+    _queue_job(done, account_id, status="posted")
+
+    exported: list[int] = []
+
+    def fake_export(item_id, **kwargs):
+        exported.append(item_id)
+        return {"processed_path": f"C:/exports/{item_id}.mp4"}
+
+    monkeypatch.setattr(export_svc, "export_item", fake_export)
+
+    result = batch_finish.finish_batch([keep, done])
+
+    assert exported == [keep]
+    assert [entry["item_id"] for entry in result["exported"]] == [keep]
+    assert {entry["item_id"] for entry in result["skipped"]} == {done}
+
+
+def test_finish_batch_names_the_stale_list_when_everything_already_exported() -> None:
+    # "Import the batch reply first" is the wrong instruction here — the drafts
+    # exist, the reels are just already out. Say what actually happened.
+    account_id = _make_account(name="All Committed History")
+    item_id = _make_item(account_id, title="all-committed")
+    _give_revision(item_id)
+    _queue_job(item_id, account_id, status="cloud")
+
+    with pytest.raises(BatchFinishError, match="already exported and queued"):
+        batch_finish.finish_batch([item_id])
+
+
+def test_finish_batch_reports_a_rejected_reel_as_skipped(monkeypatch) -> None:
+    account_id = _make_account(name="Reject Finish History")
+    keep = _make_item(account_id, title="finish-keep")
+    rejected = _make_item(account_id, title="finish-rejected")
+    _give_revision(keep)
+    _give_revision(rejected)
+    with get_session() as session:
+        session.get(DownloadItem, rejected).review_state = "blocked"
+        session.commit()
+
+    exported: list[int] = []
+
+    def fake_export(item_id: int, **_kwargs) -> dict:
+        exported.append(item_id)
+        return {"processed_path": f"C:/out/{item_id}.mp4"}
+
+    monkeypatch.setattr(export_svc, "export_item", fake_export)
+
+    result = batch_finish.finish_batch([keep, rejected])
+
+    assert exported == [keep]
+    assert [row["item_id"] for row in result["skipped"]] == [rejected]

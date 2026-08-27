@@ -337,6 +337,45 @@ def unschedule(job_id: int) -> dict:
         return _job_view(job, account.name if account else None)
 
 
+def swap_scheduled_job(job_id: int, replacement_job_id: int) -> dict:
+    """Put ``replacement_job_id`` into ``job_id``'s slot and free the old reel.
+
+    The case this exists for: two days of history reels are already scheduled,
+    and a campaign clip has to go out *now*. Retiming the campaign clip into an
+    occupied slot would double-book it, and removing the sitting reel would throw
+    away work — so the displaced reel drops back to ``draft`` (unscheduled), where
+    the schedule grid offers it again for any open slot.
+
+    Built out of :func:`unschedule` + :func:`reschedule` rather than editing the
+    rows directly, and in that order, so the outgoing job's cloud handoff is
+    cancelled before the incoming one is created. Doing it the other way round
+    would leave both live on the Worker at the same instant.
+    """
+    if job_id == replacement_job_id:
+        raise PublishQueueError("Pick a different reel to swap in.")
+    with get_session() as session:
+        current = _require_job(session, job_id)
+        replacement = _require_job(session, replacement_job_id)
+        if current.posted_at is not None or current.status == "posted":
+            raise PublishQueueError("This slot has already posted; it cannot be swapped.")
+        if replacement.posted_at is not None or replacement.status == "posted":
+            raise PublishQueueError("That reel has already been posted.")
+        if current.account_id != replacement.account_id:
+            raise PublishQueueError(
+                "A slot can only be swapped for a reel on the same account."
+            )
+        if current.scheduled_at is None:
+            raise PublishQueueError("That slot is not scheduled, so there is nothing to swap.")
+        # Through _iso, never .isoformat(): SQLite hands back a naive datetime,
+        # and a naive string is re-read as LOCAL time, silently moving the
+        # replacement by the machine's UTC offset (7 hours here).
+        slot_at = _iso(current.scheduled_at)
+
+    freed = unschedule(job_id)
+    scheduled = reschedule(replacement_job_id, slot_at)
+    return {"slot_at": slot_at, "unscheduled": freed, "scheduled": scheduled}
+
+
 def unschedule_jobs_for_item(item_id: int) -> list[dict]:
     """Unschedule every pending (non-posted) publish job for a download item.
 

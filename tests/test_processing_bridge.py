@@ -678,3 +678,244 @@ def test_webview_storage_path_lives_under_the_data_dir(
     """Persistent webview storage must be gitignored app data, not a temp dir."""
     monkeypatch.setenv("NICHEFLOW_DATA_DIR", str(tmp_path))
     assert webview_app.webview_storage_path() == tmp_path / "webview-storage"
+
+
+# --- Clip Studio --- #
+
+
+def test_clip_studio_campaign_crud_round_trips(monkeypatch) -> None:
+    store: dict = {}
+    monkeypatch.setattr(
+        "nicheflow_studio.services.ui_settings.get_setting",
+        lambda key, default=None: store.get(key, default),
+    )
+    monkeypatch.setattr(
+        "nicheflow_studio.services.ui_settings.set_setting",
+        lambda key, value: store.__setitem__(key, value),
+    )
+    bridge = ProcessingBridge()
+
+    saved = bridge.save_campaign(
+        {
+            "slug": "cardbound",
+            "name": "CardBound",
+            "required_mention": "YOUTUBE: CardBound",
+            "hashtags": ["#CardBound"],
+        }
+    )
+    assert saved["ok"] is True
+    assert bridge.list_campaigns()["data"][0]["slug"] == "cardbound"
+
+    caption = bridge.build_campaign_caption("cardbound", "The card nobody knew existed")
+    assert "YOUTUBE: CardBound" in caption["data"]["caption"]
+    assert caption["data"]["problems"] == []
+
+    assert bridge.delete_campaign("cardbound")["data"]["remaining"] == 0
+
+
+def test_clip_studio_caption_validation_surfaces_rule_breaks(monkeypatch) -> None:
+    store = {
+        "clip_campaigns": [
+            {"slug": "cb", "name": "CB", "required_mention": "YOUTUBE: CardBound"}
+        ]
+    }
+    monkeypatch.setattr(
+        "nicheflow_studio.services.ui_settings.get_setting",
+        lambda key, default=None: store.get(key, default),
+    )
+    bridge = ProcessingBridge()
+
+    result = bridge.validate_campaign_caption("cb", "Kartu yang langka")
+
+    assert result["ok"] is True
+    problems = result["data"]["problems"]
+    assert any("Indonesian" in problem for problem in problems)
+    assert any("missing required mention" in problem for problem in problems)
+
+
+def test_clip_plan_job_does_not_download_the_source(monkeypatch) -> None:
+    """The bridge must route planning through plan_url, never analyze_url."""
+    called: dict = {}
+    monkeypatch.setattr(
+        "nicheflow_studio.services.clip_studio.plan_url",
+        lambda url, workspace, top_n=10: called.setdefault("planned", (url, top_n)),
+    )
+    monkeypatch.setattr(
+        "nicheflow_studio.services.clip_studio.analyze_url",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not download")),
+    )
+    bridge = ProcessingBridge()
+
+    result = bridge.start_clip_plan("https://youtu.be/abc", top_n=5)
+
+    assert result["ok"] is True
+    assert "job_id" in result["data"]
+
+
+def test_clip_submission_status_counts_down() -> None:
+    import datetime as dt
+
+    bridge = ProcessingBridge()
+    posted = (dt.datetime.now() - dt.timedelta(minutes=10)).isoformat()
+
+    status = bridge.clip_submission_status(posted)["data"]
+
+    assert 0 < status["seconds_remaining"] <= 50 * 60
+    assert status["expired"] is False
+    assert status["view_ceiling"] == 1000
+
+
+# --- Intake: Clip Studio and manual files both land in the library --- #
+
+
+def _clip_account(name: str = "Clip account") -> int:
+    with get_session() as session:
+        account = Account(name=name, platform="instagram")
+        session.add(account)
+        session.commit()
+        return account.id
+
+
+def test_bridge_send_clip_to_processing_registers_the_moment(monkeypatch, tmp_path) -> None:
+    account_id = _clip_account()
+    captured: dict = {}
+
+    def fake_register(source, **kwargs):
+        captured["source"] = source
+        captured.update(kwargs)
+        return {"item_id": 7, "title": kwargs.get("title"), "file_path": "C:/x.mp4"}
+
+    monkeypatch.setattr(
+        "nicheflow_studio.services.clip_intake.register_moment", fake_register
+    )
+
+    result = ProcessingBridge().send_clip_to_processing(
+        {
+            "video_path": "C:/clips/source.mp4",
+            "start": 61.5,
+            "end": 79.0,
+            "account_id": account_id,
+            "title": "The comeback",
+            "transcript_context": "nobody saw it coming",
+            "caption_draft": "hook\n\nYOUTUBE: CardBound",
+        }
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["item_id"] == 7
+    assert captured["start_seconds"] == 61.5
+    assert captured["end_seconds"] == 79.0
+    assert captured["account_id"] == account_id
+    # The spoken words and the rule-checked caption must survive the boundary,
+    # or Processing starts from a blank prompt and an empty caption.
+    assert captured["transcript_context"] == "nobody saw it coming"
+    assert captured["caption_draft"] == "hook\n\nYOUTUBE: CardBound"
+
+
+def test_bridge_import_local_clip_registers_the_file(monkeypatch) -> None:
+    account_id = _clip_account()
+    captured: dict = {}
+
+    def fake_register(source, **kwargs):
+        captured["source"] = source
+        captured.update(kwargs)
+        return {"item_id": 12, "file_path": "C:/x.mp4"}
+
+    monkeypatch.setattr(
+        "nicheflow_studio.services.clip_intake.register_clip", fake_register
+    )
+
+    result = ProcessingBridge().import_local_clip(
+        {"video_path": "C:/Downloads/macklemore_clip_08.mov", "account_id": account_id}
+    )
+
+    assert result["ok"] is True
+    assert captured["source"] == "C:/Downloads/macklemore_clip_08.mov"
+    assert captured["account_id"] == account_id
+
+
+def test_bridge_intake_without_an_account_explains_itself() -> None:
+    result = ProcessingBridge().import_local_clip({"video_path": "C:/x.mp4"})
+
+    assert result["ok"] is False
+    assert "account" in result["error"].lower()
+
+
+def test_bridge_intake_surfaces_the_real_reason_not_a_generic_error(tmp_path) -> None:
+    """ClipIntakeError must reach the UI verbatim; a generic 'unexpected error'
+    leaves the operator with no idea why the import failed."""
+    account_id = _clip_account()
+    document = tmp_path / "notes.txt"
+    document.write_text("not a video")
+
+    result = ProcessingBridge().import_local_clip(
+        {"video_path": str(document), "account_id": account_id}
+    )
+
+    assert result["ok"] is False
+    assert "supported video" in result["error"]
+
+
+def test_bridge_pick_video_file_uses_the_injected_picker() -> None:
+    bridge = ProcessingBridge()
+    bridge.set_file_picker(lambda: ["C:/Downloads/clip.mov"])
+
+    assert bridge.pick_video_file()["data"]["path"] == "C:/Downloads/clip.mov"
+
+
+def test_bridge_pick_video_file_reports_a_cancelled_dialog() -> None:
+    bridge = ProcessingBridge()
+    bridge.set_file_picker(lambda: None)
+
+    result = bridge.pick_video_file()
+
+    assert result["ok"] is True
+    assert result["data"]["path"] is None
+
+
+def test_clip_render_uses_the_destination_accounts_template() -> None:
+    """A clip must be styled like the account posting it, not a fixed default.
+
+    Every history account exports with historytrails_post_header; a hardcoded
+    template produced clips in a style none of them use.
+    """
+    import json
+
+    with get_session() as session:
+        account = Account(
+            name="History Acc",
+            platform="instagram",
+            niche_label="history",
+            processing_preferences=json.dumps({"template": "historytrails_post_header"}),
+        )
+        session.add(account)
+        session.commit()
+        account_id = account.id
+
+    bridge = ProcessingBridge()
+    assert bridge._clip_template({"account_id": account_id}) == "historytrails_post_header"
+    # An explicit choice still wins over the account default.
+    assert (
+        bridge._clip_template({"account_id": account_id, "template": "cinema_normal"})
+        == "cinema_normal"
+    )
+
+
+def test_clip_render_template_falls_back_without_an_account() -> None:
+    bridge = ProcessingBridge()
+    assert bridge._clip_template({}) == "historytrails_post_header"
+
+
+def test_account_template_ignores_an_unknown_template() -> None:
+    """A stale preference must not reach the renderer as a bogus key."""
+    import json
+
+    from nicheflow_studio.services import processing_workflow as pw
+
+    account = Account(
+        name="Stale",
+        platform="instagram",
+        processing_preferences=json.dumps({"template": "template_that_was_removed"}),
+    )
+    assert pw.account_template(account) == ""
+    assert pw.account_template(None) == ""

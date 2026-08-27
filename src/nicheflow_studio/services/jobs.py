@@ -22,6 +22,7 @@ import logging
 import threading
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,28 @@ def _accepts_param(func: Callable[..., Any], name: str) -> bool:
         return False
 
 
+def _jsonable(value: Any) -> Any:
+    """Coerce a job result into something ``json.dumps`` accepts.
+
+    Only ``Path`` needs handling today, but the failure it caused deserves the
+    general guard: a job returning one raised ``TypeError: Object of type
+    WindowsPath is not JSON serializable`` *inside pywebview's own serializer*,
+    after the work had already succeeded. The UI saw a failed call with no error
+    message and no way to tell that the render itself was fine.
+
+    Paths are the natural return value for anything that writes a file, so this
+    belongs here rather than at each call site — ``snapshot`` is what promises
+    the result is serializable.
+    """
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {key: _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    return value
+
+
 @dataclass
 class Job:
     id: str
@@ -68,7 +91,7 @@ class Job:
             "status": self.status,
             "progress": self.progress,
             "message": self.message,
-            "result": self.result,
+            "result": _jsonable(self.result),
             "error": self.error,
             "cancel_requested": self.cancel_event.is_set(),
         }

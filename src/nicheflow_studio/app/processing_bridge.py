@@ -23,15 +23,21 @@ import logging
 import os
 import threading
 from pathlib import Path
+from typing import Callable
 
 from nicheflow_studio.app.local_media import media_url
 from nicheflow_studio.core import clipboard
 from nicheflow_studio.core.ui_prefs import set_ui_pref
-from nicheflow_studio.db.models import DownloadItem
+from nicheflow_studio.db.models import Account, DownloadItem
+from nicheflow_studio.processing import transcript_clips
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.services import (
     accounts as accounts_svc,
     batch_finish,
+    campaigns as campaigns_svc,
+    clip_history,
+    clip_intake,
+    clip_studio,
     cloud_publisher,
     draft_generation,
     draft_handoff,
@@ -103,6 +109,15 @@ class ProcessingBridge:
         # One job manager per window; tracks background generation/export work.
         self._jobs = JobManager()
         self._media_ready = media_ready
+        # Opening a native file dialog needs the pywebview window, which this
+        # class deliberately does not import. The host injects a picker after
+        # the window exists (see webview_app); without one, callers fall back to
+        # typing a path.
+        self._file_picker: "Callable[[], list[str] | None] | None" = None
+
+    def set_file_picker(self, picker: "Callable[[], list[str] | None] | None") -> None:
+        """Install the host's native open-file dialog."""
+        self._file_picker = picker
 
     @_guard
     def list_items(self) -> list[dict]:
@@ -190,6 +205,11 @@ class ProcessingBridge:
     @_guard
     def unschedule_job(self, job_id: int) -> dict:
         return publish_queue.unschedule(job_id)
+
+    @_guard
+    def swap_scheduled_job(self, job_id: int, replacement_job_id: int) -> dict:
+        """Swap a filled slot's reel for another; the old one returns to drafts."""
+        return publish_queue.swap_scheduled_job(job_id, replacement_job_id)
 
     @_guard
     def remove_publish_job(self, job_id: int) -> dict:
@@ -609,6 +629,18 @@ class ProcessingBridge:
         return {"groups": groups}
 
     @_guard
+    def start_fetch_missing_batch_media(self, account_ids: list[int] | None = None) -> dict:
+        """Re-download footage for distributed reels stuck without a local file.
+
+        A job, not a plain call: each stuck clip is a real Instagram fetch, so a
+        handful of them would block the bridge for minutes.
+        """
+        job_id = self._jobs.start(
+            pooling.fetch_missing_pending_media, account_ids=account_ids
+        )
+        return {"job_id": job_id}
+
+    @_guard
     def build_multi_account_batch_chat_prompt(
         self, item_ids: list[int], payload: dict | None = None
     ) -> dict:
@@ -710,6 +742,15 @@ class ProcessingBridge:
     def get_crop_override(self, item_id: int) -> dict | None:
         """The item's manual crop keep-region, or ``None`` if it auto-crops."""
         return export_svc.get_crop_override(item_id)
+
+    @_guard
+    def get_effective_crop(self, item_id: int) -> dict:
+        """The keep-region the export will use, manual or auto-detected.
+
+        Detection decodes frames, so this is slower than ``get_crop_override``;
+        callers should fetch it once per item rather than per render.
+        """
+        return export_svc.effective_crop(item_id)
 
     @_guard
     def get_crop_preview(self, item_id: int, at_seconds: float | None = None) -> dict:
@@ -892,3 +933,440 @@ class ProcessingBridge:
         posted/failed outcomes show up in the Processing list. The UI calls this
         on a timer; it is a no-op unless cloud publishing is configured."""
         return publishing.sync_cloud_jobs()
+
+    # --- Clip Studio (campaign clip-and-repost workflow) --- #
+    #
+    # Ordering matters here: `start_clip_plan` ranks from the caption track
+    # alone (seconds), and only the chosen span is fetched by
+    # `start_clip_section_download`. Downloading the whole source first would
+    # cost minutes per clip, and campaigns are decided in hours.
+
+    @_guard
+    def list_campaigns(self) -> list[dict]:
+        return campaigns_svc.list_campaigns()
+
+    @_guard
+    def save_campaign(self, payload: dict | None = None) -> dict:
+        return campaigns_svc.save_campaign(payload or {})
+
+    @_guard
+    def delete_campaign(self, slug: str) -> dict:
+        return campaigns_svc.delete_campaign(slug)
+
+    @_guard
+    def build_campaign_caption(self, slug: str, hook: str = "") -> dict:
+        """Compose a rules-compliant caption (required mention + hashtags)."""
+        campaign = campaigns_svc.get_campaign(slug)
+        caption = campaigns_svc.build_caption(campaign, hook)
+        return {"caption": caption, "problems": campaigns_svc.validate_caption(campaign, caption)}
+
+    @_guard
+    def validate_campaign_caption(self, slug: str, caption: str = "") -> dict:
+        """Why this caption would be rejected; empty list means it is compliant."""
+        campaign = campaigns_svc.get_campaign(slug)
+        return {"problems": campaigns_svc.validate_caption(campaign, caption)}
+
+    @_guard
+    def clip_submission_status(self, posted_at: str) -> dict:
+        """Countdown to the campaign's one-hour Discord submission deadline."""
+        import datetime as dt
+
+        posted = dt.datetime.fromisoformat(posted_at)
+        return campaigns_svc.submission_status(posted, dt.datetime.now(posted.tzinfo))
+
+    @_guard
+    def start_clip_plan(self, url: str, top_n: int = 10) -> dict:
+        """Rank a source's moments from its transcript alone (no video download)."""
+        job_id = self._jobs.start(
+            clip_studio.plan_url, url, self._clip_workspace(url), top_n=top_n
+        )
+        return {"job_id": job_id}
+
+    @_guard
+    def start_clip_previews(self, url: str, top_n: int = 8) -> dict:
+        """Rank a source, fetch it once, and cut the top moments for review.
+
+        The review batch is the product: ranking cannot tell a static talking
+        head from a payoff, so the job is to put the good moments somewhere in a
+        batch short enough to watch, and let the operator pick.
+        """
+        job_id = self._jobs.start(
+            clip_history.plan_and_record_url, url, self._clip_workspace(url), top_n=top_n
+        )
+        return {"job_id": job_id}
+
+    @_guard
+    def start_local_clip_previews(self, video_path: str, top_n: int = 8) -> dict:
+        """Same review batch as a URL, for a file already on disk.
+
+        Slower than the URL path — there are no captions to fetch, so the audio
+        is transcribed locally — which is why it is a job like the rest.
+        """
+        source = Path(str(video_path or "").strip())
+        if not source.is_file():
+            raise ServiceError(f"No such video file: {source}")
+        job_id = self._jobs.start(
+            clip_history.plan_and_record_file,
+            source,
+            self._clip_workspace(str(source.resolve())),
+            top_n=top_n,
+        )
+        return {"job_id": job_id}
+
+    # --- Clip Studio history: which sources were mined, and what came out --- #
+
+    @_guard
+    def list_clip_sources(self) -> list[dict]:
+        return clip_history.list_sources()
+
+    @_guard
+    def list_clip_source_clips(self, source_ref: str) -> list[dict]:
+        return clip_history.list_clips(source_ref)
+
+    @_guard
+    def forget_clip_source(self, source_ref: str, delete_workspace: bool = False) -> dict:
+        return clip_history.forget_source(source_ref, delete_workspace=bool(delete_workspace))
+
+    @_guard
+    def start_clip_section_download(self, url: str, start: float, end: float) -> dict:
+        """Fetch only the chosen span of the source, ready to render."""
+        job_id = self._jobs.start(
+            clip_studio.download_source_section,
+            url,
+            self._clip_workspace(url),
+            start=start,
+            end=end,
+        )
+        return {"job_id": job_id}
+
+    @_guard
+    def start_clip_render(self, payload: dict | None = None) -> dict:
+        """Render a chosen span into a templated vertical clip."""
+        data = payload or {}
+        source = Path(str(data["video_path"]))
+        output = source.parent / f"clip_{int(float(data['start']))}_{int(float(data['end']))}.mp4"
+        job_id = self._jobs.start(
+            clip_studio.render_clip,
+            source,
+            output,
+            float(data["start"]),
+            float(data["end"]),
+            str(data.get("title") or ""),
+            template=self._clip_template(data),
+            account_id=int(data["account_id"]) if data.get("account_id") is not None else None,
+            transcript_path=(
+                Path(str(data["transcript_path"])) if data.get("transcript_path") else None
+            ),
+            burn_captions=bool(data.get("burn_captions")),
+        )
+        return {"job_id": job_id}
+
+    def _clip_template(self, data: dict) -> str:
+        """The template a clip should render with: explicit, else the account's.
+
+        A clip belongs to the account it is going to, so its styling is that
+        account's saved workflow template — the same one Processing exports
+        with. Hardcoding a default here produced clips in a style no account
+        actually uses (every history account is on ``historytrails_post_header``,
+        not ``historytrails_left``).
+        """
+        explicit = str(data.get("template") or "").strip()
+        if explicit:
+            return explicit
+        account_id = data.get("account_id")
+        if account_id is not None:
+            with get_session() as session:
+                account = session.get(Account, int(account_id))
+                template = processing_workflow.account_template(account)
+                if template:
+                    return template
+        return "historytrails_post_header"
+
+    @_guard
+    def start_clip_title_suggestions(self, payload: dict | None = None) -> dict:
+        """Write title options for one candidate from its own spoken words.
+
+        A job, not a plain call: this is the same provider round trip the
+        Processing generator makes, so it takes seconds.
+        """
+        data = payload or {}
+        account_id = data.get("account_id")
+        if account_id is None:
+            raise ServiceError("Pick the account this clip is for first.")
+        window_text = str(data.get("transcript_text") or "")
+        # The evidence the writer works from. Measured on a real clip: the 36-word
+        # window produced 9-11 word titles no length instruction could lengthen —
+        # correctly, because the style refuses to pad thin evidence — while the
+        # same clip with its surrounding minute reached a full 15-word sentence
+        # and named a specific ("Pikachu") the window never says.
+        job_id = self._jobs.start(
+            draft_generation.generate_titles_for_clip,
+            account_id=int(account_id),
+            transcript_text=self._clip_surrounding_context(data) or window_text,
+            # Written from the surrounding minute, verified against the clip.
+            grounding_text=window_text or None,
+            video_path=data.get("video_path"),
+            source_title=data.get("source_title"),
+            title_style=data.get("title_style"),
+            title_length=data.get("title_length"),
+        )
+        return {"job_id": job_id}
+
+    @_guard
+    def build_clip_title_prompt(self, payload: dict | None = None) -> dict:
+        """Copy-paste prompt for writing this clip's titles in Claude/ChatGPT.
+
+        Same escape hatch Processing has: the local provider is fast and free but
+        its titles are not always usable, and a chat model that can open the clip
+        file writes better ones. Puts the prompt on the OS clipboard so the paste
+        target is one keystroke away.
+        """
+        data = payload or {}
+        account_id = data.get("account_id")
+        if account_id is None:
+            raise ServiceError("Pick the account this clip is for first.")
+        prompt = draft_handoff.build_clip_title_prompt(
+            account_id=int(account_id),
+            clip_words=str(data.get("transcript_text") or ""),
+            surrounding_context=self._clip_surrounding_context(data),
+            source_title=data.get("source_title"),
+            video_path=data.get("video_path"),
+            range_label=data.get("range_label"),
+        )
+        copied = True
+        try:
+            clipboard.set_text(prompt)
+        except clipboard.ClipboardError:
+            # The prompt is still returned, so the UI can offer manual copy.
+            copied = False
+        return {"prompt": prompt, "copied": copied}
+
+    @_guard
+    def import_clip_titles(self, payload: dict | None = None) -> dict:
+        """Parse a pasted chat reply into this clip's title options.
+
+        Reads the OS clipboard when no text is supplied — the webview's own
+        clipboard read fails once the window loses focus, which is exactly what
+        happens while the user is in another app copying the reply.
+        """
+        data = payload or {}
+        text = str(data.get("text") or "").strip()
+        if not text:
+            try:
+                text = clipboard.get_text()
+            except clipboard.ClipboardError as exc:
+                raise ServiceError(str(exc)) from exc
+        parsed = draft_handoff.parse_pasted_draft(text)
+        return draft_generation.guard_clip_titles(
+            titles=parsed.title_options,
+            grounding_text=str(data.get("transcript_text") or ""),
+            source_title=data.get("source_title"),
+            # parse_pasted_draft reports 1-based option numbers ("Title Option 3");
+            # the guard works in 0-based indexes. Passing it through raw put the
+            # pick out of range, so a flagged option stayed recommended instead of
+            # being moved off — the same conversion the revision import does.
+            recommended_index=(
+                parsed.recommended_title_index - 1
+                if parsed.recommended_title_index
+                else None
+            ),
+            recommendation_reason=parsed.reason,
+            provider_label=str(data.get("provider_label") or "Pasted"),
+        )
+
+    @_guard
+    def build_clip_batch_title_prompt(self, payload: dict | None = None) -> dict:
+        """One prompt covering every candidate, instead of one copy-paste each."""
+        data = payload or {}
+        account_id = data.get("account_id")
+        if account_id is None:
+            raise ServiceError("Pick the account this clip is for first.")
+        clips = data.get("clips") or []
+        if not clips:
+            raise ServiceError("No clips to write titles for.")
+        transcript_path = data.get("transcript_path")
+        entries = [
+            {
+                "number": index + 1,
+                "words": str(clip.get("transcript_text") or ""),
+                "range_label": clip.get("range_label"),
+                "context": self._clip_surrounding_context(
+                    {
+                        "transcript_path": transcript_path,
+                        "start": clip.get("start"),
+                        "end": clip.get("end"),
+                    }
+                ),
+            }
+            for index, clip in enumerate(clips)
+        ]
+        prompt = draft_handoff.build_clip_batch_title_prompt(
+            account_id=int(account_id),
+            clips=entries,
+            source_title=data.get("source_title"),
+        )
+        copied = True
+        try:
+            clipboard.set_text(prompt)
+        except clipboard.ClipboardError:
+            copied = False
+        return {"prompt": prompt, "copied": copied, "clip_count": len(entries)}
+
+    @_guard
+    def import_clip_batch_titles(self, payload: dict | None = None) -> dict:
+        """Route a batch reply back to each candidate, guarded per clip.
+
+        Returns results keyed by the candidate's own index (0-based, as the UI
+        holds them), plus the clip numbers the reply never mentioned so the
+        screen can say which ones still need titles rather than silently
+        dropping them.
+        """
+        data = payload or {}
+        text = str(data.get("text") or "").strip()
+        if not text:
+            try:
+                text = clipboard.get_text()
+            except clipboard.ClipboardError as exc:
+                raise ServiceError(str(exc)) from exc
+        clips = data.get("clips") or []
+        parsed = draft_handoff.parse_clip_batch_titles(text)
+        if not parsed:
+            raise ServiceError(
+                "No 'Clip N' blocks found. The reply must repeat a plain-text "
+                "'Clip 1:' header before each clip's Title Option lines."
+            )
+        results: dict[str, dict] = {}
+        missing: list[int] = []
+        for index, clip in enumerate(clips):
+            draft = parsed.get(index + 1)
+            if draft is None:
+                missing.append(index + 1)
+                continue
+            results[str(index)] = draft_generation.guard_clip_titles(
+                titles=draft.title_options,
+                grounding_text=str(clip.get("transcript_text") or ""),
+                source_title=data.get("source_title"),
+                recommended_index=(
+                    draft.recommended_title_index - 1
+                    if draft.recommended_title_index
+                    else None
+                ),
+                recommendation_reason=draft.reason,
+                provider_label=str(data.get("provider_label") or "Pasted"),
+            )
+        return {"results": results, "missing": missing, "imported": len(results)}
+
+    # Seconds either side of the window read as context. Wide enough to cover the
+    # setup a clip was cut out of, short enough that the writer is still being
+    # told about this moment rather than the whole documentary.
+    _CLIP_CONTEXT_PADDING_SECONDS = 75.0
+
+    def _clip_surrounding_context(self, data: dict) -> str | None:
+        """The clip's words plus the minute either side, as the writer's evidence.
+
+        The window alone is too thin to write from: the title style's own rule is
+        "do not pad a thin clip just to reach a length", so a 36-word window
+        yields a 9-word title however hard the length control asks otherwise.
+
+        The trade this makes is real and deliberate. A title written from the
+        surrounding minute can name something the clip itself never says, so it
+        may promise slightly more than the 15 seconds delivers. The padding stays
+        tight for that reason — this is "the part of the video the clip came
+        from", not the whole source.
+        """
+        transcript_path = data.get("transcript_path")
+        if not transcript_path:
+            return None
+        try:
+            start = float(data.get("start"))
+            end = float(data.get("end"))
+        except (TypeError, ValueError):
+            return None
+        source = Path(str(transcript_path))
+        if not source.is_file():
+            return None
+        try:
+            sentences = transcript_clips.sentences_from_srt_file(source)
+        except Exception:  # noqa: BLE001 - context is advisory, never fatal
+            return None
+        pad = self._CLIP_CONTEXT_PADDING_SECONDS
+        window = [
+            sentence.text
+            for sentence in sentences
+            if sentence.end > start - pad and sentence.start < end + pad
+        ]
+        return " ".join(window) or None
+
+    @_guard
+    def clip_media_url(self, path: str) -> dict:
+        """Serve a rendered clip to the webview for inline preview."""
+        url = _cache_busted(media_url(path), path)
+        if url is None:
+            raise ServiceError("That file is not inside the app data folder.")
+        return {"url": url}
+
+    # --- Intake: both paths land in the library as a normal item --- #
+
+    @_guard
+    def pick_video_file(self) -> dict:
+        """Open the native file dialog; ``{"path": None}`` when cancelled."""
+        if self._file_picker is None:
+            raise ServiceError(
+                "No file dialog available here — paste the file path instead."
+            )
+        chosen = self._file_picker()
+        if not chosen:
+            return {"path": None}
+        return {"path": str(chosen[0])}
+
+    @_guard
+    def import_local_clip(self, payload: dict | None = None) -> dict:
+        """Path B: take a hand-downloaded video into the library."""
+        data = payload or {}
+        account_id = data.get("account_id")
+        if account_id is None:
+            raise ServiceError("Pick the account this clip is for first.")
+        return clip_intake.register_clip(
+            str(data.get("video_path") or ""),
+            account_id=int(account_id),
+            title=data.get("title"),
+            source_url=data.get("source_url"),
+            transcript_context=data.get("transcript_context"),
+            caption_draft=data.get("caption_draft"),
+            clip_source_ref=data.get("clip_source_ref"),
+        )
+
+    @_guard
+    def send_clip_to_processing(self, payload: dict | None = None) -> dict:
+        """Path A: cut the chosen moment out of the source and register it."""
+        data = payload or {}
+        account_id = data.get("account_id")
+        if account_id is None:
+            raise ServiceError("Pick the account this clip is for first.")
+        return clip_intake.register_moment(
+            str(data.get("video_path") or ""),
+            start_seconds=float(data.get("start") or 0.0),
+            end_seconds=float(data.get("end") or 0.0),
+            account_id=int(account_id),
+            title=data.get("title"),
+            source_url=data.get("source_url"),
+            transcript_context=data.get("transcript_context"),
+            caption_draft=data.get("caption_draft"),
+            clip_source_ref=data.get("clip_source_ref"),
+            transcript_path=data.get("transcript_path"),
+            burn_captions=bool(data.get("burn_captions")),
+            # Set only by a deliberate "send anyway" after the duplicate guard
+            # has already refused this window once.
+            force=bool(data.get("force")),
+        )
+
+    def _clip_workspace(self, url: str) -> Path:
+        """Per-source scratch folder under data/clips, keyed by the URL."""
+        import hashlib
+
+        from nicheflow_studio.core.paths import data_dir
+
+        digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:12]
+        workspace = data_dir() / "clips" / digest
+        workspace.mkdir(parents=True, exist_ok=True)
+        return workspace

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import time
@@ -11,6 +12,8 @@ from pathlib import Path
 
 from nicheflow_studio.processing import title_references
 from nicheflow_studio.processing.video import sample_video_frame_data_urls
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_OLLAMA_MODEL = "qwen2.5:7b"
@@ -268,6 +271,15 @@ def generate_smart_drafts(
             errors.append(str(exc))
 
     if errors:
+        # Logged, not just stashed in generation_meta. Every configured provider
+        # failing is the difference between real titles and the local fallback's
+        # raw transcript fragments, and it was previously invisible: a retired
+        # Groq model id 404'd on all keys for hours while the UI showed titles
+        # that merely looked bad rather than broken.
+        logger.warning(
+            "Smart drafts fell back to local generation; every provider failed: %s",
+            " | ".join(errors),
+        )
         if require_vision and low_context:
             raise VisionRequiredError(
                 "Vision required for low-context item but no provider returned "
@@ -925,10 +937,11 @@ def _smart_draft_prompt(
             "overclaim (you should not have written it — fix the title instead of tagging it red).",
             f"- claim_support: exactly {SMART_DRAFT_OPTION_COUNT} strings, one per title in "
             "the same order. For every yellow title, copy the EXACT phrase from the "
-            "transcript, source caption, or visual evidence JSON that backs its concrete "
-            "claim. For green titles write 'none needed'. If you cannot quote a supporting "
-            "phrase, the claim is unsupported: rewrite the title without it instead of "
-            "writing 'none'.",
+            "transcript or visual evidence JSON that backs its concrete claim. For green "
+            "titles write 'none needed'. If the only phrase you can quote comes from the "
+            "source caption, prefix it with 'SOURCE CAPTION ONLY: ' so it is reviewed "
+            "rather than trusted. If you cannot quote a supporting phrase at all, the "
+            "claim is unsupported: rewrite the title without it instead of writing 'none'.",
             "",
             "AVOID",
             (
@@ -985,11 +998,27 @@ def _hook_drama_and_fact_safety_rules() -> list[str]:
         "such as a name, age, height, date, place, record, cause, quote, a "
         "precise duration ('36 hours before'), or a 'first / last / final / "
         "shortest / biggest / only time' superlative. Use these ONLY when the "
-        "transcript, source caption, niche, or visual evidence actually backs "
-        "them. If a number, record, or identity is not in the signals, do not "
-        "state it as fact. Timeline finality ('his final rehearsal', 'never "
-        "again') counts as a claim: keep the source's own framing and never "
-        "upgrade it to 'last/final' yourself.",
+        "transcript or visual evidence actually backs them. If a number, "
+        "record, or identity is not in the signals, do not state it as fact. "
+        "Timeline finality ('his final rehearsal', 'never again') counts as a "
+        "claim: keep the source's own framing and never upgrade it to "
+        "'last/final' yourself.",
+        "- SECOND-HAND CLAIMS (the source caption is NOT proof): the source "
+        "caption was written by another repost account, and those accounts "
+        "routinely embellish dates, records, identities, and causes. Use it to "
+        "identify the SUBJECT (who or what is on screen), never as evidence "
+        "for a checkable fact. When the only thing backing a number, record, "
+        "superlative, or causal story is the source caption, you have three "
+        "options and must pick one: (a) drop the claim and build the title on "
+        "what is visible, (b) attribute it in-line ('the story goes that...', "
+        "'she told the interviewer...'), or (c) make the dispute itself the "
+        "hook ('the version everyone repeats is not what happened'). Never "
+        "restate it flatly as established fact.",
+        "- VIRAL-MYTH CAUTION: history and 'facts' clips circulate with famous "
+        "stories attached that are wrong or heavily disputed. If a claim feels "
+        "like a well-travelled internet story rather than something the clip "
+        "shows, treat it as second-hand above. Attribution costs nothing and "
+        "kills the 'this is misinformation' comments that sink reach.",
         "- RED (never write): unverifiable rarity, secrecy, or world-changing "
         "claims. Banned phrasings include 'never-before-seen', 'rare footage "
         "nobody has seen', 'the last video ever of him', 'they tried to hide "
@@ -1937,7 +1966,8 @@ def _historytrails_title_rules(
         "- FORMATS: use THREE DIFFERENT shapes across the three options (never "
         "three rewrites of one). Proven shapes on this account, strongest first: "
         "(1) a real question the footage makes a stranger want to answer; "
-        "(2) a first-person or 'we' reaction taking a gentle stance; "
+        "(2) a collective 'we' reaction taking a gentle stance (never singular "
+        "'I'; see the register mix rule); "
         "(3) 'This <thing> <does/did X>' declarative; (4) 'That time <named "
         "person> <improbable thing>'; (5) plain descriptive sentence naming "
         "subject + action + context; (6) 'In <year>, <what happened>'. Do NOT "
@@ -1953,11 +1983,20 @@ def _historytrails_title_rules(
         "enough to say every clip deserves one. The two reactive options must "
         "be DIFFERENT shapes, and "
         "exactly one of them MUST be first-person: (A) FIRST PERSON (required for "
-        "one option, singular or collective): a reaction that takes a gentle "
-        "stance in your own voice and uses I, my, me, we, our, or us "
-        "('I had never seen this before', 'We grew up with this and nobody talks "
-        "about it', 'This is one of my favourite moments in sport'). Do not "
-        "substitute a 'you' question for it; second person is not first person. "
+        "one option, COLLECTIVE ONLY): a reaction that takes a gentle stance in "
+        "the account's own voice, speaking for the audience watching, using we, "
+        "our, or us ('We grew up with this and nobody talks about it', 'None of "
+        "us saw this at the time'). Do not substitute a 'you' question for it; "
+        "second person is not first person. "
+        "HARD RULE, singular first person is BANNED: never I, me, my, or mine. "
+        "This account reposts other people's footage, so a singular 'I' claims "
+        "whoever is on screen as the account itself: 'I was just offered a "
+        "quarter million' reads as the page being offered it, when it was the "
+        "collector in the clip, and 'My house cost less than this card' claims a "
+        "house the page does not own. Collective 'we' speaks as the audience "
+        "watching, which is true of the page; singular 'I' is an impersonation. "
+        "If the only reactive angle is the subject's own experience, put it in "
+        "the third person and let the question option carry the reaction. "
         "(B) the other reactive option, pick ONE of: a real question the footage "
         "makes a stranger want to answer ('How is he this calm under that kind of "
         "pressure?'); or a nostalgia prompt that names the era and asks the "

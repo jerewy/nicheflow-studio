@@ -41,6 +41,9 @@ export interface BatchFramesResult {
 export interface BatchDraftImportResult {
   imported: number[];
   failed: { item_id: number; error: string }[];
+  /** Reels rejected after the batch was prepared: the reply still carried a
+   *  block for them, but no draft was saved. Distinct from `unmatched`. */
+  skipped: { item_id: number; reason: string }[];
   unmatched: number[];
 }
 
@@ -65,8 +68,20 @@ export interface BatchCandidateGroup {
   items: BatchCandidateItem[];
   /** Total eligible reels for this account, before the per-account limit. */
   available: number;
-  /** Draftable reels whose footage is still downloading, so not offered yet. */
+  /** Draftable reels with no local footage yet, so not offered. May be stalled. */
   pending_media: number;
+}
+
+/** What a "Fetch footage" retry recovered across the stuck distributed reels. */
+export interface FetchMissingMediaResult {
+  stuck_rows: number;
+  /** Rows fixed by re-linking footage a sibling account had already pulled. */
+  linked_from_disk: number;
+  fetched: number;
+  retired_gone: number;
+  /** Rows with no shortcode or registered asset — open them in Processing. */
+  unresolved: number;
+  failures: { shortcode: string; error: string }[];
 }
 
 /** What "Finish batch" would do to one reel, before it runs. */
@@ -355,6 +370,17 @@ export interface CropRect {
   y: number;
   w: number;
   h: number;
+}
+
+// The keep-region an export will actually use. "manual" is a saved override,
+// "auto" a detected footage rectangle, "none" a clip kept whole because
+// detection found nothing.
+export type CropSource = "manual" | "auto" | "none";
+
+export interface EffectiveCrop {
+  item_id: number;
+  rect: CropRect;
+  source: CropSource;
 }
 
 export interface ApifyUsage {
@@ -732,4 +758,220 @@ export interface PublishQueueJob {
   posted_shares: number | null;
   content_type: string | null;
   processed_path: string | null;
+}
+
+// --- Clip Studio (campaign clip-and-repost workflow) --- //
+
+export interface Campaign {
+  slug: string;
+  name: string;
+  required_mention: string;
+  hashtags: string[];
+  min_clip_seconds: number;
+  max_clips_per_day: number;
+  country_tiers: number[];
+  min_views_per_clip: number;
+  min_views_for_payout: number;
+  notes: string[];
+}
+
+export interface SourceMoment {
+  start: number;
+  end: number;
+  duration: number;
+  score: number;
+  range_label: string;
+  length_note: string;
+  reasons: string[];
+  context: string;
+}
+
+export interface ClipPlan {
+  /** Null for a file taken off disk rather than fetched from a URL. */
+  url: string | null;
+  transcript_path: string | null;
+  transcript_available: boolean;
+  moments: SourceMoment[];
+  /** The source had no captions, so its audio was transcribed here. */
+  transcribed_locally?: boolean;
+  /** Why transcription produced nothing (no speech, missing ffmpeg). */
+  transcript_error?: string;
+  /** The source's own title. Read from metadata, so it survives a cache hit —
+   *  unlike the download result's, which is null on every run after the first. */
+  title?: string | null;
+  /** BCP-47 language YouTube reports for the source, e.g. "ko". */
+  source_language?: string | null;
+  /** Source is not in English, so a viewer cannot follow it without captions. */
+  captions_recommended?: boolean;
+}
+
+/** How much the picture changes, derived from the preview's encoded bitrate. */
+export interface VisualActivity {
+  kb_per_second: number;
+  /** A locked-off shot: great audio, nothing to look at. */
+  looks_static: boolean;
+}
+
+/** One candidate cut from the source, ready to be watched and judged. */
+export interface ClipPreview {
+  index: number;
+  video_path: string;
+  start: number;
+  end: number;
+  duration: number;
+  score: number;
+  range_label: string;
+  reasons: string[];
+  visual_activity: VisualActivity;
+  /** The exact words in this window — grounding for the hook and caption. */
+  context: string;
+  /** Seconds already shaved off the front because the window opened mid-thought. */
+  opening_trimmed: number;
+  /** Still starts mid-conversation — check the in-point before sending it over. */
+  opens_mid_thought: boolean;
+  /** Stops before the speaker finishes — the clip plays as if cut off. */
+  ends_mid_thought?: boolean;
+  /** Silence held after the last word so the clip lands. Part of `end`. */
+  tail_hold?: number;
+  /** Whether the picture gets busier after the talking stops (a cutaway). */
+  visual_payoff?: VisualPayoff;
+  /** Seconds the preview plays PAST `end`, so payoff can be seen and measured. */
+  lookahead_seconds?: number;
+}
+
+/** Title options written for one candidate from its own spoken words. */
+export interface ClipTitleSuggestions {
+  titles: string[];
+  /** Per title: "green" (no checkable claim), "yellow" (claims the clip backs
+   *  up), "red" (a claim it does not). Checked against the clip alone. */
+  tiers: string[];
+  notes: string[];
+  /** Index (as a string key) -> the words the clip does not support. */
+  flagged_terms: Record<string, string[]>;
+  recommended_index: number | null;
+  /** True when the guard moved the pick off a flagged option. */
+  recommendation_shifted: boolean;
+  reason: string | null;
+  summary: string;
+  provider_label: string;
+  used_fallback: boolean;
+}
+
+/** A batch reply routed back to each candidate by its clip number. */
+export interface ClipBatchTitleImport {
+  /** Keyed by the candidate's own 0-based index, as a string. */
+  results: Record<string, ClipTitleSuggestions>;
+  /** 1-based clip numbers the reply never mentioned. */
+  missing: number[];
+  imported: number;
+}
+
+/** One suggested title with its grounding verdict. */
+export interface ClipTitleOption {
+  text: string;
+  tier: string;
+  flagged: string[];
+}
+
+/** Measured picture activity after the out-point — the "they finally show it" case. */
+export interface VisualPayoff {
+  detected: boolean;
+  body_kb_per_second?: number;
+  tail_kb_per_second?: number;
+  /** How much further the out-point should run to include the reveal. */
+  extra_seconds?: number;
+}
+
+export interface ClipSourceInfo {
+  video_path: string;
+  title: string | null;
+  width: number;
+  height: number;
+  duration_seconds: number | null;
+  from_cache: boolean;
+}
+
+export interface ClipPreviewBatch extends ClipPlan {
+  source: ClipSourceInfo | null;
+  previews: ClipPreview[];
+  /** History key for this source — travels onto every clip cut from it. */
+  source_ref?: string;
+}
+
+/** One long video Clip Studio has been through, as the history table shows it. */
+export interface ClipSourceHistory {
+  source_ref: string;
+  kind: "url" | "file";
+  title: string | null;
+  workspace_path: string | null;
+  duration_seconds: number | null;
+  transcript_available: boolean;
+  preview_count: number;
+  clip_count: number;
+  created_at: string | null;
+  last_analyzed_at: string | null;
+}
+
+/** How far one clip cut from a source has travelled. */
+export type ClipStage = "library" | "exported" | "scheduled" | "posted";
+
+export interface ClipSourceClip {
+  item_id: number;
+  title: string | null;
+  created_at: string | null;
+  file_path: string | null;
+  processed_path: string | null;
+  review_state: string;
+  account_id: number | null;
+  account_name: string | null;
+  stage: ClipStage;
+  job_id: number | null;
+  job_status: string | null;
+  scheduled_at: string | null;
+  posted_at: string | null;
+  posted_url: string | null;
+}
+
+export interface ClipSection {
+  video_path: string;
+  title: string | null;
+  width: number;
+  height: number;
+  duration_seconds: number | null;
+  section_start: number;
+  section_end: number;
+  // Where the chosen clip starts inside the downloaded section.
+  clip_offset: number;
+}
+
+export interface CaptionCheck {
+  caption: string;
+  problems: string[];
+}
+
+/** A clip taken into the library — the row every downstream tool hangs off. */
+export interface RegisteredClip {
+  item_id: number;
+  title: string | null;
+  file_path: string;
+  account_id: number;
+  source_url: string;
+  /** True when the clip carries its spoken words for the draft prompt. */
+  has_transcript_context: boolean;
+}
+
+/** Result of putting a different reel into an already-scheduled slot. */
+export interface SwapScheduledJobResult {
+  slot_at: string | null;
+  /** The reel that was sitting in the slot, now back in the unscheduled pool. */
+  unscheduled: PublishQueueJob;
+  /** The reel that now owns the slot. */
+  scheduled: PublishQueueJob;
+}
+
+export interface SubmissionStatus {
+  deadline: string;
+  seconds_remaining: number;
+  expired: boolean;
+  view_ceiling: number;
 }
