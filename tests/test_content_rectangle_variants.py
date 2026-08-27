@@ -151,6 +151,46 @@ def _static_footage_animated_card(index: int):
     return frame
 
 
+def _dark_slow_footage_top(index: int):
+    """Footage that opens dark and slow: thin active bands, no dead canvas.
+
+    The layout the ungated trim destroyed. A dim stage or a held wide produces
+    the same run pattern as stacked caption lines — short active stretches split
+    by low-coverage gaps — so run shape alone cannot tell them apart. What
+    differs is that every row here still carries motion: it is picture, not
+    canvas, and none of it may be cropped away.
+    """
+    frame = _canvas()
+    for band_top in (150, 186):
+        frame[band_top : band_top + 21, 20:340, :] = _noise(
+            400 + index + band_top, 21, 320, low=10, high=90
+        )
+    for gap_top in (171, 207):
+        gap = np.zeros((15, 320, 3), dtype=np.uint8)
+        # A trace of movement across the gap — far below the coverage threshold,
+        # but not the zero of true canvas.
+        gap[:, ::20, :] = _noise(500 + index + gap_top, 15, 16, low=10, high=90)
+        frame[gap_top : gap_top + 15, 20:340, :] = gap
+    frame[222:520, 20:340, :] = _noise(index, 298, 320)
+    return frame
+
+
+def _card_over_dark_footage(index: int):
+    """A repost card whose clip then opens dark: the gate must still fire.
+
+    Guards the other side of the gate. The canvas above is genuinely dead, so
+    the caption lines should come off even though the footage under them starts
+    dim enough to look like more of the same.
+    """
+    frame = _canvas()
+    frame[60:80, 30:150, :] = _noise(100 + index, 20, 120)
+    for line_top in (100, 125, 150):
+        frame[line_top : line_top + 15, 30:330, :] = _noise(200 + index + line_top, 15, 300)
+    frame[185:260, 20:340, :] = _noise(600 + index, 75, 320, low=10, high=90)
+    frame[260:520, 20:340, :] = _noise(index, 260, 320)
+    return frame
+
+
 def _blurred_background(index: int):
     """A landscape clip over a heavy-blurred enlargement of itself."""
     clip = _noise(index, 240, 320)
@@ -174,16 +214,11 @@ def _detect(monkeypatch, build) -> video.CropSettings | None:
     return video.detect_content_rectangle(Path("layout.mp4"), probe)
 
 
-_KNOWN_ANIMATED_CARD = pytest.mark.xfail(
-    strict=True,
-    reason="Gap bridging welds an animated repost card's rows onto the footage "
-    "band. The leading-run trim that fixed this was reverted after a 2,531-clip "
-    "sweep scored it ~19 better against ~17 worse.",
-)
 _KNOWN_CONTIGUOUS = pytest.mark.xfail(
     strict=True,
-    reason="A caption block with no internal gaps is welded onto the footage "
-    "band the same way, and reads as one tall run rather than stacked lines.",
+    reason="A caption block with no internal gaps is one run longer than "
+    "CONTENT_RECT_TOP_LINE_MAX_RATIO, so the leading-run walk stops on it "
+    "before the dead-row gate is ever consulted.",
 )
 _KNOWN_TALL_TEXT = pytest.mark.xfail(
     strict=True,
@@ -201,9 +236,7 @@ _KNOWN_STATIC_FOOTAGE = pytest.mark.xfail(
     ("build", "expected_top"),
     [
         pytest.param(_plain_letterbox, 200, id="plain_letterbox"),
-        pytest.param(
-            _repost_card_gapped, 185, id="repost_card_gapped", marks=_KNOWN_ANIMATED_CARD
-        ),
+        pytest.param(_repost_card_gapped, 185, id="repost_card_gapped"),
         pytest.param(
             _repost_card_contiguous, 185, id="repost_card_contiguous", marks=_KNOWN_CONTIGUOUS
         ),
@@ -221,6 +254,8 @@ _KNOWN_STATIC_FOOTAGE = pytest.mark.xfail(
             marks=_KNOWN_STATIC_FOOTAGE,
         ),
         pytest.param(_blurred_background, 200, id="blurred_background"),
+        pytest.param(_dark_slow_footage_top, 150, id="dark_slow_footage_top"),
+        pytest.param(_card_over_dark_footage, 185, id="card_over_dark_footage"),
     ],
 )
 def test_content_rectangle_top_edge_by_layout(monkeypatch, build, expected_top: int) -> None:
@@ -228,6 +263,35 @@ def test_content_rectangle_top_edge_by_layout(monkeypatch, build, expected_top: 
 
     assert crop is not None
     assert abs(crop.top - expected_top) <= EDGE_TOLERANCE
+
+
+def test_dark_footage_regresses_without_the_dead_row_gate(monkeypatch) -> None:
+    """Guards the guard: the gate, not luck, is what protects dark footage.
+
+    With the dead-row requirement dropped to zero the leading-run walk runs
+    unconditionally — the behaviour that scored 15 better against 20 worse on
+    the library — and it eats the dark opening of this clip. If this ever stops
+    failing, the layout above is passing for some other reason and the gate has
+    quietly stopped doing anything.
+    """
+    monkeypatch.setattr(video, "CONTENT_RECT_TOP_LINE_DEAD_ROW_MIN", 0.0)
+
+    crop = _detect(monkeypatch, _dark_slow_footage_top)
+
+    assert crop is not None
+    # Walks past the dark bands at 150 and lands on the bright footage at 222.
+    assert crop.top > 150 + EDGE_TOLERANCE
+
+
+def test_repost_card_regresses_without_the_leading_run_trim(monkeypatch) -> None:
+    """The card fix depends on the trim, not on some other guard upstream."""
+    monkeypatch.setattr(video, "CONTENT_RECT_TOP_LINE_MAX_RATIO", 0.0)
+
+    crop = _detect(monkeypatch, _repost_card_gapped)
+
+    assert crop is not None
+    # Lands on the avatar row at 60 rather than the footage at 185.
+    assert crop.top < 100
 
 
 def test_content_rectangle_returns_empty_for_full_frame_footage(monkeypatch) -> None:
