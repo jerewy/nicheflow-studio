@@ -520,3 +520,101 @@ def test_top_up_adds_new_accounts_without_touching_existing(tmp_path) -> None:
         # No pool item is double-booked across the whole niche.
         all_pool_ids = [a.pool_item_id for a in session.query(Assignment).all()]
         assert len(all_pool_ids) == len(set(all_pool_ids))
+
+
+_NOW = dt.datetime(2026, 9, 10, 12, 0, tzinfo=dt.timezone.utc)
+
+
+def _add_scored_clip(
+    session, account_id: int, shortcode: str, *, views: int, captured_days_ago: int
+) -> int:
+    """One pooled clip with a known source reach and capture age; returns its pool id."""
+    url = f"https://www.instagram.com/reel/{shortcode}/"
+    asset, _ = find_or_register_media_asset(session, source_url=url, shortcode=shortcode)
+    pool_item = accept_into_pool(session, media_asset=asset, niche="history")
+    pool_item.created_at = _NOW - dt.timedelta(days=captured_days_ago)
+    session.add(
+        ScrapeCandidate(
+            scrape_source_url=url,
+            source_url=url,
+            video_id=shortcode,
+            title="A photographed appearance",
+            state="pooled",
+            account_id=account_id,
+            view_count=views,
+            like_count=views // 20,
+            comment_count=0,
+            published_at=dt.datetime(2026, 8, 1, tzinfo=dt.timezone.utc),
+        )
+    )
+    session.flush()
+    return pool_item.id
+
+
+def test_distribute_places_fresh_capture_before_stronger_backlog_clip(tmp_path) -> None:
+    init_db()
+    with get_session() as session:
+        (account_id,) = _make_accounts(session, "history", 1)
+        fresh_id = _add_scored_clip(
+            session, account_id, "fresh", views=10_000, captured_days_ago=2
+        )
+        _add_scored_clip(session, account_id, "oldhit", views=1_000_000, captured_days_ago=90)
+        session.commit()
+
+        created = distribute_niche(
+            session, "history", rng=random.Random(1), max_per_account=1, now=_NOW
+        )
+        session.commit()
+
+        assert [a.pool_item_id for a in created] == [fresh_id]
+
+
+def test_distribute_fills_leftover_slots_from_best_of_backlog(tmp_path) -> None:
+    init_db()
+    with get_session() as session:
+        (account_id,) = _make_accounts(session, "history", 1)
+        fresh_id = _add_scored_clip(
+            session, account_id, "fresh", views=5_000, captured_days_ago=1
+        )
+        best_old = _add_scored_clip(
+            session, account_id, "old1", views=900_000, captured_days_ago=60
+        )
+        second_old = _add_scored_clip(
+            session, account_id, "old2", views=500_000, captured_days_ago=70
+        )
+        _add_scored_clip(session, account_id, "old3", views=2_000, captured_days_ago=80)
+        session.commit()
+
+        created = distribute_niche(
+            session, "history", rng=random.Random(1), max_per_account=3, now=_NOW
+        )
+        session.commit()
+
+        placed = [a.pool_item_id for a in created]
+        # Fresh first, then the two strongest backlog clips fill the rest.
+        assert placed[0] == fresh_id
+        assert set(placed[1:]) == {best_old, second_old}
+
+
+def test_distribute_still_honours_pins_on_old_clips(tmp_path) -> None:
+    init_db()
+    with get_session() as session:
+        pinned_account, other_account = _make_accounts(session, "history", 2)
+        old_pinned = _add_scored_clip(
+            session, pinned_account, "oldpin", views=1_000, captured_days_ago=120
+        )
+        session.get(PoolItem, old_pinned).pinned_account_id = pinned_account
+        fresh_id = _add_scored_clip(
+            session, pinned_account, "fresh", views=50_000, captured_days_ago=3
+        )
+        session.commit()
+
+        created = distribute_niche(
+            session, "history", rng=random.Random(1), max_per_account=1, now=_NOW
+        )
+        session.commit()
+
+        by_item = {a.pool_item_id: a for a in created}
+        assert by_item[old_pinned].account_id == pinned_account
+        assert by_item[old_pinned].distribution_reason == "pinned"
+        assert by_item[fresh_id].distribution_reason == "ranked"

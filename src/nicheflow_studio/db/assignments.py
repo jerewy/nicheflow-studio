@@ -63,6 +63,13 @@ ASSIGNMENT_STATUS_REJECTED = "rejected"
 ACCOUNT_OPERATIONAL_STATUSES = frozenset({"active", "resting", "flagged"})
 ACCOUNT_OPERATIONAL_STATUS_ACTIVE = "active"
 
+# Pool items captured within this many days are distributed ahead of the older
+# backlog. Measured on 1,428 posted reels (2026-09-10): clips posted within 14
+# days of capture hit 100k+ views 17% of the time, clips 71+ days old 2%. It is
+# a ranking preference, never a gate: on that date only 29 of 321 unassigned
+# clips were fresh, so a cutoff would have stopped posting after one day.
+FRESH_POOL_DAYS = 14
+
 
 def _validate_niche(niche: str) -> str:
     value = (niche or "").strip().lower()
@@ -301,6 +308,7 @@ def distribute_niche(
     eligible_pool_item_ids: set[int] | None = None,
     allow_risky: bool = False,
     existing_counts: dict[int, int] | None = None,
+    now: dt.datetime | None = None,
 ) -> list[Assignment]:
     """Distribute the niche's unassigned accepted pool across its accounts.
 
@@ -374,16 +382,30 @@ def distribute_niche(
     # meant a fuller pool discarded more of the ranking (see ranked_clip_order).
     if existing_counts is None:
         existing_counts = undrafted_item_counts_by_account(session, niche)
-    ranked_ids = ranked_clip_order(
-        [(pool_item_id, scores.get(pool_item_id, 0.0)) for pool_item_id in unassigned_ids],
-        rng=rng,
-        slots=_slots_to_fill(
-            account_ids,
-            max_per_account=max_per_account,
-            targets_by_account=targets_by_account,
-            existing_counts=existing_counts,
-        ),
+    slots = _slots_to_fill(
+        account_ids,
+        max_per_account=max_per_account,
+        targets_by_account=targets_by_account,
+        existing_counts=existing_counts,
     )
+    # Fresh captures go out before the backlog; each group keeps its own
+    # engagement ranking, and the backlog only fills slots fresh clips cannot.
+    fresh_ids, backlog_ids = _split_fresh_pool_items(
+        unassigned_items, set(unassigned_ids), now=now
+    )
+    backlog_slots = None if slots is None else max(0, slots - len(fresh_ids))
+    ranked_ids = [
+        *ranked_clip_order(
+            [(pool_item_id, scores.get(pool_item_id, 0.0)) for pool_item_id in fresh_ids],
+            rng=rng,
+            slots=slots,
+        ),
+        *ranked_clip_order(
+            [(pool_item_id, scores.get(pool_item_id, 0.0)) for pool_item_id in backlog_ids],
+            rng=rng,
+            slots=backlog_slots,
+        ),
+    ]
     # existing_counts makes max_per_account a TOTAL target: re-running
     # "Distribute" only tops up accounts below target and never piles a second
     # full batch onto accounts that already reached it. With max_per_account=None
@@ -418,6 +440,30 @@ def distribute_niche(
         created.append(assignment)
     session.flush()
     return created
+
+
+def _split_fresh_pool_items(
+    items: list[PoolItem],
+    include_ids: set[int],
+    *,
+    now: dt.datetime | None = None,
+) -> tuple[list[int], list[int]]:
+    """Split pool item ids into (fresh, backlog) by how recently they were captured.
+
+    SQLite hands back naive datetimes while ``now`` is aware, so both sides are
+    compared naive (all stored times are UTC). A missing ``created_at`` counts
+    as backlog: with no capture date there is no evidence the clip is fresh.
+    """
+    now_naive = (now or dt.datetime.now(dt.timezone.utc)).replace(tzinfo=None)
+    cutoff = now_naive - dt.timedelta(days=FRESH_POOL_DAYS)
+    fresh: list[int] = []
+    backlog: list[int] = []
+    for item in items:
+        if item.id not in include_ids:
+            continue
+        created = item.created_at.replace(tzinfo=None) if item.created_at else None
+        (fresh if created is not None and created >= cutoff else backlog).append(item.id)
+    return fresh, backlog
 
 
 def _slots_to_fill(
