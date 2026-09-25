@@ -11,6 +11,7 @@ import urllib.parse
 
 from nicheflow_studio.db.models import AccountPostMetric
 from nicheflow_studio.db.post_metrics import (
+    WINNER_REACH_POOL,
     top_titles_for_account,
     upsert_account_post_metrics,
 )
@@ -157,6 +158,8 @@ def test_fetch_media_insights_falls_back_after_unsupported_metrics() -> None:
     )
 
     assert requested_metric_sets == [
+        "reach,likes,comments,saved,shares,total_interactions,views"
+        ",ig_reels_avg_watch_time,ig_reels_video_view_total_time",
         "reach,likes,comments,saved,shares,total_interactions,views",
         "reach,likes,comments,saved,shares,total_interactions",
     ]
@@ -169,7 +172,7 @@ def test_fetch_media_insights_drops_shares_and_interactions_on_second_400() -> N
     def fake_fetch_json(url: str) -> dict[str, object]:
         metrics = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)["metric"][0]
         requested_metric_sets.append(metrics)
-        if len(requested_metric_sets) < 3:
+        if len(requested_metric_sets) < 4:
             raise GraphAPIError(400, "unsupported metric")
         return {
             "data": [
@@ -246,6 +249,13 @@ def test_build_metric_row_normalizes_missing_metrics_and_calculates_score() -> N
         "saved": 5,
         "shares": 0,
         "total_interactions": 0,
+        # No split passed, so the row carries None - distinguishable from a real
+        # zero, which would mean Instagram showed the post to no non-followers.
+        "reach_follower": None,
+        "reach_non_follower": None,
+        # Same contract for retention: absent means None, not a measured 0.
+        "avg_watch_time_ms": None,
+        "total_watch_time_ms": None,
         "conversion_score": 0.25,
         "pulled_at": pulled_at,
     }
@@ -501,3 +511,170 @@ def test_build_metric_row_carries_the_graph_media_id() -> None:
 
     assert row["media_id"] == "17912345678901234"
     assert row["shortcode"] == "ABC123"
+
+
+def test_fetch_media_insights_asks_for_reels_retention_first() -> None:
+    requested_metric_sets: list[str] = []
+
+    def fake_fetch_json(url: str) -> dict[str, object]:
+        metrics = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)["metric"][0]
+        requested_metric_sets.append(metrics)
+        return {
+            "data": [
+                {"name": "reach", "values": [{"value": 940}]},
+                {"name": "views", "values": [{"value": 1301}]},
+                {"name": "ig_reels_avg_watch_time", "values": [{"value": 7407}]},
+                {"name": "ig_reels_video_view_total_time", "values": [{"value": 7318737}]},
+            ]
+        }
+
+    result = fetch_media_insights(
+        media_id="17890000000000000",
+        token="secret-token",
+        fetch_json=fake_fetch_json,
+    )
+
+    # One request, not two: a reel answers the richest set, so adding retention
+    # costs no extra quota on the media type that makes up the whole network.
+    assert len(requested_metric_sets) == 1
+    assert "ig_reels_avg_watch_time" in requested_metric_sets[0]
+    assert result["ig_reels_avg_watch_time"] == 7407
+    assert result["ig_reels_video_view_total_time"] == 7318737
+
+
+def test_fetch_media_insights_keeps_views_when_media_rejects_retention() -> None:
+    """A non-reel must still yield views, not fall all the way to the bare set."""
+    requested_metric_sets: list[str] = []
+
+    def fake_fetch_json(url: str) -> dict[str, object]:
+        metrics = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)["metric"][0]
+        requested_metric_sets.append(metrics)
+        if "ig_reels_avg_watch_time" in metrics:
+            raise GraphAPIError(400, "does not support the metric for this media product type")
+        return {
+            "data": [
+                {"name": "reach", "values": [{"value": 100}]},
+                {"name": "views", "values": [{"value": 250}]},
+            ]
+        }
+
+    result = fetch_media_insights(
+        media_id="17890000000000000",
+        token="secret-token",
+        fetch_json=fake_fetch_json,
+    )
+
+    assert requested_metric_sets[-1] == "reach,likes,comments,saved,shares,total_interactions,views"
+    assert result == {"reach": 100, "views": 250}
+    assert "ig_reels_avg_watch_time" not in result
+
+
+def test_build_metric_row_carries_retention_and_leaves_it_none_when_absent() -> None:
+    pulled_at = dt.datetime(2026, 9, 19, 11, tzinfo=dt.timezone.utc)
+    media = {
+        "permalink": "https://www.instagram.com/reel/ABC123/",
+        "caption": "A real caption",
+        "timestamp": "2026-09-17T04:04:30+0000",
+    }
+
+    reel = build_metric_row(
+        account_key="beneathhistory",
+        media=media,
+        insights={
+            "reach": 940,
+            "views": 1301,
+            "ig_reels_avg_watch_time": 7407,
+            "ig_reels_video_view_total_time": 7318737,
+        },
+        pulled_at=pulled_at,
+    )
+    assert reel["avg_watch_time_ms"] == 7407
+    assert reel["total_watch_time_ms"] == 7318737
+
+    # Absent retention must be None, never 0: a post Instagram never measured is
+    # not a post nobody watched, and 0 would drag every average it lands in.
+    other = build_metric_row(
+        account_key="beneathhistory",
+        media=media,
+        insights={"reach": 940, "views": 1301},
+        pulled_at=pulled_at,
+    )
+    assert other["avg_watch_time_ms"] is None
+    assert other["total_watch_time_ms"] is None
+
+
+def test_upsert_keeps_retention_when_a_later_pull_omits_it() -> None:
+    init_db()
+    pulled_at = dt.datetime(2026, 9, 19, 11, tzinfo=dt.timezone.utc)
+    base = {
+        "account_key": "beneathhistory",
+        "shortcode": "ABC123",
+        "media_id": "18142631992569519",
+        "caption": "A real caption",
+        "timestamp": dt.datetime(2026, 9, 17, 4, 4, 30, tzinfo=dt.timezone.utc),
+        "reach": 940,
+        "views": 1301,
+        "likes": 20,
+        "comments": 1,
+        "saved": 3,
+        "shares": 2,
+        "total_interactions": 26,
+        "reach_follower": None,
+        "reach_non_follower": None,
+        "conversion_score": 0.05,
+        "pulled_at": pulled_at,
+    }
+
+    upsert_account_post_metrics(
+        [{**base, "avg_watch_time_ms": 7407, "total_watch_time_ms": 7318737}]
+    )
+    upsert_account_post_metrics(
+        [{**base, "avg_watch_time_ms": None, "total_watch_time_ms": None}]
+    )
+
+    with get_session() as session:
+        stored = session.query(AccountPostMetric).one()
+        assert stored.avg_watch_time_ms == 7407
+        assert stored.total_watch_time_ms == 7318737
+
+
+def test_top_titles_ranks_conversion_inside_the_most_reached_posts() -> None:
+    # MIN_WINNER_REACH is one flat bar, and these accounts median about 2,500
+    # reach while their best clear a million, so interactions-over-reach stays
+    # unstable well above the floor. Measured on vaultedhistory: a reel seen by
+    # 1,655 people led the example block while a genuine 716,024-reach winner
+    # placed third, purely on the denominator. Conversion now ranks only inside
+    # the account's WINNER_REACH_POOL most-reached posts, so the thin one has to
+    # out-REACH the pool before its score counts at all.
+    pulled_at = dt.datetime(2026, 6, 20, 2, tzinfo=dt.timezone.utc)
+    timestamp = dt.datetime(2026, 6, 1, tzinfo=dt.timezone.utc)
+
+    def metric(shortcode: str, caption: str, score: float, reach: int) -> dict:
+        return {
+            "account_key": "pooltest",
+            "shortcode": shortcode,
+            "caption": caption,
+            "timestamp": timestamp,
+            "reach": reach,
+            "views": reach,
+            "likes": 0,
+            "comments": 0,
+            "saved": 0,
+            "shares": 0,
+            "total_interactions": 0,
+            "conversion_score": score,
+            "pulled_at": pulled_at,
+        }
+
+    # The thin post clears MIN_WINNER_REACH and has the best score, so the flat
+    # floor alone cannot keep it out. It is only excluded by being outranked on
+    # reach by a full pool of genuinely distributed posts.
+    filler = [
+        metric(f"WIDE{i}", f"Reached post {i}", 0.20, reach=100_000 + i)
+        for i in range(WINNER_REACH_POOL)
+    ]
+    upsert_account_post_metrics([*filler, metric("THIN", "Barely distributed", 0.99, reach=1_655)])
+
+    winners = top_titles_for_account("pooltest", n=5)
+    assert "Barely distributed" not in winners
+    assert len(winners) == 5

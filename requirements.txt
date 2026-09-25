@@ -22,6 +22,15 @@ faster-whisper==1.2.1
 # sharpness/exposure scoring if this import is ever unavailable.
 opencv-python-headless==4.13.0.92
 
+# Local OCR for the source clip's burned-in hook (PP-OCRv4 ONNX, CPU, no key and
+# no quota). It started as a research-script extra, but draft_handoff now calls
+# on_screen_hook.read_hook while preparing a batch, so it is a runtime dependency.
+# Install order matters: this wheel declares opencv-python (the GUI build), which
+# provides the same cv2 module as the headless pin above and clashes with PyQt6's
+# Qt in the packaged Studio build. Install this first, then reinstall
+# opencv-python-headless so the headless build is the one left on disk.
+rapidocr-onnxruntime==1.4.4
+
 # Apify (alternative IG scraping path — no IG accounts required, pay-per-result)
 apify-client==1.8.1
 apify-shared<2

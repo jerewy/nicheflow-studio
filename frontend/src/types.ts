@@ -55,21 +55,31 @@ export interface BatchCandidateItem {
   source_url: string | null;
   /** Virtual-host URL for the source clip, or null until media mapping is ready. */
   preview_url: string | null;
+  /** True once a draft revision exists, i.e. a batch reply was imported for it.
+   *  These rows are listed but never auto-selected. */
   has_draft: boolean;
+  /** Imported but never finished: a revision exists and no option was ever
+   *  applied, so the reel needs Finish rather than a new draft. */
+  needs_finish: boolean;
   has_vision: boolean;
+  /** Processing review state ("draft", "pending_review", ...), or null. */
+  review_state: string | null;
 }
 
-/** One account's draftless reels, offered for a cross-account batch. */
+/** One account's reels offered for a cross-account batch, drafted ones last. */
 export interface BatchCandidateGroup {
   account_id: number;
   account_name: string;
   niche: string | null;
   auto_schedules: boolean;
   items: BatchCandidateItem[];
-  /** Total eligible reels for this account, before the per-account limit. */
+  /** Total eligible DRAFTLESS reels for this account, before the per-account
+   *  limit. Drafted rows in `items` are not counted here. */
   available: number;
   /** Draftable reels with no local footage yet, so not offered. May be stalled. */
   pending_media: number;
+  /** Reels stuck between Import and Finish, before the per-account limit. */
+  pending_finish: number;
 }
 
 /** What a "Fetch footage" retry recovered across the stuck distributed reels. */
@@ -435,8 +445,13 @@ export interface PoolAssignmentCount {
 export interface NichePool {
   niche: string;
   pooled: number;
+  /** Allotted to an account and still open. */
   assigned: number;
+  /** Never allotted, so still placeable by Distribute. */
   unused: number;
+  /** Allotted and closed out (posted, rejected there, dead source). Spent, not
+   *  free: `assigned + used + unused === pooled`. */
+  used: number;
   rejected: number;
   pending: number;
   assignments_by_account: PoolAssignmentCount[];
@@ -472,6 +487,10 @@ export interface NicheAccount {
   id: number;
   name: string;
   operational_status: AccountOperationalStatus;
+  /** Pool clips THIS account has never held, minus any still in the reuse gap.
+   *  The pool is shared, so the niche-wide "unused" says nothing about what a
+   *  given account can still be given. */
+  available: number;
 }
 
 export interface PoolSourceClip {

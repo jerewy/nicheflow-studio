@@ -10,11 +10,25 @@ import urllib.request
 
 GRAPH_HOST = "graph.instagram.com"
 GRAPH_VERSION = "v21.0"
+# Tried richest-first; each 400 falls through to the next. The retention pair
+# leads because it is the only INPUT to reel ranking we can see - views, reach
+# and likes are all outputs of a distribution decision Instagram already made.
+# Reels answer set 1, so the network's posts cost no extra quota; other media
+# product types reject the pair and land on set 2, which is what every pull
+# before 2026-09-19 asked for.
 INSIGHT_METRIC_SETS = (
+    "reach,likes,comments,saved,shares,total_interactions,views"
+    ",ig_reels_avg_watch_time,ig_reels_video_view_total_time",
     "reach,likes,comments,saved,shares,total_interactions,views",
     "reach,likes,comments,saved,shares,total_interactions",
     "reach,likes,comments,saved",
 )
+
+# Graph reports both in milliseconds.
+RETENTION_FIELDS = {
+    "avg_watch_time_ms": "ig_reels_avg_watch_time",
+    "total_watch_time_ms": "ig_reels_video_view_total_time",
+}
 
 
 # Graph error subcodes meaning "this media can never have insights", as opposed
@@ -190,6 +204,8 @@ def build_metric_row(
     media: dict[str, object],
     insights: dict[str, int],
     pulled_at: dt.datetime,
+    reach_follower: int | None = None,
+    reach_non_follower: int | None = None,
 ) -> dict[str, object]:
     permalink = str(media.get("permalink") or "")
     timestamp_value = media.get("timestamp")
@@ -216,6 +232,15 @@ def build_metric_row(
         "caption": str(media.get("caption") or ""),
         "timestamp": timestamp,
         **normalized,
+        "reach_follower": reach_follower,
+        "reach_non_follower": reach_non_follower,
+        # Absent retention stays None rather than joining `normalized`'s 0
+        # default: a post Instagram never measured is not a post nobody
+        # watched, and a 0 would drag down every average it lands in.
+        **{
+            column: (int(insights[metric]) if metric in insights else None)
+            for column, metric in RETENTION_FIELDS.items()
+        },
         "conversion_score": calculate_conversion_score(
             reach=normalized["reach"],
             likes=normalized["likes"],
@@ -231,6 +256,16 @@ def calculate_conversion_score(
     *, reach: int, likes: int, comments: int, saved: int, shares: int
 ) -> float:
     return (3 * saved + 3 * shares + 2 * comments + likes) / max(reach, 1)
+
+
+# NOTE: there is no per-post follower/non-follower split. Graph rejects it:
+#   "Incompatible breakdowns (follow_type) for metric (reach)"  [v21.0, 2026-08-28]
+# The follow_type breakdown exists only on ACCOUNT-level insights
+# (/{user_id}/insights?metric=reach&period=day&breakdown=follow_type), which
+# returns a daily total, not a per-media value. A per-post fetcher lived here
+# briefly and cost one extra request per post to always return None, doubling
+# the quota spend of a pull for nothing. AccountPostMetric.reach_follower /
+# reach_non_follower remain in the schema, unpopulated, for that reason.
 
 
 def fetch_media_insights(

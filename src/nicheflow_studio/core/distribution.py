@@ -190,6 +190,7 @@ def plan_first_cycle(
     targets_by_account: dict[int, int] | None = None,
     existing_counts: dict[int, int] | None = None,
     shuffle_items: bool = True,
+    blocked_by_account: dict[int, set[int]] | None = None,
 ) -> list[PlannedAssignment]:
     """Assign each pool item to exactly one account, balanced and shuffled.
 
@@ -214,6 +215,11 @@ def plan_first_cycle(
         total so "Top Up" levels under-filled accounts without touching the
         ones already at target. Omit (or pass empty) for a clean first cycle,
         where every account starts at zero.
+    blocked_by_account:
+        ``account_id -> pool_item_ids that account must not receive``. The pool
+        is shared and a clip may reach several accounts over its life, so the
+        thing that must never happen is ONE account getting the same clip twice.
+        A clip no account may take is skipped, not fatal — see the loop below.
 
     Returns
     -------
@@ -250,15 +256,28 @@ def plan_first_cycle(
         )
         return target is None or per_account[account_id] < target
 
+    blocked = blocked_by_account or {}
+
     assignments: list[PlannedAssignment] = []
     for pool_item_id in items:
         # Fill the emptiest account that still has room first (ties broken by the
         # shuffled account order). This keeps per-account volume even to within
         # one across accounts that have capacity — even when some started this
         # run already full from a previous cycle.
-        eligible = [account_id for account_id in accounts if _has_room(account_id)]
-        if not eligible:
+        with_room = [account_id for account_id in accounts if _has_room(account_id)]
+        if not with_room:
             break  # every account is at target — leave the rest unassigned
+        eligible = [
+            account_id
+            for account_id in with_room
+            if pool_item_id not in blocked.get(account_id, ())
+        ]
+        if not eligible:
+            # Every account with room has already had this clip. Skip it rather
+            # than break: the clips after it in the ranking may still have a
+            # home, and breaking would strand the whole tail behind one
+            # exhausted clip.
+            continue
         account_id = min(eligible, key=lambda acct: per_account[acct])
         assignments.append(
             PlannedAssignment(pool_item_id=pool_item_id, account_id=account_id)

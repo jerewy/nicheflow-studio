@@ -7,7 +7,8 @@ import re
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from nicheflow_studio.processing import title_references
@@ -262,6 +263,50 @@ def generate_smart_drafts(
                     low_context=low_context,
                 )
             _enforce_require_vision(result, require_vision=require_vision)
+            result = _enforce_register_mix(
+                result,
+                title_style=title_style,
+                regenerate=lambda: (
+                    _generate_groq_smart_drafts(
+                        api_key=resolved_api_key or "",
+                        reasoning_model=resolved_model,
+                        transcript_text=cleaned_transcript,
+                        source_title=cleaned_source_title or None,
+                        source_description=cleaned_source_description or None,
+                        niche_label=cleaned_niche or None,
+                        visual_frame_urls=visual_frame_urls,
+                        account_voice=normalized_voice,
+                        prompt_profile=prompt_profile,
+                        caption_style=caption_style,
+                        title_style=title_style,
+                        title_length=title_length,
+                        recent_titles=recent_titles,
+                        recent_captions=recent_captions,
+                        few_shot_winners=few_shot_winners,
+                        caption_outro=caption_outro,
+                        low_context=low_context,
+                    )
+                    if provider == "groq"
+                    else _generate_ollama_smart_drafts(
+                        model=resolved_model,
+                        transcript_text=cleaned_transcript,
+                        source_title=cleaned_source_title or None,
+                        source_description=cleaned_source_description or None,
+                        niche_label=cleaned_niche or None,
+                        visual_frame_urls=visual_frame_urls,
+                        account_voice=normalized_voice,
+                        prompt_profile=prompt_profile,
+                        caption_style=caption_style,
+                        title_style=title_style,
+                        title_length=title_length,
+                        recent_titles=recent_titles,
+                        recent_captions=recent_captions,
+                        few_shot_winners=few_shot_winners,
+                        caption_outro=caption_outro,
+                        low_context=low_context,
+                    )
+                ),
+            )
             return result
         except VisionRequiredError:
             # Vision-required failure is a deliberate signal — do not swallow
@@ -308,6 +353,230 @@ def generate_smart_drafts(
         )
 
     raise RuntimeError("Smart draft generation failed: No smart-draft provider is configured.")
+
+
+# Styles whose prompt carries the REGISTER MIX rule. Only these are checked:
+# a cinema or meme style has no reactive-option requirement to violate.
+_REGISTER_MIX_STYLES = frozenset({"historytrails_record"})
+
+# REGISTER MIX asks option B to be reactive and option C - the one carrying the
+# hard specific - to be reactive too. Option A (scene description) is exempt, so
+# the satisfiable floor is ONE, not two. It was briefly two, which the A/B/C
+# structure cannot produce: a measured batch came back 1/3 reactive on all six
+# reels while satisfying every other rule, because the two rules contradicted.
+_MIN_REACTIVE_OPTIONS = 1
+
+# At least one option must carry no name, year or number. Measured at 2.1x
+# (125,736 median over 127 titles against 58,880 over 417), the widest
+# effect on the reference set and wider than the register effect.
+_MIN_UNSPECIFIC_OPTIONS = 1
+
+
+# Reaction/opinion vocabulary: the account taking a stance on the clip rather
+# than reporting it. Deliberately NOT the same test as
+# title_references.classify_register, which sorts the few-shot pool into four
+# buckets for round-robin balancing and would mis-score a real reactive line:
+# "Greatest face reveal of all time" (4.8M views) lands in its short_label
+# bucket and "The level of disrespect was crazy" (4.9M) in documentary, so
+# counting only question+first_person scored a good batch at zero reactive and
+# spent a retry on it. This uses the best-powered cut measured on the 726-title
+# reference set instead: personal voice OR a reaction word reaches a 91,038
+# median against 69,784 for neither (n=185 vs 541).
+_REACTION_WORDS = re.compile(
+    r"\b(crazy|greatest|best|worst|legend|legendary|finally|wild|perfect|amazing|"
+    r"incredible|never|actually|literally|somehow|still|smart|genius|favou?rite|"
+    r"iconic|insane|unreal|nobody|everyone|of all time|make your day)\b",
+    re.IGNORECASE,
+)
+_PERSONAL_VOICE = re.compile(
+    r"\b(we|our|us|let's|you|your|yourself)\b", re.IGNORECASE
+)
+
+
+def _is_reactive_title(title: str) -> bool:
+    """True when the title speaks as someone reacting, not reporting.
+
+    Three ways to qualify: it asks the viewer something, it speaks in a personal
+    voice, or it carries reaction/opinion vocabulary. Singular first person is
+    intentionally absent from _PERSONAL_VOICE - the REGISTER MIX rule bans it
+    (this account reposts other people's footage, so "I" is an impersonation).
+    """
+    if "?" in title:
+        return True
+    return bool(_PERSONAL_VOICE.search(title) or _REACTION_WORDS.search(title))
+
+
+def _reactive_option_count(titles: list[str]) -> int:
+    """How many of the options speak in a reactive register."""
+    return sum(1 for title in titles if _is_reactive_title(title))
+
+
+# Sentence-initial words and bare capitalised openers that are not names. A
+# title's FIRST word is capitalised by grammar, so it can never be evidence of a
+# proper noun; these cover the mid-sentence capitals that are still not names.
+_NOT_A_NAME = frozenset(
+    "the this that a an in on at it he she they we you i when what how why once "
+    "and but for if so then his her their my our your one two every some no not "
+    "just men women people everyone nobody life fun scientists".split()
+)
+_DIGIT_RE = re.compile(r"\d")
+_PROPER_NOUN_RE = re.compile(r"^[A-Z][a-z]{2,}")
+# A capital or hyphen inside the word: Spider-Man, McCartney, O'Brien.
+_INTERNAL_CAPITAL_RE = re.compile(r"[a-z][A-Z]|-[A-Z]|'[A-Z]")
+
+
+def _carries_hard_specific(title: str) -> bool:
+    """True when the title names a person/place or states a year or number.
+
+    The single widest effect measured on the account's 726 scored titles:
+    titles carrying none of these reach a 125,736 median (n=127) against 58,880
+    (n=417) for those that do - 2.1x, wider than the register effect. Nothing
+    guarded it, so every option could arrive carrying one.
+
+    Deliberately crude. It over-reports (a capitalised common noun mid-sentence
+    reads as a name) which is the safe direction: the check only decides whether
+    to spend ONE regeneration, never whether a title ships.
+    """
+    if _DIGIT_RE.search(title):
+        return True
+    words = title.split()
+    for index, word in enumerate(words):
+        stripped = word.strip(".,!?:;\"'“”‘’()")
+        if not stripped or stripped.lower() in _NOT_A_NAME:
+            continue
+        if not _PROPER_NOUN_RE.match(stripped):
+            continue
+        if index > 0:
+            return True
+        # Position 0 is capitalised by grammar, so a name needs a second signal.
+        # Requiring one costs a miss on a bare single-word name ("Socrates
+        # stands...") and avoids reading every capitalised common noun as one:
+        # counting position 0 unconditionally flagged "Passengers line up...",
+        # "Rush hour...", "Commuters stand..." and 33.8% of all posted titles,
+        # against 13.7% for this rule.
+        if _INTERNAL_CAPITAL_RE.search(stripped):
+            return True  # Spider-Man, McCartney
+        if index + 1 < len(words):
+            following = words[index + 1].strip(".,!?:;\"'“”‘’()")
+            if (
+                _PROPER_NOUN_RE.match(following)
+                and following.lower() not in _NOT_A_NAME
+            ):
+                return True  # Michael Jackson, Gregory Peck
+    return False
+
+
+def _unspecific_option_count(titles: list[str]) -> int:
+    """How many options carry no name, year or number at all."""
+    return sum(1 for title in titles if not _carries_hard_specific(title))
+
+
+def _flat_specific_option_count(titles: list[str]) -> int:
+    """Options that carry a hard specific WITHOUT a reactive voice to carry it.
+
+    Register earns its keep precisely here: among titles carrying a name, year
+    or number, reactive reaches an 81,220 median against 58,880 flat (1.4x),
+    while among titles carrying none the two are within noise (132,162 against
+    125,736). So a bare documentary line with a date in it is the one shape
+    that loses on both levers at once.
+    """
+    return sum(
+        1
+        for title in titles
+        if _carries_hard_specific(title) and not _is_reactive_title(title)
+    )
+
+
+def _enforce_register_mix(
+    result: SmartDrafts,
+    *,
+    title_style: str | None,
+    regenerate: Callable[[], SmartDrafts],
+) -> SmartDrafts:
+    """Regenerate once when the model ignored the REGISTER MIX hard rule.
+
+    The rule ("two of three options in a REACTIVE voice") was advisory text in
+    an 18-rule prompt with nothing checking the output, and it was being ignored
+    wholesale: a measured batch came back 18 of 18 documentary. That also breaks
+    RECOMMENDED PICK downstream, which defaults to a reactive option and so had
+    none to choose from.
+
+    Deliberately does NOT raise when the retry also fails. A title that is merely
+    off-register is still usable, and failing here would drop the item into the
+    local fallback, whose raw transcript fragments are far worse than an
+    off-register real title. The outcome is always recorded in generation_meta
+    so the miss rate is measurable rather than invisible.
+    """
+    if (title_style or "") not in _REGISTER_MIX_STYLES:
+        return result
+
+    def _tagged(drafts: SmartDrafts, **meta: object) -> SmartDrafts:
+        # SmartDrafts is frozen, so record the outcome on a copy.
+        return replace(drafts, generation_meta={**(drafts.generation_meta or {}), **meta})
+
+    def _score(titles: list[str]) -> tuple[int, int, int]:
+        """(unspecific, -flat specifics, reactive), highest wins.
+
+        Ordered by measured effect size. Winning back an option free of a hard
+        specific is 2.1x and comes first; removing a specific that has no
+        reactive voice to carry it is 1.4x and comes second; bare register is
+        within noise once the specific is gone, so it only breaks ties.
+        """
+        return (
+            _unspecific_option_count(titles),
+            -_flat_specific_option_count(titles),
+            _reactive_option_count(titles),
+        )
+
+    unspecific, neg_flat, reactive = _score(result.title_options)
+    if (
+        reactive >= _MIN_REACTIVE_OPTIONS
+        and unspecific >= _MIN_UNSPECIFIC_OPTIONS
+        and neg_flat == 0
+    ):
+        return _tagged(
+            result,
+            register_mix_reactive=reactive,
+            register_mix_unspecific=unspecific,
+            register_mix_retried=False,
+        )
+
+    logger.info(
+        "Title mix miss: %d/%d reactive (need %d), %d/%d free of a hard specific "
+        "(need %d); regenerating once.",
+        reactive,
+        len(result.title_options),
+        _MIN_REACTIVE_OPTIONS,
+        unspecific,
+        len(result.title_options),
+        _MIN_UNSPECIFIC_OPTIONS,
+    )
+    try:
+        retried = regenerate()
+    except Exception as exc:  # noqa: BLE001 - keep the usable first result
+        logger.warning("Title mix retry failed (%s); keeping the first result.", exc)
+        return _tagged(
+            result,
+            register_mix_reactive=reactive,
+            register_mix_unspecific=unspecific,
+            register_mix_retried=True,
+            register_mix_retry_error=str(exc),
+        )
+
+    # Keep whichever attempt scored higher, so a retry can only improve the set.
+    winner, (winner_unspecific, _, winner_reactive) = (
+        (retried, _score(retried.title_options))
+        if _score(retried.title_options) > (unspecific, neg_flat, reactive)
+        else (result, (unspecific, neg_flat, reactive))
+    )
+    return _tagged(
+        winner,
+        register_mix_reactive=winner_reactive,
+        register_mix_unspecific=winner_unspecific,
+        register_mix_retried=True,
+        register_mix_first_attempt=reactive,
+        register_mix_first_unspecific=unspecific,
+    )
 
 
 def _enforce_require_vision(result: SmartDrafts, *, require_vision: bool) -> None:
@@ -1935,21 +2204,38 @@ def _historytrails_title_rules(
         winners = _HISTORYTRAILS_FEW_SHOT_WINNERS
         winner_label = "STATIC WINNER EXAMPLES"
     return [
-        "- GOAL: write the long, calm documentary caption that sits at the top of "
-        "the clip. It SETS A SCENE in full sentences, names who/what/when, and "
-        "ends on the surprising or emotional beat so a stranger stops, watches to "
-        "the payoff, and wants to SAVE or SEND it. A hook, never a label.",
-        "- VOICE: documentary lower third meets a museum caption. Calm, certain, "
-        "past tense. State real facts plainly and let them carry; no hype words, "
-        "no selling, no exclamation marks. This is the same restraint as Cinematic "
-        "Record, only written out as a complete descriptive sentence.",
-        "- BE SPECIFIC, BUT NOT NECESSARILY FACTUAL: the test is that a stranger "
-        "can tell THIS clip from any other by the title alone. A hard detail "
-        "(name, year, number, place) is one way to pass it and a vivid visible "
-        "detail is another, so use a hard specific when the clip's evidence "
-        "genuinely carries one and never reach for one to satisfy a quota. "
-        "Measured on this account, titles built around a year or a superlative "
-        "slightly UNDERperform the ones built around a moment.",
+        # GOAL and VOICE used to define the job as "the calm documentary museum
+        # caption", then REGISTER MIX five rules later demanded the opposite in
+        # two options out of three. The opening framing won every time: across a
+        # measured batch, 18 of 18 generated options came back documentary and
+        # zero were reactive, so RECOMMENDED PICK (which defaults to a reactive
+        # option) had nothing to pick. These two rules are now register-neutral
+        # and REGISTER MIX is the only thing that assigns voice.
+        "- GOAL: write the on-screen title that sits at the top of the clip. It "
+        "makes a stranger stop, watch to the payoff, and want to SAVE or SEND it. "
+        "A hook, never a label. Say enough that someone who knows nothing about "
+        "the subject understands what they are looking at.",
+        "- VOICE: sound like a person who just watched this and is showing it to "
+        "someone, not like a museum placard narrating it. Which register that "
+        "means is set by REGISTER MIX below, and it is not documentary by "
+        "default. Whatever the register: no hype words, no manufactured outrage, "
+        "no exclamation-point selling. Naming the payoff plainly is not hype - "
+        "'will make your day' is a promise the clip keeps, not clickbait.",
+        "- BE CLEAR, NOT SPECIFIC (this is the single biggest lever): the test is "
+        "that a stranger who knows nothing about the subject understands what "
+        "they are looking at. A vivid, concrete description of the visible scene "
+        "passes that test. A name, year, number or place is NOT required and is "
+        "usually a cost. Measured on this account's own 726 scored titles: "
+        "titles carrying NO name, year or number reach a 125,736 median across "
+        "127 titles against 58,880 across 417 for titles that carry one - a 2.1x "
+        "gap, and the widest of any effect measured here. Carry a hard specific "
+        "ONLY when that fact IS the hook (a patent number that explains the "
+        "trick), never as scene-setting furniture ('at the 2006 APA convention') "
+        "and never to satisfy a quota. If the evidence does not clearly support "
+        "a specific, the correct move is to leave it out, NOT to invent a "
+        "plausible one - a real title read 'a room full of psychiatrists' over "
+        "footage of two people interviewed separately, because an earlier "
+        "version of this rule demanded a detail the clip did not have.",
         "- LENGTH AND LAYOUT: the proven sweet spot on this account is a fuller "
         "sentence of about 18-24 words that wraps to FOUR left-aligned overlay "
         "lines; that length and line count earn the most saves here, so default "
@@ -1959,28 +2245,78 @@ def _historytrails_title_rules(
         "still carries a hard specific, never a vague label. Make every word "
         "earn its place and do NOT pad a thin clip just to reach a length; the "
         "only ceiling is on-screen readability.",
-        "- SHAPE: lead with the subject or the scene, give the specific action or "
-        "context (with the year/place/name), and land the final clause on the "
-        "surprising, emotional, or record detail. End on the beat the VIDEO pays "
-        "off; do not state the full visual payoff in words.",
+        "- SCOPE (HARD RULE): the title must cover as much of the clip as the "
+        "clip covers. If the evidence describes more than one person, attempt, "
+        "or answer, the title must NOT collapse it to one of them. A compilation "
+        "of three psychiatrists each failing to name a cure is about "
+        "PSYCHIATRISTS, plural; writing 'a psychiatrist was asked how many "
+        "patients she had cured' throws away the pattern that is the entire "
+        "point and reduces the clip to its first ten seconds. Check this against "
+        "the FULL evidence, not against the source title: the source title is "
+        "one account's hook for the same footage and is frequently narrower "
+        "than the clip, so anchoring on it inherits its blind spot.",
+        "- SHAPE: lead with the subject or the scene, describe what is happening "
+        "in plain concrete words, and land the final clause on the turn - the "
+        "surprising, emotional or record detail. End on the beat the VIDEO pays "
+        "off; do not state the full visual payoff in words. A year, place or "
+        "name goes in ONLY when it is the hook itself (see BE CLEAR, NOT "
+        "SPECIFIC); the default shape carries none.",
+        "- THE THREE OPTIONS SPAN SPECIFICITY, NOT JUST VOICE (HARD RULE). Write "
+        "exactly one of each: "
+        "(A) SCENE DESCRIPTION, no checkable claim - describe the visible moment "
+        "in plain concrete nouns and land the turn at the end ('A baby goat "
+        "started pushing against a cat, but the critter thought it was getting "
+        "cuddles', 'The day a cockroach got into the room and this paraplegic "
+        "cat learned to run'). This is the account's strongest measured class at "
+        "a 141,971 median. "
+        "(B) REACTIVE, no checkable claim - the register set by REGISTER MIX "
+        "below, still naming no year, place or person. "
+        "(C) HARD SPECIFIC - the line carrying the name, year or number, for the "
+        "case where that fact IS the story. C MUST BE WRITTEN IN A REACTIVE "
+        "VOICE (a reaction statement, a question, or a collective 'we' line). "
+        "A flat documentary line with a name or a date in it is the single "
+        "worst-performing shape measured on this account, at a 58,880 median; "
+        "the same specific carried in a reactive voice reaches 81,220. Do not "
+        "write C as a plain third-person recap of the facts. "
+        "At least one of A and B must contain no name, year or number at all. "
+        "If all three options end up carrying a hard specific, the set is wrong "
+        "and must be rewritten. "
+        "A note on names, because the instinct runs the other way: a named "
+        "person is NOT a safer specific than a date. Measured here, titles "
+        "naming a person reach a 55,910 median across 339 titles, BELOW the "
+        "69,784 for titles carrying a year or number and no person, and far "
+        "below the 127,536 for titles carrying neither. Do not reach for a "
+        "famous name on the theory that recognition sells the clip.",
         "- FORMATS: use THREE DIFFERENT shapes across the three options (never "
         "three rewrites of one). Proven shapes on this account, strongest first: "
-        "(1) a real question the footage makes a stranger want to answer; "
-        "(2) a collective 'we' reaction taking a gentle stance (never singular "
+        "(1) DENSE SCENE DESCRIPTION with the turn at the end and no name, year "
+        "or number - the top measured class at a 141,971 median across 57 "
+        "titles ('Durability test of a wolf's tooth and a human tooth under a "
+        "hydraulic press', 'Men will do anything to avoid trying on clothes. He "
+        "made the clothes try him on'); "
+        "(2) REACTION LABEL naming the category and the trigger, answer withheld "
+        "- '<people> when <asked/shown/told> <thing>' ('Psychiatrists when asked "
+        "how many patients have they cured'); "
+        "(3) a real question the footage makes a stranger want to answer; "
+        "(4) a collective 'we' reaction taking a gentle stance (never singular "
         "'I'; see the register mix rule); "
-        "(3) 'This <thing> <does/did X>' declarative; (4) 'That time <named "
-        "person> <improbable thing>'; (5) plain descriptive sentence naming "
-        "subject + action + context; (6) 'In <year>, <what happened>'. Do NOT "
-        "open with 'When ...': it is the weakest measured shape on this account.",
-        "- REGISTER MIX (HARD RULE): write TWO of the three options in a REACTIVE "
-        "voice and only ONE as a calm documentary line. This is measured, not "
-        "taste: on this account's own scored titles, questions reach 187k median "
-        "views against 73k for everything else, and first-person lines reach 95k "
-        "against 73k, while the museum-label declarative is the weakest of the "
-        "three registers. Treat those two figures as roughly equal rather than "
-        "as a ranking: the question number rests on just 18 measured titles, "
-        "which is enough to say questions belong in the mix and nowhere near "
-        "enough to say every clip deserves one. The two reactive options must "
+        "(5) 'This <thing> <does/did X>' declarative; "
+        "(6) plain descriptive sentence naming subject + action + context; "
+        "(7) 'That time <named person> <improbable thing>' and (8) 'In <year>, "
+        "<what happened>' - use these two ONLY when the name or the year is the "
+        "hook; both measured at or below average here and (7) rests on 5 titles. "
+        "Do NOT open with 'When ...': it is the weakest measured shape on this "
+        "account.",
+        "- REGISTER MIX (HARD RULE): option B is REACTIVE, and option C - the one "
+        "carrying the hard specific - MUST ALSO be reactive. Option A (scene "
+        "description) may be either; register barely moves it. This is measured, "
+        "not taste, and the size depends on specificity: among titles that carry "
+        "a name, year or number, reactive reaches an 81,220 median against 58,880 "
+        "for the flat documentary line (1.4x), while among titles carrying none "
+        "the gap all but vanishes (132,162 against 125,736, overlapping). So "
+        "register is what rescues an option that HAS to carry a specific, and is "
+        "optional everywhere else. Do not force option A into a reactive voice if "
+        "the plain scene description is stronger. The reactive options must "
         "be DIFFERENT shapes, and "
         "exactly one of them MUST be first-person: (A) FIRST PERSON (required for "
         "one option, COLLECTIVE ONLY): a reaction that takes a gentle stance in "
@@ -1997,10 +2333,23 @@ def _historytrails_title_rules(
         "watching, which is true of the page; singular 'I' is an impersonation. "
         "If the only reactive angle is the subject's own experience, put it in "
         "the third person and let the question option carry the reaction. "
-        "(B) the other reactive option, pick ONE of: a real question the footage "
-        "makes a stranger want to answer ('How is he this calm under that kind of "
-        "pressure?'); or a nostalgia prompt that names the era and asks the "
-        "viewer to confirm they remember it ('Remember <thing> (years)?'). "
+        "(B) the other reactive option, pick ONE of: a REACTION STATEMENT that "
+        "takes a plain stance on what the clip shows and NAMES the recognisable "
+        "subject ('Michael Jackson never actually defied gravity, and the shoes "
+        "are the reason', 'The level of disrespect was crazy', 'Greatest face "
+        "reveal of all time'); or a real question the footage makes a stranger "
+        "want to answer ('How is he this calm under that kind of pressure?'); or "
+        "a nostalgia prompt that names the era and asks the viewer to confirm "
+        "they remember it ('Remember <thing> (years)?'). "
+        "PREFER THE REACTION STATEMENT. Measured on the 726-title reference set, "
+        "reactive statements reach an 89,432 median across 155 titles with a "
+        "95% CI of 60k-132k, while the question bucket's higher 187,193 median "
+        "rests on 20 titles with a CI of 50k-552k - too wide to rank against "
+        "anything. Statements are the supported bet; questions are allowed, not "
+        "required. Being clear about WHAT the viewer is looking at is not the "
+        "same as naming it: 'Psychiatrists when asked how many patients have "
+        "they cured' names nobody and is instantly legible. Reach for the clear "
+        "frame, not the proper noun. "
         "The reactive options drop the third-person distance but STILL obey "
         "green-tier (no invented facts) and the anti-clickbait ban below: never "
         "'you won't believe', never manufactured outrage, never an "
@@ -2022,13 +2371,19 @@ def _historytrails_title_rules(
         "rarity claim the evidence does not back.",
         *_thin_evidence_and_artifact_rules(),
         "- NO emoji, NO hashtags, NO all-caps lines, sentence case.",
-        "- RECOMMENDED PICK (READ THIS BEFORE CHOOSING): a REACTIVE option is the "
-        "default pick, and the documentary option has to clearly beat it on "
-        "delivery to win. Do NOT pick an option because it is the most concrete, "
-        "the most factual, or carries the most specifics: concreteness is a "
-        "tiebreaker inside a register, never a reason to cross registers. Never "
-        "pick an option because it is the safest or most hedged either; hedging "
-        "is not a virtue.",
+        "- RECOMMENDED PICK (READ THIS BEFORE CHOOSING): an option carrying NO "
+        "name, year or number is the default pick. Option C (the hard specific) "
+        "has to clearly beat it on delivery to win, and it only clears that bar "
+        "when the specific IS the reveal - a patent that explains the trick, not "
+        "a convention name that merely says where a thing happened. This is the "
+        "widest effect measured on this account: 125,736 median across 127 "
+        "titles carrying no specific, against 58,880 across 417 that carry one. "
+        "Do NOT pick an option because it is the most concrete, the most "
+        "factual, or carries the most specifics - that instinct is what the "
+        "number above contradicts, and a measured batch picked the specific "
+        "option in 4 of 6 reels while justifying it exactly that way. Never pick "
+        "an option because it is the safest or most hedged either; hedging is "
+        "not a virtue.",
         "- CHOOSING BETWEEN THE TWO REACTIVE OPTIONS (do not shortcut this): the "
         "question and the first-person option are BOTH strong here and neither "
         "outranks the other by default. Pick whichever one THIS clip earns. A "

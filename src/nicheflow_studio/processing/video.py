@@ -1329,11 +1329,20 @@ def detect_static_top_overlay_height(
 def _spread_timestamps(
     candidates: list[float], *, count: int, duration: float | None
 ) -> list[float]:
-    """Pick ``count`` timestamps from ``candidates``, spread across the clip.
+    """Pick ``count`` timestamps spread across the CLIP, snapping to real cuts.
 
-    Scene detection often clusters cuts (a fast cutaway and back), so taking the
-    first N would sample one busy second and miss the rest of the clip. Walking
-    evenly through the sorted candidates keeps coverage.
+    Spreading evenly through the candidate LIST is not the same as covering the
+    clip, and the gap between the two is where drafts go wrong. ffmpeg's scene
+    filter fires on camera shake, so handheld footage can put every candidate
+    inside the opening seconds; walking that list then returns ``count`` tiles
+    that all show the first shot. A two-part clip (a comparison, a setup and its
+    payoff) loses the half carrying the point, and the draft is written from
+    evidence that never showed it.
+
+    So the timeline is divided into ``count`` windows and each contributes one
+    tile: the cut nearest its centre, or the centre itself when no cut landed in
+    it. Real cuts still win wherever they exist; what is guaranteed is that the
+    last tile comes from the end of the clip.
     """
     unique: list[float] = []
     for value in sorted({round(value, 2) for value in candidates if value >= 0}):
@@ -1344,12 +1353,23 @@ def _spread_timestamps(
         if unique and value - unique[-1] < _MIN_SHEET_TILE_GAP_SECONDS:
             continue
         unique.append(value)
-    if not unique:
-        return []
-    if len(unique) <= count:
-        return unique
-    step = len(unique) / count
-    return [unique[min(int(index * step), len(unique) - 1)] for index in range(count)]
+    if not duration or duration <= 0:
+        # No known timeline to spread over, so the candidate walk is all there
+        # is. Only probe failures land here.
+        if not unique:
+            return []
+        if len(unique) <= count:
+            return unique
+        step = len(unique) / count
+        return [unique[min(int(index * step), len(unique) - 1)] for index in range(count)]
+    picked: list[float] = []
+    for index in range(count):
+        low = duration * index / count
+        high = duration * (index + 1) / count
+        centre = (low + high) / 2
+        inside = [value for value in unique if low <= value < high]
+        picked.append(min(inside, key=lambda value: abs(value - centre)) if inside else centre)
+    return sorted({round(value, 2) for value in picked})
 
 
 def build_contact_sheet(

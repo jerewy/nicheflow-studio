@@ -23,7 +23,10 @@ from nicheflow_studio.core.distribution import DEFAULT_DISTRIBUTE_DAILY_TARGET
 from nicheflow_studio.core.instagram_profile_pool import ProfilePool
 from nicheflow_studio.core.paths import downloads_dir
 from nicheflow_studio.db import assignments as assignments_db, pools
-from nicheflow_studio.db.media_library import mark_media_asset_downloaded
+from nicheflow_studio.db.media_library import (
+    BlankDownloadError,
+    mark_media_asset_downloaded,
+)
 from nicheflow_studio.processing.dedup import safe_video_fingerprint
 from nicheflow_studio.db.models import (
     Account,
@@ -142,23 +145,34 @@ def _ensure_asset_downloaded(asset_id: int) -> str | None:
         asset = session.get(MediaAsset, asset_id)
         if asset is None:
             raise PoolingError(f"Media asset {asset_id} disappeared during download.")
-        mark_media_asset_downloaded(
-            asset,
-            original_download_path=str(file_path),
-            file_size_bytes=file_path.stat().st_size,
-            content_hash=content_hash,
-        )
+        try:
+            mark_media_asset_downloaded(
+                asset,
+                original_download_path=str(file_path),
+                file_size_bytes=file_path.stat().st_size,
+                content_hash=content_hash,
+            )
+        except BlankDownloadError as exc:
+            # Transient (a stale sourcing session), not a dead reel - so the
+            # asset stays pending for the next attempt rather than being retired
+            # like a gone source. Distribution has to hear about it either way,
+            # or the slot silently fills with a black clip.
+            raise PoolingError(
+                f"Could not download this clip before distribution: {exc}"
+            ) from exc
         session.commit()
         return asset.source_shortcode
 
 
-def _unassigned_pool_item_ids(niche: str) -> list[int]:
-    """Currently unassigned accepted pool item ids for a niche (no download).
+def _distributable_pool_item_ids(niche: str) -> list[int]:
+    """Accepted pool item ids a distribute run may draw from (no download).
 
-    Excludes clips whose footage was already published by any account
-    (:func:`assignments_db.posted_media_asset_ids`): posts made before the
-    pooling layer existed have no assignment rows, so without this check
-    distribution keeps re-serving videos the network already posted.
+    Deliberately NOT filtered by "already assigned" or "already posted" any
+    more. Those are per-account questions now — a clip one account used is still
+    new to the others — and ``assignments_db.distribute_niche`` answers them
+    with the per-account hold map plus the reuse gap. Filtering here as well
+    would re-impose the network-wide rule this exists to undo, and silently:
+    the ids are handed down as ``eligible_pool_item_ids``, an intersection.
 
     Distribution ranks and assigns from these immediately; the chosen clips'
     footage is fetched off the request path by :func:`_start_background_download`
@@ -166,13 +180,7 @@ def _unassigned_pool_item_ids(niche: str) -> list[int]:
     """
     try:
         with get_session() as session:
-            already = assignments_db.assigned_pool_item_ids(session, niche)
-            posted_assets = assignments_db.posted_media_asset_ids(session)
-            return [
-                item.id
-                for item in pools.pool_items_for_niche(session, niche)
-                if item.id not in already and item.media_asset_id not in posted_assets
-            ]
+            return [item.id for item in pools.pool_items_for_niche(session, niche)]
     except ValueError as exc:
         raise PoolingError(str(exc)) from exc
 
@@ -303,6 +311,7 @@ def overview() -> dict:
                     "pooled": stats.pooled,
                     "assigned": stats.assigned,
                     "unused": stats.unused,
+                    "used": stats.used,
                     "rejected": stats.rejected,
                     "pending": stats.pending,
                     "assignments_by_account": per_account,
@@ -632,6 +641,11 @@ def niche_accounts(niche: str) -> list[dict]:
     UI can render a non-active account disabled with its status instead of
     silently omitting it. Only "active" accounts ever receive assignments
     (db/assignments.account_ids_for_niche); the status here is display-only.
+
+    Each row carries ``available``: clips in the pool THIS account has never
+    held. The pool is shared, so one number for the whole niche says nothing
+    about what any given account can still be given — Past Moments Daily had
+    1442 untouched clips on the day the niche-wide counter read 0 unused.
     """
     value = (niche or "").strip().lower()
     if value not in pools.VALID_NICHES:
@@ -645,14 +659,27 @@ def niche_accounts(niche: str) -> list[dict]:
             .order_by(Account.id.asc())
             .all()
         )
-        return [
-            {
-                "id": account.id,
-                "name": account.name,
-                "operational_status": account.operational_status or "active",
-            }
-            for account in accounts
-        ]
+        pool_items = pools.pool_items_for_niche(session, value)
+        pool_ids = {item.id for item in pool_items}
+        held_by_account = assignments_db.assigned_pool_item_ids_by_account(session, value)
+        resting = assignments_db.pool_item_ids_in_reuse_gap(session, value)
+        rows = []
+        for account in accounts:
+            held = set(held_by_account.get(account.id, ()))
+            posted_assets = assignments_db.posted_media_asset_ids(session, account.id)
+            if posted_assets:
+                held.update(
+                    item.id for item in pool_items if item.media_asset_id in posted_assets
+                )
+            rows.append(
+                {
+                    "id": account.id,
+                    "name": account.name,
+                    "operational_status": account.operational_status or "active",
+                    "available": len(pool_ids - held - resting),
+                }
+            )
+        return rows
 
 
 # Rights-confidence labels that are allowed to distribute but haven't been
@@ -773,9 +800,11 @@ def distribute_niche(
     - ``"no_ready_accounts"`` — accounts exist, but none are publish-ready
       (only with ``publish_ready_only=True``).
     - ``"all_at_cap"``   — every account already holds its target clips.
-    - ``"pool_empty"``   — all accepted clips are already assigned.
+    - ``"pool_empty"``   — every selected account has already had every accepted
+      clip, or the rest are still inside the reuse gap. NOT "the pool is empty":
+      the pool is shared, so this is a per-account verdict.
     """
-    eligible_pool_item_ids = _unassigned_pool_item_ids(niche)
+    eligible_pool_item_ids = _distributable_pool_item_ids(niche)
     with get_session() as session:
         accounts = session.query(Account).filter(Account.niche == niche).all()
         if publish_ready_only:
@@ -1265,7 +1294,7 @@ def distribute_niche_explicit(
         int(account_id): max(0, int(target))
         for account_id, target in (targets_by_account or {}).items()
     }
-    eligible_pool_item_ids = _unassigned_pool_item_ids(niche)
+    eligible_pool_item_ids = _distributable_pool_item_ids(niche)
     with get_session() as session:
         # "Distribute now" counts are ADDITIONAL clips, so the base has to be the
         # same one distribute_niche measures against. Reading a different number

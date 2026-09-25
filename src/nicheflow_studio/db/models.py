@@ -2,7 +2,17 @@ from __future__ import annotations
 
 import datetime as dt
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, UniqueConstraint, event
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    UniqueConstraint,
+    event,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from nicheflow_studio.core.engagement import source_engagement_rate
@@ -34,6 +44,18 @@ class AccountPostMetric(Base):
     saved: Mapped[int] = mapped_column(Integer, default=0)
     shares: Mapped[int] = mapped_column(Integer, default=0)
     total_interactions: Mapped[int] = mapped_column(Integer, default=0)
+    # Reach split by whether the viewer follows the account, from the Graph
+    # "reach / breakdown=follow_type" call. NULL (not 0) when the breakdown was
+    # unavailable for that post, so an unmeasured post is distinguishable from
+    # one Instagram genuinely showed to no non-followers.
+    reach_follower: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reach_non_follower: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Reel retention, in milliseconds, from ig_reels_avg_watch_time and
+    # ig_reels_video_view_total_time. NULL (not 0) when Instagram did not
+    # report it, same reason as the reach split above. total_watch_time_ms
+    # passes INT32 at roughly 270k views, so it needs SQLite's 64-bit INTEGER.
+    avg_watch_time_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_watch_time_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     conversion_score: Mapped[float] = mapped_column(Float)
     pulled_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True))
 
@@ -250,6 +272,16 @@ class ScrapeCandidate(Base):
     extractor: Mapped[str | None] = mapped_column(String(64), nullable=True)
     video_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     title: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    # The hook the SOURCE account burned into the video, read off the thumbnail
+    # by scripts/extract_history_titles.py. Distinct from `title`/`description`,
+    # which carry the scraped caption: on these accounts the caption is loose
+    # descriptive prose while the on-screen line is the actual editorial angle
+    # that earned the views ("The Breed (2006) features a scene so accidentally
+    # hilarious it completely steals the movie" against a caption reading
+    # "Fierce pursuit unleashes absolute mayhem as a woman clad in bright
+    # pink..."). Reference for the drafter, never copy: the wording would be
+    # duplicate content and the claims in it are unverified.
+    on_screen_title: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     channel_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
     published_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     description: Mapped[str | None] = mapped_column(String(8192), nullable=True)

@@ -23,6 +23,7 @@ from nicheflow_studio.db.blocklist import block_asset
 from nicheflow_studio.db.media_library import (
     find_media_asset,
     find_or_register_media_asset,
+    BlankDownloadError,
     mark_media_asset_downloaded,
 )
 from nicheflow_studio.processing.dedup import safe_video_fingerprint
@@ -243,12 +244,12 @@ def already_posted_item_ids(session) -> set[int]:
 def posted_source_video_ids(session) -> set[str]:
     """``video_id`` of every reel that has already posted from ANY account.
 
-    The same source reel can reach two accounts — the pool dedups on its own
-    items, but clips pulled in through the legacy direct-download path were
-    never pool items, so the pool had no record that another account already
-    held them. Posting one reel from two accounts in the same network is a
-    footprint risk, so the batch screen uses this to skip a clip whose footage
-    is already out, whichever account published it.
+    Network-wide, so it answers "is this footage out anywhere". Since the pool
+    became shared per account (``assignments.MIN_REUSE_GAP_DAYS``) that is no
+    longer the question the drafting surfaces ask — a clip a sibling posted is
+    legitimately on its way out again here — so they use
+    :func:`posted_source_video_ids_by_account` instead. Kept for callers that
+    really do mean the whole network.
     """
     posted = already_posted_item_ids(session)
     if not posted:
@@ -262,6 +263,32 @@ def posted_source_video_ids(session) -> set[str]:
         ).all()
         if video_id
     }
+
+
+def posted_source_video_ids_by_account(session) -> dict[int, set[str]]:
+    """``account_id -> video_ids that account has already posted``.
+
+    One account must never post the same footage twice — including through the
+    legacy direct-download path, whose clips were never pool items and so carry
+    no assignment row to catch it. A SIBLING account posting it is a different
+    matter and is spaced by the reuse gap, not blocked here.
+
+    Built in one query rather than per account: the drafting screen asks this
+    for every account in the niche on every refresh.
+    """
+    posted = already_posted_item_ids(session)
+    if not posted:
+        return {}
+    by_account: dict[int, set[str]] = {}
+    for account_id, video_id in session.execute(
+        select(DownloadItem.account_id, DownloadItem.video_id)
+        .where(DownloadItem.id.in_(posted))
+        .where(DownloadItem.video_id.is_not(None))
+        .where(DownloadItem.account_id.is_not(None))
+    ).all():
+        if video_id:
+            by_account.setdefault(account_id, set()).add(video_id)
+    return by_account
 
 
 def list_items(account_id: int | None = None, limit: int = _LIST_LIMIT) -> list[dict]:
@@ -630,9 +657,23 @@ def ensure_item_downloaded(item_id: int, *, downloader=None, progress=None) -> d
             asset, _ = find_or_register_media_asset(
                 session, source_url=source_url, shortcode=shortcode, platform="instagram"
             )
-            mark_media_asset_downloaded(
-                asset, original_download_path=file_path, content_hash=content_hash
-            )
+            try:
+                mark_media_asset_downloaded(
+                    asset,
+                    original_download_path=file_path,
+                    file_size_bytes=Path(file_path).stat().st_size,
+                    content_hash=content_hash,
+                )
+            except BlankDownloadError as exc:
+                # NOT SessionExpiredError: the June 2026 batch proved the common
+                # cause is a junk source post (Apify had already measured those
+                # 24 at 1 second), and sending the user to re-login over a clip
+                # that is genuinely blank wastes a session rotation.
+                raise LibraryError(
+                    f"This clip's original isn't usable video: {exc} Check the post "
+                    "on Instagram — if it really is a blank or 1-second clip, "
+                    "reject it."
+                ) from exc
             for row in session.scalars(select(DownloadItem).where(DownloadItem.source_url == source_url)).all():
                 if row.file_path is None:
                     row.file_path = file_path

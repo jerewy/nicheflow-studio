@@ -1171,13 +1171,16 @@ def test_historytrails_title_rules_require_two_reactive_options() -> None:
     rules = smart_drafts._historytrails_title_rules()
     joined = "\n".join(rules)
 
-    # Two of three options must be reactive, not one. Scoring the 726-title
-    # reference set put questions at 187k median views against 73k for the rest
-    # and first-person at 95k, so the museum-label declarative is the weakest of
-    # the three registers and must not hold the majority of the options.
+    # The requirement is scoped to where register actually pays. Among titles
+    # carrying a name/year/number, reactive reaches 81,220 against 58,880 flat
+    # (1.4x); among titles carrying none the two are within noise (132,162 vs
+    # 125,736). So option C MUST be reactive and option A need not be. It used
+    # to demand TWO of three, which the A/B/C structure cannot produce - a
+    # measured batch came back 1/3 reactive on all six reels as a result.
     assert "REGISTER MIX" in joined
-    assert "TWO of the three options in a REACTIVE" in joined
-    assert "only ONE as a calm documentary line" in joined
+    assert "option B is REACTIVE" in joined
+    assert "MUST ALSO be reactive" in joined
+    assert "TWO of the three options in a REACTIVE" not in joined
     # The sanctioned reactive shapes are spelled out.
     assert "a real question" in joined
     assert "nostalgia prompt" in joined
@@ -1219,10 +1222,14 @@ def test_historytrails_recommender_leads_on_register_not_concreteness() -> None:
     # that line's wording. Concreteness must not be able to outrank register.
     joined = "\n".join(smart_drafts._historytrails_title_rules())
 
-    assert "a REACTIVE option is the default pick" in joined
-    assert "concreteness is a tiebreaker inside a register" in joined
-    assert "never a reason to cross registers" in joined
+    # Stronger than before: the default pick is now the option carrying NO
+    # name, year or number (125,736 median against 58,880), because a later
+    # batch picked the specific option in 4 of 6 reels and justified each one
+    # on concreteness.
+    assert "carrying NO" in joined and "is the default pick" in joined
+    assert "Do NOT pick an option because it is the most concrete" in joined
     assert "whose specific this clip delivers most strongly" not in joined
+    assert "a REACTIVE option is the default pick" not in joined
     # Loosening the voice must not loosen fact or clickbait discipline.
     assert "no invented facts" in joined
     assert "you won't believe" in joined
@@ -1240,7 +1247,11 @@ def test_historytrails_title_rules_do_not_mandate_hard_specifics() -> None:
 
     assert "At least TWO options must carry a hard specific" not in joined
     assert "Do NOT open with 'When ...'" in joined
-    assert "never reach for one to satisfy a quota" in joined
+    # The rules no longer merely permit dropping a hard specific, they make it
+    # the default: carrying none measured 125,736 median against 58,880 with.
+    assert "BE CLEAR, NOT SPECIFIC" in joined
+    assert "never as scene-setting furniture" in joined
+    assert "At least one of A and B must contain no name, year or number" in joined
 
 
 def test_history_title_rules_ban_artifact_narration_with_thin_evidence_fallback() -> None:
@@ -2992,7 +3003,293 @@ def test_historytrails_recommender_does_not_rank_question_above_first_person() -
     assert "neither outranks the other by default" in joined
     assert "Do NOT default to the question every time" in joined
     assert "do NOT keep recommending the same option NUMBER" in joined
-    # The 187k figure rests on 18 titles; the prompt must say so where it is
-    # quoted, or it reads as law rather than as a prior.
-    assert "just 18 measured titles" in joined
-    assert "roughly equal rather than" in joined
+    # The question figure rests on a tiny sample; the prompt must say so where
+    # it is quoted, or it reads as law rather than as a prior. The caveat now
+    # lives in the reaction-statement block that supersedes it.
+    assert "rests on 20 titles" in joined
+    assert "too wide to rank against" in joined
+
+
+def _register_mix_drafts(titles: list[str], label: str = "first") -> smart_drafts.SmartDrafts:
+    return smart_drafts.SmartDrafts(
+        summary="s",
+        title_options=list(titles),
+        caption_options=["c"],
+        provider_label=label,
+    )
+
+
+# The exact shape of a real miss: three calm documentary declaratives, which is
+# what a measured batch of six reels produced for all 18 options.
+_ALL_DOCUMENTARY = [
+    "German boy soldier surrenders to American troops as World War Two ends.",
+    "American troops expected resistance in the spring of 1945 and found a boy instead.",
+    "1945, and a German boy soldier raises his hands to end the war.",
+]
+# The A/B/C shape: a scene description carrying no checkable claim, a reactive
+# line carrying none either, and the hard specific in a reactive voice. The
+# third slot used to be a flat documentary line with a name in it, which is the
+# one shape that loses on both measured levers at once.
+_COMPLIANT = [
+    "A boy in an oversized uniform walks toward the other side with his hands already up.",
+    "We were never shown this side of the war's last weeks.",
+    "Nobody talks about how young the German soldiers were by 1945.",
+]
+
+
+def test_register_mix_regenerates_when_no_option_is_reactive() -> None:
+    calls: list[int] = []
+
+    def regenerate() -> smart_drafts.SmartDrafts:
+        calls.append(1)
+        return _register_mix_drafts(_COMPLIANT, "retry")
+
+    result = smart_drafts._enforce_register_mix(
+        _register_mix_drafts(_ALL_DOCUMENTARY),
+        title_style="historytrails_record",
+        regenerate=regenerate,
+    )
+
+    assert len(calls) == 1
+    assert result.provider_label == "retry"
+    assert result.generation_meta["register_mix_first_attempt"] == 0
+    assert result.generation_meta["register_mix_reactive"] == 2
+
+
+def test_register_mix_spends_no_retry_when_the_mix_is_already_right() -> None:
+    def regenerate() -> smart_drafts.SmartDrafts:  # pragma: no cover - must not be called
+        raise AssertionError("should not regenerate a compliant result")
+
+    result = smart_drafts._enforce_register_mix(
+        _register_mix_drafts(_COMPLIANT),
+        title_style="historytrails_record",
+        regenerate=regenerate,
+    )
+    assert result.generation_meta["register_mix_retried"] is False
+
+
+def test_register_mix_only_applies_to_styles_carrying_the_rule() -> None:
+    def regenerate() -> smart_drafts.SmartDrafts:  # pragma: no cover - must not be called
+        raise AssertionError("cinema_hook has no register mix rule to enforce")
+
+    result = smart_drafts._enforce_register_mix(
+        _register_mix_drafts(_ALL_DOCUMENTARY),
+        title_style="cinema_hook",
+        regenerate=regenerate,
+    )
+    assert result.generation_meta is None
+
+
+def test_register_mix_keeps_a_usable_result_when_the_retry_fails() -> None:
+    """An off-register real title beats dropping through to the local fallback."""
+
+    def regenerate() -> smart_drafts.SmartDrafts:
+        raise RuntimeError("groq 429")
+
+    result = smart_drafts._enforce_register_mix(
+        _register_mix_drafts(_ALL_DOCUMENTARY),
+        title_style="historytrails_record",
+        regenerate=regenerate,
+    )
+    assert result.title_options == _ALL_DOCUMENTARY
+    assert result.generation_meta["register_mix_retry_error"] == "groq 429"
+
+
+def test_register_mix_retry_can_only_improve_the_result() -> None:
+    """A retry that scores lower on BOTH levers is discarded.
+
+    Scoring is (unspecific, reactive) in that order, so a retry that wins back
+    an option free of a hard specific legitimately beats the first attempt even
+    if it loses register - the specificity gap is 2.1x against 1.4x. To test the
+    discard path the retry has to be worse on both.
+    """
+    partial = [_COMPLIANT[0]] + _ALL_DOCUMENTARY[:2]
+
+    def regenerate() -> smart_drafts.SmartDrafts:
+        # Every option names someone and none is reactive: (0, 0).
+        return _register_mix_drafts(
+            [
+                "Berlin fell in 1945 to the Allied advance.",
+                "Churchill spoke to Parliament that evening.",
+                "Roosevelt had died in April 1945.",
+            ],
+            "worse",
+        )
+
+    assert smart_drafts._unspecific_option_count(partial) == 1
+    result = smart_drafts._enforce_register_mix(
+        _register_mix_drafts(partial),
+        title_style="historytrails_record",
+        regenerate=regenerate,
+    )
+    assert result.provider_label == "first"
+    assert result.generation_meta["register_mix_unspecific"] == 1
+
+
+def test_reactive_detection_recognises_reaction_statements() -> None:
+    """Real winners that the four-bucket classifier does NOT call reactive.
+
+    "Greatest face reveal of all time" (4.8M views) lands in classify_register's
+    short_label bucket and "The level of disrespect was crazy" (4.9M) in
+    documentary, so scoring reactive-ness with that classifier counted a good
+    batch as zero reactive and spent a retry on it.
+    """
+    for title in (
+        "The level of disrespect was crazy.",
+        "Greatest face reveal of all time",
+        "Smart guy finally cracked the Turkish ice cream hack",
+        "Japanese people trying to pronounce refrigerator will make your day",
+        "We all tried this lean as kids and none of us had the shoes for it.",
+        "How young were the soldiers Germany was still sending out in 1945?",
+    ):
+        assert smart_drafts._is_reactive_title(title), title
+
+
+def test_reactive_detection_still_rejects_plain_documentary_lines() -> None:
+    for title in (
+        "German boy soldier surrenders to American troops as World War Two ends.",
+        "Smooth Criminal's lean used wires on film and a patented shoe onstage.",
+        "Ancient romans used lewis tools",
+        "A psychiatrist at the 2006 APA convention admitted she had cured one patient.",
+    ):
+        assert not smart_drafts._is_reactive_title(title), title
+
+
+def test_reaction_word_patterns_carry_no_control_characters() -> None:
+    r"""Guards the escaping bug that made these regexes match nothing.
+
+    A backspace (0x08) reached the source in place of the \b word-boundary
+    escape, so the compiled pattern was "<BS>(crazy|...)<BS>" and every title
+    scored non-reactive while still compiling and passing import.
+    """
+    for pattern in (smart_drafts._REACTION_WORDS, smart_drafts._PERSONAL_VOICE):
+        assert "\x08" not in pattern.pattern
+        assert pattern.pattern.startswith(r"\b")
+
+
+def test_hard_specific_detection() -> None:
+    """Names, years and numbers are the 2.1x lever; scene descriptions are not."""
+    for title in (
+        "At the 2006 APA Convention, one psychiatrist after another is asked.",
+        "Michael Jackson never actually defied gravity, and the shoes are the reason.",
+        "In 1945, a German boy soldier raises his hands.",
+        "Jim Clyburn stepped in and took the baby.",
+    ):
+        assert smart_drafts._carries_hard_specific(title), title
+    for title in (
+        "A baby goat started pushing against a cat, but the critter thought it was getting cuddles.",
+        "Psychiatrists when asked how many patients have they cured.",
+        "The day a cockroach got into the room and this paraplegic cat learned to run",
+        "We never think to ask a psychiatrist how many people they have actually cured.",
+    ):
+        assert not smart_drafts._carries_hard_specific(title), title
+
+
+def test_mix_regenerates_when_every_option_carries_a_hard_specific() -> None:
+    """Register alone is not enough: the specificity gap is the wider effect."""
+    all_specific = [
+        "How did Michael Jackson lean past the point where anyone should fall?",
+        "We all tried the Michael Jackson lean and none of us had the shoes.",
+        "Michael Jackson patented the boot in 1993.",
+    ]
+    better = [
+        "A dancer leans past the point where anyone should fall, and never touches the floor.",
+        "We all tried this as kids and none of us had the shoes for it.",
+        "Michael Jackson patented the boot in 1993.",
+    ]
+    calls: list[int] = []
+
+    def regenerate() -> smart_drafts.SmartDrafts:
+        calls.append(1)
+        return _register_mix_drafts(better, "retry")
+
+    # Two reactive options, so the register rule alone would have passed.
+    assert smart_drafts._reactive_option_count(all_specific) >= 2
+    result = smart_drafts._enforce_register_mix(
+        _register_mix_drafts(all_specific),
+        title_style="historytrails_record",
+        regenerate=regenerate,
+    )
+    assert len(calls) == 1
+    assert result.provider_label == "retry"
+    assert result.generation_meta["register_mix_first_unspecific"] == 0
+    assert result.generation_meta["register_mix_unspecific"] >= 1
+
+
+def test_mix_passes_when_both_levers_are_satisfied() -> None:
+    titles = [
+        # A: scene description, no checkable claim.
+        "A baby goat pushed against a cat, but the critter thought it was getting cuddles.",
+        # B: reactive, no checkable claim.
+        "We were not ready for how that ended.",
+        # C: the hard specific, for the case where the fact is the story.
+        "Nobody expected Michael Jackson to patent the boot in 1993.",
+    ]
+
+    def regenerate() -> smart_drafts.SmartDrafts:  # pragma: no cover
+        raise AssertionError("should not regenerate a compliant set")
+
+    result = smart_drafts._enforce_register_mix(
+        _register_mix_drafts(titles),
+        title_style="historytrails_record",
+        regenerate=regenerate,
+    )
+    assert result.generation_meta["register_mix_retried"] is False
+    assert result.generation_meta["register_mix_unspecific"] >= 1
+
+
+def test_title_rules_require_the_title_to_match_the_clip_scope() -> None:
+    """Regression: a three-psychiatrist compilation got a singular title.
+
+    The source title ("A female psychiatrist ... how many patients SHE has
+    cured") is one account's hook for the same footage and covers only the first
+    subject. The evidence names all three; the model anchored on the source
+    title and wrote "a psychiatrist was asked how many patients she had cured",
+    throwing away the pattern that is the whole point of the clip. The rules
+    must state that the source title can be narrower than the clip.
+    """
+    joined = "\n".join(smart_drafts._historytrails_title_rules())
+
+    assert "SCOPE (HARD RULE)" in joined
+    assert "must NOT collapse it to one of them" in joined
+    assert "not against the source title" in joined
+
+
+def test_hard_specific_detection_catches_a_name_that_opens_the_title() -> None:
+    """Position 0 is capitalised by grammar, so a name there needs a 2nd signal.
+
+    Skipping position 0 outright missed "Spider-Man realizes..." and made a
+    measured batch look cleaner than it was. Counting it unconditionally is
+    worse: it read "Passengers line up...", "Rush hour...", "Commuters stand..."
+    as names and flagged 33.8% of all posted titles against 13.7% for this rule.
+    """
+    for title in (
+        "Spider-Man realizes his own hands just changed",
+        "Michael Jackson made a stadium go silent",
+        "Gregory Peck pulls his hand back from the Mouth of Truth",
+    ):
+        assert smart_drafts._carries_hard_specific(title), title
+    for title in (
+        "Passengers line up on colored floor markings as a red train glides in",
+        "Rush hour here looks nothing like ours",
+        "Commuters stand lined up on a busy platform",
+        "A woman in bright pink loses her footing on the stairs",
+    ):
+        assert not smart_drafts._carries_hard_specific(title), title
+
+
+def test_option_c_rule_demands_a_reactive_voice_and_warns_off_names() -> None:
+    """A flat documentary line carrying a specific is the worst measured shape.
+
+    A real 18-reel batch produced 10 such options, so the requirement moved out
+    of REGISTER MIX and into the A/B/C block that defines the structure.
+    """
+    joined = "\n".join(smart_drafts._historytrails_title_rules())
+
+    assert "C MUST BE WRITTEN IN A REACTIVE VOICE" in joined
+    assert "58,880" in joined and "81,220" in joined
+    # The naming instinct is explicitly contradicted: named people measured
+    # WORSE than dates (55,910 against 69,784), which is counter-intuitive
+    # enough that the prompt has to say so or the model reaches for the name.
+    assert "a named person is NOT a safer specific than a date" in joined
+    assert "55,910" in joined

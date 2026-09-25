@@ -5,18 +5,33 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import os
 import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
+from sqlalchemy.orm import object_session
 
 from nicheflow_studio.core.paths import processed_dir
-from nicheflow_studio.db.models import Account, DownloadItem, DraftRevision
+from nicheflow_studio.db.models import (
+    ScrapeCandidate,
+    Account,
+    DownloadItem,
+    DraftRevision,
+    UploadJob,
+)
 from nicheflow_studio.db.post_metrics import top_titles_for_account
 from nicheflow_studio.db.session import get_session
-from nicheflow_studio.processing import draft_guard, smart_drafts, video
+from nicheflow_studio.processing import (
+    draft_guard,
+    on_screen_hook,
+    smart_drafts,
+    title_lab,
+    transcription,
+    video,
+)
 from nicheflow_studio.services import draft_generation, draft_revisions, export as export_svc
 from nicheflow_studio.services.draft_revisions import DraftRevisionDTO, DraftRevisionError
 from nicheflow_studio.services.export import ExportError
@@ -118,6 +133,17 @@ def _resolve_caption_references(captions: list[str]) -> list[str]:
 # the setting says, so switching modes never strands a reply already in flight.
 # The selectable labels live in processing_workflow.CAPTION_MODES; only the raw
 # values are needed here (same arrangement as title_length).
+# The title style that swaps in the v2 rulebook. Selectable in the Processing
+# screen's Title Style dropdown (processing_workflow.TITLE_STYLES) so the two
+# rule sets can be A/B'd per account without a code change; every other style
+# keeps the historytrails/cinematic blocks it has always used.
+TITLE_STYLE_BEATS_V2 = "beats_v2"
+# v3 is v2 with ONE wording rule changed: a title may state the fact plainly and
+# end on a reaction only that clip could earn, instead of always withholding the
+# reveal. Its own style value rather than a flag on v2, so switching one account
+# to it is a real A/B and the rest keep the rules they are measured under.
+TITLE_STYLE_BEATS_V3 = "beats_v3"
+
 CAPTION_MODE_SHARED = "shared"
 CAPTION_MODE_PER_OPTION = "per_option"
 
@@ -352,7 +378,7 @@ def _field_disambiguation_lines(
             "Title Option and Caption Option are TWO DIFFERENT texts for each option, "
             "never the same words twice:",
             "- Title Option N is the on-screen overlay line from the on-screen title "
-            "rules above (one sentence; its length follows the AUTO MIX bands).",
+            "rules above (one sentence, inside the character ceiling in those rules).",
             f"- Caption Option N is the Instagram description from the caption rules "
             f"above: about {word_target} words, in the exact paragraph structure those "
             "caption rules specify. Writing toward the upper end of that range beats "
@@ -369,7 +395,7 @@ def _field_disambiguation_lines(
         "Title Option and Shared Caption are TWO DIFFERENT texts, never the same "
         "words twice:",
         "- Title Option N is the on-screen overlay line from the on-screen title "
-        "rules above (one sentence; its length follows the AUTO MIX bands). Write "
+        "rules above (one sentence, inside the character ceiling in those rules). Write "
         "THREE of these, meaningfully different from each other.",
         f"- Shared Caption is the ONE Instagram description from the caption rules "
         f"above: about {word_target} words, in the exact paragraph structure those "
@@ -416,6 +442,15 @@ _WEB_RESEARCH_LINES = [
     "NOT describe the recording itself; write from the visible scene per the "
     "thin-evidence rules above, or ask the user for a one-line description if "
     "even the scene is unclear.",
+    "- If the source caption CONTRADICTS the footage (it names a period, person, "
+    "or event the frames cannot show), drop the caption and write from the "
+    "visible scene, noting the mismatch in the selection note. NEVER write that "
+    "finding into a Title Option or the caption text: the title is burned onto "
+    "the video and the viewer has no access to the source caption, so a line "
+    "like 'the caption attached to this clip is wrong' is unpostable, and the "
+    "importer rejects a reel whose every title reads that way. When even the "
+    "visible scene will not carry a title, write NO options for that reel and "
+    "say so in one plain line instead.",
 ]
 
 # Explicit verify-and-prune step: tighten green-tier (drop/soften unsupported
@@ -465,6 +500,12 @@ _SOURCE_CAPTION_GUIDANCE = [
 
 def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
     settings = settings or {}
+    # Same first step as the batch path (see batch_frames): read the source's
+    # burned-in hook before the builder below looks for one. Local OCR, no
+    # quota, and a no-op once a reel has a hook or when its file is gone. Until
+    # this ran here, the one-click path was the only prompt that could go out
+    # with no visual grounding at all.
+    _ensure_on_screen_hooks([item_id])
     with get_session() as session:
         item = session.get(DownloadItem, item_id)
         if item is None:
@@ -476,6 +517,7 @@ def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
         few_shot_winners = top_titles_for_account(account_key) if account_key else []
         caption_outro = draft_generation.caption_outro_for_account(account)
         caption_voice = _caption_rule_voice(account)
+        hook_lines = _on_screen_hook_lines(item)
         fields = [
             f"Account: {account.name if account else '(none)'}",
             f"Niche: {niche_label or '(none)'}",
@@ -485,23 +527,52 @@ def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
             f"Banned phrases: {account.banned_phrases if account and account.banned_phrases else '(none)'}",
             f"Title rules: {account.title_style_notes if account and account.title_style_notes else '(none)'}",
             f"Caption rules: {account.caption_style_notes if account and account.caption_style_notes else '(none)'}",
-            f"Source title: {item.title or '(none)'}",
+            f"Scraped caption line (loose descriptive prose from the repost, NOT their hook - context only, often narrower than the clip, and never a model for the title): {item.title or '(none)'}",
             f"Source URL: {item.source_url or '(none)'}",
             f"Source description: {item.source_description or '(none)'}",
+            *hook_lines,
         ]
-        transcript = (item.transcript_text or "").strip() or "(none; inspect the local video)"
-        vision_text = (item.smart_vision_payload or "").strip() or "(none)"
-    caption_style = settings.get("caption_style") or None
+        transcript_text = (item.transcript_text or "").strip()
+        vision_raw = (item.smart_vision_payload or "").strip()
+        clip_premise = str(settings.get("clip_premise") or "").strip()
+        # Does this reel say anything at all about itself? A chat assistant
+        # cannot open the local path, so one with every field empty arrives
+        # blind and the only honest reply it can give is to ask what is in the
+        # clip. Item 2371 went out that way: Apify returned a metadata-less row
+        # in June, nothing downstream filled it, and the copied prompt read
+        # "(none)" on every context line. The batch path cannot hit this - it
+        # runs the vision pass and attaches a contact sheet - so the guard is
+        # only on this one.
+        has_signal = any(
+            (
+                (item.title or "").strip(),
+                (item.source_description or "").strip(),
+                transcript_text,
+                vision_raw,
+                bool(hook_lines),
+                clip_premise,
+            )
+        )
+        transcript = transcript_text or "(none; inspect the local video)"
+        vision_text = vision_raw or "(none)"
+    if not has_signal:
+        raise DraftRevisionError(
+            "This reel has no caption, description, transcript, on-screen hook or "
+            "visual evidence, so the prompt would say nothing about the clip and a "
+            "chat assistant cannot open the local file. Use Prepare batch instead "
+            "(it runs the vision pass and writes a contact sheet to attach), or "
+            "describe the clip in Clip premise first."
+        )
+    title_style, caption_style, title_length = _resolved_styles(account, settings)
     caption_mode = _caption_mode(settings)
-    title_style = settings.get("title_style") or None
     # Same rule source as the live Groq prompt (see effective_title_rules
     # docstring) so the chat path and the API path never drift apart.
-    title_rules = smart_drafts.effective_title_rules(
+    title_rules = _effective_title_rules(
         title_style,
         caption_style,
         niche_label,
         few_shot_winners=few_shot_winners,
-        title_length=settings.get("title_length") or "long",
+        title_length=title_length,
     )
     hook_rules = smart_drafts._hook_drama_and_fact_safety_rules()
     # Same source as the live CAPTION block so caption length/structure can't
@@ -521,9 +592,7 @@ def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
             "Account and source context:",
             *fields,
             f"Clip premise / user direction: {settings.get('clip_premise') or '(none)'}",
-            f"Caption style: {settings.get('caption_style') or '(none)'}",
-            f"Title style: {settings.get('title_style') or 'Auto (match caption style)'}",
-            f"Title length: {(settings.get('title_length') or 'long').title()}",
+            *_style_header_lines(title_style, caption_style, title_length),
             f"Processing template: {settings.get('template') or '(none)'}",
             "",
             "Visual evidence JSON (from an earlier vision pass; empty means no pass ran):",
@@ -736,7 +805,7 @@ def _clip_title_prompt_parts(
     few_shot_winners = top_titles_for_account(account_key) if account_key else []
     resolved_style = title_style or prefs.get("prompt_title_style") or None
     resolved_length = title_length or prefs.get("title_length") or "long"
-    title_rules = smart_drafts.effective_title_rules(
+    title_rules = _effective_title_rules(
         resolved_style,
         None,
         niche_label,
@@ -752,7 +821,11 @@ def _clip_title_prompt_parts(
         "Account context:",
         *fields,
         f"Title style: {resolved_style or 'Auto'}",
-        f"Title length: {str(resolved_length).title()}",
+        *(
+            []
+            if resolved_style == TITLE_STYLE_BEATS_V2
+            else [f"Title length: {str(resolved_length).title()}"]
+        ),
         "",
         f"Source video title: {source_title or '(unknown)'}",
     ]
@@ -889,15 +962,22 @@ def parse_clip_batch_titles(text: str) -> dict[int, PastedDraft]:
     return parsed
 
 
-def _batch_item_delimiter(index: int, seq: int | None) -> str:
+def _batch_item_delimiter(index: int, seq: int | None, account_name: str | None = None) -> str:
     # Header carries the reel number (which models reproduce reliably) plus the
     # account-relative "#id" the user sees in the list. Import prefers the #id
     # when it survives and falls back to the reel number otherwise, and it
     # validates the #id against this batch — so a dropped or garbled id never
     # misroutes (the failure that retired the older id-in-header scheme).
+    # The account name rides AFTER the closing "=====" on purpose. _REEL_HEADER
+    # already tolerates trailing text there, so routing still keys off the (#id)
+    # even if a model paraphrases or drops the name - it is a label for the
+    # operator matching a prepared row to the chat window it belongs to, never a
+    # routing key. Putting it INSIDE the bars ("REEL 1 (#401) Beneath History
+    # =====") does not parse.
+    suffix = f" {account_name}" if account_name else ""
     if seq is not None:
-        return f"===== REEL {index} (#{seq}) ====="
-    return f"===== REEL {index} ====="
+        return f"===== REEL {index} (#{seq}) ====={suffix}"
+    return f"===== REEL {index} ====={suffix}"
 
 
 # Every prompt on this path carries a style-specific "RECOMMENDED PICK" rule
@@ -909,11 +989,26 @@ def _batch_item_delimiter(index: int, seq: int | None) -> str:
 # strongest concrete signal", which is the global line's wording, not the style
 # rule's. The header now defers instead of instructing, so the style rule is the
 # only voice on this decision.
+# An objection used to have nowhere to go. The block contract says "one block per
+# reel, one for every reel" and forbids skipping, but named no way to REGISTER a
+# problem, so a model with a real one (a source caption that misidentifies
+# somebody, a clip it thinks is off-niche or unsafe) answered in prose outside the
+# format instead. The block vanished, the import reported "1 unmatched", and the
+# reel reached Finish Batch with no draft, where it exports under its raw scraped
+# caption. A concern must cost a line inside the block, never the block.
+_CONCERN_ESCAPE_HATCH = (
+    "If you have a problem with a reel (the source caption looks wrong, the "
+    "footage does not support the story, or the clip seems off-niche), still "
+    "return its block and put the problem on a 'Concern:' line inside it. You "
+    "may write no options for that reel; the operator reads Concern lines and "
+    "rejects those reels. A missing block is worse, because the reel reaches "
+    "export with its raw scraped caption as the on-screen title."
+)
+
 _RECOMMENDER_DEFERRAL = (
     "Recommend one option per reel using the RECOMMENDED PICK rule in the "
-    "on-screen title rules above; that rule is tuned per account and overrides "
-    "any instinct to pick the most factual or most hedged option. Add one short "
-    "selection note per option."
+    "on-screen title rules above; that rule is tuned per account. Only options "
+    "the evidence supports are eligible. Add one short selection note per option."
 )
 
 # The title rules police variety WITHIN a reel's three options, and nothing used
@@ -965,8 +1060,18 @@ _VISUAL_EVIDENCE_GUIDANCE = [
     "meme format the clip depends on. Use them; do not guess a different one.",
     "- 'confidence' and 'uncertainty_notes' bound how specific you may be. On low "
     "confidence, stay with what the source caption supports.",
-    "- When the JSON is '(none)', there was no vision pass for that reel: work from "
-    "the source caption and any attached frame, and stay more conservative.",
+    # This used to end "and stay more conservative", which fired on EVERY reel:
+    # the vision pass is Groq-backed, no key is configured, and 0 of 185 items on
+    # the live account carry a payload. So the prompt was issuing a blanket
+    # instruction to hedge on 100% of clips, while the contact sheet and the
+    # source's own OCR'd hook sat in the same block as real evidence. Timid
+    # output was being asked for, not merely tolerated.
+    "- When the JSON is '(none)', no vision pass ran for that reel. That is the "
+    "normal case, not a degraded one, and it is NOT a reason to write timidly: "
+    "the attached contact sheet, the source caption, and the source account's "
+    "own on-screen hook when one is given are real evidence. Be conservative "
+    "about SPECIFICS the evidence cannot carry. Do not be conservative about the "
+    "writing.",
 ]
 
 
@@ -981,19 +1086,20 @@ def _account_prompt_header(
     caption_mode = _caption_mode(settings)
     account_key = account.instagram_handle if account is not None else None
     few_shot_winners = top_titles_for_account(account_key) if account_key else []
-    title_rules = smart_drafts.effective_title_rules(
-        settings.get("title_style") or None,
-        settings.get("caption_style") or None,
+    title_style, caption_style, title_length = _resolved_styles(account, settings)
+    title_rules = _effective_title_rules(
+        title_style,
+        caption_style,
         niche_label,
         few_shot_winners=few_shot_winners,
-        title_length=settings.get("title_length") or "long",
+        title_length=title_length,
     )
     hook_rules = smart_drafts._hook_drama_and_fact_safety_rules()
     # Same source as the live CAPTION block (see effective_caption_rules); the
     # batch path used to emit only a bare "Caption style:" token, so the web
     # model had no length/structure target and returned one-line captions.
     caption_rules = smart_drafts.effective_caption_rules(
-        settings.get("caption_style") or None,
+        caption_style,
         account_voice=_caption_rule_voice(account),
     )
     return [
@@ -1022,9 +1128,7 @@ def _account_prompt_header(
         f"Title rules: {account.title_style_notes if account and account.title_style_notes else '(none)'}",
         f"Caption rules: {account.caption_style_notes if account and account.caption_style_notes else '(none)'}",
         f"Clip premise / user direction: {settings.get('clip_premise') or '(none)'}",
-        f"Caption style: {settings.get('caption_style') or '(none)'}",
-        f"Title style: {settings.get('title_style') or 'Auto (match caption style)'}",
-        f"Title length: {(settings.get('title_length') or 'long').title()}",
+        *_style_header_lines(title_style, caption_style, title_length),
         f"Processing template: {settings.get('template') or '(none)'}",
         f"Number of reels in this batch: {len(item_ids)}",
         "",
@@ -1061,11 +1165,14 @@ def _account_prompt_header(
         "",
         "Return one block per reel, one for every reel, in order.",
         "START each reel's block with its own header line that is exactly:",
-        "===== REEL <n> (#<id>) =====",
-        "copying BOTH the reel number and the (#id) exactly as shown in that reel's "
-        "context below (for example '===== REEL 1 (#143) ====='). The (#id) is how the "
-        "app files each reply to the correct video, so never change, drop, or invent it.",
+        "===== REEL <n> (#<id>) ===== <account name>",
+        "copying the whole line exactly as shown in that reel's context below (for "
+        "example '===== REEL 1 (#143) ===== Past Moments Daily'). The (#id) is how the "
+        "app files each reply to the correct video, so never change, drop, or invent it. "
+        "The account name after the bars is what lets a human tell which batch this "
+        "reply belongs to, so echo it too.",
         "Do not rename, renumber, merge, or skip any reel, even if two clips look similar.",
+        _CONCERN_ESCAPE_HATCH,
         "",
         "Niche fit check (per reel, MANDATORY): compare the clip's actual subject to "
         f"the account niche ('{niche_label or 'none set'}'). Directly under the reel's "
@@ -1087,6 +1194,19 @@ def _account_prompt_header(
     ]
 
 
+def _item_account_name(item: DownloadItem) -> str | None:
+    """The item's account name, for labelling its reel header.
+
+    Uses the item's own session so this adds no connection handling to callers,
+    exactly like ``_on_screen_hook_lines`` above.
+    """
+    session = object_session(item)
+    if session is None or item.account_id is None:
+        return None
+    account = session.get(Account, item.account_id)
+    return (account.name or None) if account else None
+
+
 def _batch_item_context(index: int, item: DownloadItem, seq: int | None) -> list[str]:
     """One reel's context block.
 
@@ -1102,15 +1222,16 @@ def _batch_item_context(index: int, item: DownloadItem, seq: int | None) -> list
     vision_text = (item.smart_vision_payload or "").strip()
     frame_name = f"reel_{index}_item{item.id}.jpg"
     return [
-        _batch_item_delimiter(index, seq),
+        _batch_item_delimiter(index, seq, _item_account_name(item)),
         *(
             []
             if vision_text
             else [f"Attach and inspect image file: {frame_name} {_CONTACT_SHEET_HINT}"]
         ),
-        f"Source title: {item.title or '(none)'}",
+        f"Scraped caption line (loose descriptive prose from the repost, NOT their hook - context only, often narrower than the clip, and never a model for the title): {item.title or '(none)'}",
         f"Source URL: {item.source_url or '(none)'}",
         f"Source description: {item.source_description or '(none)'}",
+        *_on_screen_hook_lines(item),
         "",
         "Visual evidence JSON:",
         vision_text[:4000] or "(none)",
@@ -1191,19 +1312,224 @@ def _account_voice_delta(account: Account | None, *, item_count: int) -> list[st
     ]
 
 
+def _on_screen_hook_lines(item: DownloadItem) -> list[str]:
+    """The source account's own burned-in hook, when we have OCR'd it.
+
+    This is the single most useful line in the block and it was missing until
+    now. The scraped caption is descriptive prose, so a drafter working from it
+    alone writes a description: a real batch produced "A woman in bright pink
+    loses her footing on the stairs as the dog behind her closes the gap" while
+    the source's own on-screen line for the same clip read "The Breed (2006)
+    features a scene so accidentally hilarious it completely steals the movie".
+    One describes the footage, the other says why it is worth watching.
+
+    Framed as an angle to match and NOT a text to copy, for three reasons: the
+    same clip under the same wording is a duplicate-content signal, the claims
+    in it are the reposter's and unverified (see the asserted_signals_text
+    channel in draft_guard), and five accounts posting one reel under one hook
+    would be indistinguishable.
+
+    Returns [] when the reel has no OCR'd title, which is most of them today
+    (coverage is 14% of scraped candidates), so the block simply omits the line.
+    """
+    # Lives on ScrapeCandidate (keyed by video_id), not on the item. Uses the
+    # item's own session so this adds no connection handling to the callers.
+    video_id = (item.video_id or "").strip()
+    session = object_session(item)
+    if not video_id or session is None:
+        return []
+    hook = (
+        session.query(ScrapeCandidate.on_screen_title)
+        .filter(ScrapeCandidate.video_id == video_id)
+        .filter(ScrapeCandidate.on_screen_title.is_not(None))
+        .limit(1)
+        .scalar()
+    )
+    hook = " ".join((hook or "").split())
+    if not hook:
+        return []
+    return [
+        "SOURCE ACCOUNT'S OWN ON-SCREEN HOOK (read off their video - this is the "
+        "angle that actually earned the views on their account, so MATCH THE "
+        "ANGLE AND THE REGISTER: what it treats as the draw, and whether it is a "
+        "verdict, a reaction or a plain statement. Write your own line on that "
+        "angle. Do NOT reuse its wording, and do NOT inherit its factual claims "
+        "unless the evidence above supports them independently): "
+        f"{hook}",
+    ]
+
+
+# Without this the three options come back at whatever length the writer
+# gravitates to, and the operator picks from one band with no alternative. A
+# real batch (2026-09-11) returned five reels for one account with ten long
+# options and five medium ones, no short option anywhere, and every pick landed
+# long - that account's worst measured band. The rule does not prescribe a
+# length, it only guarantees the choice exists; scripts/title_length_report.py
+# batch reports when a batch violates it anyway.
+_LENGTH_SPREAD_RULE = (
+    "- SPREAD THE THREE OPTIONS ACROSS LENGTHS. Inside the ceiling above, the "
+    "options must not all come back the same size: write at least one at 60 "
+    "characters or fewer, and at least one over 100, with the third wherever "
+    "the clip wants it. Length follows the beats you choose, so this is a "
+    "check on those, not licence to pad one option or gut another. If the clip "
+    "genuinely only supports one length, say so in that reel's selection notes "
+    "rather than stretching a line to fill a band."
+)
+
+
+def _effective_title_rules(
+    title_style: str | None,
+    caption_style: str | None,
+    niche_label: str | None,
+    *,
+    few_shot_winners: list[str] | None = None,
+    title_length: str | None = None,
+) -> list[str]:
+    """The on-screen title rules for a batch prompt.
+
+    v2 (``processing.title_lab.production_title_rules``) replaces the 2,534-word
+    historytrails block with ~940 words. What changed, and why, in order of
+    measured effect on this account's own 726-title reference set:
+
+    * BEATS. A title moving through three or more beats - setup, what happened,
+      the turn, someone's reaction - outperforms one that states a single thing,
+      and the gap holds inside every length band (1-2 beats sits at 63-73k
+      regardless of length; 3+ reaches 150-350k). The old block had no such rule
+      and asked for word counts instead, which is why its titles came back as
+      one long statement.
+    * SINGULAR "I" IS NO LONGER BANNED OUTRIGHT... it is still banned, but for
+      the right reason. The old rule's stated justification (an "I" claims the
+      on-screen action) did not survive testing: what unbanning it actually
+      produced was the account speaking as a person with opinions about a real
+      person on screen. The ban stays; the register it was blamed for came from
+      the option matrix, not from the ban.
+    * The specificity matrix, the length bands, and the per-option measured
+      medians are gone. They were unsatisfiable as a set - a real batch broke
+      the block's own "at least one option carries no specific" hard rule in
+      6 of 6 reels - and the numbers they cited no longer match the data.
+    * A 130-character ceiling replaces "18-24 words", because the constraint is
+      the renderer, not reach: ``_fit_title_overlay`` gives up past four lines at
+      the font floor and dumps the remainder onto one line that runs off-frame.
+
+    Selected per account through the Title Style dropdown rather than a global
+    switch, so one account can run v2 while the rest stay on their current
+    rules - which is what makes a real A/B possible instead of an all-or-nothing
+    cutover.
+
+    ``title_length``/``few_shot_winners`` are accepted. Under v2 the length
+    control is replaced by the character ceiling, with one exception: "short"
+    adds a hard 70-character rule on top. That exists for a per-account A/B -
+    this account's own reels measured the other way from the reference set (in
+    June 2026, titles of 60 characters or fewer hit 100k+ views 17% of the time
+    against 7% for longer ones), and a two-arm test settles it where neither
+    dataset can. The draft guard enforces the same limit on the reply, because
+    a prompt length rule alone was ignored in August.
+    """
+    if title_style in (TITLE_STYLE_BEATS_V2, TITLE_STYLE_BEATS_V3):
+        rules = title_lab.production_title_rules(
+            few_shot_winners=few_shot_winners,
+            reaction_ending=title_style == TITLE_STYLE_BEATS_V3,
+        )
+        limit = draft_guard.title_char_limit(title_length)
+        if limit is None:
+            return [*rules, _LENGTH_SPREAD_RULE]
+        return [
+            *rules,
+            f"- SHORT TITLES FOR THIS ACCOUNT, OVERRIDING THE 130-CHARACTER CEILING: "
+            f"every title option must be at most {limit} characters including "
+            f"spaces, which is two lines on screen. Count them. Keep the single "
+            f"strongest beat, usually the payoff, and name the person or thing. "
+            f"Drop the setup rather than squeezing every beat in.",
+        ]
+    return smart_drafts.effective_title_rules(
+        title_style,
+        caption_style,
+        niche_label,
+        few_shot_winners=few_shot_winners,
+        title_length=title_length,
+    )
+
+
+def _style_header_lines(
+    title_style: str | None, caption_style: str | None, title_length: str | None
+) -> list[str]:
+    """The Caption/Title style lines for a prompt header, from the RESOLVED styles.
+
+    These lines used to read ``settings`` directly while the rules below them
+    read the account's saved preferences, so a batch screen that sends ``{}``
+    (it has no style picker) printed "Title style: Auto (match caption style)"
+    and "Title length: Long" above a v2 rulebook that was neither. The header
+    is what a human reads to check the prompt is right, so it has to agree with
+    the rules it sits above.
+
+    Title length is omitted under v2 unless it is one the rules honour, because
+    v2 replaces the length control with its own ceiling (see
+    ``_effective_title_rules``) and printing an ignored setting is the same bug
+    in the other direction.
+    """
+    lines = [
+        f"Caption style: {caption_style or '(none)'}",
+        f"Title style: {title_style or 'Auto (match caption style)'}",
+    ]
+    honoured = title_style not in (
+        TITLE_STYLE_BEATS_V2,
+        TITLE_STYLE_BEATS_V3,
+    ) or draft_guard.title_char_limit(title_length)
+    if honoured:
+        lines.append(f"Title length: {str(title_length or 'long').title()}")
+    return lines
+
+
+def _resolved_styles(account: Account | None, settings: dict) -> tuple[str | None, str | None, str]:
+    """The styles a prompt should actually use: caller's choice, else the account's.
+
+    Every builder needs this and only the multi-account one had it, so the other
+    two silently produced a DIFFERENT rulebook for the same account. The live
+    accounts are saved as ``beats_v2``; an empty ``settings`` resolved
+    ``title_style=None``, which falls past the v2 branch to the v1 rules. So the
+    Processing screen's single-clip prompt and the single-account batch were
+    handing out Curiosity / Open Loop while the batch screen handed out v2. Same
+    account, same clip, two different sets of instructions.
+    """
+    prefs: dict = {}
+    if account is not None:
+        try:
+            loaded = json.loads(account.processing_preferences or "{}")
+        except ValueError:
+            loaded = {}
+        if isinstance(loaded, dict):
+            prefs = loaded
+    return (
+        settings.get("title_style") or prefs.get("prompt_title_style") or None,
+        settings.get("caption_style") or prefs.get("caption_style") or None,
+        settings.get("title_length") or prefs.get("title_length") or "long",
+    )
+
+
 def _account_style_rules(account: Account | None, settings: dict) -> list[str]:
-    """The style-rule block for one account (title + hook + caption rules)."""
+    """The style-rule block for one account (title + hook + caption rules).
+
+    Styles fall back to the ACCOUNT's saved processing_preferences when the
+    caller does not name one. The multi-account batch screen sends ``{}`` (it
+    has no per-account style picker), so without this every account resolved
+    title_style=None and dropped to the caption-derived rules -- meaning the
+    historytrails_record rule set the accounts are actually configured for,
+    including the register mix and the specificity rules, never reached the
+    prompt the operator pasted. The single-clip path already reads these same
+    preference keys (see draft_generation.generate_titles_for_clip).
+    """
     niche_label = account.niche_label if account and account.niche_label else None
     account_key = account.instagram_handle if account is not None else None
     few_shot_winners = top_titles_for_account(account_key) if account_key else []
+    title_style, caption_style, title_length = _resolved_styles(account, settings)
     return [
         "On-screen title rules (follow these exactly):",
-        *smart_drafts.effective_title_rules(
-            settings.get("title_style") or None,
-            settings.get("caption_style") or None,
+        *_effective_title_rules(
+            title_style,
+            caption_style,
             niche_label,
             few_shot_winners=few_shot_winners,
-            title_length=settings.get("title_length") or "long",
+            title_length=title_length,
         ),
         "",
         "Hook framing (drama is allowed, overclaiming is not):",
@@ -1211,7 +1537,7 @@ def _account_style_rules(account: Account | None, settings: dict) -> list[str]:
         "",
         "Caption rules (follow these exactly):",
         *smart_drafts.effective_caption_rules(
-            settings.get("caption_style") or None,
+            caption_style,
             account_voice=_caption_rule_voice(account),
         ),
     ]
@@ -1228,23 +1554,48 @@ def _account_style_rules(account: Account | None, settings: dict) -> list[str]:
 UNDRAFTABLE_REVIEW_STATES = frozenset({"rejected", "blocked"})
 
 
+def has_applied_draft(item: DownloadItem) -> bool:
+    """Whether a draft is live ON THE ITEM, as opposed to merely imported.
+
+    A ``DraftRevision`` row only means a batch reply was parsed into options;
+    ``draft_revisions.apply_revision`` (which ``batch_finish`` calls) is what
+    copies a chosen option onto ``title_draft``/``caption_draft``. That pair is
+    what export and publish read and what the Processing table calls "Draft", so
+    it is the only honest answer to "does this reel have a draft yet".
+    """
+    return bool((item.title_draft or "").strip() or (item.caption_draft or "").strip())
+
+
 def batch_candidates(
     *,
     niche: str | None = None,
     per_account: int = 6,
     account_ids: list[int] | None = None,
 ) -> list[dict]:
-    """Draftless, publishable reels per account, ready for a cross-account batch.
+    """Publishable reels per account, ready for a cross-account batch.
 
-    Mirrors the Processing screen's own draftable filter (no draft yet, not
-    posted/skipped, neither locally rejected nor globally blocked) so the two
-    surfaces agree on what still needs a draft. Resting and flagged accounts are
-    excluded for the same reason distribution skips them: their reels should not
-    be queued up for posting.
+    Mirrors the Processing screen's own draftable filter (not posted/skipped,
+    neither locally rejected nor globally blocked) so the two surfaces agree on
+    what is in play. Resting and flagged accounts are excluded for the same
+    reason distribution skips them: their reels should not be queued up for
+    posting.
+
+    Rows carry ``has_draft``. Already-drafted reels are INCLUDED, appended after
+    the draftless ones, because dropping them made an imported reel disappear
+    from this screen on the next poll: redrafting a title meant going to
+    Processing, and an import that matched nothing looked exactly like one that
+    worked. ``available`` still counts only the DRAFTLESS reels, so the "N of M
+    draftless" label keeps its meaning; the caller filters on ``has_draft`` for
+    everything else.
+
+    Rows also carry ``needs_finish`` (and the group ``pending_finish``) for the
+    reels whose draft was imported but never applied — see the comment on that
+    list below. They sit between the draftless reels and the finished ones so
+    the per-account limit cannot bury them.
     """
     limit = max(1, int(per_account))
     # Lazy import: keep draft_handoff free of library's downloader import chain.
-    from nicheflow_studio.services import library, pooling
+    from nicheflow_studio.services import batch_finish, library, pooling
 
     # Distribution creates a Processing row before its shared footage lands, and
     # the only thing that ever fills in the path is a one-shot daemon thread. If
@@ -1281,10 +1632,26 @@ def batch_candidates(
         # the item's own status alone let already-posted reels back in here as
         # "draftless" while Processing correctly showed them as Posted.
         posted_item_ids = library.already_posted_item_ids(session)
-        # ...and the same reel reaching a SECOND account is still a repost of
-        # footage the network has already published, so match on the source
-        # video too, not just on this account's own copy of it.
-        posted_video_ids = library.posted_source_video_ids(session)
+        # ...and match on the source video too, not just on this account's own
+        # copy of it, so the legacy direct-download path (no pool item, no
+        # assignment row) cannot hand an account footage it already published.
+        # Scoped PER ACCOUNT: the pool is shared, so a reel a sibling posted is
+        # legitimately on its way out here — the reuse gap spaces those, this
+        # only stops one account repeating itself.
+        posted_video_ids_by_account = library.posted_source_video_ids_by_account(session)
+        # Exports already booked to publish. Same rule batch_finish applies when
+        # it refuses to re-render a reel (see _COMMITTED_JOB_STATUSES there).
+        committed_item_ids = {
+            row[0]
+            for row in session.execute(
+                select(UploadJob.download_item_id).where(
+                    or_(
+                        UploadJob.status.in_(batch_finish.COMMITTED_JOB_STATUSES),
+                        UploadJob.posted_at.is_not(None),
+                    )
+                )
+            ).all()
+        }
 
         groups: list[dict] = []
         for account in accounts:
@@ -1297,6 +1664,7 @@ def batch_candidates(
                 .order_by(DownloadItem.id)
                 .all()
             )
+            posted_video_ids = posted_video_ids_by_account.get(account.id, frozenset())
             # Everything the account still owes a draft on. Rejected and blocked
             # reels drop out HERE, so a clip the user killed can never come back
             # as a "still downloading" ghost below — retired rows keep no media
@@ -1317,8 +1685,45 @@ def batch_candidates(
             # 6-clip distribute.
             eligible = [item for item in draftable if item.file_path]
             pending_media = len(draftable) - len(eligible)
-            candidates = [
-                {
+            # Reels this account HAS drafted, offered alongside the draftless
+            # ones. Importing a draft used to delete the reel from this screen
+            # on the next poll, so a title the operator wanted to redo was only
+            # reachable from Processing - and an import that silently matched
+            # nothing looked identical to one that worked. They are listed, not
+            # selected: `has_draft` is what the UI ticks on.
+            #
+            # COMMITTED reels stay out. Once an export is booked into a slot,
+            # handed to the Worker, or published, redrafting its title changes
+            # nothing that is going out, and the screen's post-finish reconcile
+            # reads "reels that did export drop out of the candidate list" to
+            # tell a successful finish from a no-op. Having a draft used to be
+            # what removed them; now the commit check has to say so directly.
+            listed_drafted = [
+                item
+                for item in items
+                if item.id in drafted_item_ids
+                and item.file_path
+                and item.id not in committed_item_ids
+                and item.id not in posted_item_ids
+                and (item.video_id or "") not in posted_video_ids
+                and (item.review_state or "") not in UNDRAFTABLE_REVIEW_STATES
+            ]
+            # Imported but never finished: a revision exists, no option was ever
+            # applied. finish_batch only touches the ids it is handed and the
+            # Finish button is driven by an in-session plan, so a batch that was
+            # imported and then left (app closed, only part of it finished)
+            # stranded its leftovers here — counted as drafted, hidden behind the
+            # "already drafted" fold, with no surface left that could act on
+            # them. 23 reels had piled up that way by 2026-09-22. They are listed
+            # FIRST and counted separately: what they need is Finish, not a new
+            # draft, so re-prompting them would throw away a draft already paid
+            # for.
+            pending_finish = [item for item in listed_drafted if not has_applied_draft(item)]
+            pending_finish_ids = {item.id for item in pending_finish}
+            already_drafted = [item for item in listed_drafted if item.id not in pending_finish_ids]
+
+            def _row(item: DownloadItem) -> dict:
+                return {
                     "id": item.id,
                     "account_seq": seq_by_item.get(item.id),
                     "title": item.title,
@@ -1327,9 +1732,16 @@ def batch_candidates(
                     # service stays free of the app layer's media mapping.
                     "file_path": item.file_path,
                     "has_draft": item.id in drafted_item_ids,
+                    # Drafted, but the draft is still sitting in its revision.
+                    "needs_finish": item.id in pending_finish_ids,
                     "has_vision": bool((item.smart_vision_payload or "").strip()),
+                    "review_state": item.review_state or None,
                 }
-                for item in eligible[:limit]
+
+            candidates = [
+                *map(_row, eligible[:limit]),
+                *map(_row, pending_finish[:limit]),
+                *map(_row, already_drafted[:limit]),
             ]
             groups.append(
                 {
@@ -1346,6 +1758,10 @@ def batch_candidates(
                     # so a short list reads as "wait a moment", not "distribute
                     # gave me fewer than I asked for".
                     "pending_media": pending_media,
+                    # Reels stuck between Import and Finish, before the limit —
+                    # same "N of M" contract as `available`, so a capped list
+                    # still reports the true size of the backlog.
+                    "pending_finish": len(pending_finish),
                 }
             )
     return groups
@@ -1466,9 +1882,22 @@ def build_multi_account_batch_chat_prompt(item_ids: list[int], settings: dict | 
             f"Accounts in this batch: {len(grouped)}. Total reels: {len(ids)}.",
             "Each account has its own voice block below. Write every reel in the voice of "
             "the account it sits under, and never mix one account's voice into another's.",
-            f"Caption style: {settings.get('caption_style') or '(none)'}",
-            f"Title style: {settings.get('title_style') or 'Auto (match caption style)'}",
-            f"Title length: {(settings.get('title_length') or 'long').title()}",
+            *(
+                [f"Caption style: {settings['caption_style']}"]
+                if settings.get("caption_style")
+                else []
+            ),
+            *(
+                [f"Title style: {settings['title_style']}"]
+                if settings.get("title_style")
+                else []
+            ),
+            *(
+                [f"Title length: {str(settings['title_length']).title()}"]
+                if settings.get("title_length")
+                and settings.get("title_style") != TITLE_STYLE_BEATS_V2
+                else []
+            ),
             f"Clip premise / user direction: {settings.get('clip_premise') or '(none)'}",
             "",
         ]
@@ -1504,12 +1933,15 @@ def build_multi_account_batch_chat_prompt(item_ids: list[int], settings: dict | 
                 "",
                 "Return one block per reel, one for every reel, in order.",
                 "START each reel's block with its own header line that is exactly:",
-                "===== REEL <n> (#<id>) =====",
-                "copying BOTH the reel number and the (#id) exactly as shown in that reel's "
-                "context below. The (#id) is how the app files each reply to the correct "
-                "video ACROSS accounts, so never change, drop, or invent it.",
+                "===== REEL <n> (#<id>) ===== <account name>",
+                "copying the whole line exactly as shown in that reel's context below. The "
+                "(#id) is how the app files each reply to the correct video ACROSS "
+                "accounts, so never change, drop, or invent it. The account name after the "
+                "bars is what lets a human tell which batch this reply belongs to, so echo "
+                "it too.",
                 "Do not rename, renumber, merge, or skip any reel, even if two clips look "
                 "similar or belong to different accounts.",
+                _CONCERN_ESCAPE_HATCH,
                 "",
                 "Niche fit check (per reel, MANDATORY): compare the clip's actual subject to "
                 "the niche of ITS OWN account. Directly under the reel's header line, before "
@@ -1679,10 +2111,123 @@ def _reject_prompt_paste(text: str) -> None:
         )
 
 
+# The account name a reel header carries AFTER its closing "=====" (see
+# _batch_item_delimiter). Never a routing key -- routing is by echoed id, then by
+# reel number. It matters only as evidence of a WRONG-ROW paste, and it is the
+# only such evidence on the single-account path, where account-relative "#id"s
+# collide across accounts by design and so can never prove one.
+_HEADER_ACCOUNT_LABEL = re.compile(r"={2,}\s*([^=]+?)\s*$")
+
+
+def _header_account_label(line: str) -> str | None:
+    """The account name trailing one reel header, or None when it carries none.
+
+    A header with no name ends in the closing bars, so the group can never reach
+    the end of the line and no label is invented.
+    """
+    match = _HEADER_ACCOUNT_LABEL.search(line.strip())
+    if match is None:
+        return None
+    return match.group(1).strip().strip("*_#`").strip() or None
+
+
+def _pasted_account_labels(text: str) -> list[str]:
+    """Account names echoed by this reply's reel headers, in document order."""
+    labels: list[str] = []
+    for line in (text or "").splitlines():
+        _, match = _split_header_line(line)
+        if match is None:
+            continue
+        label = _header_account_label(line)
+        if label:
+            labels.append(label)
+    return labels
+
+
+def _normalized_account_name(name: str | None) -> str:
+    return " ".join((name or "").lower().split())
+
+
+def _wrong_batch_message(culprits: list[str], own: list[str]) -> str:
+    belongs = ", ".join(culprits) or "another account"
+    here = ", ".join(own) or "this"
+    return (
+        f"This reply is for {belongs}, but Import was pressed on the {here} row. "
+        "Nothing was imported. Copy that row's own chat reply and press Import again."
+    )
+
+
+def _requested_account_names(session, requested: list[int]) -> list[str]:
+    rows = (
+        session.query(Account.name)
+        .join(DownloadItem, DownloadItem.account_id == Account.id)
+        .filter(DownloadItem.id.in_(requested))
+        .distinct()
+        .all()
+    )
+    return sorted({row[0] for row in rows if row[0]})
+
+
+def _reject_wrong_batch_paste(text: str, requested: list[int], *, global_ids: bool) -> None:
+    """Hard-fail a reply pasted onto the wrong prepared row.
+
+    Routing falls back to REEL NUMBER whenever a header's echoed id is not part
+    of this batch, so that one garbled id cannot misroute. Applied to a whole
+    reply meant for a DIFFERENT row, that same fallback files every block
+    positionally onto THIS row's clips: real drafts, all on the wrong account's
+    videos, reported as a clean "imported N" and carried through to export and
+    scheduling. Nothing downstream can tell them from correct ones, so the paste
+    has to die here rather than warn.
+
+    Fires only when NOTHING in the reply points at this batch. A single stray id,
+    or an account name the model paraphrased, still imports exactly as before.
+    """
+    blocks = _split_batch_blocks(text)
+    if not blocks:
+        return  # no headers at all: the per-item parser reports the real problem
+    requested_ids = set(requested)
+    with get_session() as session:
+        # Strongest evidence, and the only one that needs no cooperation from the
+        # model beyond the id it was told never to change. Cross-account replies
+        # echo the GLOBAL item id, so an id outside this batch names a real video
+        # on some other row.
+        if global_ids:
+            echoed = [echoed_id for _, echoed_id, _ in blocks if echoed_id is not None]
+            if echoed and not requested_ids.intersection(echoed):
+                rows = (
+                    session.query(DownloadItem.id, Account.name)
+                    .outerjoin(Account, Account.id == DownloadItem.account_id)
+                    .filter(DownloadItem.id.in_(echoed))
+                    .all()
+                )
+                if rows:
+                    culprits = sorted({row[1] for row in rows if row[1]})
+                    raise DraftRevisionError(
+                        _wrong_batch_message(culprits, _requested_account_names(session, requested))
+                    )
+        labels = {_normalized_account_name(label) for label in _pasted_account_labels(text)}
+        if not labels:
+            return
+        own = _requested_account_names(session, requested)
+        if labels.intersection(_normalized_account_name(name) for name in own):
+            return
+        # An exact match against a REAL account name, on every header that
+        # carries one, with no header naming this row. A paraphrase matches
+        # nothing and falls through to the existing routing.
+        known = {
+            _normalized_account_name(row[0]): row[0]
+            for row in session.query(Account.name).all()
+            if row[0]
+        }
+        culprits = sorted({known[label] for label in labels if label in known})
+        if culprits:
+            raise DraftRevisionError(_wrong_batch_message(culprits, own))
+
+
 def import_account_batch_draft(text: str, item_ids: list[int]) -> dict:
     """Import a single-account batch reply, routing by account-relative ``#id``."""
     requested = [int(item_id) for item_id in item_ids]
-    return _import_batch(text, requested, _batch_seq_to_item(requested))
+    return _import_batch(text, requested, _batch_seq_to_item(requested), global_ids=False)
 
 
 def import_multi_account_batch_draft(text: str, item_ids: list[int]) -> dict:
@@ -1695,7 +2240,9 @@ def import_multi_account_batch_draft(text: str, item_ids: list[int]) -> dict:
     shared with the single-account path.
     """
     requested = [int(item_id) for item_id in item_ids]
-    return _import_batch(text, requested, {item_id: item_id for item_id in requested})
+    return _import_batch(
+        text, requested, {item_id: item_id for item_id in requested}, global_ids=True
+    )
 
 
 def _rejected_in_batch(item_ids: list[int]) -> set[int]:
@@ -1720,7 +2267,9 @@ def _rejected_in_batch(item_ids: list[int]) -> set[int]:
     return {row[0] for row in rows if (row[1] or "") in UNDRAFTABLE_REVIEW_STATES}
 
 
-def _import_batch(text: str, requested: list[int], seq_to_item: dict[int, int]) -> dict:
+def _import_batch(
+    text: str, requested: list[int], seq_to_item: dict[int, int], *, global_ids: bool
+) -> dict:
     """Import a batch reply. Each block routes to a specific item by the echoed
     ``(#id)`` when it names an item in this batch (most reliable — survives
     reordering, reel-number drift, and duplicate reel numbers), otherwise by REEL
@@ -1729,6 +2278,7 @@ def _import_batch(text: str, requested: list[int], seq_to_item: dict[int, int]) 
     model parroted a frame filename's item id) is ignored and the reel number is
     used instead, so a garbled id never misroutes."""
     _reject_prompt_paste(text)
+    _reject_wrong_batch_paste(text, requested, global_ids=global_ids)
     imported: list[int] = []
     failed: list[dict] = []
     routed: dict[int, str] = {}
@@ -1795,6 +2345,13 @@ def batch_frames(item_ids: list[int]) -> dict:
     ids = [int(item_id) for item_id in item_ids]
     if not ids:
         raise DraftRevisionError("Choose at least one item for the batch.")
+    # Before anything else, because the PROMPT builder reads the hook straight
+    # from the database and the UI calls this step first. Doing it here rather
+    # than at distribute time means only reels actually being drafted pay for it,
+    # and the footage is guaranteed on disk, which it is not when a clip is
+    # freshly assigned.
+    _ensure_on_screen_hooks(ids)
+    _ensure_transcripts(ids)
     vision = draft_generation.ensure_batch_vision_payloads(ids)
     described = set(vision["described"])
 
@@ -1817,6 +2374,134 @@ def batch_frames(item_ids: list[int]) -> dict:
         "described": sorted(described),
         "skipped": vision["skipped"],
     }
+
+
+def _ensure_on_screen_hooks(item_ids: list[int]) -> int:
+    """OCR the source's burned-in hook for any reel that has none yet.
+
+    Reading it is the difference between two shipping rules firing and sitting
+    dead: the evidence block's "match the angle, never the wording" and
+    ``title_lab``'s hook-is-not-evidence rule both need a hook to point at, and the field was
+    empty on 161 of 185 reels on the live account.
+
+    Best-effort by design. A reel whose banner will not read still drafts from
+    its caption and contact sheet, so no failure here may block a batch. Reads
+    below the confidence floor are dropped rather than stored: the prompt tells
+    the model to match whatever angle it is handed, so a garbled hook would steer
+    every option on that reel, and none is better than wrong.
+    """
+    written = 0
+    for item_id in item_ids:
+        try:
+            with get_session() as session:
+                item = session.get(DownloadItem, item_id)
+                if item is None:
+                    continue
+                video_id = (item.video_id or "").strip()
+                path = Path(item.file_path or "")
+                if not video_id or not item.file_path:
+                    continue
+                existing = (
+                    session.query(ScrapeCandidate.on_screen_title)
+                    .filter(ScrapeCandidate.video_id == video_id)
+                    .limit(1)
+                    .scalar()
+                )
+                if (existing or "").strip():
+                    continue
+            if not path.exists():
+                continue
+            hook, score = on_screen_hook.read_hook(path)
+            if not hook or score < on_screen_hook.MIN_HOOK_SCORE:
+                continue
+            with get_session() as session:
+                rows = (
+                    session.query(ScrapeCandidate)
+                    .filter(ScrapeCandidate.video_id == video_id)
+                    .all()
+                )
+                for row in rows:
+                    row.on_screen_title = hook
+                session.commit()
+                written += len(rows)
+        except Exception:  # noqa: BLE001 - a hook is a bonus, never a blocker
+            logger.exception("Reading the on-screen hook for item %s failed.", item_id)
+    return written
+
+
+# What faster-whisper says when vad_filter finds no speech. A music-only
+# repost is the common case here, not an error, so it is skipped quietly
+# instead of filling the log with stack traces on every batch.
+_NO_SPEECH_MARKER = "no speech was detected"
+
+# Minimum words before a transcript is worth storing.
+#
+# Whisper's VAD returns nothing at all on most music-only reposts, which is the
+# clean case. The dangerous case is the one in between: a reel scored with music
+# under which it hallucinates a single short fragment. Item 1959 (1970s Iran,
+# music only) produced "I passed along the state" -- five words of pure noise
+# that would then sit in the prompt under "Transcript/context excerpt:" as if it
+# were evidence, steering all three titles. None beats wrong, the same rule
+# _ensure_on_screen_hooks applies to a low-confidence OCR read.
+#
+# Measured over 12 library reels: the two hallucinations were 5 words each; real
+# speech ran 16, 30, 60, 60, 72, 100 and 169 words; four reels returned nothing.
+# Ten sits in the gap with margin on both sides. A genuinely terse clip loses its
+# transcript, which costs little -- six words of dialogue ground a draft barely
+# better than silence does.
+_MIN_TRANSCRIPT_WORDS = 10
+
+
+def _ensure_transcripts(item_ids: list[int]) -> int:
+    """Transcribe the audio of any reel that has none yet.
+
+    Every title in this library was drafted with ``transcript_text`` empty,
+    leaving the reposter's scraped caption as the ONLY statement of who or what
+    is in a clip -- and a reposter's caption is a claim, not evidence. Two live
+    cases came out of that one gap: item 1959, whose caption described the Qajar
+    dynasty (ended 1925) over footage of 1970s Iran, and item 1948, whose
+    caption credited Snoop Dogg for a clip he never appears in. The second was
+    CORRECT (his narration IS the audio track) and from the draft alone looked
+    exactly as wrong as the first. Reading the audio is what tells them apart.
+
+    Best-effort on the same terms as ``_ensure_on_screen_hooks``: a reel with no
+    audio stream, no speech, or a whisper failure still drafts from its caption
+    and contact sheet, so nothing here may block a batch.
+    """
+    written = 0
+    for item_id in item_ids:
+        try:
+            with get_session() as session:
+                item = session.get(DownloadItem, item_id)
+                if item is None or not item.file_path:
+                    continue
+                if (item.transcript_text or "").strip():
+                    continue  # already transcribed, or hand-written by the user
+                path = Path(item.file_path)
+            if not path.exists() or not video.has_audio_stream(path):
+                continue
+            # Subprocess, not in-process: whisper pins a core for the whole
+            # decode and a fault in the native runtime would take the app with
+            # it. The module already ships this entry point for the same reason.
+            draft = transcription.generate_transcript_draft_in_subprocess(path)
+            text = (draft.transcript_text or "").strip()
+            if len(text.split()) < _MIN_TRANSCRIPT_WORDS:
+                continue
+            with get_session() as session:
+                item = session.get(DownloadItem, item_id)
+                if item is None:
+                    continue
+                # ONLY the transcript. TranscriptDraft also carries title and
+                # caption drafts; writing those here would silently clobber a
+                # draft the user has already reviewed and applied.
+                item.transcript_text = text
+                session.commit()
+                written += 1
+        except Exception as exc:  # noqa: BLE001 - a transcript is a bonus, never a blocker
+            if _NO_SPEECH_MARKER in str(exc).casefold():
+                continue
+            logger.exception("Transcribing item %s failed.", item_id)
+    return written
 
 
 def _write_contact_sheet(item_id: int, target: Path) -> None:
@@ -1893,6 +2578,8 @@ def import_pasted_draft(item_id: int, text: str) -> DraftRevisionDTO:
         asserted_text = draft_guard.build_signals_text(
             item.source_description if item else None,
         )
+        # The account's saved Title Length, the same resolution the prompt used.
+        _, _, title_length = _resolved_styles(account, {})
     guarded = draft_guard.guard_options(
         title_options=parsed.title_options,
         signals_text=signals_text,
@@ -1902,7 +2589,28 @@ def import_pasted_draft(item_id: int, text: str) -> DraftRevisionDTO:
             parsed.recommended_title_index - 1 if parsed.recommended_title_index else None
         ),
         recommendation_reason=parsed.reason,
+        max_title_chars=draft_guard.title_char_limit(title_length),
     )
+    # One metadata-referential title among three is a bad option the guard has
+    # already reddened and moved the pick off. ALL of them means the model
+    # declined to draft this reel and wrote its reasoning into the title slots
+    # -- usually because the scraped caption contradicts the footage. Saving
+    # that produces a revision whose every option is unpostable, and Apply then
+    # burns one onto the video (item 1959, "The caption attached to this clip
+    # is about a dynasty gone a century ago"). Refuse the import and say what
+    # to do instead.
+    filled = [i for i, title in enumerate(parsed.title_options) if title.strip()]
+    if filled and all(i in guarded.meta_terms for i in filled):
+        phrases = sorted({term for i in filled for term in guarded.meta_terms[i]})
+        raise DraftRevisionError(
+            "Every title option refers to the clip's metadata rather than what is on "
+            f"screen ({', '.join(phrases)}). A title is burned into the video, so the "
+            "viewer cannot see the source caption it is talking about. This is what a "
+            "reply looks like when the model decided the reel is undraftable, usually "
+            "because the scraped caption contradicts the footage. Nothing was saved. "
+            "Either reject this reel, or ask for titles written from the visible scene "
+            "and import again."
+        )
     if guarded.recommendation_shifted and guarded.recommended_index is not None:
         recommended_title_index = recommended_caption_index = guarded.recommended_index + 1
     else:

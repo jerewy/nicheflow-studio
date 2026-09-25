@@ -358,10 +358,30 @@ def _ensure_compatibility() -> None:
             connection.execute(
                 text("ALTER TABLE account_post_metrics ADD COLUMN media_id VARCHAR(128)")
             )
+        if "reach_follower" not in metric_columns:
+            connection.execute(
+                text("ALTER TABLE account_post_metrics ADD COLUMN reach_follower INTEGER")
+            )
+        if "reach_non_follower" not in metric_columns:
+            connection.execute(
+                text("ALTER TABLE account_post_metrics ADD COLUMN reach_non_follower INTEGER")
+            )
+        if "avg_watch_time_ms" not in metric_columns:
+            connection.execute(
+                text("ALTER TABLE account_post_metrics ADD COLUMN avg_watch_time_ms INTEGER")
+            )
+        if "total_watch_time_ms" not in metric_columns:
+            connection.execute(
+                text("ALTER TABLE account_post_metrics ADD COLUMN total_watch_time_ms BIGINT")
+            )
 
         candidate_columns = {
             column["name"] for column in inspect(connection).get_columns("scrape_candidates")
         }
+        if "on_screen_title" not in candidate_columns:
+            connection.execute(
+                text("ALTER TABLE scrape_candidates ADD COLUMN on_screen_title VARCHAR(1024)")
+            )
         if "description" not in candidate_columns:
             connection.execute(
                 text("ALTER TABLE scrape_candidates ADD COLUMN description VARCHAR(8192)")

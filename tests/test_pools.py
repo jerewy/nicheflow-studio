@@ -346,6 +346,47 @@ def test_niche_pool_stats_counts_pooled_assigned_unused_rejected(tmp_path) -> No
         assert niche_pool_stats(session, "movie").pooled == 0
 
 
+def test_niche_pool_stats_does_not_return_spent_clips_to_unused(tmp_path) -> None:
+    """A clip that posted is spent, not free inventory.
+
+    ``unused`` counted every pool item without an OPEN assignment, but
+    ``distribute_niche`` skips a clip that has an assignment row in ANY state - a
+    posted clip never comes back. On the real history pool that gap read as
+    "1994 pooled - 1867 unused" while Distribute correctly placed nothing,
+    because 1871 of those assignments had already posted. The screen was
+    promising months of runway that did not exist.
+    """
+    init_db()
+    import random
+
+    from nicheflow_studio.db.assignments import distribute_niche
+    from nicheflow_studio.db.models import Assignment
+    from nicheflow_studio.db.pools import niche_pool_stats
+
+    with get_session() as session:
+        session.add(Account(name="Hist B", platform="instagram", niche="history"))
+        session.flush()
+        for i in range(5):
+            accept_into_pool(session, media_asset=_asset(session, f"S{i}"), niche="history")
+        distribute_niche(session, "history", rng=random.Random(1), max_per_account=2)
+        session.commit()
+
+        # One of the two goes out. Its slot closes; its clip does not return.
+        posted = session.query(Assignment).filter(Assignment.niche == "history").first()
+        posted.status = "posted"
+        session.commit()
+
+        stats = niche_pool_stats(session, "history")
+        assert stats.assigned == 1  # still holding a backlog slot
+        assert stats.used == 1  # assigned and closed out
+        assert stats.unused == 3  # never assigned, so still placeable
+        assert stats.assigned + stats.used + stats.unused == stats.pooled
+
+        # The count has to mean what Distribute will do, or it is just a number.
+        placed = distribute_niche(session, "history", rng=random.Random(2))
+        assert len(placed) == 3
+
+
 # ---------------------------------------------------------------------------
 # Pre-download caption dedup (SOURCING_POOLING_PLAN.md §3, dedup-before-download)
 # ---------------------------------------------------------------------------

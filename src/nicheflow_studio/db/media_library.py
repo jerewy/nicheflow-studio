@@ -14,6 +14,40 @@ from sqlalchemy.orm import Session
 
 from nicheflow_studio.db.models import MediaAsset
 
+# Smallest byte count a genuine Instagram reel has ever had here: the 2569 real
+# assets on record bottom out at 111 KB, while a failed yt-dlp fetch lands a
+# 2.4 KB placeholder. 50 KB sits an order of magnitude clear of both, so the
+# floor rejects the stub without ever touching a real (if short) clip.
+MIN_PLAUSIBLE_VIDEO_BYTES = 50_000
+
+
+class BlankDownloadError(ValueError):
+    """A "successful" download produced something that is not real footage.
+
+    Two different causes land here and the guard does not need to tell them
+    apart. The source post itself can be junk: the June 2026 batch was 24 posts
+    that Apify had already measured at 1 second with no caption, so the download
+    faithfully fetched a 1-second black clip. Instagram can also answer a request
+    it dislikes with a placeholder instead of an error. Either way yt-dlp reports
+    success with no title, and the reel reaches the batch picker as an untitled
+    row with a black contact sheet. Raised rather than returned so a caller
+    cannot count one as a success by ignoring a result.
+    """
+
+
+def _is_blank_fingerprint(content_hash: str | None) -> bool:
+    """Whether every sampled frame hashed to zero, i.e. flat/black footage.
+
+    ``content_hash`` is ``processing.dedup``'s comma-separated frame dHashes. A
+    dHash compares neighbouring pixels, so a uniform frame yields exactly zero;
+    five zeroes means the centre of the frame was flat at 10/30/50/70/90% of the
+    duration, which no real reel does. Parsed as a string so this module keeps
+    the dependency-light promise in the docstring above and never imports the
+    video stack.
+    """
+    parts = [part.strip() for part in (content_hash or "").split(",") if part.strip()]
+    return bool(parts) and all(set(part) == {"0"} for part in parts)
+
 
 def normalize_source_url(url: str | None) -> str:
     """Canonical form of a post/reel URL for dedup: scheme/host lowercased,
@@ -122,7 +156,26 @@ def mark_media_asset_downloaded(
     ``content_hash`` is the perceptual fingerprint (``processing/dedup.py``); the
     caller computes it from the downloaded file so this module stays
     dependency-light. Left ``None`` when fingerprinting is unavailable.
+
+    Raises :class:`BlankDownloadError` when the evidence says the file is not
+    real footage. Every download path funnels through here, so this is the one
+    place that can stop a placeholder from entering the pool as good footage.
+    The asset is left untouched (still ``pending``) so the next run retries it
+    rather than skipping it as already on disk.
     """
+    if file_size_bytes is not None and file_size_bytes < MIN_PLAUSIBLE_VIDEO_BYTES:
+        raise BlankDownloadError(
+            f"Download is only {file_size_bytes} bytes "
+            f"(under {MIN_PLAUSIBLE_VIDEO_BYTES}), which is not usable footage. "
+            "Either the source post is junk (check its duration on Instagram) or "
+            "Instagram returned a placeholder instead of the video."
+        )
+    if _is_blank_fingerprint(content_hash):
+        raise BlankDownloadError(
+            "Every sampled frame of the download is blank, so this is not usable "
+            "footage. Either the source post is a blank clip or Instagram returned "
+            "a placeholder instead of the video."
+        )
     asset.original_download_path = original_download_path
     asset.file_size_bytes = file_size_bytes
     asset.checksum = checksum

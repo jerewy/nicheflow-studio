@@ -13,6 +13,7 @@ import { useAutoRefresh } from "@/hooks/useAutoRefresh";
 import { useRevisitRefresh } from "@/hooks/useKeepAlive";
 import { bridge, whenBridgeReady } from "@/lib/bridge";
 import { formatDate } from "@/lib/format";
+import { cn } from "@/lib/utils";
 import type {
   BatchDraftImportResult,
   DraftRevision,
@@ -24,6 +25,9 @@ import type {
   PublishRecency,
   WorkflowSettings,
 } from "@/types";
+
+// Must match services/draft_handoff.TITLE_STYLE_BEATS_V2.
+const TITLE_STYLE_BEATS_V2 = "beats_v2";
 
 const POLL_INTERVAL_MS = 4000;
 const JOB_POLL_INTERVAL_MS = 1000;
@@ -1680,6 +1684,13 @@ export function ProcessingScreen({
     return matchesStatus && matchesSearch;
   });
 
+  // Story Beats v2 replaces the length bands with a character ceiling and never
+  // reads title_length (draft_handoff's TITLE_STYLE_BEATS_V2 branch returns
+  // title_lab rules before effective_title_rules is reached). The dropdown used
+  // to stay live under it, so a length could be picked, saved, and quietly do
+  // nothing.
+  const titleLengthIgnored = workflow?.title_style === TITLE_STYLE_BEATS_V2;
+
   return (
     <div className="mx-auto max-w-7xl space-y-4 p-6">
       <header className="flex items-start justify-between gap-4">
@@ -2017,9 +2028,29 @@ export function ProcessingScreen({
                 </select>
               </label>
               <label className="space-y-1">
-                <span className="text-sm font-medium">Title Length</span>
+                <span className="text-sm font-medium">
+                  Title Length
+                  {titleLengthIgnored && (
+                    <span className="ml-2 font-normal text-xs text-muted-foreground">
+                      not used by this title style
+                    </span>
+                  )}
+                </span>
                 <select
-                  className="h-10 w-full rounded-md border border-input bg-transparent px-2 text-sm"
+                  className={cn(
+                    "h-10 w-full rounded-md border border-input bg-transparent px-2 text-sm",
+                    titleLengthIgnored && "opacity-50",
+                  )}
+                  // Story Beats v2 replaces the length bands with a character
+                  // ceiling and never reads this value (see draft_handoff's
+                  // TITLE_STYLE_BEATS_V2 branch). Leaving the control live meant
+                  // an operator could set a length, save it, and see no change.
+                  disabled={titleLengthIgnored}
+                  title={
+                    titleLengthIgnored
+                      ? "Story Beats v2 sets its own length. Pick another Title Style to use this."
+                      : undefined
+                  }
                   value={workflow.title_length}
                   onChange={(event) =>
                     applyWorkflowChange({ title_length: event.target.value })

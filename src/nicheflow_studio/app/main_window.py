@@ -88,6 +88,7 @@ from nicheflow_studio.db.assignments import (
 from nicheflow_studio.db.media_library import (
     find_media_asset,
     find_or_register_media_asset,
+    BlankDownloadError,
     mark_media_asset_downloaded,
     normalize_source_url,
 )
@@ -4612,12 +4613,17 @@ class MainWindow(QWidget):
             # the app ("Not Responding"). Registration only needs to record the file
             # on disk; the footage fingerprint is computed in the dedicated download/
             # fingerprint flow (scripts/download_pool.py / pool_admin fingerprint).
-            mark_media_asset_downloaded(
-                asset,
-                original_download_path=item.file_path,
-                file_size_bytes=size,
-                content_hash=None,
-            )
+            try:
+                mark_media_asset_downloaded(
+                    asset,
+                    original_download_path=item.file_path,
+                    file_size_bytes=size,
+                    content_hash=None,
+                )
+            except BlankDownloadError:
+                # Backfill walks every downloaded item; one placeholder on disk
+                # must leave that asset pending rather than abort the whole loop.
+                pass
         return asset, created
 
     def _on_pool_backfill_clicked(self) -> None:
@@ -5081,7 +5087,7 @@ class MainWindow(QWidget):
                 s = stats[niche]
                 label.setText(
                     f"{niche.title()} pool: {s.pooled} accepted · {s.assigned} assigned · "
-                    f"{s.unused} unused · {s.rejected} rejected"
+                    f"{s.unused} unused · {s.used} used · {s.rejected} rejected"
                 )
         self._pooling_summary_label.setText(
             f"{dl_count} downloaded Instagram clip(s), {registered} in the media library.  "
