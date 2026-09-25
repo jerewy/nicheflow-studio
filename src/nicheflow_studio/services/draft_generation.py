@@ -178,6 +178,7 @@ def generate_titles_for_clip(
         claim_supports=drafts.claim_supports,
         recommended_index=drafts.recommended_title_index,
         recommendation_reason=drafts.recommendation_reason,
+        max_title_chars=draft_guard.title_char_limit(title_length),
     )
     return {
         "titles": list(drafts.title_options),
@@ -351,6 +352,17 @@ def caption_outro_for_account(account: Account | None) -> str | None:
     return template.format(handle=handle)
 
 
+def _account_title_length(account: Account | None) -> str | None:
+    """The account's saved Title Length from processing_preferences, if any."""
+    if account is None:
+        return None
+    try:
+        prefs = json.loads(account.processing_preferences or "{}")
+    except ValueError:
+        return None
+    return prefs.get("title_length") if isinstance(prefs, dict) else None
+
+
 def _space_caption_outro(caption: str, outro: str | None) -> str:
     """Keep the follow outro readable even when the model ignores paragraph rules."""
     if not outro:
@@ -473,6 +485,11 @@ def generate_revision_for_item(
             "caption_outro": caption_outro_for_account(account),
             "require_vision": True,
         }
+        # The caller's choice, else the account's saved setting, so a Short
+        # account's length limit holds even when the UI sent no override.
+        title_char_limit = draft_guard.title_char_limit(
+            title_length or _account_title_length(account)
+        )
 
     # The provider call is slow and must run outside the DB session.
     drafts = smart_drafts.generate_smart_drafts(**gen_kwargs)
@@ -504,6 +521,7 @@ def generate_revision_for_item(
         claim_supports=drafts.claim_supports,
         recommended_index=drafts.recommended_title_index,
         recommendation_reason=drafts.recommendation_reason,
+        max_title_chars=title_char_limit,
     )
     if guarded.recommendation_shifted:
         recommended_title_index = recommended_caption_index = guarded.recommended_index

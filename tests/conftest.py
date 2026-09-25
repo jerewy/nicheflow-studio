@@ -16,6 +16,12 @@ if str(SRC_ROOT) not in sys.path:
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+# Stand-in footage for tests that never decode the file. Padded past
+# media_library.MIN_PLAUSIBLE_VIDEO_BYTES because the download chokepoint now
+# refuses anything small enough to be Instagram's black placeholder, and a
+# 5-byte fixture is indistinguishable from one.
+FAKE_VIDEO_BYTES = b"video" * 12_000
+
 
 @pytest.fixture(autouse=True)
 def isolated_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

@@ -27,6 +27,8 @@ TITLE_STYLES = [
     {"value": "", "label": "Auto (match caption style)"},
     {"value": "curiosity_open_loop", "label": "(History) Cinematic Record"},
     {"value": "historytrails_record", "label": "(History) HistoryTrails"},
+    {"value": "beats_v2", "label": "(History) Story Beats v2"},
+    {"value": "beats_v3", "label": "(History) Story Beats v3 (react)"},
     {"value": "meme_setup_punchline", "label": "(Meme) Setup -> Punchline"},
     {"value": "meme_relatable", "label": "(Meme) Relatable Hook"},
     {"value": "meme_friend_group", "label": "(Meme) Friend Group"},

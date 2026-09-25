@@ -287,9 +287,14 @@ class NichePoolStats:
     """At-a-glance counts for one niche's pool (SOURCING_POOLING_PLAN.md §12).
 
     ``pooled`` is the accepted inventory; ``assigned`` is how much of it is
-    already allotted to accounts; ``unused`` is what's still free to distribute;
-    ``rejected`` is how many scraped candidates in this niche were rejected with
-    a reason (and therefore never enter the pool).
+    allotted to an account and still open; ``used`` is how much has been through
+    an account already (posted, rejected there, or dead source); ``unused`` is
+    what's still free to distribute; ``rejected`` is how many scraped candidates
+    in this niche were rejected with a reason (and therefore never enter the
+    pool).
+
+    ``assigned + used + unused == pooled``: a pool item is allotted at most once,
+    and closing its assignment never returns it to the free pile.
     """
 
     niche: str
@@ -298,6 +303,7 @@ class NichePoolStats:
     unused: int
     rejected: int
     pending: int = 0
+    used: int = 0
 
 
 @dataclass(frozen=True)
@@ -360,16 +366,24 @@ def dedupe_pool_by_caption(session: Session, niche: str) -> PoolDedupResult:
 def niche_pool_stats(session: Session, niche: str) -> NichePoolStats:
     """Compute the pool summary counts for ``niche`` (see :class:`NichePoolStats`)."""
     niche = _validate_niche(niche)
-    pooled = pool_size(session, niche)
-    assigned_item_ids = {
-        row[0]
-        for row in session.query(Assignment.pool_item_id)
-        .filter(Assignment.niche == niche)
-        # Only pending assignments hold active backlog slots.
-        .filter(Assignment.status == "assigned")
-        .all()
-    }
-    assigned = len(assigned_item_ids)
+    pooled_ids = {item.id for item in pool_items_for_niche(session, niche)}
+    pooled = len(pooled_ids)
+    rows = session.query(Assignment.pool_item_id, Assignment.status).filter(
+        Assignment.niche == niche
+    )
+    # Counted against the ACCEPTED pool only, so the four numbers describe one
+    # population and add up. An assignment can outlive its pool item (removed in
+    # review), and those must not be counted against inventory that excludes them.
+    open_item_ids = {pid for pid, status in rows if status == "assigned"} & pooled_ids
+    # Every clip an account has ever been given, in whatever state. This is the
+    # set distribute_niche skips (assignments.assigned_pool_item_ids), so it is
+    # the only one `unused` can be derived from: a posted or rejected assignment
+    # closes its slot but never puts the clip back in the pile. Deriving it from
+    # open assignments instead counted spent clips as free and had the history
+    # pool advertising 1867 unused against a distributor that could place none.
+    spoken_for_ids = {pid for pid, _ in rows} & pooled_ids
+    assigned = len(open_item_ids)
+    used = len(spoken_for_ids) - assigned
     rejected = (
         session.query(ScrapeCandidate)
         .join(Account, Account.id == ScrapeCandidate.account_id)
@@ -382,9 +396,10 @@ def niche_pool_stats(session: Session, niche: str) -> NichePoolStats:
         niche=niche,
         pooled=pooled,
         assigned=assigned,
-        unused=max(0, pooled - assigned),
+        unused=max(0, pooled - len(spoken_for_ids)),
         rejected=rejected,
         pending=pending,
+        used=used,
     )
 
 

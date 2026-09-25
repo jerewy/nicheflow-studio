@@ -31,6 +31,15 @@ from nicheflow_studio.db.pools import (
 )
 
 
+# Shortest post worth pooling. Picked from the scrape history rather than by
+# feel: 24 candidates sit at 1 second (a source account's blank filler, the June
+# 2026 batch that reached the batch picker as untitled reels with black contact
+# sheets) and the next shortest is 3 seconds. A floor of 3 removes exactly that
+# junk and has never excluded a candidate that went on to be published, while 5
+# would already cost one real post and 6 would cost seven.
+MIN_POOLABLE_DURATION_SECONDS = 3
+
+
 @dataclass(frozen=True)
 class ReelMetadata:
     """Metadata for one reel, as fetched (e.g. via yt-dlp) before intake."""
@@ -57,6 +66,7 @@ class PoolIntakeResult:
       * ``"duplicate"`` — already in a pool (its ``niche`` is reported); skipped.
       * ``"blocked"``   — footage on the global blocklist; skipped.
       * ``"no_account"`` — no account in the target niche to own the clip.
+      * ``"too_short"`` — under :data:`MIN_POOLABLE_DURATION_SECONDS`; skipped.
     """
 
     status: str
@@ -77,6 +87,22 @@ def add_reel_to_pool(
     if value not in VALID_NICHES:
         raise ValueError(f"niche must be one of {sorted(VALID_NICHES)}, got {niche!r}.")
     niche = value
+
+    # Duration floor first: it is pure metadata, so a junk post costs no dedup
+    # queries and never registers a MediaAsset. An unknown duration passes -
+    # not knowing how long a post is says nothing about whether it is usable,
+    # and 20 candidates on record have no duration at all.
+    duration = metadata.duration_seconds
+    if duration is not None and duration < MIN_POOLABLE_DURATION_SECONDS:
+        return PoolIntakeResult(
+            status="too_short",
+            niche=niche,
+            shortcode=metadata.shortcode,
+            message=(
+                f"Only {duration}s long — under the {MIN_POOLABLE_DURATION_SECONDS}s "
+                "minimum, so it is filler rather than usable footage. Skipped."
+            ),
+        )
 
     # Global blocklist: footage the user rejected must never re-pool.
     if is_blocked(session, source_url=metadata.source_url, shortcode=metadata.shortcode):

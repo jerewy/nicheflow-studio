@@ -15,6 +15,18 @@ from nicheflow_studio.db.session import get_session
 # post to have actually been distributed before its wording counts as a win.
 MIN_WINNER_REACH = 1_000
 
+# How many of the account's most-reached posts conversion_score is allowed to
+# rank within. The flat floor above fixed the extreme case (reach 75) but not
+# the shape of the problem: these accounts median about 2,500 reach while their
+# best posts clear a million, so interactions-over-reach stays unstable well
+# past 1,000. Measured on vaultedhistory, a post seen by 1,655 people outranked
+# one seen by 2,366,007 and led the example block, while a genuine 716,024-reach
+# winner placed third. One flat bar cannot separate those - it is the same
+# number for an account averaging 2k and one averaging 40k - but taking each
+# account's own top slice by reach first does, and conversion_score still picks
+# the best converter inside it.
+WINNER_REACH_POOL = 20
+
 # posted_at (when the app handed the reel to Instagram) and the media's own
 # timestamp differ by the API round-trip — measured at 1-3s across a real
 # account. Posts sit hours apart, so a minute of slack pins each metric row to
@@ -63,8 +75,12 @@ def top_titles_for_account(account_key: str, n: int = 5) -> list[str]:
     if not normalized_key or n <= 0:
         return []
     with get_session() as session:
-        rows = (
-            session.query(AccountPostMetric.caption, AccountPostMetric.timestamp)
+        distributed = (
+            session.query(
+                AccountPostMetric.caption.label("caption"),
+                AccountPostMetric.timestamp.label("timestamp"),
+                AccountPostMetric.conversion_score.label("conversion_score"),
+            )
             .filter(
                 AccountPostMetric.account_key == normalized_key,
                 AccountPostMetric.caption.is_not(None),
@@ -73,9 +89,15 @@ def top_titles_for_account(account_key: str, n: int = 5) -> list[str]:
                 AccountPostMetric.reach.is_not(None),
                 AccountPostMetric.reach >= MIN_WINNER_REACH,
             )
+            .order_by(AccountPostMetric.reach.desc())
+            .limit(WINNER_REACH_POOL)
+            .subquery()
+        )
+        rows = (
+            session.query(distributed.c.caption, distributed.c.timestamp)
             .order_by(
-                AccountPostMetric.conversion_score.desc(),
-                AccountPostMetric.timestamp.desc(),
+                distributed.c.conversion_score.desc(),
+                distributed.c.timestamp.desc(),
             )
             .limit(n)
             .all()
@@ -150,5 +172,17 @@ def upsert_account_post_metrics(rows: Iterable[Mapping[str, object]]) -> int:
             media_id = row.get("media_id")
             if media_id:
                 metric.media_id = str(media_id)
+            # Same treatment as media_id, for the same reason plus one more: the
+            # follow_type breakdown is unavailable for some media, and a re-pull
+            # that comes back empty must not erase a split an earlier pull got.
+            for field in (
+                "reach_follower",
+                "reach_non_follower",
+                "avg_watch_time_ms",
+                "total_watch_time_ms",
+            ):
+                value = row.get(field)
+                if value is not None:
+                    setattr(metric, field, int(value))
         session.commit()
     return len(row_list)

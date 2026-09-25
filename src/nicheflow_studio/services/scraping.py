@@ -168,7 +168,7 @@ def scrape_source_to_pool(
     if progress:
         progress(0.5, f"Pooling {len(results)} result(s)…")
 
-    added = duplicates = blocked = no_account = 0
+    added = duplicates = blocked = no_account = too_short = 0
     with get_session() as session:
         for index, candidate in enumerate(results):
             metadata = ReelMetadata(
@@ -191,6 +191,8 @@ def scrape_source_to_pool(
                 duplicates += 1
             elif result.status == "blocked":
                 blocked += 1
+            elif result.status == "too_short":
+                too_short += 1
             else:  # "no_account"
                 no_account += 1
             if progress and results:
@@ -210,6 +212,9 @@ def scrape_source_to_pool(
         "duplicates": duplicates,
         "blocked": blocked,
         "no_account": no_account,
+        # Posts under the duration floor. Counted separately from "blocked" so a
+        # source that has started posting filler is visible as exactly that.
+        "too_short": too_short,
         # True when the results did not continue from the previous watermark, so
         # posts in between were missed and the watermark was left where it was.
         # Re-run to pick them up; the caller should say so rather than reporting

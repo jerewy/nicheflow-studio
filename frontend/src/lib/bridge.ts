@@ -1231,7 +1231,19 @@ export const bridge = {
   },
 
   poolNicheAccounts(niche: string): Promise<NicheAccount[]> {
-    if (!hasBridge()) return Promise.resolve([]);
+    // Mixed `available` on purpose: the shared pool gives each account its own
+    // remaining count, and one account at 0 must read differently from a niche
+    // with nothing left at all.
+    if (!hasBridge())
+      return Promise.resolve(
+        niche === "history"
+          ? [
+              { id: 1, name: "Past Moments Daily", operational_status: "active", available: 1182 },
+              { id: 2, name: "Beneath History", operational_status: "active", available: 1283 },
+              { id: 3, name: "Vaulted History", operational_status: "active", available: 0 },
+            ]
+          : [],
+      );
     return unwrap(window.pywebview!.api.pool_niche_accounts(niche));
   },
 
@@ -1627,10 +1639,19 @@ const mock = {
         // a fresh distribute can briefly offer fewer clips than it assigned) is
         // visible in dev too.
         pending_media: groupIndex === 1 ? 1 : 0,
+        // One account carrying a reel whose reply was imported and never
+        // finished, so dev exercises the "not exported" badge and the per-card
+        // Finish button without needing a half-finished batch in the DB.
+        pending_finish: groupIndex === 0 ? 1 : 0,
         items: Array.from(
-          { length: groupIndex === 2 ? Math.min(2, perAccount) : perAccount },
+          // Two extra rows per account: one standing in for an already-drafted
+          // reel (listed, never auto-ticked) and one for an unfinished import.
+          { length: (groupIndex === 2 ? Math.min(2, perAccount) : perAccount) + 2 },
           (_, i) => {
             const id = 100 * (groupIndex + 1) + i;
+            const draftlessCount = groupIndex === 2 ? Math.min(2, perAccount) : perAccount;
+            const unfinished = groupIndex === 0 && i === draftlessCount;
+            const drafted = unfinished || i >= draftlessCount;
             return {
               id,
               // Mock the real gap between the raw id and the per-account "#N"
@@ -1639,9 +1660,11 @@ const mock = {
               title: `${account.account_name} clip ${i + 1}`,
               source_url: `https://instagram.com/reel/mock${id}`,
               preview_url: null,
-              has_draft: false,
+              has_draft: drafted,
+              needs_finish: unfinished,
               // Mixed on purpose so the UI's vision/frame split is visible in dev.
               has_vision: i % 2 === 0,
+              review_state: drafted ? (unfinished ? "pending_review" : "draft") : null,
             };
           },
         ),
@@ -2131,9 +2154,12 @@ const mock = {
       niches: [
         {
           niche: "history",
-          pooled: 3,
+          pooled: 4,
           assigned: 2,
           unused: 1,
+          // One clip already posted, so dev shows spent inventory sitting apart
+          // from the free pile instead of being folded back into "unused".
+          used: 1,
           rejected: 0,
           pending: 1,
           assignments_by_account: [
@@ -2145,6 +2171,7 @@ const mock = {
           pooled: 0,
           assigned: 0,
           unused: 0,
+          used: 0,
           rejected: 0,
           pending: 0,
           assignments_by_account: [],

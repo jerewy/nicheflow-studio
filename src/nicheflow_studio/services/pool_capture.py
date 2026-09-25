@@ -271,11 +271,13 @@ def capture_instagram_reels_to_pool(items: list[dict]) -> dict:
         "queued": len(items),
         "added": sum(result["status"] == "added" for result in results),
         "duplicates": sum(result["status"] == "duplicate" for result in results),  # noqa: E501
-        # "blocked" and "no_account" would otherwise vanish from the popup's
-        # "X added, Y duplicate, Z failed" line — count them as failed so
-        # every queued reel is accounted for.
+        # "blocked", "no_account" and "too_short" would otherwise vanish from
+        # the popup's "X added, Y duplicate, Z failed" line — count them as
+        # failed so every queued reel is accounted for. Each carries its own
+        # message, so the per-reel rows still say which one it was.
         "failed": sum(
-            result["status"] in {"failed", "blocked", "no_account"} for result in results
+            result["status"] in {"failed", "blocked", "no_account", "too_short"}
+            for result in results
         ),
         "apify_results": len(candidates),
     }

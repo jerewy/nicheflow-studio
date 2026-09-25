@@ -6,6 +6,7 @@ import { DashboardTable } from "@/components/DashboardTable";
 import { useRevisitRefresh } from "@/hooks/useKeepAlive";
 import { formatDate } from "@/lib/format";
 import { bridge } from "@/lib/bridge";
+import { cn } from "@/lib/utils";
 import type {
   ApifyUsage,
   NicheAccount,
@@ -16,6 +17,10 @@ import type {
 } from "@/types";
 
 const SCRAPE_TIMEOUT_MS = 600000;
+
+// Mirrors assignments.MIN_REUSE_GAP_DAYS. Display only — the backend enforces
+// it — but the "0 left" tooltip is wrong if the two ever drift apart.
+const REUSE_GAP_DAYS = 14;
 
 // Poll a background scrape job until it finishes; resolve with its result or
 // throw its error message. Mirrors ScrapingScreen's poller.
@@ -229,7 +234,8 @@ export function PoolingScreen({
             target === null
               ? "All accounts already hold their daily backlog target. Raise \"Reels per account\" to top them up further, or use Distribute now to add more on top."
               : `All accounts already hold ${target} clip(s) or more. Raise "Reels per account" to top them up further, or use Distribute now to add more on top.`,
-          pool_empty: "Pool is fully distributed — no unused clips remain.",
+          pool_empty:
+            "Every account has already had every clip in the pool, or the rest are still inside the 14-day reuse gap. Scrape a new source to add more.",
         };
         setMessage(reasonMessages[result.reason ?? ""] ?? "Nothing to distribute.");
       } else {
@@ -271,7 +277,7 @@ export function PoolingScreen({
       setManualTargets({});
       if (result.assigned === 0) {
         setMessage(
-          "No clips were distributed — this niche's pool has no unused clips left to add.",
+          "No clips were distributed — these accounts have already had every clip in the pool, or the rest are still inside the 14-day reuse gap.",
         );
       } else {
         const breakdown = result.accounts
@@ -397,7 +403,19 @@ export function PoolingScreen({
           <option value="history">History</option>
           <option value="movie">Movie</option>
         </select>
-        {stats && <p className="text-sm text-muted-foreground">{stats.pooled} pooled · {stats.assigned} assigned · {stats.unused} unused · {stats.rejected} rejected</p>}
+        {stats && (
+          // Inventory only. What can actually be distributed is PER ACCOUNT
+          // (the "N left" beside each account below), because the same clip may
+          // go to several accounts over time — so "never used" being 0 does not
+          // mean Distribute has nothing to do.
+          <p
+            className="text-sm text-muted-foreground"
+            title="How much of the pool has been touched at least once, by any account. What each account can still take is shown next to it under Distribute now."
+          >
+            {stats.pooled} pooled · {stats.assigned} in a backlog · {stats.used} used at least
+            once · {stats.unused} never used · {stats.rejected} rejected
+          </p>
+        )}
         <div className="grow" />
         <label className="text-sm text-muted-foreground" htmlFor="auto-target">
           Reels per account
@@ -474,6 +492,22 @@ export function PoolingScreen({
                     }))
                   }
                 />
+                {/* Per account, because the pool is shared: a clip one account
+                    used is still new to this one, so the niche-wide "unused"
+                    number says nothing about what THIS account can take. */}
+                <span
+                  className={cn(
+                    "text-[11px]",
+                    account.available === 0 ? "text-amber-500" : "text-muted-foreground",
+                  )}
+                  title={
+                    account.available === 0
+                      ? `${account.name} has already had every clip in the pool, or the rest are still inside the ${REUSE_GAP_DAYS}-day reuse gap. Scrape a new source to give it more.`
+                      : `${account.available} pool clip(s) ${account.name} has never had`
+                  }
+                >
+                  {account.available} left
+                </span>
               </label>
             );
           })}

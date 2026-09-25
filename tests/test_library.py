@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from conftest import FAKE_VIDEO_BYTES
+
 import datetime as dt
 from pathlib import Path
 from types import SimpleNamespace
@@ -767,7 +769,7 @@ def test_pending_review_first_use_downloads_once_and_reuses_globally(tmp_path: P
     def fake_download(*, url, output_dir):
         calls.append(url)
         path = tmp_path / "lazy.mp4"
-        path.write_bytes(b"video")
+        path.write_bytes(FAKE_VIDEO_BYTES)
         return SimpleNamespace(file_path=path)
 
     first = library.ensure_item_downloaded(item_ids[0], downloader=fake_download)
@@ -813,7 +815,7 @@ def test_pending_review_download_never_uses_publishing_account_session(
     def fake_download(*, url, output_dir, cookiefile=None):
         seen["cookiefile"] = cookiefile
         path = tmp_path / "z.mp4"
-        path.write_bytes(b"video")
+        path.write_bytes(FAKE_VIDEO_BYTES)
         return SimpleNamespace(file_path=path)
 
     monkeypatch.setattr(library, "download_instagram_url", fake_download)
@@ -853,7 +855,7 @@ def test_download_persists_content_hash(tmp_path: Path, monkeypatch: pytest.Monk
 
     def fake_download(*, url, output_dir):
         path = tmp_path / "fp.mp4"
-        path.write_bytes(b"video")
+        path.write_bytes(FAKE_VIDEO_BYTES)
         return SimpleNamespace(file_path=path)
 
     result = library.ensure_item_downloaded(item_id, downloader=fake_download)
@@ -934,7 +936,7 @@ def test_transient_download_failure_retries_then_succeeds(
         if calls < 3:
             raise RuntimeError("Connection reset by peer")
         path = tmp_path / "ok.mp4"
-        path.write_bytes(b"video")
+        path.write_bytes(FAKE_VIDEO_BYTES)
         return SimpleNamespace(file_path=path)
 
     result = library.ensure_item_downloaded(item_id, downloader=flaky_then_ok)
@@ -1026,7 +1028,7 @@ def test_prefetch_warms_uncached_skips_cached_and_swallows_failures(
     monkeypatch.setattr(library.time, "sleep", lambda _seconds: None)
 
     cached = tmp_path / "cached.mp4"
-    cached.write_bytes(b"video")
+    cached.write_bytes(FAKE_VIDEO_BYTES)
     with get_session() as session:
         account = Account(name="A", niche="history")
         session.add(account)
@@ -1066,7 +1068,7 @@ def test_prefetch_warms_uncached_skips_cached_and_swallows_failures(
         if url.endswith("/p2"):
             raise RuntimeError("Connection reset by peer")
         path = tmp_path / "dl.mp4"
-        path.write_bytes(b"video")
+        path.write_bytes(FAKE_VIDEO_BYTES)
         return SimpleNamespace(file_path=path)
 
     result = library.prefetch_items(ids, downloader=fake_download)
@@ -1099,7 +1101,7 @@ def test_concurrent_downloads_of_same_clip_run_once(
         entered.set()  # signal we're inside the download, holding the per-clip lock
         assert release.wait(2)
         path = tmp_path / "race.mp4"
-        path.write_bytes(b"video")
+        path.write_bytes(FAKE_VIDEO_BYTES)
         return SimpleNamespace(file_path=path)
 
     results: dict[str, dict] = {}

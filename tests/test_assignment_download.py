@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from conftest import FAKE_VIDEO_BYTES
+
 import random
 from pathlib import Path
 
@@ -78,7 +80,7 @@ def test_download_assigned_pending_marks_downloaded_with_fingerprint(tmp_path) -
         # Materialise a real file so size + reuse checks behave like production.
         shortcode = url.rstrip("/").rsplit("/", 1)[-1]
         path = tmp_path / f"{shortcode}.mp4"
-        path.write_bytes(b"fake video bytes")
+        path.write_bytes(FAKE_VIDEO_BYTES)
         return _FakeResult(str(path))
 
     # Unique fingerprint per clip so the footage-dedup step doesn't treat them
@@ -113,7 +115,7 @@ def test_download_assigned_pending_reuses_existing_file(tmp_path) -> None:
     def counting_downloader(url: str) -> _FakeResult:
         calls.append(url)
         path = tmp_path / f"{url.rstrip('/').rsplit('/', 1)[-1]}.mp4"
-        path.write_bytes(b"v")
+        path.write_bytes(FAKE_VIDEO_BYTES)
         return _FakeResult(str(path))
 
     fp = lambda path: f"FP-{Path(path).stem}"  # unique per clip -> no false dups
@@ -165,7 +167,7 @@ def test_download_retires_gone_source_and_distribute_refills(tmp_path) -> None:
         if "SEED0" in url:
             raise RuntimeError("ERROR: [Instagram] SEED0: The post may have been deleted.")
         path = tmp_path / f"{url.rstrip('/').rsplit('/', 1)[-1]}.mp4"
-        path.write_bytes(b"v")
+        path.write_bytes(FAKE_VIDEO_BYTES)
         return _FakeResult(str(path))
 
     summary = download_assigned_pending(
@@ -223,7 +225,7 @@ def test_download_dedup_replace_flags_duplicate_footage(tmp_path) -> None:
 
     def fake_downloader(url: str) -> _FakeResult:
         path = tmp_path / f"{url.rstrip('/').rsplit('/', 1)[-1]}.mp4"
-        path.write_bytes(b"x")
+        path.write_bytes(FAKE_VIDEO_BYTES)
         return _FakeResult(str(path))
 
     # Identical (valid-format) fingerprint for every clip => clips 2 and 3 are

@@ -1,5 +1,8 @@
+import json
 import re
 import datetime as dt
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -9,10 +12,14 @@ from nicheflow_studio.db.models import (
     DownloadItem,
     MediaAsset,
     UploadJob,
+    ScrapeCandidate,
 )
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.processing import smart_drafts
+from nicheflow_studio.processing import draft_guard
 from nicheflow_studio.services import draft_handoff, draft_revisions, library
+
+NL = chr(10)
 from nicheflow_studio.services.draft_revisions import DraftRevisionError
 
 
@@ -101,6 +108,70 @@ def test_build_chat_prompt_contains_selected_item_context() -> None:
     assert "Cinema Bold Keywords" in prompt
 
 
+def _strip_signals(item_id: int) -> None:
+    """Leave an item with nothing a drafter could write from."""
+    with get_session() as session:
+        item = session.get(DownloadItem, item_id)
+        item.title = None
+        item.source_description = None
+        item.transcript_text = None
+        item.smart_vision_payload = None
+        session.commit()
+
+
+def test_build_chat_prompt_refuses_a_reel_with_no_signals(hook_fixture) -> None:
+    """A prompt whose every context field reads "(none)" is not worth copying.
+
+    Item 2371 went out that way: Apify returned a metadata-less row, nothing
+    downstream filled it, and a chat assistant cannot open the local path, so
+    the only honest reply it could give was to ask what was in the clip. The
+    round trip through ChatGPT is a slow way to learn that, so fail at the
+    button instead.
+    """
+    _account_id, item_ids = hook_fixture.account("BlankHistory", 1)
+    _strip_signals(item_ids[0])
+
+    with pytest.raises(DraftRevisionError) as excinfo:
+        draft_handoff.build_chat_prompt(item_ids[0])
+
+    assert "Prepare batch" in str(excinfo.value)
+
+
+def test_a_clip_premise_alone_unblocks_a_signal_less_reel(hook_fixture) -> None:
+    # The premise IS the one-line description the guard asks for, so typing one
+    # has to unblock the same reel rather than dead-ending it.
+    _account_id, item_ids = hook_fixture.account("PremiseHistory", 1)
+    _strip_signals(item_ids[0])
+
+    prompt = draft_handoff.build_chat_prompt(
+        item_ids[0], {"clip_premise": "Pastor loses his place mid-sermon."}
+    )
+
+    assert "Pastor loses his place mid-sermon." in prompt
+
+
+def test_build_chat_prompt_reads_a_missing_on_screen_hook_first(monkeypatch, hook_fixture) -> None:
+    """The single-reel path has to fill the hook itself.
+
+    ``batch_frames`` does it for the batch path, which left the one-click path
+    as the only prompt that could go out with no visual grounding at all. The
+    read is local OCR, so it costs nothing but a second.
+    """
+    account_id, item_ids = hook_fixture.account("OcrHistory", 1)
+    hook_fixture.link(item_ids[0], "vid-ocr-1", account_id)
+    _strip_signals(item_ids[0])
+    monkeypatch.setattr(
+        draft_handoff.on_screen_hook,
+        "read_hook",
+        lambda path: ("At least he is honest", 0.96),
+    )
+    monkeypatch.setattr(Path, "exists", lambda self: True)
+
+    prompt = draft_handoff.build_chat_prompt(item_ids[0])
+
+    assert "At least he is honest" in prompt
+
+
 def test_build_chat_prompt_carries_title_rules_and_hook_framing() -> None:
     # The chat path must share the live prompt's title rules (history account
     # with no explicit style auto-routes to the Cinematic Record hook) and the
@@ -172,7 +243,9 @@ def test_chat_prompts_allow_verified_web_research() -> None:
         assert "shortest verbatim quote" in prompt
         assert "Naming an outlet without a quote does NOT count" in prompt
         assert "Never state a guess you could not verify" in prompt
-        assert "safest or most hedged" in prompt
+        # Same intent, v2's wording: research must not push the model toward
+        # recommending whichever option commits to the least.
+        assert "hedging is not a virtue" in prompt
     assert "work ONLY from the signals" not in single
 
 
@@ -1390,7 +1463,218 @@ def test_import_multi_account_batch_routes_across_accounts() -> None:
     assert draft_revisions.latest_revision(second[0]).title_options == ["Beta hook"]
 
 
-def test_batch_candidates_skips_drafted_and_resting_accounts() -> None:
+def test_every_prompt_path_uses_the_accounts_saved_title_style(hook_fixture) -> None:
+    """One account must not get two different rulebooks.
+
+    Only the multi-account builder resolved the account's saved
+    processing_preferences. The other two read `settings` alone, so an empty
+    dict gave title_style=None, which falls past the beats_v2 branch to the v1
+    rules - the Processing screen's single-clip prompt and the single-account
+    batch were handing out Curiosity / Open Loop for an account saved as v2,
+    while the batch screen handed out v2. Same account, same clip, two
+    different sets of instructions.
+    """
+    account_id, item_ids = hook_fixture.account("RhoHistory", 2)
+    with get_session() as session:
+        session.get(Account, account_id).processing_preferences = json.dumps(
+            {"prompt_title_style": "beats_v2"}
+        )
+        session.commit()
+
+    prompts = {
+        "multi": draft_handoff.build_multi_account_batch_chat_prompt(item_ids, {}),
+        "account_batch": draft_handoff.build_account_batch_chat_prompt(account_id, item_ids),
+        "single_clip": draft_handoff.build_chat_prompt(item_ids[0]),
+    }
+    for name, prompt in prompts.items():
+        # v2 markers
+        assert "DO NOT CLOSE THE LOOP" in prompt, name
+        assert "130 CHARACTERS" in prompt, name
+        # and NOT the v1 rulebook it used to fall through to
+        assert "SIX MOVES" not in prompt, name
+
+
+@pytest.fixture
+def hook_fixture():
+    """Make a history account with items, optionally linked to a ScrapeCandidate.
+
+    Cleans up everything it creates, which existing callers of
+    ``_make_second_account_items`` do not. Two couplings make that necessary:
+    the factory hardcodes ``niche="history"`` and test_assignments asserts an
+    exact distribution across EVERY history account that exists, and
+    distribution also queries ScrapeCandidate globally. So a leftover account or
+    candidate row from a test in this file fails a distribution test several
+    files later, which is exactly what adding these did.
+    """
+    accounts: list[int] = []
+
+    class _Fixture:
+        def account(self, name: str, count: int = 1):
+            account_id, item_ids = _make_second_account_items(name, count)
+            accounts.append(account_id)
+            return account_id, item_ids
+
+        def link(self, item_id: int, video_id: str, account_id: int) -> None:
+            """on_screen_title lives per SOURCE VIDEO, not per item, so one
+            reading is shared by every account the reel reached."""
+            with get_session() as session:
+                session.get(DownloadItem, item_id).video_id = video_id
+                session.add(
+                    ScrapeCandidate(
+                        video_id=video_id,
+                        source_url=f"https://x/{video_id}",
+                        scrape_source_url=f"https://x/{video_id}",
+                        account_id=account_id,
+                    )
+                )
+                session.commit()
+
+    yield _Fixture()
+
+    with get_session() as session:
+        for account_id in accounts:
+            for item in session.query(DownloadItem).filter_by(account_id=account_id).all():
+                if item.video_id:
+                    session.query(ScrapeCandidate).filter_by(video_id=item.video_id).delete()
+                session.delete(item)
+            session.query(ScrapeCandidate).filter_by(account_id=account_id).delete()
+            account = session.get(Account, account_id)
+            if account is not None:
+                session.delete(account)
+        session.commit()
+
+
+def test_frame_prep_fills_a_missing_on_screen_hook(monkeypatch, hook_fixture) -> None:
+    """The hook has to exist before the prompt builder reads it.
+
+    Two shipping rules need one to point at - the evidence block's "match the
+    angle" and title_lab's ONE EXCEPTION - and the field was empty on 161 of 185
+    reels. Frame prep is where it belongs: the UI calls it before building the
+    prompt, and the footage is guaranteed on disk, which it is not at distribute
+    time.
+    """
+    account_id, item_ids = hook_fixture.account("NuHistory", 1)
+    hook_fixture.link(item_ids[0], "vid-nu-1", account_id)
+
+    monkeypatch.setattr(
+        draft_handoff.on_screen_hook, "read_hook", lambda path: ("A read hook", 0.97)
+    )
+    monkeypatch.setattr(Path, "exists", lambda self: True)
+
+    assert draft_handoff._ensure_on_screen_hooks(item_ids) == 1
+
+    with get_session() as session:
+        stored = (
+            session.query(ScrapeCandidate.on_screen_title)
+            .filter(ScrapeCandidate.video_id == "vid-nu-1")
+            .scalar()
+        )
+    assert stored == "A read hook"
+
+
+def test_an_existing_hook_is_never_re_read(monkeypatch, hook_fixture) -> None:
+    # Some of the 719 rows already there were hand-checked; OCR must not stomp them.
+    account_id, item_ids = hook_fixture.account("PiHistory", 1)
+    hook_fixture.link(item_ids[0], "vid-pi-1", account_id)
+    with get_session() as session:
+        row = session.query(ScrapeCandidate).filter_by(video_id="vid-pi-1").one()
+        row.on_screen_title = "hand checked"
+        session.commit()
+
+    def boom(path):
+        raise AssertionError("should not have re-read an existing hook")
+
+    monkeypatch.setattr(draft_handoff.on_screen_hook, "read_hook", boom)
+    monkeypatch.setattr(Path, "exists", lambda self: True)
+
+    assert draft_handoff._ensure_on_screen_hooks(item_ids) == 0
+
+
+def test_a_low_confidence_hook_is_dropped_not_stored(monkeypatch, hook_fixture) -> None:
+    """A wrong hook is worse than none.
+
+    The prompt tells the model to MATCH THE ANGLE of whatever hook it is handed,
+    so a garbled read would steer every option on that reel. RapidOCR separates
+    the cases cleanly: real banners read above 0.95, music-only frames near 0.25.
+    """
+    account_id, item_ids = hook_fixture.account("XiHistory", 1)
+    hook_fixture.link(item_ids[0], "vid-xi-1", account_id)
+
+    monkeypatch.setattr(
+        draft_handoff.on_screen_hook, "read_hook", lambda path: ("garbled noise", 0.20)
+    )
+    monkeypatch.setattr(Path, "exists", lambda self: True)
+
+    assert draft_handoff._ensure_on_screen_hooks(item_ids) == 0
+    with get_session() as session:
+        stored = (
+            session.query(ScrapeCandidate.on_screen_title)
+            .filter(ScrapeCandidate.video_id == "vid-xi-1")
+            .scalar()
+        )
+    assert not stored
+
+
+def test_a_failing_hook_read_never_blocks_the_batch(monkeypatch, hook_fixture) -> None:
+    # A reel whose banner will not read still drafts from its caption and sheet.
+    account_id, item_ids = hook_fixture.account("OmicronHistory", 1)
+    hook_fixture.link(item_ids[0], "vid-om-1", account_id)
+
+    def boom(path):
+        raise RuntimeError("ffmpeg exploded")
+
+    monkeypatch.setattr(draft_handoff.on_screen_hook, "read_hook", boom)
+    monkeypatch.setattr(Path, "exists", lambda self: True)
+
+    assert draft_handoff._ensure_on_screen_hooks(item_ids) == 0  # no exception
+
+
+def test_a_missing_vision_pass_does_not_ask_for_timid_writing() -> None:
+    """No vision payload is the normal case, not a degraded one.
+
+    The vision pass is Groq-backed and no key is configured, so 0 of 185 items
+    on the live account carry a payload. The guidance used to end "stay more
+    conservative", which therefore fired on every single reel while the contact
+    sheet and the source's own OCR'd hook sat in the same block as real
+    evidence. Hedged titles were being asked for.
+    """
+    guidance = NL.join(draft_handoff._VISUAL_EVIDENCE_GUIDANCE)
+
+    assert "stay more conservative" not in guidance
+    assert "NOT a reason to write timidly" in guidance
+    # the fact-safety half must survive the reword
+    assert "conservative about SPECIFICS the evidence cannot carry" in guidance
+
+
+def test_both_batch_prompts_offer_a_concern_line_instead_of_a_dropped_block() -> None:
+    """An objection must cost a line, never the whole block.
+
+    The contract says "one block per reel, one for every reel" and forbids
+    skipping, but named no way to register a problem - so a model with a real
+    one answered in prose outside the format, the block vanished, the import
+    reported "1 unmatched", and the reel reached Finish Batch with no draft,
+    where it exports under its raw scraped caption.
+    """
+    account_id, item_ids = _make_second_account_items("MuHistory", 2)
+
+    single = draft_handoff.build_account_batch_chat_prompt(account_id, item_ids)
+    multi = draft_handoff.build_multi_account_batch_chat_prompt(item_ids, {})
+
+    for prompt in (single, multi):
+        assert "Concern:" in prompt
+        assert "still return its block" in prompt
+        # the hatch must not weaken the no-skip rule it sits beside
+        assert "skip any reel" in prompt
+
+
+def test_batch_candidates_lists_drafted_reels_last_and_flags_them() -> None:
+    """An imported reel must stay on this screen.
+
+    Dropping it meant the row vanished on the next poll: redoing a title had to
+    go through Processing, and an import that silently matched nothing looked
+    exactly like one that worked. `available` still counts only the draftless
+    reels, so the "N of M draftless" label keeps its meaning.
+    """
     account_id, item_ids = _make_second_account_items("IotaHistory", 3)
     draft_handoff.import_pasted_draft(
         item_ids[0],
@@ -1399,7 +1683,108 @@ def test_batch_candidates_skips_drafted_and_resting_accounts() -> None:
 
     groups = draft_handoff.batch_candidates(niche="history", per_account=10)
     mine = next(g for g in groups if g["account_id"] == account_id)
-    assert [item["id"] for item in mine["items"]] == item_ids[1:]
+
+    # draftless first, the drafted reel appended after them
+    assert [item["id"] for item in mine["items"]] == [*item_ids[1:], item_ids[0]]
+    assert [item["has_draft"] for item in mine["items"]] == [False, False, True]
+    assert mine["available"] == 2
+
+
+def test_batch_candidates_flags_an_imported_reel_that_was_never_finished() -> None:
+    """An import that never reached Finish is stranded work, not a finished draft.
+
+    Importing writes a DraftRevision; only finish_batch applies an option onto
+    the item's title_draft/caption_draft. A reel left between the two used to
+    read here as plain "drafted" and drop out of the queue for good, while the
+    Processing table still showed it as pending review - 23 reels had piled up
+    that way with no surface left that could act on them.
+    """
+    account_id, item_ids = _make_second_account_items("NuHistory", 3)
+    draft_handoff.import_pasted_draft(
+        item_ids[0],
+        NL.join(["Title Option 1:", "Imported, never finished", "Shared Caption:", "A caption."]),
+    )
+
+    groups = draft_handoff.batch_candidates(niche="history", per_account=10)
+    mine = next(g for g in groups if g["account_id"] == account_id)
+    stranded = next(item for item in mine["items"] if item["id"] == item_ids[0])
+
+    assert stranded["needs_finish"] is True
+    assert stranded["has_draft"] is True
+    assert mine["pending_finish"] == 1
+    # It needs finishing, not re-drafting, so it stays out of the draftless count.
+    assert mine["available"] == 2
+
+
+def test_batch_candidates_clears_the_finish_flag_once_the_draft_is_applied() -> None:
+    """Applying an option is what turns an import into a real draft."""
+    account_id, item_ids = _make_second_account_items("XiHistory", 2)
+    draft_handoff.import_pasted_draft(
+        item_ids[0],
+        NL.join(["Title Option 1:", "Applied for real", "Shared Caption:", "A caption."]),
+    )
+    draft_revisions.apply_revision(item_ids[0], 1)
+
+    groups = draft_handoff.batch_candidates(niche="history", per_account=10)
+    mine = next(g for g in groups if g["account_id"] == account_id)
+    applied = next(item for item in mine["items"] if item["id"] == item_ids[0])
+
+    assert applied["needs_finish"] is False
+    assert applied["has_draft"] is True
+    assert mine["pending_finish"] == 0
+
+
+def test_batch_candidates_lists_unfinished_reels_ahead_of_finished_ones() -> None:
+    """The per-account cap must not be what hides stranded work.
+
+    Both groups are capped at ``per_account``, so with finished drafts listed
+    first a backlog of them would push every unfinished reel past the cut - the
+    exact way the 23 stayed invisible behind a "6 already drafted" line.
+    """
+    account_id, item_ids = _make_second_account_items("OmicronHistory", 3)
+    for index, item_id in enumerate(item_ids, start=1):
+        draft_handoff.import_pasted_draft(
+            item_id,
+            NL.join(["Title Option 1:", f"Draft {index}", "Shared Caption:", "A caption."]),
+        )
+    # The first two were finished; the third was left between import and Finish.
+    draft_revisions.apply_revision(item_ids[0], 1)
+    draft_revisions.apply_revision(item_ids[1], 1)
+
+    groups = draft_handoff.batch_candidates(niche="history", per_account=1)
+    mine = next(g for g in groups if g["account_id"] == account_id)
+
+    assert [item["id"] for item in mine["items"]][0] == item_ids[2]
+    assert mine["pending_finish"] == 1
+
+
+def test_batch_candidates_drops_a_drafted_reel_once_its_export_is_committed() -> None:
+    """A booked export must leave this screen even though it has a draft.
+
+    Drafted reels are now listed, and the screen's post-finish reconcile reads
+    "reels that did export drop out of the candidate list" to tell a successful
+    18-reel finish from a no-op. Having a draft used to be what removed them, so
+    the commit check has to do it now or a good finish reads as "did nothing".
+    """
+    account_id, item_ids = _make_second_account_items("LambdaHistory", 2)
+    draft_handoff.import_pasted_draft(
+        item_ids[0],
+        "Title Option 1:\nDrafted then exported\nShared Caption:\nA caption.",
+    )
+
+    groups = draft_handoff.batch_candidates(niche="history", per_account=10)
+    mine = next(g for g in groups if g["account_id"] == account_id)
+    assert item_ids[0] in [item["id"] for item in mine["items"]]
+
+    _add_upload_job(account_id, item_ids[0], "scheduled", posted=False)
+
+    groups = draft_handoff.batch_candidates(niche="history", per_account=10)
+    mine = next(g for g in groups if g["account_id"] == account_id)
+    assert item_ids[0] not in [item["id"] for item in mine["items"]]
+
+
+def test_batch_candidates_skips_resting_accounts() -> None:
+    account_id, _ = _make_second_account_items("KappaHistory", 2)
 
     with get_session() as session:
         session.get(Account, account_id).operational_status = "resting"
@@ -1455,26 +1840,39 @@ def test_batch_candidates_keep_a_posted_reel_that_was_reopened() -> None:
     assert [item["id"] for item in mine["items"]] == item_ids
 
 
-def test_batch_candidates_skips_a_reel_another_account_already_posted() -> None:
-    # The same source reel can reach two accounts: clips from the legacy
-    # direct-download path were never pool items, so the pool's dedup never knew
-    # another account held them. Publishing it twice from one network is a
-    # footprint risk, so match on the source video, not just this account's copy.
-    poster_id, posted_ids = _make_second_account_items("TauHistory", 1)
+def test_batch_candidates_offers_a_reel_another_account_already_posted() -> None:
+    """The source-video check is PER ACCOUNT now that the pool is shared.
+
+    It used to skip any reel whose footage had gone out anywhere in the network.
+    That made a shared pool behave like private inventory - the same reasoning
+    as ``assignments.MIN_REUSE_GAP_DAYS``: a sibling account posting it is
+    spaced by the reuse gap at distribution time, not blocked here. What this
+    check still catches is ONE account repeating its own footage, including
+    through the legacy direct-download path, whose clips were never pool items
+    and so carry no assignment row to catch it.
+    """
+    poster_id, posted_ids = _make_second_account_items("TauHistory", 2)
     _add_upload_job(poster_id, posted_ids[0], "posted", posted=True)
     other_id, other_ids = _make_second_account_items("UpsilonHistory", 2)
     with get_session() as session:
-        # Same footage, different DownloadItem row on the other account.
         shared = session.get(DownloadItem, posted_ids[0]).video_id or "shared-reel"
         session.get(DownloadItem, posted_ids[0]).video_id = shared
+        # The publisher's OWN second copy of that footage...
+        session.get(DownloadItem, posted_ids[1]).video_id = shared
+        # ...and a different account's copy of the same footage.
         session.get(DownloadItem, other_ids[0]).video_id = shared
         session.commit()
 
     groups = draft_handoff.batch_candidates(niche="history", per_account=10)
     other = next(g for g in groups if g["account_id"] == other_id)
+    poster = next(g for g in groups if g["account_id"] == poster_id)
 
-    assert [item["id"] for item in other["items"]] == [other_ids[1]]
-    assert other["available"] == 1
+    # The sibling may draft it: both of its reels are offered.
+    assert [item["id"] for item in other["items"]] == other_ids
+    assert other["available"] == 2
+    # The account that published it may not run it again.
+    assert [item["id"] for item in poster["items"]] == []
+    assert poster["available"] == 0
 
 
 def test_batch_candidates_keep_reels_with_no_video_id() -> None:
@@ -1680,8 +2078,11 @@ def test_batch_headers_defer_the_recommendation_to_the_style_rules() -> None:
 
     assert "whose specific the clip delivers most strongly" not in prompt
     assert "RECOMMENDED PICK rule in the on-screen title rules above" in prompt
-    # The style rule must still be the one voice that IS present.
-    assert "a REACTIVE option is the default pick" in prompt
+    # The style rule must still be the one voice that IS present. The default
+    # moved from "a reactive option" to "an option carrying no hard specific"
+    # once the specificity gap (2.1x) was measured against the register gap.
+    assert "carrying NO" in prompt and "is the default pick" in prompt
+    assert "a REACTIVE option is the default pick" not in prompt
 
 
 def test_batch_headers_ban_repeating_a_title_stem_across_reels() -> None:
@@ -1890,3 +2291,518 @@ def test_clip_batch_reply_routes_by_number_not_position() -> None:
 def test_clip_batch_reply_ignores_blocks_with_no_titles() -> None:
     reply = "Clip 1:\nSorry, I could not write titles for this one.\n"
     assert draft_handoff.parse_clip_batch_titles(reply) == {}
+
+
+def test_multi_account_prompt_uses_the_account_saved_title_style() -> None:
+    """The batch screen sends {}, so styles must resolve from the account.
+
+    Regression: with an empty settings dict every account resolved
+    title_style=None and fell through to the caption-derived rules, so the
+    historytrails_record rule set the accounts are configured for - the register
+    mix, the specificity rules, the scene-description format - never reached the
+    prompt the operator actually pasted into a chat model.
+    """
+    account = Account(
+        id=1,
+        name="Vaulted History",
+        platform="instagram",
+        instagram_handle="vaultedhistory",
+        niche_label="history",
+        processing_preferences=json.dumps(
+            {
+                "prompt_title_style": "historytrails_record",
+                "caption_style": "history_lost_archive",
+                "title_length": "auto",
+            }
+        ),
+    )
+
+    rules = "\n".join(draft_handoff._account_style_rules(account, {}))
+
+    assert "BE CLEAR, NOT SPECIFIC" in rules
+    assert "THE THREE OPTIONS SPAN SPECIFICITY" in rules
+    assert "REGISTER MIX (HARD RULE)" in rules
+
+
+def test_beats_v2_is_selected_per_account_through_the_title_style() -> None:
+    """v2 is a title STYLE, not a global switch.
+
+    Selecting it per account is what makes an A/B possible: one account can run
+    the new rules while the rest keep theirs, and reverting is a dropdown change
+    rather than a restart. Every other style must still resolve to its own block.
+    """
+    account = Account(
+        id=1,
+        name="Vaulted History",
+        platform="instagram",
+        instagram_handle="vaultedhistory",
+        niche_label="history",
+        processing_preferences=json.dumps({"prompt_title_style": "historytrails_record"}),
+    )
+
+    # The account is saved as historytrails_record, so it keeps the old block.
+    rules = "\n".join(draft_handoff._account_style_rules(account, {}))
+    assert "THE THREE OPTIONS SPAN SPECIFICITY" in rules
+    # "END ON A VERDICT" is the v2 marker; it was "TELL IT AS A SEQUENCE"
+    # until that rule was rewritten to lead on the ending, not the beat count.
+    assert "END ON A VERDICT" not in rules
+
+    # Picking the new style in the dropdown swaps the rulebook for this account.
+    picked = "\n".join(
+        draft_handoff._account_style_rules(
+            account, {"title_style": draft_handoff.TITLE_STYLE_BEATS_V2}
+        )
+    )
+    assert "END ON A VERDICT" in picked
+    assert "THE THREE OPTIONS SPAN SPECIFICITY" not in picked
+    # And the rule that keeps a hook's unsupported claim out of the title rides with it.
+    assert "THE SOURCE'S OWN ON-SCREEN HOOK IS NOT EVIDENCE" in picked
+
+
+def test_explicit_settings_still_win_over_the_account_preferences() -> None:
+    account = Account(
+        id=1,
+        name="Vaulted History",
+        platform="instagram",
+        instagram_handle="vaultedhistory",
+        niche_label="history",
+        processing_preferences=json.dumps({"prompt_title_style": "historytrails_record"}),
+    )
+
+    rules = "\n".join(
+        draft_handoff._account_style_rules(account, {"title_style": "cinema_hook"})
+    )
+
+    assert "THE THREE OPTIONS SPAN SPECIFICITY" not in rules
+
+
+def test_prompt_carries_the_source_on_screen_hook_as_an_angle_not_a_template() -> None:
+    """The line the drafter was missing entirely.
+
+    Without it the only evidence is the scraped caption, which on these accounts
+    is descriptive prose - so a real batch wrote "A woman in bright pink loses
+    her footing on the stairs as the dog behind her closes the gap" while the
+    source's own on-screen line read "The Breed (2006) features a scene so
+    accidentally hilarious it completely steals the movie".
+    """
+    with get_session() as session:
+        candidate = ScrapeCandidate(
+            scrape_source_url="https://www.instagram.com/historytrails/",
+            source_url="https://www.instagram.com/p/ABC123/",
+            video_id="ABC123",
+            state="pooled",
+            account_id=1,
+            on_screen_title="The Breed (2006) features a scene so hilarious it steals the movie",
+        )
+        item = DownloadItem(
+            source_url="https://www.instagram.com/p/ABC123/",
+            video_id="ABC123",
+            status="completed",
+            title="Fierce pursuit unleashes absolute mayhem as a woman clad in bright pink",
+        )
+        session.add_all([candidate, item])
+        session.flush()
+
+        lines = draft_handoff._on_screen_hook_lines(item)
+
+    assert len(lines) == 1
+    body = lines[0]
+    assert "The Breed (2006)" in body
+    # Framed as an angle to match, never as text to reuse.
+    assert "MATCH THE ANGLE AND THE REGISTER" in body
+    assert "Do NOT reuse its wording" in body
+    assert "do NOT inherit its factual claims" in body
+
+
+def test_on_screen_hook_line_is_omitted_when_the_reel_has_none() -> None:
+    """Coverage is 14% of scraped candidates, so absence is the common case."""
+    with get_session() as session:
+        item = DownloadItem(
+            source_url="https://www.instagram.com/p/NOHOOK/",
+            video_id="NOHOOK",
+            status="completed",
+        )
+        session.add(item)
+        session.flush()
+
+        assert draft_handoff._on_screen_hook_lines(item) == []
+
+
+def test_import_pasted_draft_rejects_an_all_metadata_reply() -> None:
+    # Item 1959: the scraped caption said Qajar dynasty (ended 1925), the
+    # footage showed 1970s Iran, and the drafting model wrote that finding into
+    # all three title slots instead of drafting or declining. Every option was
+    # green (nothing checkable was claimed), so Apply burned one onto the video.
+    item_id = _make_item()
+    with get_session() as session:
+        item = session.get(DownloadItem, item_id)
+        item.source_description = "Iran's royal family lived a secluded life in the Qajar dynasty."
+        session.commit()
+
+    with pytest.raises(DraftRevisionError) as excinfo:
+        draft_handoff.import_pasted_draft(
+            item_id,
+            """Title Option 1:
+The caption attached to this clip is about a dynasty gone a century ago.
+Title Option 2:
+This footage is mislabeled and its real source cannot be confirmed.
+Title Option 3:
+What's on screen is not what the source caption describes.
+Recommended Pick: Title Option 1
+Why: Stays true to the mismatch.
+Shared Caption:
+Young people move through sunlit streets in this clip.
+""",
+        )
+
+    assert "metadata" in str(excinfo.value)
+    assert "Nothing was saved" in str(excinfo.value)
+    assert draft_revisions.list_revisions(item_id) == []
+
+
+def test_import_pasted_draft_keeps_a_reply_with_one_usable_title() -> None:
+    # One bad option is not a refusal: it reddens and the pick moves off it,
+    # exactly like an unsupported claim, and the revision still saves.
+    item_id = _make_item()
+
+    saved = draft_handoff.import_pasted_draft(
+        item_id,
+        """Title Option 1:
+The caption attached to this clip does not match the footage.
+Title Option 2:
+Three water skiers crossed the bay carrying a flag that no longer exists.
+Recommended Pick: Title Option 1
+Why: Most honest about the mismatch.
+Shared Caption:
+Water skiers cut across a bay in formation.
+""",
+    )
+
+    assert saved.option_tiers[0] == "red"
+    assert saved.option_tiers[1] != "red"
+    assert saved.recommended_title_index == 2
+    assert "Not a viewer-facing title" in saved.option_notes[0]
+
+
+
+def _item_with_media(tmp_path) -> int:
+    """An item whose file_path actually exists, so _ensure_transcripts reaches
+    the transcriber instead of skipping on its missing-file guard."""
+    media = tmp_path / "clip.mp4"
+    media.write_bytes(b"not really a video")
+    item_id = _make_item()
+    with get_session() as session:
+        session.get(DownloadItem, item_id).file_path = str(media)
+        session.commit()
+    return item_id
+
+
+def test_ensure_transcripts_stores_real_speech(monkeypatch, tmp_path) -> None:
+    # The gap behind both live failures: every item was drafted with
+    # transcript_text empty, so the reposter's caption was the only claim about
+    # who is in the clip. Item 1948's proof that Snoop Dogg is really there was
+    # in an audio track nothing had ever read.
+    item_id = _item_with_media(tmp_path)
+    monkeypatch.setattr(draft_handoff.video, "has_audio_stream", lambda path: True)
+    monkeypatch.setattr(
+        draft_handoff.transcription,
+        "generate_transcript_draft_in_subprocess",
+        lambda path: SimpleNamespace(
+            transcript_text=(
+                "Little cute little lizard. What the hell is going on? "
+                "Snakes are straight assholes, you could tell what they looking at."
+            ),
+            title_draft="ignored",
+            caption_draft="ignored",
+        ),
+    )
+
+    assert draft_handoff._ensure_transcripts([item_id]) == 1
+    with get_session() as session:
+        assert "lizard" in (session.get(DownloadItem, item_id).transcript_text or "")
+
+
+def test_ensure_transcripts_drops_a_short_hallucination(monkeypatch, tmp_path) -> None:
+    # Item 1959: music-only footage where whisper emitted "I passed along the
+    # state". Stored, it would sit in the prompt as evidence and steer all three
+    # titles — worse than the empty field it replaced.
+    item_id = _item_with_media(tmp_path)
+    monkeypatch.setattr(draft_handoff.video, "has_audio_stream", lambda path: True)
+    monkeypatch.setattr(
+        draft_handoff.transcription,
+        "generate_transcript_draft_in_subprocess",
+        lambda path: SimpleNamespace(
+            transcript_text="I passed along the state",
+            title_draft="",
+            caption_draft="",
+        ),
+    )
+
+    assert draft_handoff._ensure_transcripts([item_id]) == 0
+    with get_session() as session:
+        assert not (session.get(DownloadItem, item_id).transcript_text or "")
+
+
+def test_ensure_transcripts_never_blocks_a_batch(monkeypatch, tmp_path) -> None:
+    # Best-effort on the same terms as the on-screen hook read: a whisper
+    # failure must not stop the batch from being prepared.
+    item_id = _item_with_media(tmp_path)
+
+    def boom(path):
+        raise RuntimeError("faster-whisper exploded")
+
+    monkeypatch.setattr(draft_handoff.video, "has_audio_stream", lambda path: True)
+    monkeypatch.setattr(
+        draft_handoff.transcription, "generate_transcript_draft_in_subprocess", boom
+    )
+
+    assert draft_handoff._ensure_transcripts([item_id]) == 0
+
+
+def test_ensure_transcripts_skips_items_that_already_have_one(monkeypatch) -> None:
+    # A transcript the user typed by hand must never be overwritten.
+    item_id = _make_item()
+    with get_session() as session:
+        session.get(DownloadItem, item_id).transcript_text = "hand written context"
+        session.commit()
+
+    def fail(path):
+        raise AssertionError("should not re-transcribe")
+
+    monkeypatch.setattr(draft_handoff.video, "has_audio_stream", lambda path: True)
+    monkeypatch.setattr(
+        draft_handoff.transcription, "generate_transcript_draft_in_subprocess", fail
+    )
+
+    assert draft_handoff._ensure_transcripts([item_id]) == 0
+    with get_session() as session:
+        assert session.get(DownloadItem, item_id).transcript_text == "hand written context"
+
+
+def _batch_reply(*blocks: tuple[int, int | None, str, str | None]) -> str:
+    lines: list[str] = []
+    for reel, echoed, hook, label in blocks:
+        header = f"===== REEL {reel} =====" if echoed is None else f"===== REEL {reel} (#{echoed}) ====="
+        lines.extend(
+            [
+                f"{header} {label}" if label else header,
+                "Title Option 1:",
+                hook,
+                "Recommended Pick: Title Option 1",
+                "Shared Caption:",
+                f"{hook} caption body.",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def test_import_multi_account_batch_rejects_a_reply_prepared_for_another_row() -> None:
+    # The silent misroute this guard exists for: several rows are prepared at
+    # once, and the operator imports account A's chat reply onto account B's row.
+    # Every echoed id misses B's batch, so routing used to fall back to reel
+    # NUMBER and file all of A's drafts onto B's clips - reported as a clean
+    # "imported 2" and carried through to export and scheduling.
+    _a1, alpha = _make_second_account_items("Resurfaced History", 2)
+    _a2, beta = _make_second_account_items("Vaulted History", 2)
+    reply = _batch_reply(
+        (1, alpha[0], "Alpha hook one", "Resurfaced History"),
+        (2, alpha[1], "Alpha hook two", "Resurfaced History"),
+    )
+
+    with pytest.raises(DraftRevisionError) as excinfo:
+        draft_handoff.import_multi_account_batch_draft(reply, beta)
+
+    assert "Resurfaced History" in str(excinfo.value)
+    assert "Vaulted History" in str(excinfo.value)
+    assert [draft_revisions.latest_revision(item_id) for item_id in beta] == [None, None]
+
+
+def test_import_multi_account_batch_keeps_importing_when_one_id_is_foreign() -> None:
+    # The guard must not undo the tolerance it sits on top of: a single stray id
+    # (a model parroting a frame filename's item id) still routes by reel number
+    # as long as the rest of the reply points at this batch.
+    _a1, own = _make_second_account_items("Lambda History", 2)
+    _a2, other = _make_second_account_items("Mu History", 1)
+    reply = _batch_reply(
+        (1, own[0], "Own hook one", None),
+        (2, other[0], "Own hook two", None),
+    )
+
+    result = draft_handoff.import_multi_account_batch_draft(reply, own)
+
+    assert result["imported"] == own
+    assert result["unmatched"] == []
+    assert draft_revisions.latest_revision(own[1]).title_options == ["Own hook two"]
+
+
+def test_import_multi_account_batch_allows_ids_that_match_no_item() -> None:
+    # An id that names no video at all is garbage, not another row's reply, and
+    # reel-number routing already handles it. Only a real foreign item can prove
+    # the paste belongs somewhere else.
+    _a1, own = _make_second_account_items("Nu History", 2)
+    reply = _batch_reply(
+        (1, 999001, "Garbled hook one", None),
+        (2, 999002, "Garbled hook two", None),
+    )
+
+    result = draft_handoff.import_multi_account_batch_draft(reply, own)
+
+    assert result["imported"] == own
+    assert draft_revisions.latest_revision(own[0]).title_options == ["Garbled hook one"]
+
+
+def test_import_account_batch_rejects_a_reply_labelled_with_another_account() -> None:
+    # Single-account rows echo account-RELATIVE ids, which collide across
+    # accounts by design, so the id can never prove a wrong-row paste here. The
+    # account name trailing the header is the only evidence, and an exact match
+    # on a real, different account is enough to stop the import.
+    _a1, own = _make_account_items(2)
+    _a2, _other = _make_second_account_items("Xi History", 2)
+    reply = _batch_reply(
+        (1, None, "Foreign hook one", "Xi History"),
+        (2, None, "Foreign hook two", "Xi History"),
+    )
+
+    with pytest.raises(DraftRevisionError) as excinfo:
+        draft_handoff.import_account_batch_draft(reply, own)
+
+    assert "Xi History" in str(excinfo.value)
+    assert [draft_revisions.latest_revision(item_id) for item_id in own] == [None, None]
+
+
+def test_import_account_batch_accepts_headers_labelled_with_its_own_account() -> None:
+    _account_id, own = _make_second_account_items("Omicron History", 2)
+    reply = _batch_reply(
+        (1, None, "Own hook one", "**Omicron History**"),
+        (2, None, "Own hook two", "omicron   history"),
+    )
+
+    result = draft_handoff.import_account_batch_draft(reply, own)
+
+    assert result["imported"] == own
+    assert draft_revisions.latest_revision(own[0]).title_options == ["Own hook one"]
+
+
+def test_import_account_batch_ignores_a_label_that_names_no_account() -> None:
+    # Models paraphrase the trailing label ("Reel set B"). That is not evidence
+    # of anything, so it must never block an otherwise valid import.
+    _account_id, own = _make_second_account_items("Pi History", 2)
+    reply = _batch_reply(
+        (1, None, "Own hook one", "Reel set B"),
+        (2, None, "Own hook two", "Reel set B"),
+    )
+
+    result = draft_handoff.import_account_batch_draft(reply, own)
+
+    assert result["imported"] == own
+
+
+def test_beats_v2_short_length_adds_a_hard_character_rule() -> None:
+    short_rules = "\n".join(
+        draft_handoff._effective_title_rules(
+            draft_handoff.TITLE_STYLE_BEATS_V2, None, "history", title_length="short"
+        )
+    )
+    limit = draft_guard.SHORT_TITLE_MAX_CHARS
+    assert f"at most {limit} characters" in short_rules
+    # A capped account needs no spread rule: the cap already fixes the band.
+    assert "SPREAD THE THREE OPTIONS" not in short_rules
+    assert "OVERRIDING THE 130-CHARACTER CEILING" in short_rules
+
+    for other in ("auto", "long", None):
+        rules = "\n".join(
+            draft_handoff._effective_title_rules(
+                draft_handoff.TITLE_STYLE_BEATS_V2, None, "history", title_length=other
+            )
+        )
+        assert f"at most {limit} characters" not in rules
+        # ...but an uncapped account must still be asked for a real choice.
+        assert "SPREAD THE THREE OPTIONS" in rules
+
+
+def test_import_pasted_draft_moves_pick_off_overlong_title_for_short_account() -> None:
+    item_id = _make_item()
+    with get_session() as session:
+        item = session.get(DownloadItem, item_id)
+        account = session.get(Account, item.account_id)
+        account.processing_preferences = json.dumps(
+            {"prompt_title_style": "beats_v2", "title_length": "short"}
+        )
+        session.commit()
+
+    long_title = (
+        "She walked into the room, everyone went quiet, and then the crowd slowly "
+        "realised who had just arrived at the party"
+    )
+    revision = draft_handoff.import_pasted_draft(
+        item_id,
+        f"""Title Option 1:
+Nobody expected her at the party
+Recommended Style 1:
+Editorial Italic
+Caption Option 1:
+First caption.
+
+Title Option 2:
+The room went quiet when she arrived
+Recommended Style 2:
+Editorial Italic
+Caption Option 2:
+Second caption.
+
+Title Option 3:
+{long_title}
+Recommended Style 3:
+Editorial Italic
+Caption Option 3:
+Third caption.
+
+Recommended Pick: Title Option 3 + Caption Option 3
+Why: It carries the most beats.
+""",
+    )
+
+    assert revision.recommended_title_index in (1, 2)
+    assert revision.recommended_title_index == revision.recommended_caption_index
+
+
+def test_prompt_header_reports_the_styles_the_rules_actually_use() -> None:
+    """The header is what a human reads to check a prompt; it must not contradict.
+
+    It used to read ``settings`` while the rules read the account's saved
+    preferences, so a batch screen sending ``{}`` printed "Title style: Auto"
+    and "Title length: Long" above a beats_v2 rulebook with a Short cap.
+    """
+    short_account = Account(
+        id=1,
+        name="Beneath History",
+        platform="instagram",
+        instagram_handle="beneathhistory",
+        niche_label="history",
+        processing_preferences=json.dumps(
+            {"prompt_title_style": draft_handoff.TITLE_STYLE_BEATS_V2, "title_length": "short"}
+        ),
+    )
+    header = "\n".join(
+        draft_handoff._account_prompt_header(short_account, settings={}, item_ids=[1])
+    )
+    assert f"Title style: {draft_handoff.TITLE_STYLE_BEATS_V2}" in header
+    assert "Title length: Short" in header
+    assert "Title length: Long" not in header
+
+    auto_account = Account(
+        id=2,
+        name="Vaulted History",
+        platform="instagram",
+        instagram_handle="vaultedhistory",
+        niche_label="history",
+        processing_preferences=json.dumps(
+            {"prompt_title_style": draft_handoff.TITLE_STYLE_BEATS_V2, "title_length": "auto"}
+        ),
+    )
+    auto_header = "\n".join(
+        draft_handoff._account_prompt_header(auto_account, settings={}, item_ids=[1])
+    )
+    # v2 ignores every length but "short", so printing one would be the same
+    # bug in the other direction.
+    assert "Title length:" not in auto_header

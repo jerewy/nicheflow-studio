@@ -9,6 +9,7 @@ planner (docs/SOURCING_POOLING_PLAN.md Phase 3).
 from __future__ import annotations
 
 import datetime as dt
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -70,6 +71,14 @@ ACCOUNT_OPERATIONAL_STATUS_ACTIVE = "active"
 # clips were fresh, so a cutoff would have stopped posting after one day.
 FRESH_POOL_DAYS = 14
 
+# How long a clip rests after it POSTS before it may go to a second account.
+# The pool is shared, so a clip legitimately reaches several accounts over its
+# life (docs/SOURCING_POOLING_PLAN.md §6 Phase 5). What must not happen is two
+# accounts in the same network posting the same footage days apart, which is the
+# most visible aggregation pattern; spacing them is the whole point of the gap.
+# It does NOT make borrowed footage original — see §2.1, an accepted risk.
+MIN_REUSE_GAP_DAYS = 14
+
 
 def _validate_niche(niche: str) -> str:
     value = (niche or "").strip().lower()
@@ -81,8 +90,10 @@ def _validate_niche(niche: str) -> str:
 def assigned_pool_item_ids(session: Session, niche: str) -> set[int]:
     """Pool items in this niche that already have an assignment (any cycle).
 
-    Used to skip already-distributed clips so the first cycle never double-books
-    a clip onto a second account.
+    Network-wide, so this answers "has ANYONE had this clip", not "may this
+    account have it". Distribution asks the per-account question instead
+    (:func:`assigned_pool_item_ids_by_account`) — a clip one account used is not
+    spent for the rest of the network.
     """
     niche = _validate_niche(niche)
     rows = (
@@ -91,16 +102,78 @@ def assigned_pool_item_ids(session: Session, niche: str) -> set[int]:
     return {row[0] for row in rows}
 
 
-def posted_media_asset_ids(session: Session) -> set[int]:
-    """Media assets whose footage was already published by ANY account.
+def assigned_pool_item_ids_by_account(session: Session, niche: str) -> dict[int, set[int]]:
+    """``account_id -> pool items that account has already been given.``
+
+    The per-account counter the shared pool needs: five accounts drawing from
+    1994 clips is ~9970 possible assignments, not 1994. Counting a used clip as
+    spent network-wide is what left every account with 1400+ untouched clips
+    while the pool reported itself empty.
+    """
+    niche = _validate_niche(niche)
+    rows = (
+        session.query(Assignment.account_id, Assignment.pool_item_id)
+        .filter(Assignment.niche == niche)
+        .all()
+    )
+    by_account: dict[int, set[int]] = {}
+    for account_id, pool_item_id in rows:
+        by_account.setdefault(account_id, set()).add(pool_item_id)
+    return by_account
+
+
+def pool_item_ids_in_reuse_gap(
+    session: Session,
+    niche: str,
+    *,
+    now: dt.datetime | None = None,
+    gap_days: int = MIN_REUSE_GAP_DAYS,
+) -> set[int]:
+    """Pool items that posted too recently to go out again on another account.
+
+    Measured from the POST, not from the assignment: a clip that was assigned
+    and then rejected never reached an audience, so it carries no footprint to
+    space out and is free immediately. Only assignments carrying a published
+    ``UploadJob`` start the clock.
+
+    SQLite hands back naive datetimes, so both sides are compared naive (stored
+    times are UTC), matching :func:`_split_fresh_pool_items`.
+    """
+    niche = _validate_niche(niche)
+    if gap_days <= 0:
+        return set()
+    now_naive = (now or dt.datetime.now(dt.timezone.utc)).replace(tzinfo=None)
+    cutoff = now_naive - dt.timedelta(days=gap_days)
+    rows = (
+        session.query(Assignment.pool_item_id, UploadJob.posted_at)
+        .join(UploadJob, UploadJob.id == Assignment.upload_job_id)
+        .filter(Assignment.niche == niche)
+        .filter(UploadJob.posted_at.is_not(None))
+        .all()
+    )
+    return {
+        pool_item_id
+        for pool_item_id, posted_at in rows
+        if posted_at is not None and posted_at.replace(tzinfo=None) >= cutoff
+    }
+
+
+def posted_media_asset_ids(session: Session, account_id: int | None = None) -> set[int]:
+    """Media assets whose footage was already published — by ``account_id``, or
+    by ANY account when it is ``None``.
 
     Publish history is read from the download items behind posted upload jobs,
     keyed by shortcode with a slash-insensitive URL fallback — NOT from
     assignment rows. Posts made before the pooling layer existed have no
     assignments, and stored URLs drift on trailing slashes, so matching on
     either of those alone lets already-posted footage back into distribution.
+
+    Distribution passes an ``account_id``: that account must not post the same
+    footage twice, but another account in the network may (the reuse gap spaces
+    them). The account-less form remains for callers asking the network-wide
+    question.
     """
-    rows = (
+    query = (
         session.query(DownloadItem.video_id, DownloadItem.source_url)
         .outerjoin(UploadJob, UploadJob.download_item_id == DownloadItem.id)
         .filter(
@@ -108,9 +181,10 @@ def posted_media_asset_ids(session: Session) -> set[int]:
             | (UploadJob.posted_at.is_not(None))
             | (UploadJob.status == "posted")
         )
-        .distinct()
-        .all()
     )
+    if account_id is not None:
+        query = query.filter(DownloadItem.account_id == account_id)
+    rows = query.distinct().all()
     shortcodes = {shortcode for shortcode, _ in rows if shortcode}
     urls = {(url or "").rstrip("/") for _, url in rows}
     urls.discard("")
@@ -329,13 +403,31 @@ def distribute_niche(
     if not account_ids:
         return []
 
-    already = assigned_pool_item_ids(session, niche)
+    # Per-account, not network-wide: a clip one account has used is still new to
+    # every other account, and the shared pool is only worth 5x its size if the
+    # counter says so. The only network-wide exclusion left is the reuse gap.
+    pool_items = pool_items_for_niche(session, niche)
+    held_by_account = assigned_pool_item_ids_by_account(session, niche)
+    # Posts made before the pooling layer existed carry no assignment row, so
+    # without this the account that published them could be handed its own
+    # footage back. Measured on the live history pool: 17 such clips on one
+    # account, 0 on the rest — small, but every one of them is a self-repost.
+    for account_id in account_ids:
+        posted_assets = posted_media_asset_ids(session, account_id)
+        if not posted_assets:
+            continue
+        held_by_account.setdefault(account_id, set()).update(
+            item.id for item in pool_items if item.media_asset_id in posted_assets
+        )
+    resting = pool_item_ids_in_reuse_gap(session, niche, now=now)
     unassigned_items = [
         item
-        for item in pool_items_for_niche(session, niche)
-        if item.id not in already
+        for item in pool_items
+        if item.id not in resting
         and (eligible_pool_item_ids is None or item.id in eligible_pool_item_ids)
         and (allow_risky or item.rights_confidence != RIGHTS_CONFIDENCE_BLOCKED)
+        # Nothing left for ANY selected account to do with it.
+        and any(item.id not in held_by_account.get(a, ()) for a in account_ids)
     ]
     unassigned_ids = [item.id for item in unassigned_items]
     if not unassigned_ids:
@@ -345,15 +437,23 @@ def distribute_niche(
     created: list[Assignment] = []
     valid_niche_accounts = set(account_ids_for_niche(session, niche))
     selected_accounts = set(account_ids)
+    # How many accounts have held each clip already, so reuse_iteration finally
+    # records which pass this is instead of being a column that is always 0.
+    prior_uses: Counter[int] = Counter()
+    for held in held_by_account.values():
+        prior_uses.update(held)
     for item in unassigned_items:
         if item.pinned_account_id not in selected_accounts:
+            continue
+        # A pin says WHICH account gets the clip, not that it gets it twice.
+        if item.id in held_by_account.get(item.pinned_account_id, ()):
             continue
         assignment = Assignment(
             pool_item_id=item.id,
             account_id=item.pinned_account_id,
             niche=niche,
             status=ASSIGNMENT_STATUS_ASSIGNED,
-            reuse_iteration=0,
+            reuse_iteration=prior_uses[item.id],
         )
         # Transient response metadata; lifecycle status remains "assigned".
         assignment.distribution_reason = "pinned"
@@ -388,24 +488,40 @@ def distribute_niche(
         targets_by_account=targets_by_account,
         existing_counts=existing_counts,
     )
-    # Fresh captures go out before the backlog; each group keeps its own
-    # engagement ranking, and the backlog only fills slots fresh clips cannot.
-    fresh_ids, backlog_ids = _split_fresh_pool_items(
-        unassigned_items, set(unassigned_ids), now=now
-    )
-    backlog_slots = None if slots is None else max(0, slots - len(fresh_ids))
-    ranked_ids = [
-        *ranked_clip_order(
-            [(pool_item_id, scores.get(pool_item_id, 0.0)) for pool_item_id in fresh_ids],
-            rng=rng,
-            slots=slots,
-        ),
-        *ranked_clip_order(
-            [(pool_item_id, scores.get(pool_item_id, 0.0)) for pool_item_id in backlog_ids],
-            rng=rng,
-            slots=backlog_slots,
-        ),
-    ]
+    def _rank_within(candidate_ids: list[int], available_slots: int | None) -> list[int]:
+        """Fresh captures before the backlog, each keeping its engagement rank.
+
+        The backlog only fills what fresh clips cannot, which is why it gets the
+        leftover slot count rather than the full one.
+        """
+        fresh_ids, backlog_ids = _split_fresh_pool_items(
+            unassigned_items, set(candidate_ids), now=now
+        )
+        backlog_slots = (
+            None if available_slots is None else max(0, available_slots - len(fresh_ids))
+        )
+        return [
+            *ranked_clip_order(
+                [(pool_item_id, scores.get(pool_item_id, 0.0)) for pool_item_id in fresh_ids],
+                rng=rng,
+                slots=available_slots,
+            ),
+            *ranked_clip_order(
+                [(pool_item_id, scores.get(pool_item_id, 0.0)) for pool_item_id in backlog_ids],
+                rng=rng,
+                slots=backlog_slots,
+            ),
+        ]
+
+    # Clips nobody has run go out before reuses, for the same reason fresh beats
+    # backlog one level down: a repost should fill a slot the untouched pool
+    # CANNOT, never one it can. Ranking the two together on engagement alone let
+    # a capped run spend its slots on reposts while never-used clips sat idle.
+    ever_held = set().union(*held_by_account.values()) if held_by_account else set()
+    never_used_ids = [item_id for item_id in unassigned_ids if item_id not in ever_held]
+    reuse_ids = [item_id for item_id in unassigned_ids if item_id in ever_held]
+    reuse_slots = None if slots is None else max(0, slots - len(never_used_ids))
+    ranked_ids = [*_rank_within(never_used_ids, slots), *_rank_within(reuse_ids, reuse_slots)]
     # existing_counts makes max_per_account a TOTAL target: re-running
     # "Distribute" only tops up accounts below target and never piles a second
     # full batch onto accounts that already reached it. With max_per_account=None
@@ -422,6 +538,7 @@ def distribute_niche(
         targets_by_account=targets_by_account,
         existing_counts=existing_counts,
         shuffle_items=False,
+        blocked_by_account=held_by_account,
     )
 
     for planned in plan:
@@ -430,7 +547,7 @@ def distribute_niche(
             account_id=planned.account_id,
             niche=niche,
             status="assigned",
-            reuse_iteration=0,
+            reuse_iteration=prior_uses[planned.pool_item_id],
         )
         session.add(assignment)
         assignment.distribution_reason = "ranked"
@@ -603,11 +720,13 @@ def undrafted_item_counts_by_account(session: Session, niche: str) -> dict[int, 
     # elsewhere in the network" keep ONE definition each.
     from nicheflow_studio.services.library import (
         already_posted_item_ids,
-        posted_source_video_ids,
+        posted_source_video_ids_by_account,
     )
 
     posted = already_posted_item_ids(session)
-    posted_videos = posted_source_video_ids(session)
+    # Per account: a sibling posting this footage does not settle THIS account's
+    # backlog, and counting it as settled would make the top-up over-fill.
+    posted_videos_by_account = posted_source_video_ids_by_account(session)
     drafted = {
         row[0]
         for row in session.query(DraftRevision.download_item_id).distinct().all()
@@ -630,6 +749,7 @@ def undrafted_item_counts_by_account(session: Session, niche: str) -> dict[int, 
         )
         .all()
     ):
+        posted_videos = posted_videos_by_account.get(account_id, frozenset())
         if item_id in posted or item_id in drafted or (video_id or "") in posted_videos:
             continue
         counts[account_id] = counts.get(account_id, 0) + 1

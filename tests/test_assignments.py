@@ -4,6 +4,7 @@ import datetime as dt
 import random
 
 from nicheflow_studio.db.assignments import (
+    MIN_REUSE_GAP_DAYS,
     account_assignment_backlog,
     assignment_counts_by_account,
     assignments_for_account,
@@ -19,6 +20,7 @@ from nicheflow_studio.db.models import (
     MediaAsset,
     PoolItem,
     ScrapeCandidate,
+    UploadJob,
 )
 from nicheflow_studio.db.pools import accept_into_pool
 from nicheflow_studio.db.session import get_session, init_db
@@ -66,6 +68,13 @@ def test_distribute_prefers_high_source_er_clips_under_cap(tmp_path) -> None:
 
     Every clip here has the same view_count, so the reach term of
     source_fit_score cannot separate them and the ER tiebreaker decides.
+
+    Likes stay low enough that every clip's ER lands UNDER
+    ``engagement._ER_TIEBREAK_CAP`` (0.10). Above the cap the tiebreak term
+    saturates and the clips score identically, which made this test flaky: with
+    likes at i * 1_000 against 100k views, eng10..eng19 all tied at the cap and
+    the jitter block drew six arbitrary members of that tie, so the assertion
+    below passed or failed on SQLite's row order.
     """
     init_db()
     with get_session() as session:
@@ -85,7 +94,7 @@ def test_distribute_prefers_high_source_er_clips_under_cap(tmp_path) -> None:
                     state="pooled",
                     account_id=account_id,
                     view_count=100_000,
-                    like_count=i * 1_000,
+                    like_count=i * 100,
                     comment_count=0,
                     published_at=published,
                 )
@@ -193,7 +202,15 @@ def test_distribute_is_niche_isolated(tmp_path) -> None:
         assert session.query(Assignment).filter(Assignment.niche == "movie").count() == 0
 
 
-def test_redistribute_only_places_new_clips(tmp_path) -> None:
+def test_redistribute_never_gives_one_account_the_same_clip_twice(tmp_path) -> None:
+    """Uniqueness is PER ACCOUNT, not per niche.
+
+    This used to assert no clip appeared twice anywhere in the niche. That is
+    what made a shared pool behave like private inventory - see
+    ``test_distribute_offers_a_used_clip_to_a_DIFFERENT_account``. A clip
+    reaching several accounts is now the point; one account holding it twice is
+    still a bug.
+    """
     init_db()
     with get_session() as session:
         _make_accounts(session, "history", 4)
@@ -204,17 +221,16 @@ def test_redistribute_only_places_new_clips(tmp_path) -> None:
         session.commit()
         assert len(first) == 8
 
-        # Add 4 more clips, re-run: only the new ones get assigned (no double-book).
-        _fill_pool(session, "history", 4)  # note: distinct shortcodes? reuse helper
+        _fill_pool(session, "history", 4)  # same shortcodes, so these dedupe away
         session.commit()
-        second = distribute_niche(session, "history", rng=random.Random(4))
+        distribute_niche(session, "history", rng=random.Random(4))
         session.commit()
 
-        # _fill_pool reuses the same shortcode scheme, so the 4 "new" ones whose
-        # shortcodes collide are deduped; assert no clip is assigned twice overall.
-        all_pool_ids = [a.pool_item_id for a in session.query(Assignment).all()]
-        assert len(all_pool_ids) == len(set(all_pool_ids))
-        assert len(second) >= 0  # may be 0 if all collided — the key invariant is no dupes
+        seen: set[tuple[int, int]] = set()
+        for row in session.query(Assignment).all():
+            pair = (row.account_id, row.pool_item_id)
+            assert pair not in seen, f"account {row.account_id} got clip {row.pool_item_id} twice"
+            seen.add(pair)
 
 
 def test_distribute_reuses_processing_row_despite_url_form_drift(tmp_path) -> None:
@@ -517,9 +533,14 @@ def test_top_up_adds_new_accounts_without_touching_existing(tmp_path) -> None:
         # The new accounts got the +28 each; nothing was added to the old two.
         assert len(second) == 84  # 3 new x 28
         assert all(counts[acc_id] == 28 for acc_id in new_ids)
-        # No pool item is double-booked across the whole niche.
-        all_pool_ids = [a.pool_item_id for a in session.query(Assignment).all()]
-        assert len(all_pool_ids) == len(set(all_pool_ids))
+        # No account is double-booked. The niche-wide version of this assertion
+        # is deliberately gone: the new accounts may draw from clips the first
+        # two already hold, which is what makes the shared pool shared.
+        seen: set[tuple[int, int]] = set()
+        for row in session.query(Assignment).all():
+            pair = (row.account_id, row.pool_item_id)
+            assert pair not in seen
+            seen.add(pair)
 
 
 _NOW = dt.datetime(2026, 9, 10, 12, 0, tzinfo=dt.timezone.utc)
@@ -618,3 +639,162 @@ def test_distribute_still_honours_pins_on_old_clips(tmp_path) -> None:
         assert by_item[old_pinned].account_id == pinned_account
         assert by_item[old_pinned].distribution_reason == "pinned"
         assert by_item[fresh_id].distribution_reason == "ranked"
+
+
+def _post_assignment(session, assignment: Assignment, *, posted_at: dt.datetime) -> None:
+    """Mark one assignment as published at ``posted_at``, the way the queue does."""
+    item = DownloadItem(
+        source_url=f"https://www.instagram.com/reel/posted{assignment.id}/",
+        account_id=assignment.account_id,
+        status="posted",
+    )
+    session.add(item)
+    session.flush()
+    job = UploadJob(
+        download_item_id=item.id,
+        account_id=assignment.account_id,
+        processed_path=f"C:/exports/posted{assignment.id}.mp4",
+        status="posted",
+        posted_at=posted_at,
+    )
+    session.add(job)
+    session.flush()
+    assignment.status = "posted"
+    assignment.upload_job_id = job.id
+    session.flush()
+
+
+def test_distribute_offers_a_used_clip_to_a_DIFFERENT_account(tmp_path) -> None:
+    """The pool is shared, so one account using a clip must not spend it for all.
+
+    Counting a clip as gone network-wide made a 1994-clip pool worth 1994 posts
+    across five accounts instead of ~9970, and the pool read as empty while
+    every account still had 1400+ clips it had never touched.
+    """
+    init_db()
+    with get_session() as session:
+        accounts = _make_accounts(session, "history", 2)
+        _fill_pool(session, "history", 1)
+        session.commit()
+
+        first = distribute_niche(session, "history", rng=random.Random(1))
+        session.commit()
+        assert len(first) == 1
+        # Posted long enough ago that the reuse gap has passed.
+        _post_assignment(
+            session,
+            first[0],
+            posted_at=dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=60),
+        )
+        session.commit()
+
+        second = distribute_niche(session, "history", rng=random.Random(2))
+        session.commit()
+
+        assert len(second) == 1
+        assert second[0].pool_item_id == first[0].pool_item_id
+        assert second[0].account_id != first[0].account_id
+        assert set(accounts) == {first[0].account_id, second[0].account_id}
+
+
+def test_distribute_never_gives_one_account_the_same_clip_twice(tmp_path) -> None:
+    """Reuse is across accounts only. One account reposting itself is the thing
+    the old global check was really protecting against, and it still must not
+    happen - even after the reuse gap has long passed."""
+    init_db()
+    with get_session() as session:
+        _make_accounts(session, "history", 1)
+        _fill_pool(session, "history", 1)
+        session.commit()
+
+        first = distribute_niche(session, "history", rng=random.Random(1))
+        session.commit()
+        _post_assignment(
+            session,
+            first[0],
+            posted_at=dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=365),
+        )
+        session.commit()
+
+        assert distribute_niche(session, "history", rng=random.Random(2)) == []
+
+
+def test_distribute_holds_a_clip_back_during_the_reuse_gap(tmp_path) -> None:
+    """Two accounts posting the same footage days apart is the most visible
+    pattern, so a clip waits MIN_REUSE_GAP_DAYS after it posts before it may
+    reach a second account."""
+    init_db()
+    with get_session() as session:
+        _make_accounts(session, "history", 2)
+        _fill_pool(session, "history", 1)
+        session.commit()
+
+        first = distribute_niche(session, "history", rng=random.Random(1))
+        session.commit()
+        _post_assignment(
+            session,
+            first[0],
+            posted_at=dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=3),
+        )
+        session.commit()
+
+        assert distribute_niche(session, "history", rng=random.Random(2)) == []
+
+        # One day past the gap it becomes available again.
+        later = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=MIN_REUSE_GAP_DAYS - 3 + 1)
+        reused = distribute_niche(session, "history", rng=random.Random(3), now=later)
+        session.commit()
+        assert len(reused) == 1
+        assert reused[0].account_id != first[0].account_id
+
+
+def test_distribute_reuses_an_assigned_but_never_posted_clip_immediately(tmp_path) -> None:
+    """The gap is measured from the POST, so a clip that was assigned and then
+    rejected never posted and carries no footprint to space out."""
+    init_db()
+    with get_session() as session:
+        _make_accounts(session, "history", 2)
+        _fill_pool(session, "history", 1)
+        session.commit()
+
+        first = distribute_niche(session, "history", rng=random.Random(1))
+        first[0].status = "rejected"
+        session.commit()
+
+        second = distribute_niche(session, "history", rng=random.Random(2))
+        session.commit()
+
+        assert len(second) == 1
+        assert second[0].account_id != first[0].account_id
+
+
+def test_distribute_prefers_a_never_used_clip_over_a_reuse(tmp_path) -> None:
+    """Reuse fills slots the untouched pool cannot, never slots it can.
+
+    Without this, a clip a sibling account already posted competes on engagement
+    alone against a clip nobody has ever run, and a capped run can spend its
+    slots on reposts while fresh inventory sits there. Same reasoning as the
+    fresh/backlog split above, one level up.
+    """
+    init_db()
+    with get_session() as session:
+        accounts = _make_accounts(session, "history", 2)
+        _fill_pool(session, "history", 2)
+        session.commit()
+
+        # Account A takes one clip; one clip stays untouched by anyone.
+        first = distribute_niche(
+            session, "history", rng=random.Random(1), targets_by_account={accounts[0]: 1}
+        )
+        session.commit()
+        assert len(first) == 1
+        used_clip = first[0].pool_item_id
+
+        # Account B has room for exactly one. It must take the untouched clip.
+        second = distribute_niche(
+            session, "history", rng=random.Random(2), targets_by_account={accounts[1]: 1}
+        )
+        session.commit()
+
+        assert len(second) == 1
+        assert second[0].pool_item_id != used_clip

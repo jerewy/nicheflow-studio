@@ -108,6 +108,28 @@ def test_duration_claim_needs_the_same_number_in_signals() -> None:
     assert unsupported.unsupported_terms == ["14 hour"]
 
 
+def test_duration_claim_accepts_spelled_out_number_in_signals() -> None:
+    # Item #2108: the source wrote "Sixty-nine years later" and the guard demoted
+    # "Same balcony, 69 years apart" because it only looked for the digits.
+    signals = "Her first appearance was in 1953. Sixty-nine years later, she returned."
+
+    supported = draft_guard.check_title_claims("Same balcony, 69 years apart", signals)
+    unsupported = draft_guard.check_title_claims("Same balcony, 68 years apart", signals)
+
+    assert supported.unsupported_terms == []
+    assert unsupported.unsupported_terms == ["68 year"]
+
+
+def test_year_span_claim_accepts_two_signal_years_that_far_apart() -> None:
+    signals = "First balcony appearance in June 1953, last one in June 2022."
+
+    supported = draft_guard.check_title_claims("Same balcony, 69 years apart", signals)
+    unsupported = draft_guard.check_title_claims("Same balcony, 70 years apart", signals)
+
+    assert supported.unsupported_terms == []
+    assert unsupported.unsupported_terms == ["70 year"]
+
+
 def test_verified_citation_clears_a_paraphrased_claim() -> None:
     signals = PRAM_SIGNALS + " Only three of these are known to survive today."
 
@@ -335,3 +357,184 @@ def test_venue_only_in_the_reposter_caption_is_flagged_for_review() -> None:
 
     assert report.asserted_terms == ["cathedral"]
     assert report.unsupported_terms == []
+
+
+def test_group_claim_from_the_contact_sheet_does_not_clear_green() -> None:
+    """A setting invented off the frames used to be the one unguarded category.
+
+    Real case: "What made a room full of psychiatrists laugh at that question?"
+    over footage of two people interviewed SEPARATELY (one at a convention, one
+    on a city street). It cleared green because "room" was in no lexicon, while
+    the accurate option naming the convention came back yellow - the guard was
+    rewarding the vaguer, wrong title.
+    """
+    signals = draft_guard.build_signals_text(
+        "A female psychiatrist at the 2006 APA Convention breaks into nervous "
+        "laughter when asked how many patients she has cured. The clip then cuts "
+        "to a gray haired doctor on a city street confessing the number is zero.",
+        None,
+        "history",
+        None,
+    )
+    report = draft_guard.check_title_claims(
+        "What made a room full of psychiatrists laugh at that question?", signals
+    )
+    assert "room full of" in report.unsupported_terms
+
+
+def test_group_claim_backed_by_the_signals_is_supported() -> None:
+    signals = draft_guard.build_signals_text(
+        "Footage from inside the classroom shows a room full of children reading "
+        "aloud while the president sits with them.",
+        None,
+        "history",
+        None,
+    )
+    report = draft_guard.check_title_claims(
+        "A room full of children kept reading aloud.", signals
+    )
+    assert report.unsupported_terms == []
+
+
+def test_visible_but_undescribed_settings_are_not_group_claims() -> None:
+    """"on stage" and a bare "audience" were deliberately left out of the lexicon.
+
+    A stage is usually visible rather than written down, so listing it flagged 17
+    of 23 legitimate performance titles. Only claims that several people were
+    together in one place are tracked.
+    """
+    signals = draft_guard.build_signals_text(
+        "Michael Jackson performing during the 1995 tour.", None, "history", None
+    )
+    report = draft_guard.check_title_claims("Michael Jackson lost it on stage.", signals)
+    assert report.unsupported_terms == []
+
+
+# The item-1959 case: the source caption described Iran's Qajar dynasty (ended
+# 1925) while the footage showed 1970s street scenes, so the drafting model
+# wrote its own mismatch finding into all three title slots. Every option
+# cleared green (nothing checkable was asserted) and Apply burned one onto the
+# video. A title is viewer-facing; metadata is not.
+QAJAR_SIGNALS = (
+    "Iran's royal family lived a secluded life in the Qajar dynasty. "
+    "The Qajar dynasty reigned Iran from 1789 to 1925."
+)
+META_TITLE = (
+    "The caption attached to this clip is about a dynasty gone a century ago. "
+    "What's on screen is not."
+)
+
+
+def test_metadata_referential_title_is_detected() -> None:
+    assert draft_guard.find_meta_references(META_TITLE)
+
+
+def test_ordinary_titles_are_not_metadata_references() -> None:
+    for title in (
+        "The flag these water skiers are carrying has been banned in Iran since 1979.",
+        "This clip was banned for 40 years.",
+        "The source of the Nile stayed a mystery for centuries.",
+        "Then the caption under it read a name everyone recognized.",
+        "Snow, pine trees, and nothing in the footage reads as a chase.",
+    ):
+        assert draft_guard.find_meta_references(title) == [], title
+
+
+def test_metadata_title_goes_red_even_though_it_claims_nothing() -> None:
+    # Without the meta check this title is green: it asserts no checkable fact.
+    assert draft_guard.check_title_claims(META_TITLE, QAJAR_SIGNALS).claim_terms == []
+
+    guarded = draft_guard.guard_options(
+        title_options=[META_TITLE],
+        signals_text=QAJAR_SIGNALS,
+    )
+
+    assert guarded.option_tiers == ["red"]
+    assert 0 in guarded.meta_terms
+    assert "Not a viewer-facing title" in (guarded.option_notes or [""])[0]
+
+
+def test_recommendation_moves_off_a_metadata_title() -> None:
+    guarded = draft_guard.guard_options(
+        # The alternative must be claim-free too, or it reddens on its own
+        # (a bare "1970s" is a date claim these signals do not support).
+        title_options=[META_TITLE, "An ordinary afternoon that feels impossible now."],
+        signals_text=QAJAR_SIGNALS,
+        recommended_index=0,
+        recommendation_reason="Stays true to the mismatch.",
+    )
+
+    assert guarded.recommendation_shifted is True
+    assert guarded.recommended_index == 1
+    assert "metadata" in (guarded.recommendation_reason or "")
+
+
+def test_adverbial_first_is_not_a_precedence_claim() -> None:
+    # "first" meaning "before that" asserts no precedence, but the signals
+    # almost never carry the literal word, so it used to come back unsupported
+    # and drag the recommendation off a perfectly good option. The Chaplin case:
+    # a verified twelve-minute ovation lost the pick to an option naming nobody.
+    signals = "Charlie Chaplin accepts an honorary award as the audience applauds."
+
+    adverbial = draft_guard.check_title_claims(
+        "The Academy gave him a lifetime achievement award, and the audience "
+        "gave him twelve straight minutes of applause first.",
+        signals,
+    )
+
+    assert adverbial.claim_terms == []
+    assert adverbial.unsupported_terms == []
+
+
+def test_precedence_first_is_still_checked() -> None:
+    signals = "Charlie Chaplin accepts an honorary award as the audience applauds."
+
+    unsupported = draft_guard.check_title_claims(
+        "Chaplin's first return to America in twenty years", signals
+    )
+    supported = draft_guard.check_title_claims(
+        "Chaplin's first return to America in twenty years",
+        "Chaplin makes his first trip back to America since 1952.",
+    )
+
+    assert unsupported.unsupported_terms == ["first"]
+    assert supported.unsupported_terms == []
+
+
+def test_short_limit_reddens_overlong_option_and_moves_the_pick() -> None:
+    long_title = (
+        "She walked into the room, everyone went quiet, and then the crowd slowly "
+        "realised who had just arrived at the party"
+    )
+    guarded = draft_guard.guard_options(
+        title_options=["Nobody expected her at the party", long_title],
+        signals_text=PRAM_SIGNALS,
+        recommended_index=1,
+        recommendation_reason="most beats",
+        max_title_chars=draft_guard.SHORT_TITLE_MAX_CHARS,
+    )
+
+    assert guarded.option_tiers[1] == "red"
+    assert "Too long for this account's Short title setting" in guarded.option_notes[1]
+    assert guarded.recommendation_shifted is True
+    assert guarded.recommended_index == 0
+    assert "over the Short title limit" in guarded.recommendation_reason
+
+
+def test_no_limit_leaves_long_titles_alone() -> None:
+    long_title = "x " * 80
+    guarded = draft_guard.guard_options(
+        title_options=[long_title.strip()],
+        signals_text=PRAM_SIGNALS,
+        recommended_index=0,
+    )
+
+    assert guarded.option_tiers == ["green"]
+    assert guarded.recommendation_shifted is False
+
+
+def test_only_the_short_setting_has_a_character_limit() -> None:
+    assert draft_guard.title_char_limit("short") == draft_guard.SHORT_TITLE_MAX_CHARS
+    assert draft_guard.title_char_limit(" Short ") == draft_guard.SHORT_TITLE_MAX_CHARS
+    for other in ("auto", "long", "medium", None, ""):
+        assert draft_guard.title_char_limit(other) is None

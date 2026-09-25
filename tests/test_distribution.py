@@ -353,3 +353,50 @@ def test_ranked_clip_order_is_deterministic_for_a_tiny_run() -> None:
 
     assert ranked_clip_order(scored, rng=random.Random(3), slots=1)[:1] == [0]
     assert sorted(ranked_clip_order(scored, rng=random.Random(3), slots=2)[:2]) == [0, 1]
+
+
+def test_blocked_by_account_keeps_a_clip_off_accounts_that_had_it() -> None:
+    """Per-account reuse: a clip an account already posted must not come back to it.
+
+    The pool is shared, so the same clip legitimately reaches several accounts
+    over time; what must never repeat is one account posting it twice.
+    """
+    plan = plan_first_cycle(
+        [10, 20],
+        [1, 2],
+        rng=random.Random(3),
+        blocked_by_account={1: {10}, 2: {20}},
+    )
+
+    placed = {a.pool_item_id: a.account_id for a in plan}
+    assert placed == {10: 2, 20: 1}
+
+
+def test_blocked_by_account_skips_a_clip_no_account_can_take() -> None:
+    """One unplaceable clip must not stop the clips after it.
+
+    The loop breaks only when every account is FULL. A clip that simply has no
+    eligible home is skipped, or a single exhausted clip would strand the rest
+    of the ranking behind it.
+    """
+    plan = plan_first_cycle(
+        [10, 20, 30],
+        [1, 2],
+        rng=random.Random(3),
+        shuffle_items=False,
+        blocked_by_account={1: {20}, 2: {20}},
+    )
+
+    assert sorted(a.pool_item_id for a in plan) == [10, 30]
+
+
+def test_blocked_by_account_still_stops_when_every_account_is_full() -> None:
+    plan = plan_first_cycle(
+        list(range(1, 51)),
+        [1, 2],
+        rng=random.Random(3),
+        max_per_account=2,
+        blocked_by_account={1: {1}},
+    )
+
+    assert len(plan) == 4

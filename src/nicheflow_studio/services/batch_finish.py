@@ -41,7 +41,9 @@ def _check_cancel(cancel_event: "threading.Event | None") -> None:
 # local slot, handed to the Cloudflare Worker, or already published. A "draft"
 # job is only queued, and "failed"/"skipped" are dead ends — none of those block
 # a re-finish.
-_COMMITTED_JOB_STATUSES = ("scheduled", "cloud", "posted")
+COMMITTED_JOB_STATUSES = ("scheduled", "cloud", "posted")
+# Kept as the module-private name this file already reads.
+_COMMITTED_JOB_STATUSES = COMMITTED_JOB_STATUSES
 
 
 def _committed_item_ids(session, item_ids: list[int]) -> set[int]:

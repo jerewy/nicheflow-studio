@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from conftest import FAKE_VIDEO_BYTES
+
 from pathlib import Path
 
 from nicheflow_studio.db.models import DownloadItem
@@ -17,7 +19,7 @@ class ImmediateExecutor:
 def test_enqueue_download_persists_success_and_callback(monkeypatch) -> None:
     output_file = Path.cwd() / "data" / "downloads" / "video.mp4"
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    output_file.touch()
+    output_file.write_bytes(FAKE_VIDEO_BYTES)
     callback_states: list[tuple[str, str | None]] = []
 
     def fake_download(*, url: str, output_dir: Path) -> DownloadResult:
@@ -59,7 +61,7 @@ def test_enqueue_download_persists_success_and_callback(monkeypatch) -> None:
 def test_enqueue_download_routes_instagram_urls(monkeypatch) -> None:
     output_file = Path.cwd() / "data" / "downloads" / "instagram" / "reel.mp4"
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    output_file.touch()
+    output_file.write_bytes(FAKE_VIDEO_BYTES)
 
     def fake_download(*, url: str, output_dir: Path):
         assert url == "https://www.instagram.com/reel/abc123/"
@@ -99,7 +101,7 @@ def test_enqueue_download_routes_instagram_urls(monkeypatch) -> None:
 def test_instagram_redownload_reuses_one_media_asset(monkeypatch) -> None:
     output_file = Path.cwd() / "data" / "downloads" / "instagram" / "dupe.mp4"
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    output_file.touch()
+    output_file.write_bytes(FAKE_VIDEO_BYTES)
 
     def fake_download(*, url: str, output_dir: Path):
         return DownloadResult(
@@ -127,7 +129,7 @@ def test_instagram_download_reuses_existing_downloaded_asset_without_ytdlp(monke
 
     output_file = Path.cwd() / "data" / "downloads" / "instagram" / "existing.mp4"
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    output_file.write_bytes(b"existing")
+    output_file.write_bytes(FAKE_VIDEO_BYTES)
     url = "https://www.instagram.com/reel/existing1/"
 
     with get_session() as session:
@@ -161,7 +163,7 @@ def test_instagram_download_reuses_existing_downloaded_asset_without_ytdlp(monke
 def test_youtube_download_does_not_register_media_asset(monkeypatch) -> None:
     output_file = Path.cwd() / "data" / "downloads" / "yt.mp4"
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    output_file.touch()
+    output_file.write_bytes(FAKE_VIDEO_BYTES)
 
     def fake_download(*, url: str, output_dir: Path) -> DownloadResult:
         return DownloadResult(
@@ -272,7 +274,7 @@ def test_enqueue_download_maps_http_403_error(monkeypatch) -> None:
 def test_retry_item_clears_error_and_allows_success_after_failure(monkeypatch) -> None:
     output_file = Path.cwd() / "data" / "downloads" / "retry.mp4"
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    output_file.touch()
+    output_file.write_bytes(FAKE_VIDEO_BYTES)
     calls = {"count": 0}
 
     def fake_download(*, url: str, output_dir: Path) -> DownloadResult:

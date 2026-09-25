@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from conftest import FAKE_VIDEO_BYTES
+
 import datetime as dt
 from pathlib import Path
 from types import SimpleNamespace
@@ -34,7 +36,7 @@ def fake_pool_download(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     def download(*, url, output_dir):
         shortcode = url.rstrip("/").rsplit("/", 1)[-1]
         path = tmp_path / f"{shortcode}.mp4"
-        path.write_bytes(b"video")
+        path.write_bytes(FAKE_VIDEO_BYTES)
         return SimpleNamespace(file_path=path)
 
     monkeypatch.setattr(pooling, "download_instagram_url", download)
@@ -220,7 +222,7 @@ def test_distribute_clip_downloads_pending_asset_before_assignment(
         session.commit()
 
     downloaded = tmp_path / "clip.mp4"
-    downloaded.write_bytes(b"video")
+    downloaded.write_bytes(FAKE_VIDEO_BYTES)
     monkeypatch.setattr(
         pooling,
         "download_instagram_url",
@@ -458,20 +460,25 @@ def test_pending_review_clip_is_not_unassigned_or_distributed() -> None:
         )
         session.commit()
 
-    assert pooling._unassigned_pool_item_ids("history") == []
+    assert pooling._distributable_pool_item_ids("history") == []
     assert pooling.distribute_niche("history", max_per_account=1)["assigned"] == 0
     with get_session() as session:
         assert session.query(Assignment).count() == 0
 
 
 def test_already_posted_footage_is_not_redistributed() -> None:
-    """A clip the network already published never re-enters distribution.
+    """A clip never returns to the account that published it.
 
     Posts made before the pooling layer existed have DownloadItem + posted
     UploadJob rows but NO Assignment row, and legacy rows store the reel URL
     with a trailing slash while the pool's canonical URL drops it. Both used to
     let distribution re-serve an already-posted video (the "same video again"
     bug: same reel re-assigned to the account that posted it a month earlier).
+
+    Still true per account now that the pool is shared across accounts: the
+    check moved from the network-wide pre-filter into ``distribute_niche``'s
+    per-account hold map, so a sibling account may take this clip after the
+    reuse gap but its publisher never gets it back.
     """
     _seed_history_network(accounts=1, clips=2)
     with get_session() as session:
@@ -503,7 +510,9 @@ def test_already_posted_footage_is_not_redistributed() -> None:
             .scalar()
         )
 
-    assert posted_pool_item_id not in pooling._unassigned_pool_item_ids("history")
+    # The pre-filter deliberately still offers it — it is a candidate for the
+    # network, just not for this account. distribute_niche makes that call.
+    assert posted_pool_item_id in pooling._distributable_pool_item_ids("history")
 
     result = pooling.distribute_niche("history", max_per_account=5)
 
@@ -772,7 +781,7 @@ def test_distribute_niche_assigns_then_downloads_in_background(
         session.commit()
 
     downloaded = tmp_path / "works.mp4"
-    downloaded.write_bytes(b"video")
+    downloaded.write_bytes(FAKE_VIDEO_BYTES)
 
     def download(*, url, output_dir):
         if url.endswith("/fails"):
@@ -934,7 +943,7 @@ def test_distribute_reuses_media_already_on_disk(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     downloaded = tmp_path / "no-fetch.mp4"
-    downloaded.write_bytes(b"video")
+    downloaded.write_bytes(FAKE_VIDEO_BYTES)
     with get_session() as session:
         account = Account(name="History", platform="instagram", niche="history")
         asset = MediaAsset(
@@ -1282,7 +1291,7 @@ def test_release_missing_media_assignments_frees_legacy_broken_clips(tmp_path: P
             download_status="pending",
         )
         good_file = tmp_path / "good.mp4"
-        good_file.write_bytes(b"video")
+        good_file.write_bytes(FAKE_VIDEO_BYTES)
         good_asset = MediaAsset(
             canonical_source_url="https://instagram.com/reel/good/",
             source_shortcode="good",
@@ -1369,7 +1378,7 @@ def test_release_missing_media_assignments_frees_legacy_broken_clips(tmp_path: P
 
 def test_repair_pending_review_media_links_reuses_shared_download(tmp_path: Path) -> None:
     media_file = tmp_path / "shared.mp4"
-    media_file.write_bytes(b"video")
+    media_file.write_bytes(FAKE_VIDEO_BYTES)
     with get_session() as session:
         asset = MediaAsset(
             canonical_source_url="https://instagram.com/reel/shared/",
@@ -1442,7 +1451,7 @@ def test_fetch_missing_pending_media_prefers_footage_already_on_disk(
     # pulled the same clip and only this row was left out. Re-downloading it
     # would be a pointless Instagram hit on an account-safety-sensitive path.
     media_file = tmp_path / "already.mp4"
-    media_file.write_bytes(b"video")
+    media_file.write_bytes(FAKE_VIDEO_BYTES)
     item_id = _stalled_row("already")
     with get_session() as session:
         asset = (
@@ -1662,7 +1671,7 @@ def test_gone_source_slot_is_refilled_from_the_pool(
         session.commit()
 
     live = tmp_path / "spare.mp4"
-    live.write_bytes(b"video")
+    live.write_bytes(FAKE_VIDEO_BYTES)
 
     def download(*, url, output_dir):
         if url.endswith("/gone"):
@@ -1715,7 +1724,7 @@ def test_gone_source_refill_replaces_only_the_lost_slot(
         if len(calls) == 1:
             raise RuntimeError("Instagram sent an empty media response")
         path = tmp_path / f"{url.rstrip('/').rsplit('/', 1)[-1]}.mp4"
-        path.write_bytes(b"video")
+        path.write_bytes(FAKE_VIDEO_BYTES)
         return SimpleNamespace(file_path=path)
 
     monkeypatch.setattr(pooling, "download_instagram_url", download)

@@ -2272,24 +2272,41 @@ def test_detect_scene_change_timestamps_survives_a_missing_ffmpeg(
 def test_spread_timestamps_drops_double_fired_cuts() -> None:
     # ffmpeg's scene filter often fires on both the transition frame and the one
     # after it, which would otherwise spend two contact-sheet tiles on one shot.
-    result = video._spread_timestamps([1.5, 1.52, 5.6, 8.6], count=4, duration=30.0)
+    result = video._spread_timestamps([1.5, 1.52, 5.6, 8.6], count=4, duration=10.0)
 
-    assert result == [1.5, 5.6, 8.6]
+    assert 1.52 not in result
+    assert result == [1.5, 3.75, 5.6, 8.6]
 
 
-def test_spread_timestamps_walks_evenly_through_clustered_cuts() -> None:
-    # A busy second of cutaways must not eat every tile: coverage across the
+def test_spread_timestamps_covers_the_whole_clip_when_cuts_cluster() -> None:
+    # A busy stretch of cutaways must not eat every tile: coverage across the
     # whole clip matters more than catching each cut in one burst.
     candidates = [1.0, 2.0, 3.0, 4.0, 5.0, 20.0, 21.0, 22.0]
 
     result = video._spread_timestamps(candidates, count=3, duration=30.0)
 
-    assert result[0] == 1.0
+    assert len(result) == 3
     assert max(result) >= 20.0
 
 
+def test_spread_timestamps_reaches_the_back_half_when_every_cut_is_early() -> None:
+    """Handheld footage fires cut candidates on camera shake alone, so a clip
+    can offer dozens of candidates that all sit in its opening seconds. The
+    sheet must still reach the second half: a two-part clip whose payoff is
+    never sampled gets drafted from its setup alone."""
+    candidates = [round(0.2 * index, 2) for index in range(1, 41)]  # 0.2s to 8.0s
+
+    result = video._spread_timestamps(candidates, count=6, duration=22.5)
+
+    assert len(result) == 6
+    assert max(result) > 18.0
+
+
 def test_spread_timestamps_ignores_cuts_past_the_end() -> None:
-    assert video._spread_timestamps([1.0, 99.0], count=3, duration=10.0) == [1.0]
+    result = video._spread_timestamps([1.0, 99.0], count=3, duration=10.0)
+
+    assert 99.0 not in result
+    assert result == [1.0, 5.0, 8.33]
 
 
 def test_default_caption_style_sits_on_the_footage_and_wraps() -> None:
