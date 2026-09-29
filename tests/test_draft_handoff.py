@@ -924,6 +924,68 @@ Caption Option 1: Third caption
     assert draft_revisions.latest_revision(third).title_options == ["Third title"]
 
 
+def _prompt_seq_ids(prompt: str) -> list[int]:
+    """The "#N" each reel header of a built batch prompt carries, in reel order."""
+    return [int(n) for n in re.findall(r"^===== REEL \d+ \(#(\d+)\) =====", prompt, re.MULTILINE)]
+
+
+def _seq_batch_reply(seq_ids: list[int]) -> str:
+    return "\n".join(
+        f"===== REEL {index} (#{seq}) =====\n"
+        f"Title Option 1: Title {index}\nCaption Option 1: Caption {index}\n"
+        for index, seq in enumerate(seq_ids, start=1)
+    )
+
+
+def test_import_account_batch_draft_routes_prompt_ids_after_a_block() -> None:
+    # 2026-09-29: an item blocked after the prompt was built dropped out of the
+    # live "#N" rank, every later item's number shifted down by one, and each
+    # later reply block silently landed on a different video in the batch.
+    account_id, item_ids = _make_account_items(3)
+    first, second, third = item_ids
+    seq_ids = _prompt_seq_ids(draft_handoff.build_account_batch_chat_prompt(account_id, item_ids))
+    assert len(seq_ids) == 3
+
+    library.reject_item_globally(first, "blocked after prompt")
+    result = draft_handoff.import_account_batch_draft(_seq_batch_reply(seq_ids), item_ids)
+
+    assert [row["item_id"] for row in result["skipped"]] == [first]
+    assert set(result["imported"]) == {second, third}
+    assert draft_revisions.latest_revision(second).title_options == ["Title 2"]
+    assert draft_revisions.latest_revision(third).title_options == ["Title 3"]
+
+
+def test_import_account_batch_draft_routes_prompt_ids_after_an_earlier_delete() -> None:
+    # Deleting an older item of the same account shifts the live rank the same
+    # way a block did; the ids the prompt echoed must still win.
+    account_id, item_ids = _make_account_items(4)
+    oldest, batch = item_ids[0], item_ids[1:]
+    seq_ids = _prompt_seq_ids(draft_handoff.build_account_batch_chat_prompt(account_id, batch))
+
+    library.remove_item(oldest)
+    # Reel numbers crossed, so only the echoed ids can route correctly.
+    reply = _seq_batch_reply(seq_ids).replace("REEL 1 (", "REEL X (").replace(
+        "REEL 3 (", "REEL 1 ("
+    ).replace("REEL X (", "REEL 3 (")
+    result = draft_handoff.import_account_batch_draft(reply, batch)
+
+    assert set(result["imported"]) == set(batch)
+    for index, item_id in enumerate(batch, start=1):
+        assert draft_revisions.latest_revision(item_id).title_options == [f"Title {index}"]
+
+
+def test_account_sequence_map_keeps_numbers_when_an_item_is_blocked() -> None:
+    _account_id, item_ids = _make_account_items(3)
+    with get_session() as session:
+        before = library.account_sequence_map(session)
+
+    library.reject_item_globally(item_ids[0], "blocked")
+    with get_session() as session:
+        after = library.account_sequence_map(session)
+
+    assert [after[item_id] for item_id in item_ids[1:]] == [before[item_id] for item_id in item_ids[1:]]
+
+
 def test_import_account_batch_draft_ignores_unknown_id_and_falls_back() -> None:
     # An echoed id that is not part of this batch (e.g. the model parroted the
     # frame filename's item id) must be ignored, falling back to the reel number.

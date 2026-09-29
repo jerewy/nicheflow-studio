@@ -1268,6 +1268,9 @@ def build_account_batch_chat_prompt(
         from nicheflow_studio.services import library
 
         seq_by_item = library.account_sequence_map(session)
+        _PROMPT_SEQ_TO_ITEM[frozenset(ids)] = {
+            seq_by_item[item_id]: item_id for item_id in ids if item_id in seq_by_item
+        }
         # Only reels WITHOUT visual evidence still need an attached still, so
         # the header's attachment instruction has to match what the reel blocks
         # below actually ask for.
@@ -2074,12 +2077,23 @@ _DRAFT_SECTION = re.compile(
 )
 
 
+# {batch item ids -> {"#N" -> item_id}} exactly as each account batch prompt
+# printed it. The live rank still shifts when an older item of the account is
+# deleted, and the reply echoes the numbers the PROMPT carried, so import prefers
+# this snapshot. In-memory only: after an app restart import falls back to the
+# live rank, which blocks no longer shift (see library.account_sequence_map).
+_PROMPT_SEQ_TO_ITEM: dict[frozenset[int], dict[int, int]] = {}
+
+
 def _batch_seq_to_item(item_ids: list[int]) -> dict[int, int]:
     """Map {account "#id" -> item_id} for this batch, so a reply that echoes a
     "(#143)" routes to the exact video. Batch items share one account, so their
     per-account sequence numbers are unique within the batch."""
     if not item_ids:
         return {}
+    snapshot = _PROMPT_SEQ_TO_ITEM.get(frozenset(item_ids))
+    if snapshot is not None:
+        return dict(snapshot)
     # Lazy import: keep draft_handoff free of library's downloader import chain.
     from nicheflow_studio.services import library
 

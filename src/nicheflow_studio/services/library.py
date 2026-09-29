@@ -176,19 +176,22 @@ def _derive_status(
 
 
 def account_sequence_map(session) -> dict[int, int]:
-    """Per-account rank of each non-blocked item (oldest = 1), keyed by item id.
+    """Per-account rank of each item (oldest = 1), keyed by item id.
 
     This is the "#N" shown in the Processing/Library table. Computed over ALL
     items (not a windowed page) so the number is stable, and shared with the
     batch-draft handoff so a pasted reply that echoes "(#143)" routes to the
     same video the user saw. Replaces exposing the global, gap-ridden id.
+
+    Blocked items keep their slot even though Processing hides them. Skipping
+    them renumbered every later item of the account the moment one clip was
+    globally rejected, so a batch reply echoing prompt-time numbers landed each
+    draft on a different video in the same batch.
     """
     seq_by_item: dict[int, int] = {}
     account_counters: dict[int | None, int] = {}
     for seq_id, seq_account_id in session.execute(
-        select(DownloadItem.id, DownloadItem.account_id)
-        .where(DownloadItem.review_state != "blocked")
-        .order_by(DownloadItem.id.asc())
+        select(DownloadItem.id, DownloadItem.account_id).order_by(DownloadItem.id.asc())
     ):
         account_counters[seq_account_id] = account_counters.get(seq_account_id, 0) + 1
         seq_by_item[seq_id] = account_counters[seq_account_id]

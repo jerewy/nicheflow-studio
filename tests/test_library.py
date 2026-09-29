@@ -105,7 +105,7 @@ def test_list_items_assigns_per_account_sequence() -> None:
     assert max(seq.values()) == 3
 
 
-def test_per_account_sequence_skips_blocked_items() -> None:
+def test_per_account_sequence_hides_blocked_items_but_keeps_their_slot() -> None:
     a = _make_account("A")
     first = _make_item(account_id=a)
     blocked = _make_item(account_id=a)
@@ -116,10 +116,10 @@ def test_per_account_sequence_skips_blocked_items() -> None:
 
     seq = {r["id"]: r["account_seq"] for r in library.list_items(account_id=a)}
 
-    # A blocked item is hidden and consumes no number, so the visible sequence
-    # stays contiguous (no gap where the blocked clip was).
+    # A blocked item is hidden but keeps its number, so later items are not
+    # renumbered by a block (a batch reply echoes the pre-block "#N").
     assert blocked not in seq
-    assert seq == {first: 1, last: 2}
+    assert seq == {first: 1, last: 3}
 
 
 def test_status_derivation_draft_exported_posted() -> None:

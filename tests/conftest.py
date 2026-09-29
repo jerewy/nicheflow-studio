@@ -31,6 +31,11 @@ def isolated_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     from nicheflow_studio.db.session import reset_db_state
 
     reset_db_state()
+    # Each test gets a fresh DB, so item ids repeat across tests; a batch-prompt
+    # "#N" snapshot left by an earlier test would route a later test's import.
+    draft_handoff = sys.modules.get("nicheflow_studio.services.draft_handoff")
+    if draft_handoff is not None:
+        monkeypatch.setattr(draft_handoff, "_PROMPT_SEQ_TO_ITEM", {})
     yield
     reset_db_state()
 
