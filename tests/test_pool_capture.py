@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 
 import pytest
 
 from nicheflow_studio.core.apify_usage import record_apify_results
+from nicheflow_studio.core.ui_prefs import set_ui_pref
 from nicheflow_studio.db.blocklist import block_asset
 from nicheflow_studio.db.models import Account, PoolItem
 from nicheflow_studio.db.pools import (
@@ -13,8 +15,9 @@ from nicheflow_studio.db.pools import (
     remove_pool_item,
 )
 from nicheflow_studio.db.session import get_session, init_db
+from nicheflow_studio.scraper.instagram_apify import ApifyScrapeError, RecentReel
 from nicheflow_studio.scraper.youtube import ScrapedVideoCandidate
-from nicheflow_studio.services import pool_capture
+from nicheflow_studio.services import creator_baselines, pool_capture
 from nicheflow_studio.services.pool_capture import PoolCaptureError
 
 
@@ -275,3 +278,84 @@ def test_batch_capture_matches_paid_row_by_url_when_shortcode_missing(monkeypatc
 
     assert batch["summary"]["added"] == 1
     assert batch["summary"]["failed"] == 0
+
+
+def _settled_reels(views: int) -> list[RecentReel]:
+    posted = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+    return [RecentReel(views, posted)] * 6
+
+
+def _capture_with_views(monkeypatch, *, views: int, fetch) -> dict:
+    init_db()
+    with get_session() as session:
+        session.add(Account(name="Past Moments Daily", platform="instagram", niche="history"))
+        session.commit()
+    monkeypatch.setattr(
+        pool_capture,
+        "scrape_instagram_urls_apify",
+        lambda urls, *, results_limit: [
+            dataclasses.replace(_candidate(urls[0]), view_count=views)
+        ],
+    )
+    monkeypatch.setattr(creator_baselines, "fetch_instagram_profile_views_apify", fetch)
+    return pool_capture.capture_instagram_reels_to_pool(
+        [{"url": "https://www.instagram.com/reel/ABC123/", "niche": "history"}]
+    )
+
+
+def test_capture_judges_views_against_the_creator_normal(monkeypatch) -> None:
+    batch = _capture_with_views(
+        monkeypatch, views=300_000, fetch=lambda names: {"historysource": _settled_reels(100_000)}
+    )
+
+    check = batch["results"][0]["check"]
+    assert check["verdict"] == "strong"
+    assert check["ratio"] == 3.0
+    assert check["summary"].startswith("Strong: 3.0x normal for @historysource")
+    assert batch["summary"]["verdicts"] == {"strong": 1, "ok": 0, "weak": 0, "unknown": 0}
+
+
+def test_strong_capture_still_waits_for_review_by_default(monkeypatch) -> None:
+    batch = _capture_with_views(
+        monkeypatch, views=300_000, fetch=lambda names: {"historysource": _settled_reels(100_000)}
+    )
+
+    assert "auto_accepted" not in batch["results"][0]
+    with get_session() as session:
+        assert session.query(PoolItem).one().acceptance_status == POOL_STATUS_PENDING_REVIEW
+
+
+def test_auto_accept_setting_promotes_only_strong_captures(monkeypatch) -> None:
+    set_ui_pref(pool_capture.AUTO_ACCEPT_STRONG_PREF, True)
+
+    batch = _capture_with_views(
+        monkeypatch, views=300_000, fetch=lambda names: {"historysource": _settled_reels(100_000)}
+    )
+
+    assert batch["results"][0]["auto_accepted"] is True
+    with get_session() as session:
+        item = session.query(PoolItem).one()
+        assert item.acceptance_status == "accepted"
+        assert item.accepted_reason.startswith("auto-accepted capture. Strong: 3.0x")
+
+
+def test_auto_accept_setting_leaves_weak_captures_pending(monkeypatch) -> None:
+    set_ui_pref(pool_capture.AUTO_ACCEPT_STRONG_PREF, True)
+
+    batch = _capture_with_views(
+        monkeypatch, views=50_000, fetch=lambda names: {"historysource": _settled_reels(100_000)}
+    )
+
+    assert batch["results"][0]["check"]["verdict"] == "weak"
+    with get_session() as session:
+        assert session.query(PoolItem).one().acceptance_status == POOL_STATUS_PENDING_REVIEW
+
+
+def test_failed_baseline_fetch_still_pools_the_clip_as_unknown(monkeypatch) -> None:
+    def failing_fetch(names):
+        raise ApifyScrapeError("Actor run failed")
+
+    batch = _capture_with_views(monkeypatch, views=300_000, fetch=failing_fetch)
+
+    assert batch["summary"]["added"] == 1
+    assert batch["results"][0]["check"]["verdict"] == "unknown"

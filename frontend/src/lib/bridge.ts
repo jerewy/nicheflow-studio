@@ -2214,6 +2214,10 @@ const mock = {
         description: "Browser-dev mock pending pool clip.",
         channel_name: "thehistologian",
         published_at: new Date(Date.now() - 3 * 86400 * 1000).toISOString(),
+        check_verdict: "strong",
+        check_ratio: 2.4,
+        check_summary:
+          "Strong: 2.4x normal for @thehistologian (56k vs 23k) | 1.2k likes | 42 comments | 3 days old",
       },
     ];
     return sourceLabel ? rows.filter((row) => row.source_label === sourceLabel) : rows;

@@ -27,6 +27,9 @@ FAKE_VIDEO_BYTES = b"video" * 12_000
 def isolated_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("NICHEFLOW_DATA_DIR", raising=False)
+    # Apify bills per result: a test that forgets to fake a call must fail on a
+    # missing token, never spend real credit.
+    monkeypatch.delenv("APIFY_TOKEN", raising=False)
 
     from nicheflow_studio.db.session import reset_db_state
 

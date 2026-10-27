@@ -182,3 +182,80 @@ def test_scrape_instagram_source_apify_uses_since_and_rewrites_source_url(monkey
     assert candidates[0].view_count == 1000
     # Both rows were billed even though the age filter dropped the old one.
     assert apify_usage.monthly_apify_usage()["used"] == 2
+
+
+def test_fetch_profile_views_reads_latest_posts_in_one_run(monkeypatch) -> None:
+    captured_input: dict | None = None
+
+    class FakeActor:
+        def call(self, *, run_input, timeout_secs):  # noqa: ANN001
+            nonlocal captured_input
+            captured_input = run_input
+            return {"defaultDatasetId": "dataset-2"}
+
+    class FakeDataset:
+        def iterate_items(self):
+            return iter(
+                [
+                    {
+                        "username": "HistoryTrails",
+                        "latestPosts": [
+                            {
+                                "type": "Video",
+                                "videoViewCount": 120_000,
+                                "likesCount": 900,
+                                "timestamp": "2026-09-20T10:00:00.000Z",
+                            },
+                            {"type": "Video", "videoPlayCount": 80_000},
+                            # Photo posts carry no view count and are skipped.
+                            {"type": "Image", "likesCount": 400},
+                        ],
+                    },
+                    {"username": "crazyfactscorner", "latestPosts": []},
+                    {"error": "Profile not found"},
+                ]
+            )
+
+    class FakeClient:
+        def actor(self, actor_id: str):
+            return FakeActor()
+
+        def dataset(self, dataset_id: str):
+            assert dataset_id == "dataset-2"
+            return FakeDataset()
+
+    monkeypatch.setattr(instagram_apify, "_require_client", lambda: FakeClient())
+
+    views = instagram_apify.fetch_instagram_profile_views_apify(
+        ["@HistoryTrails", "crazyfactscorner", "historytrails", " "]
+    )
+
+    assert captured_input == {
+        "directUrls": [
+            "https://www.instagram.com/crazyfactscorner/",
+            "https://www.instagram.com/historytrails/",
+        ],
+        "resultsType": "details",
+        "resultsLimit": 2,
+        "addParentData": False,
+    }
+    assert views == {
+        "historytrails": [
+            instagram_apify.RecentReel(
+                120_000, dt.datetime(2026, 9, 20, 10, 0, tzinfo=dt.timezone.utc)
+            ),
+            instagram_apify.RecentReel(80_000, None),
+        ],
+        "crazyfactscorner": [],
+    }
+    # Billed per dataset row, including the error stub.
+    assert apify_usage.monthly_apify_usage()["used"] == 3
+
+
+def test_fetch_profile_views_skips_the_call_for_no_names(monkeypatch) -> None:
+    def fail_if_called():
+        raise AssertionError("no Apify client should be created")
+
+    monkeypatch.setattr(instagram_apify, "_require_client", fail_if_called)
+
+    assert instagram_apify.fetch_instagram_profile_views_apify(["", "  "]) == {}

@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import datetime as dt
+from collections.abc import Iterable
 from dataclasses import asdict
 from urllib.parse import urlparse
 
+from nicheflow_studio.core import clip_check
 from nicheflow_studio.core.apify_usage import monthly_apify_usage
+from nicheflow_studio.core.ui_prefs import get_ui_pref
 from nicheflow_studio.db.blocklist import is_blocked
 from nicheflow_studio.db.media_library import find_media_asset
 from nicheflow_studio.db.models import Account, PoolItem
@@ -23,6 +27,12 @@ from nicheflow_studio.db.session import get_session
 from nicheflow_studio.downloader.instagram import instagram_shortcode_from_url
 from nicheflow_studio.scraper.instagram_apify import scrape_instagram_urls_apify  # noqa: E501
 from nicheflow_studio.scraper.youtube import ScrapedVideoCandidate
+from nicheflow_studio.services.creator_baselines import normalize_channel, resolve_baselines
+
+# When on, a capture judged "strong" skips Pool Review. Off by default: the user
+# asked (2026-09-28) to approve every capture by hand for the first week, to
+# confirm the verdicts match their own judgement before trusting them.
+AUTO_ACCEPT_STRONG_PREF = "capture_auto_accept_strong"
 
 
 class PoolCaptureError(RuntimeError):
@@ -240,6 +250,13 @@ def capture_instagram_reels_to_pool(items: list[dict]) -> dict:
         ):
             if key:
                 by_shortcode.setdefault(key, candidate)
+    baselines = _resolve_capture_baselines(
+        candidate.channel_name
+        for candidate in (by_shortcode.get(item["shortcode"]) for item in pending)
+        if candidate is not None
+    )
+    auto_accept_strong = bool(get_ui_pref(AUTO_ACCEPT_STRONG_PREF, False))
+    verdicts = {"strong": 0, "ok": 0, "weak": 0, "unknown": 0}
     with get_session() as session:
         for item in pending:
             candidate = by_shortcode.get(item["shortcode"])
@@ -264,6 +281,12 @@ def capture_instagram_reels_to_pool(items: list[dict]) -> dict:
             payload["source_url"] = metadata.source_url
             payload["channel_name"] = metadata.channel_name
             payload["title"] = metadata.title
+            check = _check_candidate(candidate, baselines)
+            payload["check"] = check.as_dict()
+            if result.status == "added":
+                verdicts[check.verdict] += 1
+                if auto_accept_strong and check.verdict == "strong":
+                    payload["auto_accepted"] = _accept_capture(session, metadata, check)
             results.append(payload)
         session.commit()
 
@@ -280,8 +303,57 @@ def capture_instagram_reels_to_pool(items: list[dict]) -> dict:
             for result in results
         ),
         "apify_results": len(candidates),
+        # Verdicts for newly added clips only (see core/clip_check.py).
+        "verdicts": verdicts,
     }
     return {"summary": summary, "results": results, "dashboard": capture_dashboard()}  # noqa: E501
+
+
+def _resolve_capture_baselines(channels: Iterable[str | None]) -> dict[str, int]:
+    names = [channel for channel in channels if channel]
+    if not names:
+        return {}
+    # Own session so a slow Apify baseline fetch never overlaps the pooling writes.
+    with get_session() as session:
+        baselines = resolve_baselines(session, names)
+        session.commit()
+    return baselines
+
+
+def _check_candidate(
+    candidate: ScrapedVideoCandidate, baselines: dict[str, int]
+) -> clip_check.ClipCheck:
+    return clip_check.check_clip(
+        views=candidate.view_count,
+        likes=candidate.like_count,
+        comments=candidate.comment_count,
+        published_at=candidate.published_at,
+        channel_name=candidate.channel_name,
+        text=candidate.description,
+        baseline_views=baselines.get(normalize_channel(candidate.channel_name)),
+    )
+
+
+def _accept_capture(session, metadata: ReelMetadata, check: clip_check.ClipCheck) -> bool:
+    """Promote a just-pooled capture straight to accepted. Does not commit."""
+    asset = find_media_asset(session, source_url=metadata.source_url, shortcode=metadata.shortcode)
+    if asset is None:
+        return False
+    item = (
+        session.query(PoolItem)
+        .filter(
+            PoolItem.media_asset_id == asset.id,
+            PoolItem.acceptance_status == POOL_STATUS_PENDING_REVIEW,
+        )
+        .first()
+    )
+    if item is None:
+        return False
+    item.acceptance_status = POOL_STATUS_ACCEPTED
+    item.accepted_at = dt.datetime.now(dt.timezone.utc)
+    item.accepted_reason = f"auto-accepted capture. {check.summary}"[:512]
+    session.flush()
+    return True
 
 
 def capture_instagram_reel_to_pool(

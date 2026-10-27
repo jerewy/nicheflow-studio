@@ -269,6 +269,15 @@ def check_title_claims(
         f"{match.group(1)} {match.group(2)}"
         for match in _DURATION_RE.finditer(normalized_title)
     )
+    # The same claim spelled out ("Six months after this photo") used to go
+    # unchecked, because only the signals were converted to digits. "one" stays
+    # out: "one day" and "one minute" are idioms far more often than timelines.
+    spelled_durations = [
+        f"{match.group(1)} {match.group(2)}"
+        for match in _DURATION_RE.finditer(_spelled_numbers_as_digits(normalized_title))
+        if match.group(1) != "1"
+    ]
+    claim_terms.extend(term for term in spelled_durations if term not in claim_terms)
     if not claim_terms:
         return TitleClaimReport(claim_terms=[], unsupported_terms=[])
 

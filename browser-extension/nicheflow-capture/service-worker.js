@@ -64,9 +64,14 @@ async function processQueue() {
       await chrome.action.setBadgeBackgroundColor({ color: "#15803d" });
       await chrome.action.setBadgeText({ text: String(summary.added) });
       setTimeout(updateBadge, 6000);
+      const verdicts = summary.verdicts;
+      const verdictText =
+        verdicts && summary.added
+          ? ` Strong ${verdicts.strong}, OK ${verdicts.ok}, weak ${verdicts.weak}.`
+          : "";
       notify(
         "NicheFlow batch complete",
-        `${summary.added} added, ${summary.duplicates} duplicate, ${summary.failed} failed.`,
+        `${summary.added} added, ${summary.duplicates} duplicate, ${summary.failed} failed.${verdictText}`,
       );
     },
   );

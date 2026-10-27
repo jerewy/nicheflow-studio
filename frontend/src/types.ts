@@ -531,7 +531,14 @@ export interface PoolReviewItem {
   description: string | null;
   channel_name: string | null;
   published_at: string | null;
+  // Views against the creator's normal views (core/clip_check.py). Sets the
+  // row order; fit_score only breaks ties.
+  check_verdict: ClipVerdict;
+  check_ratio: number | null;
+  check_summary: string;
 }
+
+export type ClipVerdict = "strong" | "ok" | "weak" | "unknown";
 
 // Rights-risk label a reviewer sets on a pool item (docs/SOURCING_POOLING_PLAN.md
 // §2.2). Drives the rights-risk badge in the Review tab.

@@ -1502,6 +1502,41 @@ def build_contact_sheet(
     return resolved_output
 
 
+# Tall enough to stay legible after a chat model downscales an 1,100px sheet,
+# short enough not to crowd the tiles.
+_SHEET_LABEL_HEIGHT = 56
+_SHEET_LABEL_FONT_SIZE = 36
+
+
+def add_label_strip(image_path: Path, label: str) -> Path:
+    """Print ``label`` in a black strip above the image, in place.
+
+    A contact sheet carries no mark of which reel it belongs to, and a chat app
+    may not show the model an attachment's filename. With 12 to 18 sheets in one
+    message the model then pairs images with reels by upload order, which the
+    file picker does not guarantee. The label makes the pairing readable from the
+    pixels themselves.
+    """
+    from PIL import Image, ImageDraw, ImageFont  # noqa: PLC0415 - optional at import time
+
+    resolved = image_path.expanduser().resolve()
+    with Image.open(resolved) as source:
+        sheet = source.convert("RGB")
+    labelled = Image.new("RGB", (sheet.width, sheet.height + _SHEET_LABEL_HEIGHT), "black")
+    labelled.paste(sheet, (0, _SHEET_LABEL_HEIGHT))
+    font_path = windows_font_file("arial_bold")
+    font = (
+        ImageFont.truetype(str(font_path), _SHEET_LABEL_FONT_SIZE)
+        if font_path is not None
+        else ImageFont.load_default(size=_SHEET_LABEL_FONT_SIZE)
+    )
+    ImageDraw.Draw(labelled).text(
+        (14, _SHEET_LABEL_HEIGHT // 2), label, fill="white", font=font, anchor="lm"
+    )
+    labelled.save(resolved, format="JPEG", quality=90)
+    return resolved
+
+
 def extract_video_preview_frame(
     input_path: Path, output_path: Path, at_seconds: float | None = None
 ) -> Path:

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from pathlib import Path
 
 from sqlalchemy import select
@@ -23,6 +24,7 @@ from nicheflow_studio.db.session import get_session
 from nicheflow_studio.processing import draft_guard, smart_drafts
 from nicheflow_studio.services import draft_revisions, library
 from nicheflow_studio.services.draft_revisions import DraftRevisionDTO, DraftRevisionError
+from nicheflow_studio.services.jobs import JobCanceled
 
 logger = logging.getLogger(__name__)
 
@@ -281,18 +283,29 @@ def ensure_vision_payload(item_id: int, *, force: bool = False) -> dict | None:
         return None
 
 
-def ensure_batch_vision_payloads(item_ids: list[int], *, force: bool = False) -> dict:
+def ensure_batch_vision_payloads(
+    item_ids: list[int],
+    *,
+    force: bool = False,
+    cancel_event: threading.Event | None = None,
+) -> dict:
     """Fill in missing visual evidence for a batch, best effort.
 
     One failing item must not sink the batch prep, so per-item errors are
     collected and reported rather than raised. A provider-level failure (no
     vision model on the account, bad key) aborts the remaining items instead of
     paying an identical failed round-trip per reel.
+
+    A set ``cancel_event`` raises :class:`JobCanceled` before the next item, so
+    a canceled batch prep stops paying for vision calls nobody will use.
     """
     described: list[int] = []
     skipped: list[dict] = []
     unavailable: str | None = None
     for item_id in item_ids:
+        # Outside the try below: it catches every Exception, JobCanceled included.
+        if cancel_event is not None and cancel_event.is_set():
+            raise JobCanceled("Prepare canceled.")
         if unavailable is not None:
             skipped.append({"item_id": item_id, "reason": unavailable})
             continue

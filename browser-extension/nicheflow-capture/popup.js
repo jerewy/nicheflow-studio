@@ -11,11 +11,36 @@ const apifyResults = document.querySelector("#apify-results");
 const queueList = document.querySelector("#queue-list");
 const queueClear = document.querySelector("#queue-clear");
 const result = document.querySelector("#result");
+const verdictList = document.querySelector("#verdict-list");
 const captureUrlHelpers = globalThis.NicheFlowCaptureUrl;
 
 function show(tone, message) {
   result.dataset.tone = tone;
   result.textContent = message;
+}
+
+// One line per newly added clip: its views against the creator's normal views,
+// judged on the desktop side (core/clip_check.py).
+function renderVerdicts(batch) {
+  verdictList.replaceChildren();
+  for (const item of batch?.results ?? []) {
+    if (item.status !== "added" || !item.check) continue;
+    const row = document.createElement("div");
+    row.className = "verdict";
+    row.dataset.verdict = item.check.verdict;
+    row.title = item.source_url ?? "";
+    const creator = document.createElement("b");
+    creator.textContent = item.channel_name ? `@${item.channel_name}` : "Unknown creator";
+    row.append(creator, document.createTextNode(item.check.summary));
+    verdictList.append(row);
+  }
+}
+
+function batchSummaryText(summary) {
+  const base = `${summary.added} added, ${summary.duplicates} duplicate, ${summary.failed} failed.`;
+  const counts = summary.verdicts;
+  if (!counts || !summary.added) return base;
+  return `${base} Strong ${counts.strong}, OK ${counts.ok}, weak ${counts.weak}, unknown ${counts.unknown}.`;
 }
 
 function renderStats(dashboard) {
@@ -150,12 +175,12 @@ async function renderQueueState() {
   } else if (staleProcessing) {
     show("error", "The last batch didn't report back. You can process again.");
   } else if (stored.lastBatch?.ok) {
-    const summary = stored.lastBatch.summary;
-    show("success", `${summary.added} added, ${summary.duplicates} duplicate, ${summary.failed} failed.`);
+    show("success", batchSummaryText(stored.lastBatch.summary));
     renderStats(stored.lastBatch.dashboard);
   } else if (stored.lastBatch?.error) {
     show("error", stored.lastBatch.error);
   }
+  renderVerdicts(activeProcessing ? null : stored.lastBatch);
 }
 
 async function queueCurrent() {
