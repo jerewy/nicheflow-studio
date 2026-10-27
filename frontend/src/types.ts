@@ -1001,3 +1001,33 @@ export interface SubmissionStatus {
   expired: boolean;
   view_ceiling: number;
 }
+
+export type AppSettingGroup = "apify" | "cloudflare" | "ai" | "instagram";
+export type AppSettingKind = "text" | "url" | "account_map" | "handles";
+/** Where the live value came from: a real env var, the Settings file, or the repo .env. */
+export type AppSettingSource = "system" | "app" | "env_file";
+
+export interface AppSettingField {
+  key: string;
+  label: string;
+  group: AppSettingGroup;
+  secret: boolean;
+  kind: AppSettingKind;
+  help: string;
+  is_set: boolean;
+  source: AppSettingSource | null;
+  /** Always null for secrets: their values never leave the backend. */
+  value: string | null;
+  /** Secrets only: the last four characters, or "set" for short values. */
+  hint: string | null;
+}
+
+export interface AppSettingsStatus {
+  settings_path: string;
+  fields: AppSettingField[];
+}
+
+export interface ConnectionCheckResult {
+  ok: boolean;
+  message: string;
+}

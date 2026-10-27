@@ -1391,6 +1391,7 @@ export function ProcessingScreen({
           throw new Error(
             `Reel ${label}: ${err instanceof Error ? err.message : String(err)} ` +
               `Untick it or reject it, then Prepare again.`,
+            { cause: err },
           );
         }
       }

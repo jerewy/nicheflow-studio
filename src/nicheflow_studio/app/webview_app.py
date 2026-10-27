@@ -26,7 +26,7 @@ from pathlib import Path
 
 from nicheflow_studio.app.local_media import install_windows_mapping
 from nicheflow_studio.app.processing_bridge import ProcessingBridge
-from nicheflow_studio.core.env import load_dotenv
+from nicheflow_studio.core.env import load_app_env
 from nicheflow_studio.core.logging import configure_logging
 from nicheflow_studio.core.paths import data_dir, ensure_data_dirs
 from nicheflow_studio.db.session import init_db
@@ -106,7 +106,7 @@ def resolve_entry() -> str:
 
 
 def run_webview() -> None:
-    load_dotenv()
+    load_app_env()
     ensure_data_dirs()
     configure_logging()
     init_db()

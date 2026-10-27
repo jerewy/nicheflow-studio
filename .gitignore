@@ -31,13 +31,13 @@ dist/
 !NicheFlowCaptureHost.spec
 *.egg-info/
 
-# Node tooling / local Codex install artifacts
+# Node tooling. The root package files are a local Codex CLI install, not part
+# of the app; the leading slash keeps frontend/ and cloudflare-publisher/
+# manifests and lockfiles tracked.
 node_modules/
-package-lock.json
-pnpm-lock.yaml
-package.json
-!cloudflare-publisher/package.json
-!cloudflare-publisher/pnpm-lock.yaml
+/package.json
+/package-lock.json
+/pnpm-lock.yaml
 cloudflare-publisher/.dev.vars
 cloudflare-publisher/.wrangler/
 

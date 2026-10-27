@@ -63,7 +63,7 @@ def _require_token() -> str:
     token = os.environ.get(APIFY_TOKEN_ENV, "").strip()
     if not token:
         raise ApifyConfigError(
-            f"{APIFY_TOKEN_ENV} not set. Add it to .env "
+            f"{APIFY_TOKEN_ENV} not set. Add it on the Settings tab "
             f"(get one from https://console.apify.com/account/integrations)."
         )
     return token

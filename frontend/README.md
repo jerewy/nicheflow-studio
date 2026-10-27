@@ -1,73 +1,39 @@
-# React + TypeScript + Vite
+# NicheFlow Studio UI
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+React + TypeScript + Vite + Tailwind front end for NicheFlow Studio. It runs inside
+a pywebview window and talks to the Python backend through `window.pywebview.api`
+(typed in `src/lib/bridge.ts`).
 
-Currently, two official plugins are available:
+## Commands
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+Run these from this folder:
 
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```powershell
+npm install        # first time only
+npm run dev        # Vite dev server on http://localhost:5173
+npm run typecheck  # tsc -b (app and vite config)
+npm run lint
+npm run build      # writes dist/, which the desktop app loads
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+## Developing without the desktop shell
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+In a plain browser there is no pywebview bridge. `src/lib/bridge.ts` then falls
+back to an in-memory mock, so every screen still renders with sample data.
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+To develop against the real backend with hot reload, start the dev server, then
+launch the desktop window pointed at it:
+
+```powershell
+$env:NICHEFLOW_WEBVIEW_URL = "http://localhost:5173"
+..\.venv\Scripts\python.exe -m nicheflow_studio.app.webview_app
 ```
+
+`..\scripts\dev_webview.ps1 -Dev` does the same in one step.
+
+## Layout
+
+- `src/App.tsx`: tab shell (Accounts, Dashboard, Scraping, Processing, Clip Studio, Settings)
+- `src/components/`: one file per screen, plus `ui/` primitives (shadcn-style)
+- `src/lib/bridge.ts`: typed bridge wrapper and the browser mock
+- `src/types.ts`: shapes returned by the Python bridge

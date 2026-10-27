@@ -33,6 +33,7 @@ from nicheflow_studio.processing import transcript_clips
 from nicheflow_studio.db.session import get_session
 from nicheflow_studio.services import (
     accounts as accounts_svc,
+    app_settings,
     batch_finish,
     campaigns as campaigns_svc,
     clip_history,
@@ -397,6 +398,21 @@ class ProcessingBridge:
     @_guard
     def dashboard_schedule_coverage(self) -> dict:
         return publishing_dashboard.schedule_coverage()
+
+    # --- Settings (integration keys) --- #
+
+    @_guard
+    def get_app_settings(self) -> dict:
+        """Integration key status. Secret values are masked, never returned."""
+        return app_settings.settings_status()
+
+    @_guard
+    def save_app_settings(self, values: dict | None = None) -> dict:
+        return app_settings.save_settings(values or {})
+
+    @_guard
+    def check_app_connection(self, service: str) -> dict:
+        return app_settings.check_connection(service)
 
     @_guard
     def cloud_publisher_health(self) -> dict:

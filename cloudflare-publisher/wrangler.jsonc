@@ -1,5 +1,9 @@
+// Deploying your own copy? Change the four values marked "PER DEPLOYMENT":
+// PUBLIC_BASE_URL, LEGAL_CONTACT, database_id, and (optionally) the Worker name.
+// See README.md in this folder for the full setup.
 {
   "$schema": "node_modules/wrangler/config-schema.json",
+  // PER DEPLOYMENT (optional): changes the workers.dev URL below.
   "name": "nicheflow-publisher",
   "main": "src/index.ts",
   "compatibility_date": "2026-06-14",
@@ -9,7 +13,11 @@
     "PUBLISH_MODE": "live",
     "GRAPH_HOST": "graph.instagram.com",
     "GRAPH_VERSION": "v21.0",
+    // PER DEPLOYMENT: your Worker URL, printed by the first `npx wrangler deploy`.
+    // Meta downloads each video from here, so it must be publicly reachable.
     "PUBLIC_BASE_URL": "https://nicheflow-publisher.jeremywijaya81.workers.dev",
+    // PER DEPLOYMENT: contact shown on /privacy, /terms and /data-deletion.
+    "LEGAL_CONTACT": "jeremywijaya81@gmail.com",
     "MAX_STORED_BYTES": "8000000000",
     "MAX_UPLOAD_BYTES": "95000000",
     "MAX_ACTIVE_JOBS": "150"
@@ -21,6 +29,7 @@
     {
       "binding": "DB",
       "database_name": "nicheflow-publisher",
+      // PER DEPLOYMENT: printed by `npx wrangler d1 create nicheflow-publisher`.
       "database_id": "ee84adc2-de33-4ede-8fb9-a3651ed8c4dc"
     }
   ],

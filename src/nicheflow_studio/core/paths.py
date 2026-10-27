@@ -48,6 +48,11 @@ def logs_dir() -> Path:
     return data_dir() / "logs"
 
 
+def settings_env_path() -> Path:
+    """Integration keys saved from the Settings screen (KEY=value, like .env)."""
+    return data_dir() / "settings.env"
+
+
 def account_headers_dir() -> Path:
     """Profile pictures used by the burned-in post header, one per account.
 

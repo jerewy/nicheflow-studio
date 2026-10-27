@@ -6,6 +6,16 @@ export function normalizeAccountKey(value: string): string {
   return normalized;
 }
 
+// For deployment config interpolated into the public legal pages.
+export function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 export function safeFileName(value: string): string {
   const name = value.trim().replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^_+|_+$/g, "");
   return name.slice(-120) || "reel.mp4";

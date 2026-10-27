@@ -10,6 +10,7 @@ import sys
 from typing import BinaryIO
 
 from nicheflow_studio.core.env import load_dotenv
+from nicheflow_studio.core.paths import settings_env_path
 
 CONFIG_PATH = (
     pathlib.Path(os.environ.get("LOCALAPPDATA", pathlib.Path.home()))
@@ -31,6 +32,9 @@ def _prepare_runtime() -> None:
     dotenv_path = config.get("dotenv_path")
     if isinstance(data_dir, str) and data_dir.strip():
         os.environ["NICHEFLOW_DATA_DIR"] = data_dir
+    # Keys saved on the app's Settings tab win over the repo .env, the same
+    # precedence the desktop app uses (core.env.load_app_env).
+    load_dotenv(settings_env_path())
     if isinstance(dotenv_path, str) and dotenv_path.strip():
         load_dotenv(pathlib.Path(dotenv_path))
 

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { isRecoverableMetaError, isTransientMetaError, normalizeAccountKey, parseRange, safeFileName, shouldOfferManualLocalPublish } from "../src/helpers.ts";
+import { escapeHtml, isRecoverableMetaError, isTransientMetaError, normalizeAccountKey, parseRange, safeFileName, shouldOfferManualLocalPublish } from "../src/helpers.ts";
 import { ageMinutes, statusCounts } from "../src/monitoring.ts";
 
 test("normalizes valid account keys", () => {
@@ -80,4 +80,11 @@ test("treats genuine job failures as non-recoverable", () => {
   assert.equal(isRecoverableMetaError('Meta HTTP 400: {"error":{"code":100,"message":"bad media"}}'), false);
   assert.equal(isRecoverableMetaError("Error: Meta did not return a container id"), false);
   assert.equal(isRecoverableMetaError("Missing Worker secret binding: IG_TOKEN_BENEATHHISTORY"), false);
+});
+
+test("escapes deployment config before it is embedded in HTML", () => {
+  assert.equal(
+    escapeHtml(`ops@example.com"><script>alert('x')</script>&`),
+    "ops@example.com&quot;&gt;&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;&amp;",
+  );
 });

@@ -83,11 +83,10 @@ function CloudSafetyPanel({ accountId }: { accountId: number }) {
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
 
+  // The parent keys this panel by account id, so switching accounts remounts it
+  // with fresh state instead of resetting state here.
   useEffect(() => {
     let cancelled = false;
-    setLoaded(false);
-    setError(null);
-    setSaved(false);
     bridge
       .dashboardCloudAccountSettings(accountId)
       .then((result) => {
@@ -471,7 +470,9 @@ export function AccountManager({ activeId, onAccountsChanged, onUseAccount }: Ac
                 />
                 Auto-schedule each reel after export
               </label>
-              {!creating && selectedId !== null && <CloudSafetyPanel accountId={selectedId} />}
+              {!creating && selectedId !== null && (
+                <CloudSafetyPanel key={selectedId} accountId={selectedId} />
+              )}
               <div className="flex items-center gap-2">
                 <Button onClick={save} disabled={busy}>
                   {creating ? "Create account" : "Save changes"}

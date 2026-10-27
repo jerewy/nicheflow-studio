@@ -1,4 +1,7 @@
-# Installation (MVP)
+# Installation (legacy PyQt6 app)
+
+> For the current React app, follow [SETUP.md](SETUP.md). This page covers the
+> older PyQt6 window and its packaged build.
 
 For MVP we support both source-run development and a packaged Windows build.
 

@@ -3,7 +3,7 @@ import sys
 
 from PyQt6.QtWidgets import QApplication
 
-from nicheflow_studio.core.env import load_dotenv
+from nicheflow_studio.core.env import load_app_env
 from nicheflow_studio.app.main_window import MainWindow
 from nicheflow_studio.core.logging import configure_logging
 from nicheflow_studio.core.paths import ensure_data_dirs
@@ -12,7 +12,7 @@ from nicheflow_studio.processing.thumbnail import face_detection_available
 
 
 def run_app() -> None:
-    load_dotenv()
+    load_app_env()
     ensure_data_dirs()
     configure_logging()
     init_db()

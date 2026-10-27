@@ -3,12 +3,15 @@
 #   .\scripts\build_webview.ps1              # build frontend, then PyInstaller bundle
 #   .\scripts\build_webview.ps1 -SkipFrontend  # reuse the existing frontend\dist
 #
+#   .\scripts\build_webview.ps1 -Windowed   # release build: no console window
+#
 # Output: dist\NicheFlowProcessing\NicheFlowProcessing.exe
 #
-# This is a CONSOLE build (no -windowed) so the first packaged smoke test prints
-# tracebacks. Switch to a windowed build once the slice is validated.
+# The default is a CONSOLE build so smoke tests print tracebacks. Use -Windowed
+# for builds you hand to other people; errors still go to the log folder under
+# the app's data directory.
 
-param([switch]$SkipFrontend)
+param([switch]$SkipFrontend, [switch]$Windowed)
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
@@ -43,9 +46,15 @@ if (-not (Test-Path $sidecar)) {
     & $sidecar -U
 }
 
+$consoleFlag = if ($Windowed) { "--windowed" } else { "--console" }
+
 Write-Host "== PyInstaller bundle =="
+# rapidocr_onnxruntime ships its OCR model weights as package data. Without
+# --collect-all the frozen build cannot read on-screen hooks, and batches
+# silently go out with no hook text.
 & .\.venv\Scripts\pyinstaller.exe `
     --noconfirm --clean `
+    $consoleFlag `
     --name NicheFlowProcessing `
     --paths src `
     --add-data "frontend\dist;frontend\dist" `
@@ -56,6 +65,7 @@ Write-Host "== PyInstaller bundle =="
     --collect-all pythonnet `
     --hidden-import clr `
     --collect-data cv2 `
+    --collect-all rapidocr_onnxruntime `
     src\nicheflow_studio\app\webview_app.py
 
 Write-Host "== Done =="

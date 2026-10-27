@@ -354,6 +354,9 @@ export function BatchDraftsScreen({
   // Wait for the stored niche before fetching, or the first paint would show
   // every account and then visibly re-filter once the preference arrives.
   useEffect(() => {
+    // load() sets state only after its bridge call resolves; the rule cannot
+    // see past the await, so this is not a synchronous cascade.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     if (active && settingsLoaded) void load();
   }, [active, load, settingsLoaded]);
 
