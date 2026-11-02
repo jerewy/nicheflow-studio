@@ -12,6 +12,7 @@ from nicheflow_studio.db import assignments as assignments_db
 from nicheflow_studio.db.models import (
     Account,
     Assignment,
+    CreatorBaseline,
     DownloadItem,
     MediaAsset,
     PoolItem,
@@ -1767,3 +1768,65 @@ def test_distribute_niche_explicit_flags_an_account_outside_the_niche() -> None:
 
     assert result["assigned"] == 0
     assert result["reason"] == "no_accounts"
+
+
+def test_review_queue_puts_strong_clips_first_with_their_verdict() -> None:
+    """Views against the creator's normal lead the order; fit_score only breaks ties."""
+    with get_session() as session:
+        account = Account(name="History", platform="instagram", niche="history")
+        session.add(account)
+        session.flush()
+        session.add(
+            CreatorBaseline(
+                channel_name="historytrails",
+                median_views=100_000,
+                sample_size=40,
+                source="pool",
+                measured_at=dt.datetime.now(dt.timezone.utc),
+            )
+        )
+        # (shortcode, creator, views): weak, unknown (no baseline), strong.
+        cases = [
+            ("weak", "historytrails", 40_000),
+            ("unknown", "newcreator", 900_000),
+            ("strong", "historytrails", 350_000),
+        ]
+        ids: dict[str, int] = {}
+        for shortcode, channel, views in cases:
+            url = f"https://instagram.com/reel/{shortcode}/"
+            asset = MediaAsset(
+                platform="instagram",
+                canonical_source_url=url,
+                source_shortcode=shortcode,
+                download_status="downloaded",
+            )
+            session.add(asset)
+            session.flush()
+            pool_item = PoolItem(
+                media_asset_id=asset.id, niche="history", acceptance_status="pending_review"
+            )
+            session.add(pool_item)
+            session.flush()
+            ids[shortcode] = pool_item.id
+            session.add(
+                ScrapeCandidate(
+                    scrape_source_url=url,
+                    source_url=url,
+                    video_id=shortcode,
+                    channel_name=channel,
+                    account_id=account.id,
+                    view_count=views,
+                    like_count=views // 50,
+                    comment_count=10,
+                    duration_seconds=20,
+                )
+            )
+        session.commit()
+
+    rows = pooling.review_queue("history")
+
+    assert [row["pool_item_id"] for row in rows] == [ids["strong"], ids["unknown"], ids["weak"]]
+    assert [row["check_verdict"] for row in rows] == ["strong", "unknown", "weak"]
+    assert rows[0]["check_ratio"] == 3.5
+    assert rows[0]["check_summary"].startswith("Strong: 3.5x normal for @historytrails")
+    assert rows[1]["check_ratio"] is None

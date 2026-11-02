@@ -25,18 +25,6 @@
 - Prefer matching existing repo patterns over introducing new abstractions.
 - Avoid broad refactors unless they clearly unblock the current MVP.
 
-## Obsidian Second Brain
-
-- This repo maps to the `nicheflow` project in `C:\Users\ASUS\.codex\memories\workspace-project-map.json`.
-- At the start of substantive work in this repo, run:
-  - `node C:\Users\ASUS\.codex\scripts\codex-second-brain.mjs bootstrap-session --workspace-path "C:\dev\nicheflow-studio" --text "<current task>"`
-- Read the returned shared-core files first, then the returned Nicheflow project files.
-- For code changes, bug investigations, multi-step tasks, or work that should survive context compaction, create a task/session note with:
-  - `node C:\Users\ASUS\.codex\scripts\codex-second-brain.mjs start-task-session --title "<task title>" --goal "<goal>" --user-ask "<original ask>" --primary-project "nicheflow" --working-directory "C:\dev\nicheflow-studio"`
-- During longer tasks, append concise progress updates to the active session note.
-- At checkpoints or task completion, close the session with a concise summary and next prompt so `Tasks/`, `Sessions/`, `Prompts/`, and `Indexes/active-context.md` stay current.
-- Keep `Daily/YYYY-MM-DD.md` human-written only; do not append daily notes automatically.
-
 ## Architecture Preferences
 
 - Keep core logic OS-agnostic where easy (`pathlib`, isolated filesystem logic), even though packaging is Windows-only for MVP.

@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import shutil
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,12 +30,14 @@ from nicheflow_studio.processing import (
     on_screen_hook,
     smart_drafts,
     title_lab,
+    title_persona,
     transcription,
     video,
 )
 from nicheflow_studio.services import draft_generation, draft_revisions, export as export_svc
 from nicheflow_studio.services.draft_revisions import DraftRevisionDTO, DraftRevisionError
 from nicheflow_studio.services.export import ExportError
+from nicheflow_studio.services.jobs import JobCanceled
 
 logger = logging.getLogger(__name__)
 
@@ -47,9 +50,15 @@ class PastedDraft:
     recommended_title_index: int | None
     recommended_caption_index: int | None
     reason: str | None
+    # The model's one-sentence account of what happens in the clip, written
+    # before its titles (persona prompt). Saved as the revision summary, which
+    # the Processing screen already shows, so a misread clip is visible at a
+    # glance instead of only through titles that feel off.
+    clip: str | None = None
 
 
 _HEADERS: list[tuple[str, re.Pattern[str]]] = [
+    ("clip", re.compile(r"^clip\s*:\s*(.*)$", re.IGNORECASE)),
     ("title", re.compile(r"^title\s*option\s*(\d+)\s*:\s*(.*)$", re.IGNORECASE)),
     ("caption", re.compile(r"^caption\s*option\s*(\d+)\s*:\s*(.*)$", re.IGNORECASE)),
     ("style", re.compile(r"^recommended\s*style\s*(\d+)\s*:\s*(.*)$", re.IGNORECASE)),
@@ -143,6 +152,11 @@ TITLE_STYLE_BEATS_V2 = "beats_v2"
 # reveal. Its own style value rather than a flag on v2, so switching one account
 # to it is a real A/B and the rest keep the rules they are measured under.
 TITLE_STYLE_BEATS_V3 = "beats_v3"
+# One @historytrails-modelled persona for every history account (see
+# processing.title_persona). It replaces both the per-account voice fields and
+# the Story Beats rulebook, so a batch where every account runs it gets its own,
+# much shorter prompt (see _build_persona_batch_prompt).
+TITLE_STYLE_PERSONA = "persona_v1"
 
 CAPTION_MODE_SHARED = "shared"
 CAPTION_MODE_PER_OPTION = "per_option"
@@ -209,7 +223,13 @@ def _strip_header_emphasis(line: str) -> str:
 
 def parse_pasted_draft(text: str) -> PastedDraft:
     indexed: dict[str, dict[int, list[str]]] = {"title": {}, "caption": {}, "style": {}}
-    singleton: dict[str, list[str]] = {"pick": [], "why": [], "notes": [], "shared_caption": []}
+    singleton: dict[str, list[str]] = {
+        "clip": [],
+        "pick": [],
+        "why": [],
+        "notes": [],
+        "shared_caption": [],
+    }
     active_kind: str | None = None
     active_index: int | None = None
     buffer: list[str] = []
@@ -334,6 +354,9 @@ def parse_pasted_draft(text: str) -> PastedDraft:
         recommended_title_index=recommended_title_index,
         recommended_caption_index=recommended_caption_index,
         reason=join_line(singleton["why"]) or None,
+        # First line only: the Niche check and Concern lines that follow it are
+        # not headers, so a join would glue them onto the clip sentence.
+        clip=next((line.strip() for line in singleton["clip"] if line.strip()), None),
     )
 
 
@@ -518,15 +541,11 @@ def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
         caption_outro = draft_generation.caption_outro_for_account(account)
         caption_voice = _caption_rule_voice(account)
         hook_lines = _on_screen_hook_lines(item)
+        persona = _resolved_styles(account, settings)[0] == TITLE_STYLE_PERSONA
         fields = [
             f"Account: {account.name if account else '(none)'}",
             f"Niche: {niche_label or '(none)'}",
-            f"Tone: {account.writing_tone if account and account.writing_tone else '(none)'}",
-            f"Target audience: {account.target_audience if account and account.target_audience else '(none)'}",
-            f"Hook style: {account.hook_style if account and account.hook_style else '(none)'}",
-            f"Banned phrases: {account.banned_phrases if account and account.banned_phrases else '(none)'}",
-            f"Title rules: {account.title_style_notes if account and account.title_style_notes else '(none)'}",
-            f"Caption rules: {account.caption_style_notes if account and account.caption_style_notes else '(none)'}",
+            *([] if persona else _account_voice_lines(account)),
             f"Scraped caption line (loose descriptive prose from the repost, NOT their hook - context only, often narrower than the clip, and never a model for the title): {item.title or '(none)'}",
             f"Source URL: {item.source_url or '(none)'}",
             f"Source description: {item.source_description or '(none)'}",
@@ -574,7 +593,6 @@ def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
         few_shot_winners=few_shot_winners,
         title_length=title_length,
     )
-    hook_rules = smart_drafts._hook_drama_and_fact_safety_rules()
     # Same source as the live CAPTION block so caption length/structure can't
     # drift between the chat path and the API path (titles already share
     # effective_title_rules above; captions used to be a bare style token here).
@@ -615,9 +633,7 @@ def build_chat_prompt(item_id: int, settings: dict | None = None) -> str:
             "On-screen title rules (follow these exactly):",
             *title_rules,
             "",
-            "Hook framing (drama is allowed, overclaiming is not):",
-            *hook_rules,
-            "",
+            *_hook_framing_block(title_style),
             "Caption rules (follow these exactly):",
             *caption_rules,
             "",
@@ -1094,7 +1110,7 @@ def _account_prompt_header(
         few_shot_winners=few_shot_winners,
         title_length=title_length,
     )
-    hook_rules = smart_drafts._hook_drama_and_fact_safety_rules()
+    persona = title_style == TITLE_STYLE_PERSONA
     # Same source as the live CAPTION block (see effective_caption_rules); the
     # batch path used to emit only a bare "Caption style:" token, so the web
     # model had no length/structure target and returned one-line captions.
@@ -1121,12 +1137,7 @@ def _account_prompt_header(
         "Shared account voice and style:",
         f"Account: {account.name if account else '(none)'}",
         f"Niche: {niche_label or '(none)'}",
-        f"Tone: {account.writing_tone if account and account.writing_tone else '(none)'}",
-        f"Target audience: {account.target_audience if account and account.target_audience else '(none)'}",
-        f"Hook style: {account.hook_style if account and account.hook_style else '(none)'}",
-        f"Banned phrases: {account.banned_phrases if account and account.banned_phrases else '(none)'}",
-        f"Title rules: {account.title_style_notes if account and account.title_style_notes else '(none)'}",
-        f"Caption rules: {account.caption_style_notes if account and account.caption_style_notes else '(none)'}",
+        *([] if persona else _account_voice_lines(account)),
         f"Clip premise / user direction: {settings.get('clip_premise') or '(none)'}",
         *_style_header_lines(title_style, caption_style, title_length),
         f"Processing template: {settings.get('template') or '(none)'}",
@@ -1135,9 +1146,7 @@ def _account_prompt_header(
         "On-screen title rules (follow these exactly):",
         *title_rules,
         "",
-        "Hook framing (drama is allowed, overclaiming is not):",
-        *hook_rules,
-        "",
+        *_hook_framing_block(title_style),
         "Caption rules (follow these exactly):",
         *caption_rules,
         "",
@@ -1294,7 +1303,43 @@ def build_account_batch_chat_prompt(
 _MAX_RULE_DELTA_LINES = 6
 
 
-def _account_voice_delta(account: Account | None, *, item_count: int) -> list[str]:
+def _account_voice_lines(account: Account | None) -> list[str]:
+    """Tone, audience, hook style, banned phrases and style notes for one account.
+
+    Callers skip these under the persona style. They ARE the per-account voice
+    the persona replaces, and printing them beside it hands the model two voices
+    to choose between: Past Moments Daily's fields still ask for a "documentary
+    feel" and "full-sentence context that sets scene and stakes".
+    """
+    return [
+        f"Tone: {account.writing_tone if account and account.writing_tone else '(none)'}",
+        f"Target audience: {account.target_audience if account and account.target_audience else '(none)'}",
+        f"Hook style: {account.hook_style if account and account.hook_style else '(none)'}",
+        f"Banned phrases: {account.banned_phrases if account and account.banned_phrases else '(none)'}",
+        f"Title rules: {account.title_style_notes if account and account.title_style_notes else '(none)'}",
+        f"Caption rules: {account.caption_style_notes if account and account.caption_style_notes else '(none)'}",
+    ]
+
+
+def _hook_framing_block(title_style: str | None) -> list[str]:
+    """The GREEN/YELLOW claim tiers, except under the persona.
+
+    Their SECOND-HAND CLAIMS rule says the source caption is not proof, while the
+    persona lets the source's hook and caption establish who and what is on
+    screen. Sending both is the same contradiction the persona exists to remove.
+    """
+    if title_style == TITLE_STYLE_PERSONA:
+        return []
+    return [
+        "Hook framing (drama is allowed, overclaiming is not):",
+        *smart_drafts._hook_drama_and_fact_safety_rules(),
+        "",
+    ]
+
+
+def _account_voice_delta(
+    account: Account | None, *, item_count: int, persona: bool = False
+) -> list[str]:
     """The per-account fields that actually differ between accounts.
 
     The style RULES (title/hook/caption blocks, ~14k characters) are emitted
@@ -1305,14 +1350,27 @@ def _account_voice_delta(account: Account | None, *, item_count: int) -> list[st
     return [
         f"Account: {account.name if account else '(none)'}",
         f"Niche: {account.niche_label if account and account.niche_label else '(none)'}",
-        f"Tone: {account.writing_tone if account and account.writing_tone else '(none)'}",
-        f"Target audience: {account.target_audience if account and account.target_audience else '(none)'}",
-        f"Hook style: {account.hook_style if account and account.hook_style else '(none)'}",
-        f"Banned phrases: {account.banned_phrases if account and account.banned_phrases else '(none)'}",
-        f"Title rules: {account.title_style_notes if account and account.title_style_notes else '(none)'}",
-        f"Caption rules: {account.caption_style_notes if account and account.caption_style_notes else '(none)'}",
+        *([] if persona else _account_voice_lines(account)),
         f"Reels for this account: {item_count}",
     ]
+
+
+def _on_screen_hook_text(item: DownloadItem) -> str:
+    """The source's burned-in hook for this reel, whitespace-normalised, or ""."""
+    # Lives on ScrapeCandidate (keyed by video_id), not on the item. Uses the
+    # item's own session so this adds no connection handling to the callers.
+    video_id = (item.video_id or "").strip()
+    session = object_session(item)
+    if not video_id or session is None:
+        return ""
+    hook = (
+        session.query(ScrapeCandidate.on_screen_title)
+        .filter(ScrapeCandidate.video_id == video_id)
+        .filter(ScrapeCandidate.on_screen_title.is_not(None))
+        .limit(1)
+        .scalar()
+    )
+    return " ".join((hook or "").split())
 
 
 def _on_screen_hook_lines(item: DownloadItem) -> list[str]:
@@ -1335,20 +1393,7 @@ def _on_screen_hook_lines(item: DownloadItem) -> list[str]:
     Returns [] when the reel has no OCR'd title, which is most of them today
     (coverage is 14% of scraped candidates), so the block simply omits the line.
     """
-    # Lives on ScrapeCandidate (keyed by video_id), not on the item. Uses the
-    # item's own session so this adds no connection handling to the callers.
-    video_id = (item.video_id or "").strip()
-    session = object_session(item)
-    if not video_id or session is None:
-        return []
-    hook = (
-        session.query(ScrapeCandidate.on_screen_title)
-        .filter(ScrapeCandidate.video_id == video_id)
-        .filter(ScrapeCandidate.on_screen_title.is_not(None))
-        .limit(1)
-        .scalar()
-    )
-    hook = " ".join((hook or "").split())
+    hook = _on_screen_hook_text(item)
     if not hook:
         return []
     return [
@@ -1428,6 +1473,10 @@ def _effective_title_rules(
     dataset can. The draft guard enforces the same limit on the reply, because
     a prompt length rule alone was ignored in August.
     """
+    if title_style == TITLE_STYLE_PERSONA:
+        # Length is the persona's own 130-character ceiling; the Title Length
+        # setting is ignored here exactly as it is under v2.
+        return title_persona.persona_title_rules()
     if title_style in (TITLE_STYLE_BEATS_V2, TITLE_STYLE_BEATS_V3):
         rules = title_lab.production_title_rules(
             few_shot_winners=few_shot_winners,
@@ -1474,10 +1523,11 @@ def _style_header_lines(
         f"Caption style: {caption_style or '(none)'}",
         f"Title style: {title_style or 'Auto (match caption style)'}",
     ]
-    honoured = title_style not in (
-        TITLE_STYLE_BEATS_V2,
-        TITLE_STYLE_BEATS_V3,
-    ) or draft_guard.title_char_limit(title_length)
+    # The persona has no Short override: its one ceiling is the renderer's.
+    honoured = title_style != TITLE_STYLE_PERSONA and (
+        title_style not in (TITLE_STYLE_BEATS_V2, TITLE_STYLE_BEATS_V3)
+        or draft_guard.title_char_limit(title_length)
+    )
     if honoured:
         lines.append(f"Title length: {str(title_length or 'long').title()}")
     return lines
@@ -1535,9 +1585,7 @@ def _account_style_rules(account: Account | None, settings: dict) -> list[str]:
             title_length=title_length,
         ),
         "",
-        "Hook framing (drama is allowed, overclaiming is not):",
-        *smart_drafts._hook_drama_and_fact_safety_rules(),
-        "",
+        *_hook_framing_block(title_style),
         "Caption rules (follow these exactly):",
         *smart_drafts.effective_caption_rules(
             caption_style,
@@ -1789,9 +1837,151 @@ def multi_account_batch_order(item_ids: list[int]) -> list[int]:
     return [item_id for group in grouped.values() for item_id in group]
 
 
-def multi_account_batch_frames(item_ids: list[int]) -> dict:
-    """Vision-first frame prep for a cross-account batch (see ``batch_frames``)."""
-    return batch_frames(multi_account_batch_order(item_ids))
+def _contact_sheet_label(index: int, item_id: int) -> str:
+    """The reel label printed on a contact sheet; it matches the reel's header."""
+    return f"REEL {index} (#{item_id})"
+
+
+def _persona_reel_context(index: int, item: DownloadItem) -> list[str]:
+    """One reel's evidence block for the persona prompt.
+
+    The same evidence as :func:`_batch_item_context`, labelled plainly. The
+    contact-sheet line names the strip printed on the image (see batch_frames):
+    a chat app may not show the model an attachment's filename, and with 12 to 18
+    images in one message the printed label is the only reliable way to pair an
+    image with its reel. Empty vision JSON is left out instead of printed as
+    "(none)", because the vision pass has not run on any chat-drafted reel since
+    September and the line was noise on every one.
+    """
+    transcript = (item.transcript_text or "").strip()
+    vision_text = (item.smart_vision_payload or "").strip()
+    lines = [_batch_item_delimiter(index, item.id, _item_account_name(item))]
+    if not vision_text:
+        lines.append(
+            f"Attach and inspect image file: reel_{index}_item{item.id}.jpg (its top "
+            f"strip reads {_contact_sheet_label(index, item.id)}; moments from this one "
+            "clip in time order, left to right, then top to bottom)"
+        )
+    lines += [
+        f"Source caption: {item.title or '(none)'}",
+        f"Source description: {item.source_description or '(none)'}",
+        f"Source's own on-screen hook: {_on_screen_hook_text(item) or '(none)'}",
+        f"Source URL: {item.source_url or '(none)'}",
+    ]
+    if vision_text:
+        lines.append(f"Vision notes (another model's read of 5 frames): {vision_text[:4000]}")
+    lines += [
+        "Transcript/context excerpt:",
+        transcript[:3000] or "(none: no speech was found, or the clip is music only)",
+    ]
+    return lines
+
+
+def _build_persona_batch_prompt(
+    grouped: dict[int, list[DownloadItem]],
+    accounts: dict[int, Account],
+    settings: dict,
+    *,
+    total: int,
+) -> str:
+    """The multi-account batch prompt when every account runs the persona style.
+
+    Built on its own rather than threaded through the v2/v3 builder as flags,
+    because the persona replaces most of what that builder assembles: the
+    per-account voice block, the hook-framing tiers, the three blocks that
+    disagree about the source caption, and the guidance for a vision pass that no
+    longer runs. What it keeps is the contract with the importer: the same reel
+    headers, the same section names, and the Concern and Niche check lines.
+    """
+    caption_mode = _caption_mode(settings)
+    caption_styles = {
+        account_id: _resolved_styles(account, settings)[1]
+        for account_id, account in accounts.items()
+    }
+    shared_caption_style = next(iter(caption_styles.values()))
+    attachments_expected = any(
+        not (item.smart_vision_payload or "").strip()
+        for items in grouped.values()
+        for item in items
+    )
+    lines = [
+        f"Write on-screen titles and one Instagram caption for each of the {total} reels "
+        f"below, from {len(grouped)} account(s). This is for ChatGPT or Claude chat.",
+        *(
+            [
+                "Attach every contact sheet image named below before you start. Each "
+                "image has its reel number printed in a strip at the top, for example "
+                "'REEL 4 (#2202)'. Match each image to its reel by that strip, never by "
+                "upload order or file name."
+            ]
+            if attachments_expected
+            else []
+        ),
+        f"Clip premise / user direction: {settings.get('clip_premise') or '(none)'}",
+        "",
+        *title_persona.persona_title_rules(),
+        "",
+        "CAPTION RULES (the Instagram description under the video, separate from the "
+        "on-screen title)",
+        *smart_drafts.effective_caption_rules(shared_caption_style),
+        "- No em dashes or double hyphens anywhere, captions included.",
+        "",
+        *_field_disambiguation_lines(shared_caption_style, caption_mode),
+        "",
+        "RETURN FORMAT",
+        "Return one block per reel, for every reel, in order. Start each block with the "
+        "reel's header line copied exactly from its context below:",
+        "===== REEL <n> (#<id>) ===== <account name>",
+        "The (#id) is how the app files each reply to the right video across accounts, "
+        "so never change, drop or invent it. Do not rename, renumber, merge or skip any "
+        "reel, even if two clips look alike.",
+        _CONCERN_ESCAPE_HATCH,
+        "Niche check: compare the clip's subject with the niche of ITS OWN account, then "
+        "write 'Niche check: fits' or 'Niche check: OFF-NICHE, <one short reason>'. Flag "
+        "borderline fits as OFF-NICHE so the user decides, and still write all three "
+        "options.",
+        "Across the batch, never start two reels' titles with the same three words.",
+        "Inside each block, write exactly these plain-text lines, in this order:",
+        "Clip: <one sentence: who is in the clip and what happens>",
+        "Niche check: <fits | OFF-NICHE, reason>",
+        *_return_format_lines(caption_mode),
+        "Selection Notes:",
+        "Option 1:",
+        "Option 2:",
+        "Option 3:",
+        "Header lines must be plain text: no bold, no italic, no bullet or number in "
+        "front. The importer reads them from the start of the line, so "
+        "'**Title Option 1:**' loses that reel.",
+    ]
+    reel_number = 0
+    for account_id, items in grouped.items():
+        account = accounts[account_id]
+        lines += [
+            "",
+            f"########## ACCOUNT: {account.name} ##########",
+            f"Niche: {account.niche_label or '(none)'}",
+            f"Reels for this account: {len(items)}",
+        ]
+        if caption_styles[account_id] != shared_caption_style:
+            lines += [
+                "This account's caption rules REPLACE the caption rules above:",
+                *smart_drafts.effective_caption_rules(caption_styles[account_id]),
+            ]
+        for item in items:
+            reel_number += 1
+            lines += ["", *_persona_reel_context(reel_number, item)]
+    return "\n".join(lines)
+
+
+def multi_account_batch_frames(
+    item_ids: list[int], cancel_event: threading.Event | None = None
+) -> dict:
+    """Vision-first frame prep for a cross-account batch (see ``batch_frames``).
+
+    Declares ``cancel_event`` so the job manager hands one in: the Batch Drafts
+    "Cancel prepare" button can then stop an accidental Prepare between reels.
+    """
+    return batch_frames(multi_account_batch_order(item_ids), cancel_event=cancel_event)
 
 
 def build_multi_account_batch_chat_prompt(item_ids: list[int], settings: dict | None = None) -> str:
@@ -1836,6 +2026,15 @@ def build_multi_account_batch_chat_prompt(item_ids: list[int], settings: dict | 
             raise DraftRevisionError(
                 f"Account(s) not found: {', '.join(missing_accounts)}."
             )
+        persona_accounts = {
+            account_id
+            for account_id, account in accounts.items()
+            if _resolved_styles(account, settings)[0] == TITLE_STYLE_PERSONA
+        }
+        # A mixed batch (some accounts still on v2/v3) keeps the older builder
+        # below, where persona accounts get the persona rules as their own block.
+        if persona_accounts == set(grouped):
+            return _build_persona_batch_prompt(grouped, accounts, settings, total=len(ids))
 
         rules_by_account = {
             account_id: _account_style_rules(accounts[account_id], settings)
@@ -1978,7 +2177,11 @@ def build_multi_account_batch_chat_prompt(item_ids: list[int], settings: dict | 
                 [
                     "",
                     f"########## ACCOUNT: {account.name} ##########",
-                    *_account_voice_delta(account, item_count=len(account_items)),
+                    *_account_voice_delta(
+                        account,
+                        item_count=len(account_items),
+                        persona=account_id in persona_accounts,
+                    ),
                 ]
             )
             if account_id in needs_own_rules:
@@ -2341,7 +2544,17 @@ def _import_batch(
     }
 
 
-def batch_frames(item_ids: list[int]) -> dict:
+def _check_cancel(cancel_event: threading.Event | None) -> None:
+    """Stop a batch prep the operator canceled.
+
+    Called between reels and never inside the per-reel ``try`` blocks below:
+    those catch every Exception, so a cancel raised there would be swallowed.
+    """
+    if cancel_event is not None and cancel_event.is_set():
+        raise JobCanceled("Prepare canceled.")
+
+
+def batch_frames(item_ids: list[int], cancel_event: threading.Event | None = None) -> dict:
     """Prepare each reel's visual grounding for the chat handoff.
 
     Vision-first: run the Groq vision pass over every item that has no visual
@@ -2355,6 +2568,9 @@ def batch_frames(item_ids: list[int]) -> dict:
     image tokens against ~971 for one full-height still, because cropping the
     letterbox and the burned-in title banner reclaims more than the extra tiles
     cost. More evidence, slightly cheaper.
+
+    ``cancel_event`` is checked before each reel in every step, so a canceled
+    prep stops after the reel it is working on instead of running to the end.
     """
     ids = [int(item_id) for item_id in item_ids]
     if not ids:
@@ -2364,9 +2580,9 @@ def batch_frames(item_ids: list[int]) -> dict:
     # than at distribute time means only reels actually being drafted pay for it,
     # and the footage is guaranteed on disk, which it is not when a clip is
     # freshly assigned.
-    _ensure_on_screen_hooks(ids)
-    _ensure_transcripts(ids)
-    vision = draft_generation.ensure_batch_vision_payloads(ids)
+    _ensure_on_screen_hooks(ids, cancel_event=cancel_event)
+    _ensure_transcripts(ids, cancel_event=cancel_event)
+    vision = draft_generation.ensure_batch_vision_payloads(ids, cancel_event=cancel_event)
     described = set(vision["described"])
 
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -2376,9 +2592,10 @@ def batch_frames(item_ids: list[int]) -> dict:
     for index, item_id in enumerate(ids, start=1):
         if item_id in described:
             continue  # vision JSON carries this reel; no attachment needed
+        _check_cancel(cancel_event)
         target = folder / f"reel_{index}_item{item_id}.jpg"
         try:
-            _write_contact_sheet(item_id, target)
+            _write_contact_sheet(item_id, target, label=_contact_sheet_label(index, item_id))
         except (ExportError, DraftRevisionError) as exc:
             raise DraftRevisionError(f"Reel {index} (item {item_id}): {exc}") from exc
         frames.append({"item_id": item_id, "path": str(target)})
@@ -2390,7 +2607,9 @@ def batch_frames(item_ids: list[int]) -> dict:
     }
 
 
-def _ensure_on_screen_hooks(item_ids: list[int]) -> int:
+def _ensure_on_screen_hooks(
+    item_ids: list[int], cancel_event: threading.Event | None = None
+) -> int:
     """OCR the source's burned-in hook for any reel that has none yet.
 
     Reading it is the difference between two shipping rules firing and sitting
@@ -2406,6 +2625,7 @@ def _ensure_on_screen_hooks(item_ids: list[int]) -> int:
     """
     written = 0
     for item_id in item_ids:
+        _check_cancel(cancel_event)
         try:
             with get_session() as session:
                 item = session.get(DownloadItem, item_id)
@@ -2466,7 +2686,9 @@ _NO_SPEECH_MARKER = "no speech was detected"
 _MIN_TRANSCRIPT_WORDS = 10
 
 
-def _ensure_transcripts(item_ids: list[int]) -> int:
+def _ensure_transcripts(
+    item_ids: list[int], cancel_event: threading.Event | None = None
+) -> int:
     """Transcribe the audio of any reel that has none yet.
 
     Every title in this library was drafted with ``transcript_text`` empty,
@@ -2484,6 +2706,7 @@ def _ensure_transcripts(item_ids: list[int]) -> int:
     """
     written = 0
     for item_id in item_ids:
+        _check_cancel(cancel_event)
         try:
             with get_session() as session:
                 item = session.get(DownloadItem, item_id)
@@ -2518,13 +2741,16 @@ def _ensure_transcripts(item_ids: list[int]) -> int:
     return written
 
 
-def _write_contact_sheet(item_id: int, target: Path) -> None:
+def _write_contact_sheet(item_id: int, target: Path, *, label: str | None = None) -> None:
     """Render one reel's contact sheet, falling back to the single still.
 
     Sheet building runs ffmpeg several times (scene detection, an overlay probe,
     one pass per tile). Any of those can fail on a truncated download, and a
     batch that refuses to prepare is worse than one reel grounded on a single
     frame, so failure degrades to the old behaviour instead of raising.
+
+    ``label`` is printed above the image (see ``video.add_label_strip``) so the
+    chat model can match the image to its reel without seeing the filename.
     """
     with get_session() as session:
         item = session.get(DownloadItem, item_id)
@@ -2532,14 +2758,66 @@ def _write_contact_sheet(item_id: int, target: Path) -> None:
             raise DraftRevisionError(f"No download item with id {item_id}.")
         source_path = Path(item.file_path) if item.file_path else None
 
+    built = False
     if source_path is not None and source_path.exists():
         try:
             video.build_contact_sheet(source_path, target)
-            return
+            built = True
         except Exception:  # noqa: BLE001 - any ffmpeg/probe failure falls back
             logger.warning("Contact sheet failed for item %s; using a single frame", item_id)
+    if not built:
+        shutil.copyfile(export_svc.crop_preview_frame(item_id), target)
+    if label:
+        try:
+            video.add_label_strip(target, label)
+        except Exception:  # noqa: BLE001 - an unlabelled sheet still drafts
+            logger.warning("Could not label the contact sheet for item %s", item_id, exc_info=True)
 
-    shutil.copyfile(export_svc.crop_preview_frame(item_id), target)
+
+# Two or more capitalised words in a row: "Tupac Shakur", "Joe Frazier".
+_CLIP_NAME_RE = re.compile(r"\b[A-Z][a-z'’]+(?:\s+[A-Z][a-z'’]+)+\b")
+# Sentence openers the pattern above would glue onto a name ("After Muhammad Ali").
+_CLIP_NAME_OPENERS = frozenset(
+    {"A", "An", "The", "This", "That", "In", "On", "At", "After", "Before", "Right",
+     "When", "While", "During"}
+)
+
+
+def _clip_full_names(clip: str | None) -> list[str]:
+    """The multi-word names in a persona reply's Clip line, in order."""
+    names: list[str] = []
+    for match in _CLIP_NAME_RE.finditer(clip or ""):
+        words = match.group(0).split()
+        while words and words[0] in _CLIP_NAME_OPENERS:
+            words = words[1:]
+        if len(words) >= 2:
+            names.append(" ".join(words))
+    return names
+
+
+def _pick_that_names_the_clip(
+    titles: list[str], tiers: list[str], pick: int | None, clip: str | None
+) -> int | None:
+    """Move a persona pick to an option that keeps the Clip line's full names.
+
+    The persona tells the model to keep the person's full name in its pick, and
+    in a blind re-test it still chose the clever line over the one saying who it
+    is on 2 of 4 reels ("Ali just lost for the first time..." over the option
+    naming Muhammad Ali and Joe Frazier). Our accounts measure better when the
+    title names the subject, so the importer holds the pick to the names the
+    model itself wrote in its Clip line. Nothing moves when no non-red option
+    keeps every name. 1-based, like the pick it takes.
+    """
+    names = _clip_full_names(clip)
+    if not names or pick is None or not 1 <= pick <= len(titles):
+        return pick
+    if all(name in titles[pick - 1] for name in names):
+        return pick
+    for index, title in enumerate(titles, start=1):
+        tier = tiers[index - 1] if index <= len(tiers) else ""
+        if tier != "red" and title.strip() and all(name in title for name in names):
+            return index
+    return pick
 
 
 def import_pasted_draft(item_id: int, text: str) -> DraftRevisionDTO:
@@ -2630,14 +2908,27 @@ def import_pasted_draft(item_id: int, text: str) -> DraftRevisionDTO:
     else:
         recommended_title_index = parsed.recommended_title_index
         recommended_caption_index = parsed.recommended_caption_index
+    reason = guarded.recommendation_reason
+    named = _pick_that_names_the_clip(
+        parsed.title_options, guarded.option_tiers, recommended_title_index, parsed.clip
+    )
+    if named != recommended_title_index:
+        note = (
+            f"Auto-moved from Option {recommended_title_index} to keep "
+            f"{', '.join(_clip_full_names(parsed.clip))} named, as the Clip line does."
+        )
+        reason = f"{reason} [{note}]" if reason else note
+        # Title and caption move as one unit: Apply pairs them by a single index.
+        recommended_title_index = recommended_caption_index = named
     return draft_revisions.save_revision(
         item_id,
         title_options=parsed.title_options,
         caption_options=parsed.caption_options,
+        summary=parsed.clip,
         option_notes=guarded.option_notes,
         option_tiers=guarded.option_tiers,
         recommended_title_index=recommended_title_index,
         recommended_caption_index=recommended_caption_index,
-        recommendation_reason=guarded.recommendation_reason,
+        recommendation_reason=reason,
         source="clipboard",
     )

@@ -12,6 +12,7 @@ import type {
   AccountDetail,
   AccountSummary,
   ApifyUsage,
+  AppSettingsStatus,
   ApplyResult,
   BatchCandidateGroup,
   BatchDraftImportResult,
@@ -21,6 +22,7 @@ import type {
   CloudPublisherHealth,
   CloudWorkerAccountsResult,
   CloudWorkerJobsResult,
+  ConnectionCheckResult,
   Campaign,
   CaptionCheck,
   ClipBatchTitleImport,
@@ -343,6 +345,9 @@ interface PywebviewApi {
   ): Promise<Envelope<DistributeNicheResult>>;
   dashboard_publish_jobs(): Promise<Envelope<DashboardPublishQueue>>;
   dashboard_schedule_coverage(): Promise<Envelope<ScheduleCoverage>>;
+  get_app_settings(): Promise<Envelope<AppSettingsStatus>>;
+  save_app_settings(values: Record<string, string>): Promise<Envelope<AppSettingsStatus>>;
+  check_app_connection(service: string): Promise<Envelope<ConnectionCheckResult>>;
   cloud_publisher_health(): Promise<Envelope<CloudPublisherHealth>>;
   dashboard_cloud_account_settings(accountId: number): Promise<Envelope<CloudAccountSettings | null>>;
   dashboard_update_cloud_account_settings(
@@ -1362,6 +1367,23 @@ export const bridge = {
     return unwrap(window.pywebview!.api.dashboard_schedule_coverage());
   },
 
+  getAppSettings(): Promise<AppSettingsStatus> {
+    if (!hasBridge()) return Promise.resolve(mockAppSettings());
+    return unwrap(window.pywebview!.api.get_app_settings());
+  },
+
+  /** Send only the fields that changed; an empty string removes a key. */
+  saveAppSettings(values: Record<string, string>): Promise<AppSettingsStatus> {
+    if (!hasBridge()) return Promise.resolve(mockAppSettings());
+    return unwrap(window.pywebview!.api.save_app_settings(values));
+  },
+
+  checkAppConnection(service: string): Promise<ConnectionCheckResult> {
+    if (!hasBridge())
+      return Promise.resolve({ ok: true, message: `Mock: ${service} connection looks fine.` });
+    return unwrap(window.pywebview!.api.check_app_connection(service));
+  },
+
   cloudPublisherHealth(): Promise<CloudPublisherHealth> {
     if (!hasBridge())
       return Promise.resolve({
@@ -1559,6 +1581,38 @@ export const bridge = {
 };
 
 // --- browser-only mock ---------------------------------------------------- //
+
+function mockAppSettings(): AppSettingsStatus {
+  const field = (
+    key: string,
+    label: string,
+    group: AppSettingsStatus["fields"][number]["group"],
+    secret: boolean,
+    kind: AppSettingsStatus["fields"][number]["kind"] = "text",
+  ): AppSettingsStatus["fields"][number] => ({
+    key,
+    label,
+    group,
+    secret,
+    kind,
+    help: "Mock field for browser development.",
+    is_set: key === "APIFY_TOKEN",
+    source: key === "APIFY_TOKEN" ? "app" : null,
+    value: secret ? null : "",
+    hint: key === "APIFY_TOKEN" ? "…9f2c" : null,
+  });
+  return {
+    settings_path: "C:/mock/data/settings.env",
+    fields: [
+      field("APIFY_TOKEN", "Apify API token", "apify", true),
+      field("CLOUDFLARE_PUBLISHER_URL", "Worker URL", "cloudflare", false, "url"),
+      field("CLOUDFLARE_PUBLISHER_API_KEY", "Worker API key", "cloudflare", true),
+      field("CLOUDFLARE_PUBLISH_ACCOUNTS", "Cloud-published accounts", "cloudflare", false, "account_map"),
+      field("GROQ_API_KEY", "Groq API key", "ai", true),
+      field("NICHEFLOW_IG_SOURCING_PROFILES", "Sourcing profiles", "instagram", false, "handles"),
+    ],
+  };
+}
 
 const mockRevision: DraftRevision = {
   id: 1,
@@ -2214,6 +2268,10 @@ const mock = {
         description: "Browser-dev mock pending pool clip.",
         channel_name: "thehistologian",
         published_at: new Date(Date.now() - 3 * 86400 * 1000).toISOString(),
+        check_verdict: "strong",
+        check_ratio: 2.4,
+        check_summary:
+          "Strong: 2.4x normal for @thehistologian (56k vs 23k) | 1.2k likes | 42 comments | 3 days old",
       },
     ];
     return sourceLabel ? rows.filter((row) => row.source_label === sourceLabel) : rows;

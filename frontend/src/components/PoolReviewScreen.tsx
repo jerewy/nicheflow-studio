@@ -4,7 +4,7 @@ import { Button } from "@/components/ui/button";
 import { useRevisitRefresh } from "@/hooks/useKeepAlive";
 import { bridge } from "@/lib/bridge";
 import { cn } from "@/lib/utils";
-import type { PoolReviewItem, RightsConfidence } from "@/types";
+import type { ClipVerdict, PoolReviewItem, RightsConfidence } from "@/types";
 
 const NICHES = [
   { value: "history", label: "History" },
@@ -83,6 +83,13 @@ function metricLine(item: PoolReviewItem): string {
     formatDate(item.published_at),
   ].join(" / ");
 }
+
+const VERDICT_STYLES: Record<ClipVerdict, { label: string; className: string }> = {
+  strong: { label: "Strong", className: "bg-emerald-500/15 text-emerald-500" },
+  ok: { label: "OK", className: "bg-sky-500/15 text-sky-500" },
+  weak: { label: "Weak", className: "bg-rose-500/15 text-rose-500" },
+  unknown: { label: "Unknown", className: "bg-muted text-muted-foreground" },
+};
 
 const GRID_COLS = "grid-cols-[2.5rem_6rem_minmax(0,1fr)_9rem_10rem_10rem_18rem]";
 
@@ -343,8 +350,8 @@ export function PoolReviewScreen({
             {loading ? "Loading clips…" : `${items.length} pending clip(s)`}
           </p>
           <p className="mt-0.5 text-xs text-muted-foreground/80">
-            Ranked by fit score (tier weight × engagement rate × recency). The Tier badge is topic
-            only — it doesn&apos;t set the order, so a high-engagement Tier A can outrank a Tier S.
+            Ranked by views against each creator&apos;s normal views: Strong is 2x or more, OK 1-2x,
+            Weak under 1x. Fit score only breaks ties, and the Tier badge is topic only.
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -455,6 +462,9 @@ export function PoolReviewScreen({
                 {item.clip_label}
               </p>
               <p className="text-xs text-muted-foreground">{metricLine(item)}</p>
+              <p className="text-xs font-medium text-foreground/80" title="Views against the creator's normal views">
+                {item.check_summary}
+              </p>
               {item.description && (
                 <p className="max-h-10 overflow-hidden text-xs text-muted-foreground">
                   {item.description}
@@ -465,7 +475,16 @@ export function PoolReviewScreen({
               {item.source_label}
             </div>
             <div className="space-y-1 text-xs">
-              <div className="flex items-center gap-1.5">
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span
+                  className={cn(
+                    "rounded-full px-2 py-1 font-medium",
+                    VERDICT_STYLES[item.check_verdict].className,
+                  )}
+                  title="Views against the creator's normal: 2x or more is Strong, 1-2x OK, under 1x Weak. Sets the row order."
+                >
+                  {VERDICT_STYLES[item.check_verdict].label}
+                </span>
                 <span
                   className="rounded-full bg-emerald-500/15 px-2 py-1 font-medium text-emerald-500"
                   title="Topic tier from keyword match (subject only). Does not set the row order."
@@ -481,7 +500,7 @@ export function PoolReviewScreen({
               </div>
               <div
                 className="text-muted-foreground"
-                title="ER = engagement rate. Fit score = tier weight × ER × recency, and sets the sort order."
+                title="ER = engagement rate. Fit score = tier weight × ER × recency. It only breaks ties: the verdict sets the order."
               >
                 ER {(item.source_er * 100).toFixed(1)}% · {item.fit_score.toFixed(3)}
               </div>

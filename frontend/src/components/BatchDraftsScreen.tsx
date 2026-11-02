@@ -28,6 +28,9 @@ const POLL_INTERVAL_MS = 900;
 // Consecutive getJob failures tolerated before a wait gives up. The job outlives
 // the poller, so a brief bridge outage must not be read as the job dying.
 const MAX_POLL_FAILURES = 5;
+// Names the clipboard because that is what an accidental Prepare puts at risk:
+// a copied chat reply would otherwise be overwritten by the prompt.
+const PREPARE_CANCELED_MESSAGE = "Prepare canceled. Nothing was copied to the clipboard.";
 
 // Whether a reel's post is the Worker's job rather than this machine's. A
 // deferred handoff still reads status "scheduled" because the upload is running
@@ -256,6 +259,11 @@ export function BatchDraftsScreen({
   // running export blocks only a second export.
   const [exporting, setExporting] = useState(false);
   const [progress, setProgress] = useState<{ value: number; message: string } | null>(null);
+  // The Prepare in flight, so "Cancel prepare" can reach it. A ref, not state:
+  // prepare() reads it after its awaits, where state would be the stale value
+  // its closure captured. `preparing` is the render-side twin for the button.
+  const prepareAbort = useRef<AbortController | null>(null);
+  const [preparing, setPreparing] = useState<"running" | "canceling" | null>(null);
   // Pinned at prepare time: reel numbers in the reply map to THIS list, so a
   // later change to the candidate pool must not shift the routing.
   // A QUEUE, not one slot. With a single `preparedIds`, preparing a second
@@ -346,6 +354,9 @@ export function BatchDraftsScreen({
   // Wait for the stored niche before fetching, or the first paint would show
   // every account and then visibly re-filter once the preference arrives.
   useEffect(() => {
+    // load() sets state only after its bridge call resolves; the rule cannot
+    // see past the await, so this is not a synchronous cascade.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     if (active && settingsLoaded) void load();
   }, [active, load, settingsLoaded]);
 
@@ -735,16 +746,41 @@ export function BatchDraftsScreen({
       pushToast("Pick at least one reel first.", "error");
       return;
     }
+    const abort = new AbortController();
+    prepareAbort.current = abort;
+    setPreparing("running");
     setBusy(true);
     setProgress({ value: 0, message: "Preparing…" });
     setFinishResult(null);
     try {
       const { job_id } = await bridge.startPrepareMultiAccountBatchFrames(ids);
+      // Cancel has to stop the Python job, not just this screen's wait on it:
+      // left running, it keeps transcribing and paying for vision calls nobody
+      // wants. Also covers a Cancel pressed before the job id came back.
+      const stopJob = () =>
+        void bridge.cancelJob(job_id).catch((err: unknown) =>
+          pushToast(
+            `Could not stop the prepare job (${err instanceof Error ? err.message : String(err)}). ` +
+              "Its result is thrown away when it finishes.",
+            "error",
+          ),
+        );
+      if (abort.signal.aborted) stopJob();
+      else abort.signal.addEventListener("abort", stopJob, { once: true });
       const frames = (await waitForJob(job_id)) as {
         folder: string;
         frames: { item_id: number }[];
       };
       const { prompt } = await bridge.buildMultiAccountBatchChatPrompt(ids, {});
+      // The last point a cancel lands cleanly: past here the clipboard changes.
+      // Checked rather than trusted, because a job can finish before it notices
+      // the cancel. From here on, the row's own "cancel prepare" is the undo.
+      if (abort.signal.aborted) {
+        pushToast(PREPARE_CANCELED_MESSAGE, "info");
+        return;
+      }
+      prepareAbort.current = null;
+      setPreparing(null);
       await bridge.copyTextToClipboard(prompt);
       // Order the prompt actually used, so REEL n routes to the right reel.
       const { item_ids: ordered } = await bridge.multiAccountBatchOrder(ids);
@@ -785,11 +821,23 @@ export function BatchDraftsScreen({
         "success",
       );
     } catch (err: unknown) {
-      pushToast(err instanceof Error ? err.message : String(err), "error");
+      // A canceled job ends by throwing ("Prepare canceled."). That is the
+      // outcome the operator asked for, so it is not reported as a failure.
+      if (abort.signal.aborted) pushToast(PREPARE_CANCELED_MESSAGE, "info");
+      else pushToast(err instanceof Error ? err.message : String(err), "error");
     } finally {
+      prepareAbort.current = null;
+      setPreparing(null);
       setBusy(false);
       setProgress(null);
     }
+  };
+
+  const cancelPrepare = () => {
+    const abort = prepareAbort.current;
+    if (!abort || abort.signal.aborted) return;
+    abort.abort();
+    setPreparing("canceling");
   };
 
   // Waves put several prompts in flight at once, and each prepare overwrites
@@ -1186,7 +1234,13 @@ export function BatchDraftsScreen({
                   style={{ width: `${Math.round((progress.value ?? 0) * 100)}%` }}
                 />
               </div>
-              <p className="text-xs text-muted-foreground">{progress.message}</p>
+              <p className="text-xs text-muted-foreground">
+                {/* The job only stops between reels, and one reel's whisper
+                    pass can take a while, so say why the cancel isn't instant. */}
+                {preparing === "canceling"
+                  ? "Stopping after the reel in progress…"
+                  : progress.message}
+              </p>
             </div>
           )}
 
@@ -1267,8 +1321,15 @@ export function BatchDraftsScreen({
                       onClick={() =>
                         setPending((prev) => prev.filter((entry) => entry.key !== batch.key))
                       }
+                      title={
+                        batch.imported
+                          ? "Remove this row. The drafts it imported stay."
+                          : "Undo this prepare. Its reels go back to unprepared; nothing is drafted, rejected or deleted."
+                      }
                     >
-                      discard
+                      {/* Before an import, removing the row IS undoing the
+                          prepare, and "discard" read as throwing the reels away. */}
+                      {batch.imported ? "discard" : "cancel prepare"}
                     </button>
                   </div>
                 );
@@ -1352,6 +1413,19 @@ export function BatchDraftsScreen({
             >
               Prepare all {selectedIds.length} in one
             </Button>
+            {/* Not gated on `busy`: busy is exactly what a running Prepare sets,
+                and without this an accidental click locked the screen until
+                every reel was transcribed and framed. */}
+            {preparing && (
+              <Button
+                variant="outline"
+                onClick={cancelPrepare}
+                disabled={preparing === "canceling"}
+                title="Stop this prepare. Nothing is copied to the clipboard and no row is added."
+              >
+                {preparing === "canceling" ? "Canceling…" : "Cancel prepare"}
+              </Button>
+            )}
             {exporting && (
               <span className="self-center text-xs text-muted-foreground">
                 Exporting in the background. Keep picking and preparing; only a second

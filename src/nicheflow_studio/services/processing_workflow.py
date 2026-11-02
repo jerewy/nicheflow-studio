@@ -29,6 +29,7 @@ TITLE_STYLES = [
     {"value": "historytrails_record", "label": "(History) HistoryTrails"},
     {"value": "beats_v2", "label": "(History) Story Beats v2"},
     {"value": "beats_v3", "label": "(History) Story Beats v3 (react)"},
+    {"value": "persona_v1", "label": "(History) HistoryTrails Persona"},
     {"value": "meme_setup_punchline", "label": "(Meme) Setup -> Punchline"},
     {"value": "meme_relatable", "label": "(Meme) Relatable Hook"},
     {"value": "meme_friend_group", "label": "(Meme) Friend Group"},

@@ -494,10 +494,12 @@ def test_precedence_first_is_still_checked() -> None:
     )
     supported = draft_guard.check_title_claims(
         "Chaplin's first return to America in twenty years",
-        "Chaplin makes his first trip back to America since 1952.",
+        "Chaplin makes his first trip back to America in twenty years, since 1952.",
     )
 
-    assert unsupported.unsupported_terms == ["first"]
+    # "twenty years" is a duration claim as well, checked since spelled-out
+    # durations in titles stopped slipping past the guard.
+    assert unsupported.unsupported_terms == ["first", "20 year"]
     assert supported.unsupported_terms == []
 
 
@@ -538,3 +540,27 @@ def test_only_the_short_setting_has_a_character_limit() -> None:
     assert draft_guard.title_char_limit(" Short ") == draft_guard.SHORT_TITLE_MAX_CHARS
     for other in ("auto", "long", "medium", None, ""):
         assert draft_guard.title_char_limit(other) is None
+
+
+def test_spelled_out_duration_in_the_title_is_checked_too() -> None:
+    # Blind-test reel #2381 shipped green: "Six months after this photo, the man
+    # beside Tupac was accused..." The guard only looked for digit durations in
+    # the TITLE, so a spelled-out "six months" was never checked at all.
+    signals = (
+        "The last photo ever taken of rapper Tupac Shakur, just 20 minutes before "
+        "his death in a drive-by shooting. 1996."
+    )
+
+    unsupported = draft_guard.check_title_claims(
+        "Six months after this photo, the man beside Tupac was accused of a murder",
+        signals,
+    )
+    supported = draft_guard.check_title_claims(
+        "Twenty minutes after this photo, Tupac was shot", signals
+    )
+    idiom = draft_guard.check_title_claims("One day in 1996, Tupac posed for this photo", signals)
+
+    assert unsupported.unsupported_terms == ["6 month"]
+    assert supported.unsupported_terms == []
+    # "one day" is an idiom far more often than a timeline claim.
+    assert idiom.claim_terms == ["1996"]

@@ -329,6 +329,26 @@ def _populate_scrape_candidate_engagement_rate(
     )
 
 
+class CreatorBaseline(Base):
+    """A source creator's normal reel views, the yardstick for captured clips.
+
+    See core/clip_check.py: a clip is judged by its views against this median.
+    Cached so a creator costs one Apify call per refresh window rather than one
+    per captured clip. ``source`` records where the number came from:
+    "apify" (their latest posts) or "pool" (our own bulk scrapes of them).
+    """
+
+    __tablename__ = "creator_baselines"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # Lower-cased Instagram handle without the "@".
+    channel_name: Mapped[str] = mapped_column(String(256), unique=True, index=True)
+    median_views: Mapped[int] = mapped_column(Integer)
+    sample_size: Mapped[int] = mapped_column(Integer)
+    source: Mapped[str] = mapped_column(String(16))
+    measured_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True))
+
+
 class Source(Base):
     __tablename__ = "sources"
 

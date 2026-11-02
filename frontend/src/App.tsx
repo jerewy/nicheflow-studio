@@ -6,13 +6,14 @@ import { ProcessingScreen, type ProcessingDeepLink } from "@/components/Processi
 import { PublishEventToaster } from "@/components/PublishEventToaster";
 import ClipStudioScreen from "@/components/ClipStudioScreen";
 import { ScrapingScreen } from "@/components/ScrapingScreen";
+import { SettingsScreen } from "@/components/SettingsScreen";
 import { ToastProvider } from "@/components/ui/Toast";
 import { usePauseHiddenMedia } from "@/hooks/useKeepAlive";
 import { bridge, whenBridgeReady } from "@/lib/bridge";
 import { cn } from "@/lib/utils";
 import type { AccountSummary } from "@/types";
 
-type Tab = "accounts" | "dashboard" | "scraping" | "processing" | "clipstudio";
+type Tab = "accounts" | "dashboard" | "scraping" | "processing" | "clipstudio" | "settings";
 
 const TABS: { id: Tab; label: string; gated: boolean }[] = [
   { id: "accounts", label: "Accounts", gated: false },
@@ -22,6 +23,8 @@ const TABS: { id: Tab; label: string; gated: boolean }[] = [
   // Campaign clipping runs on dedicated clip accounts, so it is not gated on
   // the active niche account the way the network screens are.
   { id: "clipstudio", label: "Clip Studio", gated: false },
+  // API keys have to be reachable before any account exists (first run).
+  { id: "settings", label: "Settings", gated: false },
 ];
 
 function App() {
@@ -197,12 +200,18 @@ function App() {
             <ClipStudioScreen active={effectiveTab === "clipstudio"} />
           </div>
         )}
+        {isTabMounted("settings") && (
+          <div hidden={effectiveTab !== "settings"}>
+            <SettingsScreen accounts={accounts} />
+          </div>
+        )}
       </div>
 
       {loaded && activeId === null && effectiveTab === "accounts" && (
         <p className="px-6 pb-6 text-sm text-muted-foreground">
           Tip: choose an <span className="font-medium">active niche</span> (top-right) to unlock
-          Processing and the Dashboard.
+          Processing and the Dashboard. First time here? Add your API keys on the{" "}
+          <span className="font-medium">Settings</span> tab.
         </p>
       )}
       </ToastProvider>

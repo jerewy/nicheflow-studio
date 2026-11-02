@@ -82,7 +82,7 @@ def test_webview_app_owns_loop_lifetime(monkeypatch: pytest.MonkeyPatch) -> None
         def stop(self) -> None:
             calls.append("stop")
 
-    monkeypatch.setattr(webview_app, "load_dotenv", lambda: None)
+    monkeypatch.setattr(webview_app, "load_app_env", lambda: None)
     monkeypatch.setattr(webview_app, "ensure_data_dirs", lambda: None)
     monkeypatch.setattr(webview_app, "configure_logging", lambda: None)
     monkeypatch.setattr(webview_app, "init_db", lambda: calls.append("db"))

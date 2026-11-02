@@ -39,6 +39,13 @@
       #result { margin-top: 7px; padding-top: 6px; border-top: 1px solid #334155; font-size: 11px; color: #cbd5e1; }
       #result[data-tone="success"] { color: #86efac; }
       #result[data-tone="error"] { color: #fca5a5; }
+      .verdicts { margin-top: 6px; display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow-y: auto; }
+      .verdict { padding: 4px 6px; border: 1px solid #334155; border-left-width: 3px; border-radius: 6px; background: #1e293b; font-size: 11px; color: #cbd5e1; }
+      .verdict b { margin-right: 4px; color: #e2e8f0; }
+      .verdict[data-verdict="strong"] { border-left-color: #22c55e; }
+      .verdict[data-verdict="ok"] { border-left-color: #38bdf8; }
+      .verdict[data-verdict="weak"] { border-left-color: #f43f5e; }
+      .verdict[data-verdict="unknown"] { border-left-color: #64748b; }
     </style>
   </head>
   <body>
@@ -63,6 +70,7 @@
     <div class="qhead"><h2>In queue (<span id="queue-count">0</span>)</h2><button class="qclear" id="queue-clear" type="button">Clear all</button></div>
     <div class="queue-list" id="queue-list"><div class="qempty">Queue is empty.</div></div>
     <div id="result" data-tone="neutral">Queue Reels, then process together.</div>
+    <div class="verdicts" id="verdict-list"></div>
     <script src="media-url.js"></script>
     <script src="popup.js"></script>
   </body>

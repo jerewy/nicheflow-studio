@@ -18,6 +18,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Callable
 
+from nicheflow_studio.core import clip_check
 from nicheflow_studio.core.account_health import HealthState, local_health
 from nicheflow_studio.core.distribution import DEFAULT_DISTRIBUTE_DAILY_TARGET
 from nicheflow_studio.core.instagram_profile_pool import ProfilePool
@@ -42,6 +43,7 @@ from nicheflow_studio.downloader.failures import (
     looks_like_offline,
 )
 from nicheflow_studio.downloader.instagram import download_instagram_url
+from nicheflow_studio.services.creator_baselines import normalize_channel, resolve_baselines
 from nicheflow_studio.services.errors import ServiceError
 from nicheflow_studio import queue as queue_module
 
@@ -365,12 +367,14 @@ def review_queue(niche: str, source_label: str | None = None) -> list[dict]:
             session, [item.id for item in items]
         )
         rows: list[dict] = []
+        published: dict[int, dt.datetime | None] = {}
         for item in items:
             asset = item.media_asset
             candidate = _candidate_for_asset(session, asset)
             source = candidate.channel_name if candidate and candidate.channel_name else "-"
             if source_filter and source != source_filter:
                 continue
+            published[item.id] = candidate.published_at if candidate else None
             signal = signals[item.id]
             rows.append(
                 {
@@ -413,12 +417,41 @@ def review_queue(niche: str, source_label: str | None = None) -> list[dict]:
                     "published_at": _iso(candidate.published_at if candidate else None),
                 }
             )
+        _add_clip_checks(session, rows, published)
         session.commit()
+        # Verdict first: fit_score no longer predicted our results on posts after
+        # 2026-08-15 (Spearman -0.03), views against the creator's normal did.
         return sorted(
             rows,
-            key=lambda row: signals[row["pool_item_id"]].fit_score,
-            reverse=True,
+            key=lambda row: (
+                clip_check.VERDICT_RANK[row["check_verdict"]],
+                -(row["check_ratio"] or 0.0),
+                -signals[row["pool_item_id"]].fit_score,
+            ),
         )
+
+
+def _add_clip_checks(
+    session, rows: list[dict], published: dict[int, dt.datetime | None]
+) -> None:
+    """Attach the capture verdict to review rows. Never calls Apify: it reads
+    saved baselines and our own scrapes only, so opening the screen stays free."""
+    baselines = resolve_baselines(
+        session, [row["channel_name"] for row in rows], fetch_missing=False
+    )
+    for row in rows:
+        check = clip_check.check_clip(
+            views=row["view_count"],
+            likes=row["like_count"],
+            comments=row["comment_count"],
+            published_at=published.get(row["pool_item_id"]),
+            channel_name=row["channel_name"],
+            text=row["description"],
+            baseline_views=baselines.get(normalize_channel(row["channel_name"])),
+        )
+        row["check_verdict"] = check.verdict
+        row["check_ratio"] = round(check.ratio, 2) if check.ratio is not None else None
+        row["check_summary"] = check.summary
 
 
 def pool_item_preview(pool_item_id: int) -> dict:

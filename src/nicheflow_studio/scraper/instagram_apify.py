@@ -28,7 +28,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
-from typing import Iterable
+from typing import Iterable, NamedTuple
 
 from nicheflow_studio.core.apify_usage import record_apify_results
 from nicheflow_studio.scraper.youtube import (
@@ -63,7 +63,7 @@ def _require_token() -> str:
     token = os.environ.get(APIFY_TOKEN_ENV, "").strip()
     if not token:
         raise ApifyConfigError(
-            f"{APIFY_TOKEN_ENV} not set. Add it to .env "
+            f"{APIFY_TOKEN_ENV} not set. Add it on the Settings tab "
             f"(get one from https://console.apify.com/account/integrations)."
         )
     return token
@@ -381,3 +381,71 @@ def scrape_instagram_urls_apify(
 
     logger.info("Apify returned %d candidate(s) from %d URL(s)", len(candidates), len(url_list))
     return candidates
+
+
+class RecentReel(NamedTuple):
+    views: int
+    published_at: dt.datetime | None
+
+
+def fetch_instagram_profile_views_apify(
+    usernames: Iterable[str],
+    *,
+    timeout_secs: int = 300,
+) -> dict[str, list[RecentReel]]:
+    """Recent reels (views + post time) per profile, from one ``details`` run.
+
+    A profile's ``details`` row carries ``latestPosts`` (12 on a 2026-09-28 live
+    check) with their view counts, so a creator's normal views cost one billed
+    row instead of a scrape of their feed. Photo posts carry no view count and
+    are skipped. Post times matter: a creator posting several reels a day fills
+    the latest 12 with clips whose views are still climbing.
+
+    Returns ``{lower-cased username: [RecentReel, ...]}``; a profile Apify could
+    not read is simply absent.
+    """
+    names = sorted(
+        {name.strip().lstrip("@").lower() for name in usernames if isinstance(name, str) and name.strip()}
+    )
+    if not names:
+        return {}
+
+    client = _require_client()
+    run_input = {
+        "directUrls": [f"https://www.instagram.com/{name}/" for name in names],
+        "resultsType": "details",
+        # One details row per profile; same cap convention as the URL batch above.
+        "resultsLimit": len(names),
+        "addParentData": False,
+    }
+    logger.info("Calling Apify Actor %s for %d profile baseline(s)", APIFY_ACTOR_ID, len(names))
+    try:
+        run = client.actor(APIFY_ACTOR_ID).call(  # type: ignore[attr-defined]
+            run_input=run_input,
+            timeout_secs=timeout_secs,
+        )
+    except Exception as exc:  # noqa: BLE001 - surface a clean error to callers
+        raise ApifyScrapeError(f"Apify Actor call failed: {exc}") from exc
+
+    if not isinstance(run, dict) or not run.get("defaultDatasetId"):
+        raise ApifyScrapeError(f"Apify Actor returned no dataset: {run!r}")
+
+    items = list(client.dataset(run["defaultDatasetId"]).iterate_items())  # type: ignore[attr-defined]
+    record_apify_results(len(items))
+
+    reels_by_profile: dict[str, list[RecentReel]] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        username = item.get("username")
+        if not isinstance(username, str) or not username.strip():
+            continue
+        reels: list[RecentReel] = []
+        for post in item.get("latestPosts") or []:
+            if not isinstance(post, dict):
+                continue
+            count = _optional_int(post.get("videoViewCount") or post.get("videoPlayCount"))
+            if count is not None:
+                reels.append(RecentReel(count, _parse_timestamp(post.get("timestamp"))))
+        reels_by_profile[username.strip().lower()] = reels
+    return reels_by_profile

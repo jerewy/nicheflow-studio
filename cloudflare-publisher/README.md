@@ -52,7 +52,7 @@ legitimately defer them.
 
 ## Initial setup
 
-From this directory:
+You need a free Cloudflare account. From this directory:
 
 ```powershell
 npm install
@@ -61,7 +61,14 @@ npx wrangler d1 create nicheflow-publisher
 npx wrangler r2 bucket create nicheflow-publish-media
 ```
 
-Copy the returned D1 `database_id` into `wrangler.jsonc`, then initialize it:
+`wrangler.jsonc` ships with the original author's deployment values. Before
+your first deploy, edit the values marked `PER DEPLOYMENT`:
+
+- `database_id`: the id printed by `d1 create` above.
+- `LEGAL_CONTACT`: your email, shown on the public legal pages Meta asks for.
+- `PUBLISH_MODE`: set it to `"disabled"` for now (see Safe rollout below).
+
+Initialize the database, set the API key, and deploy:
 
 ```powershell
 npm run db:remote
@@ -69,14 +76,32 @@ npx wrangler secret put API_KEY
 npm run deploy
 ```
 
-After deployment, copy the Worker URL into `PUBLIC_BASE_URL` in
+`API_KEY` is a password you make up; NicheFlow Studio sends it with every
+request. One way to generate a strong one in PowerShell:
+
+```powershell
+$bytes = New-Object byte[] 32
+[System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+($bytes | ForEach-Object { $_.ToString("x2") }) -join ""
+```
+
+The deploy prints your Worker URL. Put it in `PUBLIC_BASE_URL` in
 `wrangler.jsonc`, then deploy again.
+
+Finally, connect the desktop app: open NicheFlow Studio, go to the Settings
+tab, and enter the Worker URL and the same `API_KEY` under Cloudflare publisher.
+Use Check connection to confirm the key is accepted.
 
 For each account, add its token as a separate encrypted Worker secret:
 
 ```powershell
-npx wrangler secret put IG_TOKEN_PASTMOMENTSDAILY
+npx wrangler secret put IG_TOKEN_YOURACCOUNT
 ```
+
+The secret name is `IG_TOKEN_` plus the account key in upper case. Then, on the
+Settings tab, map the local account to that account key under
+"Cloud-published accounts". Accounts without a mapping keep using the local
+publisher.
 
 Do not put secret values directly in commands or `wrangler.jsonc`; Wrangler
 will prompt securely.

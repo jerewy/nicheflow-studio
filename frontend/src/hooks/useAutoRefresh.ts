@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useLayoutEffect, useRef } from "react";
 
 /**
  * Re-run `fn` on an interval and whenever the window regains focus or becomes
@@ -13,7 +13,11 @@ export function useAutoRefresh(
 ) {
   // Latest callback without resetting the interval on every render.
   const fnRef = useRef(fn);
-  fnRef.current = fn;
+  // Updated after commit, not during render (render must stay pure). A layout
+  // effect runs before any interval or focus tick can fire.
+  useLayoutEffect(() => {
+    fnRef.current = fn;
+  });
 
   useEffect(() => {
     if (!enabled) return;

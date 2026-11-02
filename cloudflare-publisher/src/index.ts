@@ -6,6 +6,8 @@ interface Env {
   GRAPH_HOST: string;
   GRAPH_VERSION: string;
   PUBLIC_BASE_URL: string;
+  /** Email shown on /privacy, /terms and /data-deletion. Set per deployment. */
+  LEGAL_CONTACT?: string;
   MAX_STORED_BYTES: string;
   MAX_UPLOAD_BYTES: string;
   MAX_ACTIVE_JOBS: string;
@@ -54,7 +56,7 @@ interface JobInput {
   content_type?: string;
 }
 
-import { isRecoverableMetaError, normalizeAccountKey, parseRange, safeFileName, shouldOfferManualLocalPublish } from "./helpers";
+import { escapeHtml, isRecoverableMetaError, normalizeAccountKey, parseRange, safeFileName, shouldOfferManualLocalPublish } from "./helpers";
 import {
   ageMinutes,
   STALE_AWAITING_UPLOAD_MINUTES,
@@ -663,9 +665,17 @@ async function processDueJobs(env: Env): Promise<{ processed: number; mode: stri
 }
 
 const LEGAL_UPDATED = "2026-06-16";
-const LEGAL_CONTACT = "jeremywijaya81@gmail.com";
 
-function legalPage(title: string, bodyHtml: string): Response {
+// Each deployment publishes its own operator's contact, set as the LEGAL_CONTACT
+// var in wrangler.jsonc. Returns ready-to-embed HTML.
+function legalContactHtml(env: Env): string {
+  const contact = (env.LEGAL_CONTACT ?? "").trim();
+  if (!contact) return "the operator of this deployment";
+  const safe = escapeHtml(contact);
+  return `<a href="mailto:${safe}">${safe}</a>`;
+}
+
+function legalPage(title: string, bodyHtml: string, env: Env): Response {
   const html = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -681,7 +691,7 @@ function legalPage(title: string, bodyHtml: string): Response {
 </style></head>
 <body>
 <h1>NicheFlow Studio — ${title}</h1>
-<p class="meta">Last updated ${LEGAL_UPDATED} · Contact: <a href="mailto:${LEGAL_CONTACT}">${LEGAL_CONTACT}</a></p>
+<p class="meta">Last updated ${LEGAL_UPDATED} · Contact: ${legalContactHtml(env)}</p>
 ${bodyHtml}
 </body></html>`;
   return new Response(html, { status: 200, headers: { "content-type": "text/html; charset=utf-8" } });
@@ -722,15 +732,17 @@ Instagram's and Meta's Platform Terms and Community Guidelines.</p>
 <p>The App is a personal automation tool; the operator assumes all risk arising from its use,
 including any action taken by Meta on connected accounts.</p>`;
 
-const DATA_DELETION_BODY = `
+function dataDeletionBody(env: Env): string {
+  return `
 <p>NicheFlow Studio only processes data belonging to its operator (their own Instagram accounts
 and the content they create). To delete that data:</p>
 <ol>
   <li>Revoke the App's access from your Instagram/Meta account settings (Business Integrations), which immediately invalidates its tokens.</li>
-  <li>Email <a href="mailto:${LEGAL_CONTACT}">${LEGAL_CONTACT}</a> to request deletion of any stored tokens, queued media, and job metadata.</li>
+  <li>Email ${legalContactHtml(env)} to request deletion of any stored tokens, queued media, and job metadata.</li>
 </ol>
 <p>Requests are honored within 30 days. Queued video files are in any case deleted automatically
 once publishing completes.</p>`;
+}
 
 async function route(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
@@ -742,9 +754,11 @@ async function route(request: Request, env: Env): Promise<Response> {
     return serveMedia(request, env, mediaMatch[1]);
   }
   // Public legal pages (no API key) — Meta and end users must be able to fetch these.
-  if (request.method === "GET" && url.pathname === "/privacy") return legalPage("Privacy Policy", PRIVACY_BODY);
-  if (request.method === "GET" && url.pathname === "/terms") return legalPage("Terms of Service", TERMS_BODY);
-  if (request.method === "GET" && url.pathname === "/data-deletion") return legalPage("Data Deletion", DATA_DELETION_BODY);
+  if (request.method === "GET" && url.pathname === "/privacy") return legalPage("Privacy Policy", PRIVACY_BODY, env);
+  if (request.method === "GET" && url.pathname === "/terms") return legalPage("Terms of Service", TERMS_BODY, env);
+  if (request.method === "GET" && url.pathname === "/data-deletion") {
+    return legalPage("Data Deletion", dataDeletionBody(env), env);
+  }
 
   requireAuth(request, env);
   if (request.method === "PUT" && url.pathname === "/v1/accounts") return upsertAccount(request, env);

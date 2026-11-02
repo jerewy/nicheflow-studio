@@ -2868,3 +2868,180 @@ def test_prompt_header_reports_the_styles_the_rules_actually_use() -> None:
     # v2 ignores every length but "short", so printing one would be the same
     # bug in the other direction.
     assert "Title length:" not in auto_header
+
+
+def _make_persona_account_items(
+    name: str, count: int = 2, *, caption_style: str = "historytrails_archive"
+) -> tuple[int, list[int]]:
+    with get_session() as session:
+        account = Account(
+            name=name,
+            platform="instagram",
+            niche="history",
+            niche_label="history",
+            writing_tone="plainspoken storyteller with a documentary feel",
+            hook_style="decade-stamped story openers",
+            target_audience="people who like history clips",
+            processing_preferences=json.dumps(
+                {
+                    "prompt_title_style": draft_handoff.TITLE_STYLE_PERSONA,
+                    "caption_style": caption_style,
+                }
+            ),
+        )
+        session.add(account)
+        session.flush()
+        ids: list[int] = []
+        for index in range(1, count + 1):
+            item = DownloadItem(
+                source_url=f"https://instagram.com/reel/{name}{index}",
+                title=f"{name} source {index}",
+                source_description=f"{name} description {index}",
+                file_path=f"C:/clips/{name}{index}.mp4",
+                account_id=account.id,
+                status="downloaded",
+            )
+            session.add(item)
+            session.flush()
+            ids.append(item.id)
+        session.commit()
+        return account.id, ids
+
+
+def test_persona_batch_prompt_speaks_in_one_voice() -> None:
+    # The persona replaces the per-account voice fields. Printing them beside it
+    # would hand the model two voices, one of them the "documentary feel" the
+    # persona moves away from.
+    _a1, first = _make_persona_account_items("PersonaAlpha")
+    _a2, second = _make_persona_account_items("PersonaBeta")
+
+    prompt = draft_handoff.build_multi_account_batch_chat_prompt([*first, *second])
+
+    assert prompt.count("WHO YOU ARE") == 1
+    assert "documentary feel" not in prompt
+    assert "Tone:" not in prompt
+    assert "Hook style:" not in prompt
+    assert "Hook framing" not in prompt
+    assert "Clip: <one sentence" in prompt
+    headers = re.findall(r"===== REEL (\d+) \(#(\d+)\) =====", prompt)
+    assert [int(item_id) for _reel, item_id in headers] == [*first, *second]
+
+
+def test_persona_batch_prompt_names_the_label_printed_on_each_sheet() -> None:
+    # A chat app may not show the model an attachment's filename, so the prompt
+    # points at the reel label printed on the image itself.
+    _account, items = _make_persona_account_items("PersonaGamma", 1)
+
+    prompt = draft_handoff.build_multi_account_batch_chat_prompt(items)
+
+    assert (
+        f"reel_1_item{items[0]}.jpg (its top strip reads REEL 1 (#{items[0]})" in prompt
+    )
+
+
+def test_persona_batch_prompt_is_still_caught_when_pasted_back() -> None:
+    _account, items = _make_persona_account_items("PersonaDelta", 1)
+    prompt = draft_handoff.build_multi_account_batch_chat_prompt(items)
+
+    with pytest.raises(DraftRevisionError, match="PROMPT"):
+        draft_handoff.import_pasted_draft(items[0], prompt)
+
+
+def test_mixed_batch_keeps_the_older_builder_without_persona_voice_lines() -> None:
+    _a1, persona_items = _make_persona_account_items("PersonaEpsilon", 1)
+    _a2, plain_items = _make_second_account_items("PlainZeta", 1)
+
+    prompt = draft_handoff.build_multi_account_batch_chat_prompt([*persona_items, *plain_items])
+
+    def account_fields(name: str) -> str:
+        after_header = prompt.split(f"########## ACCOUNT: {name} ##########", 1)[1]
+        return after_header.split("Reels for this account", 1)[0]
+
+    assert "Shared style rules" in prompt
+    assert "Tone:" not in account_fields("PersonaEpsilon")
+    assert "Tone:" in account_fields("PlainZeta")
+
+
+def test_parse_pasted_draft_keeps_only_the_clip_sentence() -> None:
+    parsed = draft_handoff.parse_pasted_draft(
+        "\n".join(
+            [
+                "Clip: Michael Jackson rehearses on stage two days before he died.",
+                "Niche check: fits",
+                "Title Option 1:",
+                "This was Michael Jackson rehearsing 36 hours before his death.",
+                "Title Option 2:",
+                "Second option",
+                "Title Option 3:",
+                "Third option",
+                "Recommended Pick: Title Option 1",
+                "Why:",
+                "It names him and the timing.",
+                "Shared Caption:",
+                "A caption.",
+            ]
+        )
+    )
+
+    assert parsed.clip == "Michael Jackson rehearses on stage two days before he died."
+    assert parsed.title_options[0] == (
+        "This was Michael Jackson rehearsing 36 hours before his death."
+    )
+    assert parsed.recommended_title_index == 1
+
+
+def test_import_pasted_draft_saves_the_clip_line_as_the_summary() -> None:
+    # The Processing screen already shows a revision's summary, so the model's
+    # own account of the clip appears next to its titles with no UI change.
+    item_id = _make_item()
+
+    saved = draft_handoff.import_pasted_draft(
+        item_id,
+        "Clip: A crow rides a plastic lid down a snowy roof.\n"
+        "Title Option 1: A title\nCaption Option 1: A caption",
+    )
+
+    assert saved.summary == "A crow rides a plastic lid down a snowy roof."
+
+
+def _persona_reply(pick: int, *, clip: str | None) -> str:
+    return "\n".join(
+        [
+            *([f"Clip: {clip}"] if clip else []),
+            "Title Option 1:",
+            "Muhammad Ali talks to reporters right after losing to Joe Frazier",
+            "Title Option 2:",
+            "A calm voice after a loud night",
+            "Title Option 3:",
+            "Ali just lost and still sounds like the calmest man in the room",
+            f"Recommended Pick: Title Option {pick}",
+            "Why:",
+            "It is the most shareable.",
+            "Shared Caption:",
+            "A caption.",
+        ]
+    )
+
+
+def test_import_moves_a_persona_pick_that_drops_the_clip_line_names() -> None:
+    # Blind re-test reel #2333: the persona's own Clip line named Muhammad Ali and
+    # Joe Frazier, option 1 kept both, and the model still picked "Ali just lost...".
+    item_id = _make_item()
+
+    saved = draft_handoff.import_pasted_draft(
+        item_id,
+        _persona_reply(3, clip="Muhammad Ali talks to reporters right after losing to Joe Frazier."),
+    )
+
+    assert saved.recommended_title_index == 1
+    assert saved.recommended_caption_index == 1
+    assert "Muhammad Ali" in (saved.recommendation_reason or "")
+
+
+def test_import_leaves_the_pick_alone_without_a_clip_line() -> None:
+    # v2/v3 replies carry no Clip line, so there are no names to hold them to.
+    item_id = _make_item()
+
+    saved = draft_handoff.import_pasted_draft(item_id, _persona_reply(3, clip=None))
+
+    assert saved.recommended_title_index == 3
